@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-duckdb = { version = "1.10500.0", features = ["bundled"] }
+duckdb = { version = "1.10501.0", features = ["bundled"] }
 flate2 = "1"
 quick-xml = "0.37"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
