@@ -58,14 +58,14 @@ fn import_address_nodes(conn: &Connection, pbf_path: &str) -> Result<()> {
         SELECT
             id AS osm_id,
             'node' AS osm_type,
-            tags->>'addr:housenumber' AS housenumber,
-            tags->>'addr:street' AS street,
-            tags->>'addr:city' AS city,
-            tags->>'addr:postcode' AS postcode,
+            element_at(tags, 'addr:housenumber')[1] AS housenumber,
+            element_at(tags, 'addr:street')[1] AS street,
+            element_at(tags, 'addr:city')[1] AS city,
+            element_at(tags, 'addr:postcode')[1] AS postcode,
             ST_Point(lon, lat) AS geom
         FROM ST_ReadOSM('{pbf_path}')
         WHERE kind = 'node'
-          AND tags->>'addr:housenumber' IS NOT NULL
+          AND element_at(tags, 'addr:housenumber')[1] IS NOT NULL
           AND lon IS NOT NULL
           AND lat IS NOT NULL;
         "
@@ -112,7 +112,7 @@ fn import_ways(conn: &Connection, pbf_path: &str) -> Result<()> {
             tags
         FROM ST_ReadOSM('{pbf_path}')
         WHERE kind = 'way'
-          AND (tags->>'building' IS NOT NULL OR tags->>'addr:housenumber' IS NOT NULL);
+          AND (element_at(tags, 'building')[1] IS NOT NULL OR element_at(tags, 'addr:housenumber')[1] IS NOT NULL);
         "
     ))
     .context("Failed to import way tags")?;
@@ -155,14 +155,14 @@ fn import_relations(conn: &Connection, pbf_path: &str) -> Result<()> {
         CREATE OR REPLACE TABLE osm_relation_tags AS
         SELECT
             id AS relation_id,
-            tags->>'building' AS building,
-            tags->>'addr:housenumber' AS housenumber,
-            tags->>'addr:street' AS street,
-            tags->>'addr:city' AS city,
-            tags->>'addr:postcode' AS postcode
+            element_at(tags, 'building')[1] AS building,
+            element_at(tags, 'addr:housenumber')[1] AS housenumber,
+            element_at(tags, 'addr:street')[1] AS street,
+            element_at(tags, 'addr:city')[1] AS city,
+            element_at(tags, 'addr:postcode')[1] AS postcode
         FROM ST_ReadOSM('{pbf_path}')
         WHERE kind = 'relation'
-          AND (tags->>'building' IS NOT NULL OR tags->>'addr:housenumber' IS NOT NULL);
+          AND (element_at(tags, 'building')[1] IS NOT NULL OR element_at(tags, 'addr:housenumber')[1] IS NOT NULL);
         "
     ))
     .context("Failed to import relation tags")?;
@@ -358,6 +358,162 @@ mod tests {
         // Expected ≈ 0.000084
         assert!(area < 0.0001, "Area should be less than outer ring alone");
         assert!(area > 0.00005, "Area should still be substantial");
+
+        Ok(())
+    }
+
+    /// End-to-end test: import the fixture PBF and verify final counts.
+    #[test]
+    fn test_import_fixture_pbf() -> Result<()> {
+        let conn = init_db(Path::new(":memory:"))?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+
+        // 2 buildings: way 947235698 (apartments) + relation 1891415 (school)
+        let buildings: i64 =
+            conn.query_row("SELECT COUNT(*) FROM osm_buildings", [], |row| row.get(0))?;
+        assert_eq!(buildings, 2, "Expected 2 buildings (1 way + 1 relation)");
+
+        // 3 addresses: node 13200892212 + way 947235698 + relation 1891415
+        let addresses: i64 =
+            conn.query_row("SELECT COUNT(*) FROM osm_addresses", [], |row| row.get(0))?;
+        assert_eq!(
+            addresses, 3,
+            "Expected 3 addresses (1 node + 1 way + 1 relation)"
+        );
+
+        Ok(())
+    }
+
+    /// Verify building types and tags after import.
+    #[test]
+    fn test_import_fixture_building_details() -> Result<()> {
+        let conn = init_db(Path::new(":memory:"))?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+
+        // Way building: apartments
+        let building_tag: String = conn.query_row(
+            "SELECT building FROM osm_buildings WHERE osm_id = 947235698 AND osm_type = 'way'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(building_tag, "apartments");
+
+        let geom_type: String = conn.query_row(
+            "SELECT ST_GeometryType(geom) FROM osm_buildings WHERE osm_id = 947235698",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(geom_type, "POLYGON");
+
+        // Relation building: school (multipolygon with inner hole)
+        let building_tag: String = conn.query_row(
+            "SELECT building FROM osm_buildings WHERE osm_id = 1891415 AND osm_type = 'relation'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(building_tag, "school");
+
+        // School building should have smaller area than its outer ring (it has a hole)
+        let area: f64 = conn.query_row(
+            "SELECT ST_Area(geom) FROM osm_buildings WHERE osm_id = 1891415",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(area > 0.0, "School building should have positive area");
+
+        Ok(())
+    }
+
+    /// Verify address details after import.
+    #[test]
+    fn test_import_fixture_address_details() -> Result<()> {
+        let conn = init_db(Path::new(":memory:"))?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+
+        // Node address: housenumber 32, Ludwika Narbutta
+        let (hn, street): (String, String) = conn.query_row(
+            "SELECT housenumber, street FROM osm_addresses WHERE osm_id = 13200892212 AND osm_type = 'node'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(hn, "32");
+        assert_eq!(street, "Ludwika Narbutta");
+
+        // Way address: housenumber 63, Kazimierzowska, Warszawa
+        let (hn, street, city, postcode): (String, String, String, String) = conn.query_row(
+            "SELECT housenumber, street, city, postcode FROM osm_addresses WHERE osm_id = 947235698 AND osm_type = 'way'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(hn, "63");
+        assert_eq!(street, "Kazimierzowska");
+        assert_eq!(city, "Warszawa");
+        assert_eq!(postcode, "02-538");
+
+        // Relation address: housenumber 60, Kazimierzowska, Warszawa
+        let (hn, street, city, postcode): (String, String, String, String) = conn.query_row(
+            "SELECT housenumber, street, city, postcode FROM osm_addresses WHERE osm_id = 1891415 AND osm_type = 'relation'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(hn, "60");
+        assert_eq!(street, "Kazimierzowska");
+        assert_eq!(city, "Warszawa");
+        assert_eq!(postcode, "02-543");
+
+        Ok(())
+    }
+
+    /// Verify address geometries are within expected bounding box (Warsaw area).
+    #[test]
+    fn test_import_fixture_address_geometries() -> Result<()> {
+        let conn = init_db(Path::new(":memory:"))?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+
+        // All addresses should have geometry in the Warsaw area (~21.01 lon, ~52.20 lat)
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_addresses
+             WHERE ST_X(geom) BETWEEN 21.01 AND 21.02
+               AND ST_Y(geom) BETWEEN 52.20 AND 52.21",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 3, "All 3 addresses should be in the Warsaw area");
+
+        // Node address should be a point at its exact coordinates
+        let (lon, lat): (f64, f64) = conn.query_row(
+            "SELECT ST_X(geom), ST_Y(geom) FROM osm_addresses WHERE osm_id = 13200892212",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!((lon - 21.014861).abs() < 1e-5);
+        assert!((lat - 52.206263).abs() < 1e-4);
+
+        Ok(())
+    }
+
+    /// Verify raw node import counts from the fixture.
+    #[test]
+    fn test_import_fixture_node_counts() -> Result<()> {
+        let conn = init_db(Path::new(":memory:"))?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+
+        let node_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM osm_nodes", [], |row| row.get(0))?;
+        assert!(
+            node_count >= 48,
+            "Expected at least 48 nodes, got {node_count}"
+        );
+
+        // Way-node mappings: 7 (way 947235698) + 25 (way 977731637) + 19 (way 977731638) = 51
+        let wn_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM osm_way_nodes", [], |row| row.get(0))?;
+        assert_eq!(wn_count, 51, "Expected 51 way-node mappings");
+
+        // Relations: 2 members (outer + inner way) for relation 1891415
+        let rel_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM osm_relations", [], |row| row.get(0))?;
+        assert_eq!(rel_count, 2, "Expected 2 relation members");
 
         Ok(())
     }
