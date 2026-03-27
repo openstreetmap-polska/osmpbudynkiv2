@@ -26,12 +26,14 @@ pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
     // BDOT10k files because their CRS (EPSG:2180) is stored as a projjson string-in-string
     // which DuckDB rejects as "invalid CRS". Instead we disable the automatic conversion,
     // read the file as plain parquet, and manually convert the WKB geometry column.
+    // Geometry is transformed from EPSG:2180 to EPSG:4326 for uniform spatial comparisons.
     conn.execute_batch(&format!(
         "
         SET enable_geoparquet_conversion = false;
         DROP TABLE IF EXISTS bdot10k_buildings;
         CREATE TABLE bdot10k_buildings AS
-        SELECT * EXCLUDE(GEOM), ST_GeomFromWKB(GEOM) AS geom
+        SELECT * EXCLUDE(GEOM),
+               ST_Transform(ST_GeomFromWKB(GEOM), 'EPSG:2180', 'EPSG:4326') AS geom
         FROM '{parquet_str}';
         CREATE INDEX bdot10k_buildings_geom_idx ON bdot10k_buildings USING RTREE (geom);
         "

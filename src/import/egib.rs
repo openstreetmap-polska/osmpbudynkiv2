@@ -20,11 +20,13 @@ pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
 
     info!(path = parquet_str, "Importing EGIB buildings");
 
+    // Geometry is transformed from EPSG:2180 to EPSG:4326 for uniform spatial comparisons.
     conn.execute_batch(&format!(
         "
         DROP TABLE IF EXISTS egib_buildings;
         CREATE TABLE egib_buildings AS
-        SELECT * EXCLUDE(geometry_bbox)
+        SELECT * EXCLUDE(geometry, geometry_bbox),
+               ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom
         FROM '{parquet_str}';
         CREATE INDEX egib_buildings_geom_idx ON egib_buildings USING RTREE (geom);
         "

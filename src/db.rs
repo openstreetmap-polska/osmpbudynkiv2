@@ -10,8 +10,13 @@ pub fn init_db(path: &Path) -> Result<Connection> {
     conn.execute_batch("INSTALL spatial; LOAD spatial;")
         .context("Failed to install/load spatial extension")?;
 
-    conn.execute_batch("SET preserve_insertion_order = false;")
-        .context("Failed to set preserve_insertion_order")?;
+    conn.execute_batch(
+        "
+        SET preserve_insertion_order = false;
+        SET geometry_always_xy = true;
+        ",
+    )
+    .context("Failed to configure DuckDB settings")?;
 
     create_schema(&conn)?;
 
