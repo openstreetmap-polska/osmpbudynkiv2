@@ -33,6 +33,7 @@ pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
         CREATE TABLE bdot10k_buildings AS
         SELECT * EXCLUDE(GEOM), ST_GeomFromWKB(GEOM) AS geom
         FROM '{parquet_str}';
+        CREATE INDEX bdot10k_buildings_geom_idx ON bdot10k_buildings USING RTREE (geom);
         "
     ))
     .context("Failed to import BDOT10k data from GeoParquet")?;

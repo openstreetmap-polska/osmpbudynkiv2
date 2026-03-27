@@ -25,6 +25,7 @@ pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
     geometry::build_way_geometries(conn)?;
     import_relations(conn, pbf_str)?;
     geometry::build_relation_geometries(conn)?;
+    create_spatial_indexes(conn)?;
 
     log_import_stats(conn)?;
 
@@ -172,6 +173,18 @@ fn import_relations(conn: &Connection, pbf_path: &str) -> Result<()> {
     })?;
     info!(count = tag_count, "Relations with relevant tags stored");
 
+    Ok(())
+}
+
+fn create_spatial_indexes(conn: &Connection) -> Result<()> {
+    info!("Creating spatial indexes");
+    conn.execute_batch(
+        "
+        CREATE INDEX osm_buildings_geom_idx ON osm_buildings USING RTREE (geom);
+        CREATE INDEX osm_addresses_geom_idx ON osm_addresses USING RTREE (geom);
+        ",
+    )
+    .context("Failed to create spatial indexes")?;
     Ok(())
 }
 

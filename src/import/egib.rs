@@ -26,6 +26,7 @@ pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
         CREATE TABLE egib_buildings AS
         SELECT * EXCLUDE(geometry_bbox)
         FROM '{parquet_str}';
+        CREATE INDEX egib_buildings_geom_idx ON egib_buildings USING RTREE (geom);
         "
     ))
     .context("Failed to import EGIB data from GeoParquet")?;
