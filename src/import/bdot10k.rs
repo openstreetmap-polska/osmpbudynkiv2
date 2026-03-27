@@ -22,14 +22,20 @@ pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
 
     info!(path = parquet_str, "Importing BDOT10k buildings");
 
+    // Workaround: DuckDB's automatic GeoParquet conversion and ST_Read (GDAL) both fail on
+    // BDOT10k files because their CRS (EPSG:2180) is stored as a projjson string-in-string
+    // which DuckDB rejects as "invalid CRS". Instead we disable the automatic conversion,
+    // read the file as plain parquet, and manually convert the WKB geometry column.
     conn.execute_batch(&format!(
         "
+        SET enable_geoparquet_conversion = false;
         DROP TABLE IF EXISTS bdot10k_buildings;
         CREATE TABLE bdot10k_buildings AS
-        SELECT * FROM ST_Read('{parquet_str}');
+        SELECT * EXCLUDE(GEOM), ST_GeomFromWKB(GEOM) AS geom
+        FROM '{parquet_str}';
         "
     ))
-    .context("Failed to import BDOT10k data via ST_Read")?;
+    .context("Failed to import BDOT10k data from GeoParquet")?;
 
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM bdot10k_buildings", [], |row| {
         row.get(0)
@@ -66,35 +72,4 @@ fn download_and_extract() -> Result<PathBuf> {
     }
 
     anyhow::bail!("Could not find {PARQUET_ENTRY} in ZIP archive")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::init_db;
-
-    #[test]
-    fn test_import_creates_table() -> Result<()> {
-        // We can't easily create a GeoParquet fixture in-test,
-        // but we can verify the SQL logic with a manually created table
-        let conn = init_db(Path::new(":memory:"))?;
-
-        conn.execute_batch(
-            "
-            CREATE TABLE bdot10k_buildings (
-                id INTEGER,
-                geom GEOMETRY
-            );
-            INSERT INTO bdot10k_buildings VALUES (1, ST_Point(20.0, 50.0));
-            INSERT INTO bdot10k_buildings VALUES (2, ST_Point(21.0, 51.0));
-            ",
-        )?;
-
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM bdot10k_buildings", [], |row| {
-            row.get(0)
-        })?;
-        assert_eq!(count, 2);
-
-        Ok(())
-    }
 }

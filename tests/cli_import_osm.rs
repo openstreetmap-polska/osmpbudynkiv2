@@ -10,7 +10,14 @@ fn cmd() -> Command {
 #[test]
 fn test_import_osm_from_fixture() {
     cmd()
-        .args(["--db-path", ":memory:", "import", "osm", "--file", "fixtures/osm.pbf"])
+        .args([
+            "--db-path",
+            ":memory:",
+            "import",
+            "osm",
+            "--file",
+            "fixtures/osm.pbf",
+        ])
         .assert()
         .success()
         .stdout(
@@ -23,7 +30,14 @@ fn test_import_osm_from_fixture() {
 #[test]
 fn test_import_osm_missing_file() {
     cmd()
-        .args(["--db-path", ":memory:", "import", "osm", "--file", "nonexistent.pbf"])
+        .args([
+            "--db-path",
+            ":memory:",
+            "import",
+            "osm",
+            "--file",
+            "nonexistent.pbf",
+        ])
         .assert()
         .failure();
 }
@@ -37,13 +51,27 @@ fn test_import_osm_twice_fails_on_duplicates() {
 
     // First import succeeds
     cmd()
-        .args(["--db-path", db_path, "import", "osm", "--file", "fixtures/osm.pbf"])
+        .args([
+            "--db-path",
+            db_path,
+            "import",
+            "osm",
+            "--file",
+            "fixtures/osm.pbf",
+        ])
         .assert()
         .success();
 
     // Second import fails — osm_nodes has a PRIMARY KEY constraint
     cmd()
-        .args(["--db-path", db_path, "import", "osm", "--file", "fixtures/osm.pbf"])
+        .args([
+            "--db-path",
+            db_path,
+            "import",
+            "osm",
+            "--file",
+            "fixtures/osm.pbf",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("Duplicate key"));
