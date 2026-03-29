@@ -60,10 +60,10 @@ impl Default for DownloadUrls {
 pub fn load_config(path: Option<&Path>) -> Result<Config> {
     match path {
         Some(p) => {
-            let content =
-                fs::read_to_string(p).with_context(|| format!("Failed to read config file: {p:?}"))?;
-            let config: Config =
-                toml::from_str(&content).with_context(|| format!("Failed to parse config file: {p:?}"))?;
+            let content = fs::read_to_string(p)
+                .with_context(|| format!("Failed to read config file: {p:?}"))?;
+            let config: Config = toml::from_str(&content)
+                .with_context(|| format!("Failed to parse config file: {p:?}"))?;
             Ok(config)
         }
         None => Ok(Config::default()),
