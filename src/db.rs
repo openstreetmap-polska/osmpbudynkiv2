@@ -3,20 +3,14 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use duckdb::Connection;
 
-pub fn init_db(path: &Path) -> Result<Connection> {
+pub fn init_db(path: &Path, init_commands: &[String]) -> Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("Failed to open database at {path:?}"))?;
 
-    conn.execute_batch("INSTALL spatial; LOAD spatial;")
-        .context("Failed to install/load spatial extension")?;
-
-    conn.execute_batch(
-        "
-        SET preserve_insertion_order = false;
-        SET geometry_always_xy = true;
-        ",
-    )
-    .context("Failed to configure DuckDB settings")?;
+    for cmd in init_commands {
+        conn.execute_batch(cmd)
+            .with_context(|| format!("Failed to execute DuckDB init command: {cmd}"))?;
+    }
 
     create_schema(&conn)?;
 
@@ -82,7 +76,8 @@ mod tests {
 
     #[test]
     fn test_init_db_creates_tables() -> Result<()> {
-        let conn = init_db(Path::new(":memory:"))?;
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands)?;
 
         // Verify all tables exist by querying them
         let tables = [
@@ -106,7 +101,8 @@ mod tests {
 
     #[test]
     fn test_init_db_is_idempotent() -> Result<()> {
-        let conn = init_db(Path::new(":memory:"))?;
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands)?;
         // Re-run schema creation — should not fail
         create_schema(&conn)?;
         Ok(())

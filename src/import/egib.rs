@@ -6,12 +6,10 @@ use tracing::info;
 
 use crate::download::download_file;
 
-const EGIB_URL: &str = "https://opendata.geoportal.gov.pl/InneDane/latest_exports/eziudp_wfs/PARQUET/0_budynki.parquet";
-
-pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
+pub fn import(conn: &Connection, file: Option<&Path>, url: &str) -> Result<()> {
     let parquet_path = match file {
         Some(path) => PathBuf::from(path),
-        None => download_file(EGIB_URL, Path::new("./data"))?,
+        None => download_file(url, Path::new("./data"))?,
     };
 
     let parquet_str = parquet_path

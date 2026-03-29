@@ -7,12 +7,20 @@ fn cmd() -> Command {
     cmd
 }
 
+fn memory_config() -> tempfile::NamedTempFile {
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    use std::io::Write;
+    write!(tmp, "db_path = \":memory:\"\n").unwrap();
+    tmp
+}
+
 #[test]
 fn test_import_bdot10k_from_fixture() {
+    let cfg = memory_config();
     cmd()
         .args([
-            "--db-path",
-            ":memory:",
+            "--config",
+            cfg.path().to_str().unwrap(),
             "import",
             "bdot10k",
             "--file",
@@ -28,10 +36,11 @@ fn test_import_bdot10k_from_fixture() {
 
 #[test]
 fn test_import_bdot10k_missing_file() {
+    let cfg = memory_config();
     cmd()
         .args([
-            "--db-path",
-            ":memory:",
+            "--config",
+            cfg.path().to_str().unwrap(),
             "import",
             "bdot10k",
             "--file",

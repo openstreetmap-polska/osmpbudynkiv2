@@ -7,12 +7,10 @@ use tracing::info;
 use crate::download::download_file;
 use crate::osm::geometry;
 
-const OSM_PBF_URL: &str = "https://download.openstreetmap.fr/extracts/europe/poland-latest.osm.pbf";
-
-pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
+pub fn import(conn: &Connection, file: Option<&Path>, url: &str) -> Result<()> {
     let pbf_path = match file {
         Some(path) => PathBuf::from(path),
-        None => download_file(OSM_PBF_URL, Path::new("./data"))?,
+        None => download_file(url, Path::new("./data"))?,
     };
 
     let pbf_str = pbf_path.to_str().context("PBF path is not valid UTF-8")?;
@@ -203,7 +201,8 @@ mod tests {
     use crate::db::init_db;
 
     fn setup_test_db() -> Result<Connection> {
-        let conn = init_db(Path::new(":memory:"))?;
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands)?;
 
         // Create the auxiliary tables that import creates
         conn.execute_batch(
@@ -378,8 +377,9 @@ mod tests {
     /// End-to-end test: import the fixture PBF and verify final counts.
     #[test]
     fn test_import_fixture_pbf() -> Result<()> {
-        let conn = init_db(Path::new(":memory:"))?;
-        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")), "")?;
 
         // 2 buildings: way 947235698 (apartments) + relation 1891415 (school)
         let buildings: i64 =
@@ -400,8 +400,9 @@ mod tests {
     /// Verify building types and tags after import.
     #[test]
     fn test_import_fixture_building_details() -> Result<()> {
-        let conn = init_db(Path::new(":memory:"))?;
-        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")), "")?;
 
         // Way building: apartments
         let building_tag: String = conn.query_row(
@@ -440,8 +441,9 @@ mod tests {
     /// Verify address details after import.
     #[test]
     fn test_import_fixture_address_details() -> Result<()> {
-        let conn = init_db(Path::new(":memory:"))?;
-        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")), "")?;
 
         // Node address: housenumber 32, Ludwika Narbutta
         let (hn, street): (String, String) = conn.query_row(
@@ -480,8 +482,9 @@ mod tests {
     /// Verify address geometries are within expected bounding box (Warsaw area).
     #[test]
     fn test_import_fixture_address_geometries() -> Result<()> {
-        let conn = init_db(Path::new(":memory:"))?;
-        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")), "")?;
 
         // All addresses should have geometry in the Warsaw area (~21.01 lon, ~52.20 lat)
         let count: i64 = conn.query_row(
@@ -508,8 +511,9 @@ mod tests {
     /// Verify raw node import counts from the fixture.
     #[test]
     fn test_import_fixture_node_counts() -> Result<()> {
-        let conn = init_db(Path::new(":memory:"))?;
-        import(&conn, Some(Path::new("fixtures/osm.pbf")))?;
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        import(&conn, Some(Path::new("fixtures/osm.pbf")), "")?;
 
         let node_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM osm_nodes", [], |row| row.get(0))?;

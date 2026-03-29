@@ -6,14 +6,12 @@ use tracing::info;
 
 use crate::download::download_file;
 
-const BDOT10K_URL: &str = "https://opendata.geoportal.gov.pl/bdot10k/schemat2021/GeoParquet/Polska_BDOT10k_GeoParquet.zip";
-
 const PARQUET_ENTRY: &str = "OT_BUBD_A.parquet";
 
-pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
+pub fn import(conn: &Connection, file: Option<&Path>, url: &str) -> Result<()> {
     let parquet_path = match file {
         Some(path) => PathBuf::from(path),
-        None => download_and_extract()?,
+        None => download_and_extract(url)?,
     };
 
     let parquet_str = parquet_path
@@ -48,8 +46,8 @@ pub fn import(conn: &Connection, file: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn download_and_extract() -> Result<PathBuf> {
-    let zip_path = download_file(BDOT10K_URL, Path::new("./data"))?;
+fn download_and_extract(url: &str) -> Result<PathBuf> {
+    let zip_path = download_file(url, Path::new("./data"))?;
     let extract_dir = Path::new("./data/bdot10k");
     std::fs::create_dir_all(extract_dir)?;
 

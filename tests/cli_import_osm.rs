@@ -7,12 +7,20 @@ fn cmd() -> Command {
     cmd
 }
 
+fn memory_config() -> tempfile::NamedTempFile {
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    use std::io::Write;
+    write!(tmp, "db_path = \":memory:\"\n").unwrap();
+    tmp
+}
+
 #[test]
 fn test_import_osm_from_fixture() {
+    let cfg = memory_config();
     cmd()
         .args([
-            "--db-path",
-            ":memory:",
+            "--config",
+            cfg.path().to_str().unwrap(),
             "import",
             "osm",
             "--file",
@@ -29,10 +37,11 @@ fn test_import_osm_from_fixture() {
 
 #[test]
 fn test_import_osm_missing_file() {
+    let cfg = memory_config();
     cmd()
         .args([
-            "--db-path",
-            ":memory:",
+            "--config",
+            cfg.path().to_str().unwrap(),
             "import",
             "osm",
             "--file",
@@ -49,11 +58,16 @@ fn test_import_osm_twice_fails_on_duplicates() {
     let _ = std::fs::remove_file(db_path);
     let _ = std::fs::remove_file(format!("{db_path}.wal"));
 
+    let mut cfg_file = tempfile::NamedTempFile::new().unwrap();
+    use std::io::Write;
+    write!(cfg_file, "db_path = \"{db_path}\"\n").unwrap();
+    let cfg_path = cfg_file.path().to_str().unwrap().to_string();
+
     // First import succeeds
     cmd()
         .args([
-            "--db-path",
-            db_path,
+            "--config",
+            &cfg_path,
             "import",
             "osm",
             "--file",
@@ -65,8 +79,8 @@ fn test_import_osm_twice_fails_on_duplicates() {
     // Second import fails — osm_nodes has a PRIMARY KEY constraint
     cmd()
         .args([
-            "--db-path",
-            db_path,
+            "--config",
+            &cfg_path,
             "import",
             "osm",
             "--file",

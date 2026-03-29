@@ -12,14 +12,11 @@ use crate::osm::replication::{
     sequence_to_path,
 };
 
-const REPLICATION_BASE_URL: &str =
-    "https://download.openstreetmap.fr/replication/europe/poland/minute";
-
-pub fn update(conn: &Connection) -> Result<()> {
+pub fn update(conn: &Connection, replication_base_url: &str) -> Result<()> {
     let current_seq = get_current_sequence(conn)?;
     info!(current_seq, "Current replication sequence");
 
-    let latest_seq = fetch_latest_sequence()?;
+    let latest_seq = fetch_latest_sequence(replication_base_url)?;
     info!(latest_seq, "Latest available sequence");
 
     if current_seq >= latest_seq {
@@ -31,7 +28,7 @@ pub fn update(conn: &Connection) -> Result<()> {
     info!(pending, "Sequences to apply");
 
     for seq in (current_seq + 1)..=latest_seq {
-        apply_sequence(conn, seq)?;
+        apply_sequence(conn, seq, replication_base_url)?;
 
         if (seq - current_seq) % 100 == 0 {
             info!(
@@ -61,8 +58,8 @@ fn get_current_sequence(conn: &Connection) -> Result<u64> {
     }
 }
 
-fn fetch_latest_sequence() -> Result<u64> {
-    let url = format!("{REPLICATION_BASE_URL}/state.txt");
+fn fetch_latest_sequence(replication_base_url: &str) -> Result<u64> {
+    let url = format!("{replication_base_url}/state.txt");
     let state_path = download_file(&url, Path::new("./data/replication"))?;
     let text = std::fs::read_to_string(&state_path).context("Failed to read state.txt")?;
     // Remove cached file so next call fetches fresh state
@@ -70,9 +67,9 @@ fn fetch_latest_sequence() -> Result<u64> {
     parse_state_txt(&text)
 }
 
-fn apply_sequence(conn: &Connection, seq: u64) -> Result<()> {
+fn apply_sequence(conn: &Connection, seq: u64, replication_base_url: &str) -> Result<()> {
     let path = sequence_to_path(seq);
-    let url = format!("{REPLICATION_BASE_URL}/{path}");
+    let url = format!("{replication_base_url}/{path}");
 
     let osc_gz_path = download_file(&url, Path::new("./data/replication"))?;
     let osc_xml = decompress_gz(&osc_gz_path)?;
@@ -474,7 +471,8 @@ mod tests {
     use crate::db::init_db;
 
     fn setup_test_db() -> Result<Connection> {
-        let conn = init_db(Path::new(":memory:"))?;
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands)?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS osm_way_tags (

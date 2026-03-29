@@ -8,9 +8,9 @@ use clap::{Parser, Subcommand};
     about = "Compare Polish government data with OpenStreetMap"
 )]
 pub struct Cli {
-    /// Path to DuckDB database file
-    #[arg(long, default_value = "./osmpbudynkiv2.duckdb")]
-    pub db_path: PathBuf,
+    /// Path to TOML config file
+    #[arg(long)]
+    pub config: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Command,
