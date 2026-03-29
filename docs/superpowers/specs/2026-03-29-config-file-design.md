@@ -19,6 +19,7 @@ TOML. Parsed via the `toml` crate with `serde` deserialization.
 | `download_urls.bdot10k` | string | current hardcoded URL | BDOT10k download URL |
 | `download_urls.egib` | string | current hardcoded URL | EGIB download URL |
 | `download_urls.prg` | string | `""` | PRG download URL (not yet implemented) |
+| `download_urls.osm_replication` | string | current hardcoded URL | OSM minutely replication base URL |
 
 ### Default `duckdb_init_commands`
 
@@ -53,6 +54,7 @@ osm_pbf = "https://download.openstreetmap.fr/extracts/europe/poland-latest.osm.p
 bdot10k = "https://opendata.geoportal.gov.pl/bdot10k/schemat2021/GeoParquet/Polska_BDOT10k_GeoParquet.zip"
 egib = "https://opendata.geoportal.gov.pl/InneDane/latest_exports/eziudp_wfs/PARQUET/0_budynki.parquet"
 prg = ""
+osm_replication = "https://download.openstreetmap.fr/replication/europe/poland/minute"
 ```
 
 ## Precedence
@@ -117,6 +119,11 @@ Updated startup sequence:
 
 - Remove hardcoded `*_URL` constants
 - Accept download URL from config (passed through from `main.rs` or via `Config` reference)
+
+### Modified: `src/update/osm.rs`
+
+- Remove hardcoded `REPLICATION_BASE_URL` constant
+- Accept replication base URL from config
 
 ### New dependency: `Cargo.toml`
 
