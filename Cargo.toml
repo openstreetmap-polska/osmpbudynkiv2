@@ -8,11 +8,13 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 duckdb = { version = "1.10501.0", features = ["bundled"] }
 flate2 = "1"
+prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.6.4", default-features = false }
 quick-xml = "0.37"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = "2"
@@ -20,3 +22,4 @@ zip = "2"
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+tempfile = "3"
