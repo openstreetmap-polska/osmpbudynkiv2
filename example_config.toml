@@ -1,0 +1,26 @@
+# Path to DuckDB database file
+db_path = "./osmpbudynkiv2.duckdb"
+
+# Log verbosity: trace, debug, info, warn, error
+# Can be overridden by RUST_LOG environment variable
+log_level = "info"
+
+# SQL statements executed on DuckDB initialization (after opening the database).
+# These run before schema creation.
+# WARNING: replacing this list removes the defaults — include everything you need.
+duckdb_init_commands = [
+    "INSTALL spatial",
+    "LOAD spatial",
+    "SET preserve_insertion_order = false",
+    "SET geometry_always_xy = true",
+    "SET memory_limit = '4GB'",
+    "SET threads = 8",
+]
+
+# Download URLs for data sources
+[download_urls]
+osm_pbf = "https://download.openstreetmap.fr/extracts/europe/poland-latest.osm.pbf"
+bdot10k = "https://opendata.geoportal.gov.pl/bdot10k/schemat2021/GeoParquet/Polska_BDOT10k_GeoParquet.zip"
+egib = "https://opendata.geoportal.gov.pl/InneDane/latest_exports/eziudp_wfs/PARQUET/0_budynki.parquet"
+prg = ""
+osm_replication = "https://download.openstreetmap.fr/replication/europe/poland/minute"

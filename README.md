@@ -23,11 +23,23 @@ cargo run -- <command>
 ./target/release/osmpbudynkiv2 <command>
 ```
 
-By default the database is stored in `./osmpbudynkiv2.duckdb`. Use `--db-path` to change it:
+### Configuration
+
+The app can be configured via a TOML config file. Pass its path with `--config`:
 
 ```bash
-cargo run -- --db-path /path/to/data.duckdb import osm
+cargo run -- --config config.toml import osm
 ```
+
+If no `--config` is provided, built-in defaults are used (database at `./osmpbudynkiv2.duckdb`, log level `info`, etc.). See [`example_config.toml`](example_config.toml) for all available settings and their defaults.
+
+The config file controls:
+- **`db_path`** — location of the DuckDB database file
+- **`log_level`** — log verbosity (`trace`, `debug`, `info`, `warn`, `error`)
+- **`duckdb_init_commands`** — SQL statements run on database initialization
+- **`download_urls`** — URLs for downloading data sources
+
+All fields are optional — only specify what you want to override. Note that `duckdb_init_commands` is fully replaced if specified (not merged with defaults).
 
 ## CLI commands
 
@@ -87,9 +99,10 @@ cargo clippy            # lint
 cargo fmt               # format code
 ```
 
-Set log level via the `RUST_LOG` environment variable:
+Log level can be set via the `RUST_LOG` environment variable (takes precedence) or the config file's `log_level` setting:
 
 ```bash
 RUST_LOG=debug cargo run -- import osm
+cargo run -- --config config.toml import osm  # uses log_level from config
 ```
 
