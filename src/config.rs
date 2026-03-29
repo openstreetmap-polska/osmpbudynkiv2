@@ -50,7 +50,8 @@ impl Default for DownloadUrls {
                 .to_string(),
             egib: "https://opendata.geoportal.gov.pl/InneDane/latest_exports/eziudp_wfs/PARQUET/0_budynki.parquet"
                 .to_string(),
-            prg: String::new(),
+            prg: "https://integracja.gugik.gov.pl/PRG/pobierz.php?adresy_zbiorcze_gml"
+                .to_string(),
             osm_replication:
                 "https://download.openstreetmap.fr/replication/europe/poland/minute".to_string(),
         }
