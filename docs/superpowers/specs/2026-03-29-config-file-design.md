@@ -28,6 +28,8 @@ duckdb_init_commands = [
     "LOAD spatial",
     "SET preserve_insertion_order = false",
     "SET geometry_always_xy = true",
+    "SET memory_limit = '4GB'",
+    "SET threads = 8",
 ]
 ```
 
@@ -42,6 +44,8 @@ duckdb_init_commands = [
     "LOAD spatial",
     "SET preserve_insertion_order = false",
     "SET geometry_always_xy = true",
+    "SET memory_limit = '4GB'",
+    "SET threads = 8",
 ]
 
 [download_urls]
