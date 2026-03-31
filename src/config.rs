@@ -33,6 +33,7 @@ impl Default for Config {
                 "LOAD spatial".to_string(),
                 "SET preserve_insertion_order = false".to_string(),
                 "SET geometry_always_xy = true".to_string(),
+                "SET temp_directory = './osmpbudynkiv2.duckdb.tmp'".to_string(),
                 "SET memory_limit = '4GB'".to_string(),
                 "SET threads = 8".to_string(),
             ],
@@ -81,7 +82,7 @@ mod tests {
         let config = load_config(None).unwrap();
         assert_eq!(config.db_path, "./osmpbudynkiv2.duckdb");
         assert_eq!(config.log_level, "info");
-        assert_eq!(config.duckdb_init_commands.len(), 6);
+        assert_eq!(config.duckdb_init_commands.len(), 7);
         assert_eq!(
             config.download_urls.osm_pbf,
             "https://download.openstreetmap.fr/extracts/europe/poland-latest.osm.pbf"
@@ -101,7 +102,7 @@ mod tests {
         assert_eq!(config.db_path, "/custom/path.duckdb");
         // Other fields should be defaults
         assert_eq!(config.log_level, "info");
-        assert_eq!(config.duckdb_init_commands.len(), 6);
+        assert_eq!(config.duckdb_init_commands.len(), 7);
     }
 
     #[test]

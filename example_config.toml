@@ -13,6 +13,7 @@ duckdb_init_commands = [
     "LOAD spatial",
     "SET preserve_insertion_order = false",
     "SET geometry_always_xy = true",
+    "SET temp_directory = './osmpbudynkiv2.duckdb.tmp'",
     "SET memory_limit = '4GB'",
     "SET threads = 8",
 ]

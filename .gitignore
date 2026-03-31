@@ -25,3 +25,6 @@ example_data/
 
 # git worktrees
 .worktrees/
+
+# default location of database when running this project
+osmpbudynkiv2.duckdb*
