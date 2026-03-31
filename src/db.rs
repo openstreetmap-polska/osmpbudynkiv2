@@ -21,29 +21,29 @@ fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS metadata (
-            key VARCHAR PRIMARY KEY,
+            key VARCHAR,
             value VARCHAR
         );
 
-        -- OSM raw data (needed for geometry construction and replication updates)
+        -- OSM raw data
         CREATE TABLE IF NOT EXISTS osm_nodes (
-            node_id BIGINT PRIMARY KEY,
+            node_id BIGINT,
             lon DOUBLE,
             lat DOUBLE
         );
 
-        CREATE TABLE IF NOT EXISTS osm_way_nodes (
+        CREATE TABLE IF NOT EXISTS osm_ways (
             way_id BIGINT,
-            node_id BIGINT,
-            position INT
+            node_ids BIGINT[],
+            tags MAP(VARCHAR, VARCHAR)
         );
 
         CREATE TABLE IF NOT EXISTS osm_relations (
             relation_id BIGINT,
-            member_id BIGINT,
-            member_type VARCHAR,
-            member_role VARCHAR,
-            position INT
+            member_refs BIGINT[],
+            member_types VARCHAR[],
+            member_roles VARCHAR[],
+            tags MAP(VARCHAR, VARCHAR)
         );
 
         -- Processed OSM data with geometry
@@ -83,7 +83,7 @@ mod tests {
         let tables = [
             "metadata",
             "osm_nodes",
-            "osm_way_nodes",
+            "osm_ways",
             "osm_relations",
             "osm_addresses",
             "osm_buildings",
