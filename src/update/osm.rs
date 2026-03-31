@@ -81,7 +81,11 @@ fn apply_sequence(conn: &Connection, seq: u64, replication_base_url: &str) -> Re
 
     // Update sequence number
     conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('osm_replication_sequence', ?)",
+        "DELETE FROM metadata WHERE key = 'osm_replication_sequence'",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('osm_replication_sequence', ?)",
         [&seq.to_string()],
     )?;
 
@@ -116,9 +120,10 @@ fn apply_node_changes(conn: &Connection, nodes: &[NodeChange]) -> Result<()> {
                 )?;
             }
             ChangeAction::Create | ChangeAction::Modify => {
-                // Upsert node coordinates
+                // DELETE + INSERT (no PK for INSERT OR REPLACE)
+                conn.execute("DELETE FROM osm_nodes WHERE node_id = ?", [node.id])?;
                 conn.execute(
-                    "INSERT OR REPLACE INTO osm_nodes (node_id, lon, lat) VALUES (?, ?, ?)",
+                    "INSERT INTO osm_nodes (node_id, lon, lat) VALUES (?, ?, ?)",
                     duckdb::params![node.id, node.lon, node.lat],
                 )?;
 
@@ -153,7 +158,7 @@ fn apply_way_changes(conn: &Connection, ways: &[WayChange]) -> Result<()> {
     for way in ways {
         match way.action {
             ChangeAction::Delete => {
-                conn.execute("DELETE FROM osm_way_nodes WHERE way_id = ?", [way.id])?;
+                conn.execute("DELETE FROM osm_ways WHERE way_id = ?", [way.id])?;
                 conn.execute(
                     "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way'",
                     [way.id],
@@ -162,17 +167,34 @@ fn apply_way_changes(conn: &Connection, ways: &[WayChange]) -> Result<()> {
                     "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'way'",
                     [way.id],
                 )?;
-                conn.execute("DELETE FROM osm_way_tags WHERE way_id = ?", [way.id])?;
             }
             ChangeAction::Create | ChangeAction::Modify => {
-                // Update way-node references
-                conn.execute("DELETE FROM osm_way_nodes WHERE way_id = ?", [way.id])?;
-                for (pos, &node_ref) in way.node_refs.iter().enumerate() {
-                    conn.execute(
-                        "INSERT INTO osm_way_nodes (way_id, node_id, position) VALUES (?, ?, ?)",
-                        duckdb::params![way.id, node_ref, (pos + 1) as i32],
-                    )?;
-                }
+                conn.execute("DELETE FROM osm_ways WHERE way_id = ?", [way.id])?;
+
+                let node_ids_literal = format!(
+                    "[{}]",
+                    way.node_refs
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let tag_pairs: Vec<String> = way
+                    .tags
+                    .iter()
+                    .map(|(k, v)| {
+                        format!("'{}': '{}'", k.replace('\'', "''"), v.replace('\'', "''"))
+                    })
+                    .collect();
+                let map_literal = if tag_pairs.is_empty() {
+                    "MAP([]::VARCHAR[], []::VARCHAR[])".to_string()
+                } else {
+                    format!("MAP {{{}}}", tag_pairs.join(", "))
+                };
+                conn.execute_batch(&format!(
+                    "INSERT INTO osm_ways (way_id, node_ids, tags) VALUES ({}, {}, {})",
+                    way.id, node_ids_literal, map_literal
+                ))?;
 
                 // Clean old geometry entries
                 conn.execute(
@@ -183,29 +205,8 @@ fn apply_way_changes(conn: &Connection, ways: &[WayChange]) -> Result<()> {
                     "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'way'",
                     [way.id],
                 )?;
-                conn.execute("DELETE FROM osm_way_tags WHERE way_id = ?", [way.id])?;
 
-                let building = tag_value(&way.tags, "building");
-                let housenumber = tag_value(&way.tags, "addr:housenumber");
-
-                if building.is_some() || housenumber.is_some() {
-                    // Reconstruct way tags as a MAP literal for osm_way_tags
-                    let tag_pairs: Vec<String> = way
-                        .tags
-                        .iter()
-                        .map(|(k, v)| format!("'{k}': '{v}'"))
-                        .collect();
-                    let map_literal = format!("MAP {{{}}}", tag_pairs.join(", "));
-                    conn.execute(
-                        &format!(
-                            "INSERT INTO osm_way_tags (way_id, tags) VALUES ({}, {})",
-                            way.id, map_literal
-                        ),
-                        [],
-                    )?;
-                }
-
-                // Rebuild geometry for this specific way
+                // Rebuild geometry for this way
                 rebuild_way_geometry(conn, way.id)?;
             }
         }
@@ -226,22 +227,53 @@ fn apply_relation_changes(conn: &Connection, relations: &[RelationChange]) -> Re
                     "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'relation'",
                     [rel.id],
                 )?;
-                conn.execute(
-                    "DELETE FROM osm_relation_tags WHERE relation_id = ?",
-                    [rel.id],
-                )?;
             }
             ChangeAction::Create | ChangeAction::Modify => {
-                // Update relation members
                 conn.execute("DELETE FROM osm_relations WHERE relation_id = ?", [rel.id])?;
-                for (pos, member) in rel.members.iter().enumerate() {
-                    conn.execute(
-                        "INSERT INTO osm_relations (relation_id, member_id, member_type, member_role, position) VALUES (?, ?, ?, ?, ?)",
-                        duckdb::params![rel.id, member.member_ref, member.member_type, member.role, (pos + 1) as i32],
-                    )?;
-                }
 
-                // Clean old entries
+                let refs_literal = format!(
+                    "[{}]",
+                    rel.members
+                        .iter()
+                        .map(|m| m.member_ref.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let types_literal = format!(
+                    "[{}]",
+                    rel.members
+                        .iter()
+                        .map(|m| format!("'{}'", m.member_type))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let roles_literal = format!(
+                    "[{}]",
+                    rel.members
+                        .iter()
+                        .map(|m| format!("'{}'", m.role.replace('\'', "''")))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let tag_pairs: Vec<String> = rel
+                    .tags
+                    .iter()
+                    .map(|(k, v)| {
+                        format!("'{}': '{}'", k.replace('\'', "''"), v.replace('\'', "''"))
+                    })
+                    .collect();
+                let map_literal = if tag_pairs.is_empty() {
+                    "MAP([]::VARCHAR[], []::VARCHAR[])".to_string()
+                } else {
+                    format!("MAP {{{}}}", tag_pairs.join(", "))
+                };
+
+                conn.execute_batch(&format!(
+                    "INSERT INTO osm_relations (relation_id, member_refs, member_types, member_roles, tags) VALUES ({}, {}, {}, {}, {})",
+                    rel.id, refs_literal, types_literal, roles_literal, map_literal
+                ))?;
+
+                // Clean old geometry entries
                 conn.execute(
                     "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'relation'",
                     [rel.id],
@@ -250,25 +282,8 @@ fn apply_relation_changes(conn: &Connection, relations: &[RelationChange]) -> Re
                     "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'relation'",
                     [rel.id],
                 )?;
-                conn.execute(
-                    "DELETE FROM osm_relation_tags WHERE relation_id = ?",
-                    [rel.id],
-                )?;
 
-                let building = tag_value(&rel.tags, "building");
-                let housenumber = tag_value(&rel.tags, "addr:housenumber");
-                let street = tag_value(&rel.tags, "addr:street");
-                let city = tag_value(&rel.tags, "addr:city");
-                let postcode = tag_value(&rel.tags, "addr:postcode");
-
-                if building.is_some() || housenumber.is_some() {
-                    conn.execute(
-                        "INSERT INTO osm_relation_tags (relation_id, building, housenumber, street, city, postcode) VALUES (?, ?, ?, ?, ?, ?)",
-                        duckdb::params![rel.id, building, housenumber, street, city, postcode],
-                    )?;
-                }
-
-                // Rebuild relation geometry
+                // Rebuild geometry
                 rebuild_relation_geometry(conn, rel.id)?;
             }
         }
@@ -281,8 +296,7 @@ fn tag_value(tags: &[(String, String)], key: &str) -> Option<String> {
 }
 
 fn update_ways_referencing_node(conn: &Connection, node_id: i64) -> Result<()> {
-    // Find all ways that reference this node
-    let mut stmt = conn.prepare("SELECT DISTINCT way_id FROM osm_way_nodes WHERE node_id = ?")?;
+    let mut stmt = conn.prepare("SELECT way_id FROM osm_ways WHERE list_contains(node_ids, ?)")?;
     let way_ids: Vec<i64> = stmt
         .query_map([node_id], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -295,10 +309,11 @@ fn update_ways_referencing_node(conn: &Connection, node_id: i64) -> Result<()> {
 }
 
 fn rebuild_way_geometry(conn: &Connection, way_id: i64) -> Result<()> {
-    // Check if this way has relevant tags
     let has_tags: bool = conn
         .query_row(
-            "SELECT COUNT(*) > 0 FROM osm_way_tags WHERE way_id = ?",
+            "SELECT COUNT(*) > 0 FROM osm_ways WHERE way_id = ?
+             AND (element_at(tags, 'building')[1] IS NOT NULL
+                  OR element_at(tags, 'addr:housenumber')[1] IS NOT NULL)",
             [way_id],
             |row| row.get(0),
         )
@@ -308,7 +323,6 @@ fn rebuild_way_geometry(conn: &Connection, way_id: i64) -> Result<()> {
         return Ok(());
     }
 
-    // Remove old geometry entries for this way
     conn.execute(
         "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way'",
         [way_id],
@@ -318,54 +332,63 @@ fn rebuild_way_geometry(conn: &Connection, way_id: i64) -> Result<()> {
         [way_id],
     )?;
 
-    // Rebuild building geometry
     conn.execute(
         &format!(
             "
             INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
+            WITH way_nodes AS (
+                SELECT
+                    w.way_id,
+                    element_at(w.tags, 'building')[1] AS building,
+                    UNNEST(w.node_ids) AS node_id,
+                    UNNEST(generate_series(1, len(w.node_ids))) AS position
+                FROM osm_ways w
+                WHERE w.way_id = {way_id}
+                  AND element_at(w.tags, 'building')[1] IS NOT NULL
+            )
             SELECT
-                w.way_id AS osm_id,
+                wn.way_id AS osm_id,
                 'way' AS osm_type,
-                w.building,
+                wn.building,
                 ST_MakePolygon(
                     ST_MakeLine(list(ST_Point(n.lon, n.lat) ORDER BY wn.position))
                 ) AS geom
-            FROM (
-                SELECT way_id, element_at(tags, 'building')[1] AS building
-                FROM osm_way_tags WHERE way_id = {way_id}
-            ) w
-            JOIN osm_way_nodes wn ON w.way_id = wn.way_id
+            FROM way_nodes wn
             JOIN osm_nodes n ON wn.node_id = n.node_id
-            WHERE w.building IS NOT NULL
-            GROUP BY w.way_id, w.building
+            GROUP BY wn.way_id, wn.building
             HAVING COUNT(*) >= 4
             "
         ),
         [],
     )?;
 
-    // Rebuild address geometry
     conn.execute(
         &format!(
             "
             INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
+            WITH way_nodes AS (
+                SELECT
+                    w.way_id,
+                    element_at(w.tags, 'addr:housenumber')[1] AS housenumber,
+                    element_at(w.tags, 'addr:street')[1] AS street,
+                    element_at(w.tags, 'addr:city')[1] AS city,
+                    element_at(w.tags, 'addr:postcode')[1] AS postcode,
+                    UNNEST(w.node_ids) AS node_id
+                FROM osm_ways w
+                WHERE w.way_id = {way_id}
+                  AND element_at(w.tags, 'addr:housenumber')[1] IS NOT NULL
+            )
             SELECT
-                w.way_id AS osm_id,
+                wn.way_id AS osm_id,
                 'way' AS osm_type,
-                element_at(w.tags, 'addr:housenumber')[1] AS housenumber,
-                element_at(w.tags, 'addr:street')[1] AS street,
-                element_at(w.tags, 'addr:city')[1] AS city,
-                element_at(w.tags, 'addr:postcode')[1] AS postcode,
+                wn.housenumber,
+                wn.street,
+                wn.city,
+                wn.postcode,
                 ST_Point(AVG(n.lon), AVG(n.lat)) AS geom
-            FROM osm_way_tags w
-            JOIN osm_way_nodes wn ON w.way_id = wn.way_id
+            FROM way_nodes wn
             JOIN osm_nodes n ON wn.node_id = n.node_id
-            WHERE w.way_id = {way_id}
-              AND element_at(w.tags, 'addr:housenumber')[1] IS NOT NULL
-            GROUP BY w.way_id, element_at(w.tags, 'addr:housenumber')[1],
-                     element_at(w.tags, 'addr:street')[1],
-                     element_at(w.tags, 'addr:city')[1],
-                     element_at(w.tags, 'addr:postcode')[1]
+            GROUP BY wn.way_id, wn.housenumber, wn.street, wn.city, wn.postcode
             "
         ),
         [],
@@ -375,10 +398,11 @@ fn rebuild_way_geometry(conn: &Connection, way_id: i64) -> Result<()> {
 }
 
 fn rebuild_relation_geometry(conn: &Connection, relation_id: i64) -> Result<()> {
-    // Check if this relation has relevant tags
     let has_tags: bool = conn
         .query_row(
-            "SELECT COUNT(*) > 0 FROM osm_relation_tags WHERE relation_id = ?",
+            "SELECT COUNT(*) > 0 FROM osm_relations WHERE relation_id = ?
+             AND (element_at(tags, 'building')[1] IS NOT NULL
+                  OR element_at(tags, 'addr:housenumber')[1] IS NOT NULL)",
             [relation_id],
             |row| row.get(0),
         )
@@ -388,22 +412,38 @@ fn rebuild_relation_geometry(conn: &Connection, relation_id: i64) -> Result<()> 
         return Ok(());
     }
 
-    // Building geometry from relation
     conn.execute(
         &format!(
             "
             INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
-            WITH rel_way_lines AS (
+            WITH rel_members AS (
                 SELECT
                     r.relation_id,
-                    r.member_role,
-                    ST_MakeLine(list(ST_Point(n.lon, n.lat) ORDER BY wn.position)) AS line_geom
+                    UNNEST(r.member_refs) AS member_id,
+                    UNNEST(r.member_types) AS member_type,
+                    UNNEST(r.member_roles) AS member_role
                 FROM osm_relations r
-                JOIN osm_way_nodes wn ON r.member_id = wn.way_id
-                JOIN osm_nodes n ON wn.node_id = n.node_id
                 WHERE r.relation_id = {relation_id}
-                  AND r.member_type = 'way'
-                GROUP BY r.relation_id, r.member_id, r.member_role
+            ),
+            member_way_nodes AS (
+                SELECT
+                    rm.relation_id,
+                    rm.member_id AS way_id,
+                    rm.member_role,
+                    UNNEST(w.node_ids) AS node_id,
+                    UNNEST(generate_series(1, len(w.node_ids))) AS position
+                FROM rel_members rm
+                JOIN osm_ways w ON rm.member_id = w.way_id
+                WHERE rm.member_type = 'way'
+            ),
+            rel_way_lines AS (
+                SELECT
+                    mwn.relation_id,
+                    mwn.member_role,
+                    ST_MakeLine(list(ST_Point(n.lon, n.lat) ORDER BY mwn.position)) AS line_geom
+                FROM member_way_nodes mwn
+                JOIN osm_nodes n ON mwn.node_id = n.node_id
+                GROUP BY mwn.relation_id, mwn.way_id, mwn.member_role
                 HAVING COUNT(*) >= 2
             ),
             outer_polys AS (
@@ -423,40 +463,60 @@ fn rebuild_relation_geometry(conn: &Connection, relation_id: i64) -> Result<()> 
             SELECT
                 o.relation_id AS osm_id,
                 'relation' AS osm_type,
-                rt.building,
+                element_at(r.tags, 'building')[1] AS building,
                 CASE
                     WHEN i.inner_geom IS NOT NULL THEN ST_Difference(o.outer_geom, i.inner_geom)
                     ELSE o.outer_geom
                 END AS geom
             FROM outer_polys o
-            JOIN osm_relation_tags rt ON o.relation_id = rt.relation_id
+            JOIN osm_relations r ON o.relation_id = r.relation_id
             LEFT JOIN inner_polys i ON o.relation_id = i.relation_id
-            WHERE rt.building IS NOT NULL AND o.outer_geom IS NOT NULL
+            WHERE element_at(r.tags, 'building')[1] IS NOT NULL AND o.outer_geom IS NOT NULL
             "
         ),
         [],
     )?;
 
-    // Address geometry from relation
     conn.execute(
         &format!(
             "
             INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
+            WITH rel_members AS (
+                SELECT
+                    r.relation_id,
+                    element_at(r.tags, 'addr:housenumber')[1] AS housenumber,
+                    element_at(r.tags, 'addr:street')[1] AS street,
+                    element_at(r.tags, 'addr:city')[1] AS city,
+                    element_at(r.tags, 'addr:postcode')[1] AS postcode,
+                    UNNEST(r.member_refs) AS member_id,
+                    UNNEST(r.member_types) AS member_type
+                FROM osm_relations r
+                WHERE r.relation_id = {relation_id}
+                  AND element_at(r.tags, 'addr:housenumber')[1] IS NOT NULL
+            ),
+            member_nodes AS (
+                SELECT
+                    rm.relation_id,
+                    rm.housenumber,
+                    rm.street,
+                    rm.city,
+                    rm.postcode,
+                    UNNEST(w.node_ids) AS node_id
+                FROM rel_members rm
+                JOIN osm_ways w ON rm.member_id = w.way_id
+                WHERE rm.member_type = 'way'
+            )
             SELECT
-                rt.relation_id AS osm_id,
+                mn.relation_id AS osm_id,
                 'relation' AS osm_type,
-                rt.housenumber,
-                rt.street,
-                rt.city,
-                rt.postcode,
+                mn.housenumber,
+                mn.street,
+                mn.city,
+                mn.postcode,
                 ST_Point(AVG(n.lon), AVG(n.lat)) AS geom
-            FROM osm_relation_tags rt
-            JOIN osm_relations r ON rt.relation_id = r.relation_id
-            JOIN osm_way_nodes wn ON r.member_id = wn.way_id AND r.member_type = 'way'
-            JOIN osm_nodes n ON wn.node_id = n.node_id
-            WHERE rt.relation_id = {relation_id}
-              AND rt.housenumber IS NOT NULL
-            GROUP BY rt.relation_id, rt.housenumber, rt.street, rt.city, rt.postcode
+            FROM member_nodes mn
+            JOIN osm_nodes n ON mn.node_id = n.node_id
+            GROUP BY mn.relation_id, mn.housenumber, mn.street, mn.city, mn.postcode
             "
         ),
         [],
@@ -475,32 +535,13 @@ mod tests {
         let conn = init_db(Path::new(":memory:"), &init_commands)?;
         conn.execute_batch(
             "
-            CREATE TABLE IF NOT EXISTS osm_way_tags (
-                way_id BIGINT,
-                tags MAP(VARCHAR, VARCHAR)
-            );
-            CREATE TABLE IF NOT EXISTS osm_relation_tags (
-                relation_id BIGINT,
-                building VARCHAR,
-                housenumber VARCHAR,
-                street VARCHAR,
-                city VARCHAR,
-                postcode VARCHAR
-            );
-
             -- Seed with some initial data
             INSERT INTO osm_nodes VALUES (1, 20.0, 50.0);
             INSERT INTO osm_nodes VALUES (2, 20.001, 50.0);
             INSERT INTO osm_nodes VALUES (3, 20.001, 50.001);
             INSERT INTO osm_nodes VALUES (4, 20.0, 50.001);
 
-            INSERT INTO osm_way_nodes VALUES (100, 1, 1);
-            INSERT INTO osm_way_nodes VALUES (100, 2, 2);
-            INSERT INTO osm_way_nodes VALUES (100, 3, 3);
-            INSERT INTO osm_way_nodes VALUES (100, 4, 4);
-            INSERT INTO osm_way_nodes VALUES (100, 1, 5);
-
-            INSERT INTO osm_way_tags VALUES (100, MAP {'building': 'yes'});
+            INSERT INTO osm_ways VALUES (100, [1, 2, 3, 4, 1], MAP {'building': 'yes'});
 
             INSERT INTO osm_buildings VALUES (100, 'way', 'yes', ST_MakePolygon(ST_MakeLine(
                 list_value(ST_Point(20.0, 50.0), ST_Point(20.001, 50.0),
@@ -661,12 +702,12 @@ mod tests {
         )?;
         assert_eq!(building_count, 0);
 
-        let wn_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM osm_way_nodes WHERE way_id = 100",
+        let way_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_ways WHERE way_id = 100",
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(wn_count, 0);
+        assert_eq!(way_count, 0);
 
         Ok(())
     }
