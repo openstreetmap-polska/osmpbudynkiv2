@@ -122,8 +122,7 @@ fn import_relations(conn: &Connection, pbf_path: &str) -> Result<()> {
     ))
     .context("Failed to import relations")?;
 
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM osm_relations", [], |row| row.get(0))?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM osm_relations", [], |row| row.get(0))?;
     info!(count, "Relations imported");
 
     Ok(())

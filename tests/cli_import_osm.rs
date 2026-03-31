@@ -76,7 +76,7 @@ fn test_import_osm_twice_fails_on_duplicates() {
         .assert()
         .success();
 
-    // Second import fails — osm_nodes has a PRIMARY KEY constraint
+    // Second import fails — data already exists
     cmd()
         .args([
             "--config",
@@ -88,7 +88,7 @@ fn test_import_osm_twice_fails_on_duplicates() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Duplicate key"));
+        .stderr(predicate::str::contains("already imported"));
 
     let _ = std::fs::remove_file(db_path);
     let _ = std::fs::remove_file(format!("{db_path}.wal"));
