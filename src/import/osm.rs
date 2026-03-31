@@ -68,7 +68,7 @@ fn import_address_nodes(conn: &Connection, pbf_path: &str) -> Result<()> {
             'node' AS osm_type,
             element_at(tags, 'addr:housenumber')[1] AS housenumber,
             element_at(tags, 'addr:street')[1] AS street,
-            element_at(tags, 'addr:city')[1] AS city,
+            COALESCE(element_at(tags, 'addr:city')[1], element_at(tags, 'addr:place')[1]) AS city,
             element_at(tags, 'addr:postcode')[1] AS postcode,
             ST_Point(lon, lat) AS geom
         FROM ST_ReadOSM('{pbf_path}')

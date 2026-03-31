@@ -137,7 +137,8 @@ fn apply_node_changes(conn: &Connection, nodes: &[NodeChange]) -> Result<()> {
                 let housenumber = node.tags.iter().find(|(k, _)| k == "addr:housenumber");
                 if let Some((_, hn)) = housenumber {
                     let street = tag_value(&node.tags, "addr:street");
-                    let city = tag_value(&node.tags, "addr:city");
+                    let city = tag_value(&node.tags, "addr:city")
+                        .or_else(|| tag_value(&node.tags, "addr:place"));
                     let postcode = tag_value(&node.tags, "addr:postcode");
                     conn.execute(
                         "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
@@ -371,7 +372,7 @@ fn rebuild_way_geometry(conn: &Connection, way_id: i64) -> Result<()> {
                     w.way_id,
                     element_at(w.tags, 'addr:housenumber')[1] AS housenumber,
                     element_at(w.tags, 'addr:street')[1] AS street,
-                    element_at(w.tags, 'addr:city')[1] AS city,
+                    COALESCE(element_at(w.tags, 'addr:city')[1], element_at(w.tags, 'addr:place')[1]) AS city,
                     element_at(w.tags, 'addr:postcode')[1] AS postcode,
                     UNNEST(w.node_ids) AS node_id
                 FROM osm_ways w
@@ -486,7 +487,7 @@ fn rebuild_relation_geometry(conn: &Connection, relation_id: i64) -> Result<()> 
                     r.relation_id,
                     element_at(r.tags, 'addr:housenumber')[1] AS housenumber,
                     element_at(r.tags, 'addr:street')[1] AS street,
-                    element_at(r.tags, 'addr:city')[1] AS city,
+                    COALESCE(element_at(r.tags, 'addr:city')[1], element_at(r.tags, 'addr:place')[1]) AS city,
                     element_at(r.tags, 'addr:postcode')[1] AS postcode,
                     UNNEST(r.member_refs) AS member_id,
                     UNNEST(r.member_types) AS member_type

@@ -5,19 +5,21 @@ use tracing::info;
 /// Build way geometries (buildings and addresses) from osm_ways + osm_nodes.
 /// Must be called after nodes and ways have been imported.
 pub fn build_way_geometries(conn: &Connection) -> Result<()> {
+    // Materialize UNNEST into a temp table so DuckDB can spill to disk,
+    // rather than holding the entire UNNEST + JOIN in memory.
     info!("Building building geometries from ways");
     conn.execute_batch(
         "
+        CREATE OR REPLACE TEMP TABLE building_way_nodes AS
+        SELECT
+            w.way_id,
+            element_at(w.tags, 'building')[1] AS building,
+            UNNEST(w.node_ids) AS node_id,
+            UNNEST(generate_series(1, len(w.node_ids))) AS position
+        FROM osm_ways w
+        WHERE element_at(w.tags, 'building')[1] IS NOT NULL;
+
         INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
-        WITH way_nodes AS (
-            SELECT
-                w.way_id,
-                element_at(w.tags, 'building')[1] AS building,
-                UNNEST(w.node_ids) AS node_id,
-                UNNEST(generate_series(1, len(w.node_ids))) AS position
-            FROM osm_ways w
-            WHERE element_at(w.tags, 'building')[1] IS NOT NULL
-        )
         SELECT
             wn.way_id AS osm_id,
             'way' AS osm_type,
@@ -27,10 +29,12 @@ pub fn build_way_geometries(conn: &Connection) -> Result<()> {
                     list(ST_Point(n.lon, n.lat) ORDER BY wn.position)
                 )
             ) AS geom
-        FROM way_nodes wn
+        FROM building_way_nodes wn
         JOIN osm_nodes n ON wn.node_id = n.node_id
         GROUP BY wn.way_id, wn.building
         HAVING COUNT(*) >= 4;
+
+        DROP TABLE IF EXISTS building_way_nodes;
         ",
     )
     .context("Failed to build building geometries from ways")?;
@@ -45,18 +49,18 @@ pub fn build_way_geometries(conn: &Connection) -> Result<()> {
     info!("Building address geometries from ways");
     conn.execute_batch(
         "
+        CREATE OR REPLACE TEMP TABLE address_way_nodes AS
+        SELECT
+            w.way_id,
+            element_at(w.tags, 'addr:housenumber')[1] AS housenumber,
+            element_at(w.tags, 'addr:street')[1] AS street,
+            COALESCE(element_at(w.tags, 'addr:city')[1], element_at(w.tags, 'addr:place')[1]) AS city,
+            element_at(w.tags, 'addr:postcode')[1] AS postcode,
+            UNNEST(w.node_ids) AS node_id
+        FROM osm_ways w
+        WHERE element_at(w.tags, 'addr:housenumber')[1] IS NOT NULL;
+
         INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
-        WITH way_nodes AS (
-            SELECT
-                w.way_id,
-                element_at(w.tags, 'addr:housenumber')[1] AS housenumber,
-                element_at(w.tags, 'addr:street')[1] AS street,
-                element_at(w.tags, 'addr:city')[1] AS city,
-                element_at(w.tags, 'addr:postcode')[1] AS postcode,
-                UNNEST(w.node_ids) AS node_id
-            FROM osm_ways w
-            WHERE element_at(w.tags, 'addr:housenumber')[1] IS NOT NULL
-        )
         SELECT
             wn.way_id AS osm_id,
             'way' AS osm_type,
@@ -65,9 +69,11 @@ pub fn build_way_geometries(conn: &Connection) -> Result<()> {
             wn.city,
             wn.postcode,
             ST_Point(AVG(n.lon), AVG(n.lat)) AS geom
-        FROM way_nodes wn
+        FROM address_way_nodes wn
         JOIN osm_nodes n ON wn.node_id = n.node_id
         GROUP BY wn.way_id, wn.housenumber, wn.street, wn.city, wn.postcode;
+
+        DROP TABLE IF EXISTS address_way_nodes;
         ",
     )
     .context("Failed to build address geometries from ways")?;
@@ -85,10 +91,11 @@ pub fn build_way_geometries(conn: &Connection) -> Result<()> {
 /// Build relation geometries (multipolygon buildings and addresses).
 /// Must be called after nodes, ways, and relations have been imported.
 pub fn build_relation_geometries(conn: &Connection) -> Result<()> {
+    // Materialize UNNEST steps into temp tables to avoid OOM on large datasets.
     info!("Building building geometries from relations");
     conn.execute_batch(
         "
-        CREATE OR REPLACE TEMP TABLE rel_way_lines AS
+        CREATE OR REPLACE TEMP TABLE rel_member_way_nodes AS
         WITH rel_members AS (
             SELECT
                 r.relation_id,
@@ -97,27 +104,29 @@ pub fn build_relation_geometries(conn: &Connection) -> Result<()> {
                 UNNEST(r.member_roles) AS member_role
             FROM osm_relations r
             WHERE element_at(r.tags, 'building')[1] IS NOT NULL
-        ),
-        member_way_nodes AS (
-            SELECT
-                rm.relation_id,
-                rm.member_id AS way_id,
-                rm.member_role,
-                UNNEST(w.node_ids) AS node_id,
-                UNNEST(generate_series(1, len(w.node_ids))) AS position
-            FROM rel_members rm
-            JOIN osm_ways w ON rm.member_id = w.way_id
-            WHERE rm.member_type = 'way'
         )
+        SELECT
+            rm.relation_id,
+            rm.member_id AS way_id,
+            rm.member_role,
+            UNNEST(w.node_ids) AS node_id,
+            UNNEST(generate_series(1, len(w.node_ids))) AS position
+        FROM rel_members rm
+        JOIN osm_ways w ON rm.member_id = w.way_id
+        WHERE rm.member_type = 'way';
+
+        CREATE OR REPLACE TEMP TABLE rel_way_lines AS
         SELECT
             mwn.relation_id,
             mwn.way_id,
             mwn.member_role,
             ST_MakeLine(list(ST_Point(n.lon, n.lat) ORDER BY mwn.position)) AS line_geom
-        FROM member_way_nodes mwn
+        FROM rel_member_way_nodes mwn
         JOIN osm_nodes n ON mwn.node_id = n.node_id
         GROUP BY mwn.relation_id, mwn.way_id, mwn.member_role
         HAVING COUNT(*) >= 2;
+
+        DROP TABLE IF EXISTS rel_member_way_nodes;
 
         -- Build outer polygons per relation
         CREATE OR REPLACE TEMP TABLE rel_outer_polys AS
@@ -171,31 +180,31 @@ pub fn build_relation_geometries(conn: &Connection) -> Result<()> {
     info!("Building address geometries from relations");
     conn.execute_batch(
         "
-        INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
+        CREATE OR REPLACE TEMP TABLE rel_addr_member_nodes AS
         WITH rel_members AS (
             SELECT
                 r.relation_id,
                 element_at(r.tags, 'addr:housenumber')[1] AS housenumber,
                 element_at(r.tags, 'addr:street')[1] AS street,
-                element_at(r.tags, 'addr:city')[1] AS city,
+                COALESCE(element_at(r.tags, 'addr:city')[1], element_at(r.tags, 'addr:place')[1]) AS city,
                 element_at(r.tags, 'addr:postcode')[1] AS postcode,
                 UNNEST(r.member_refs) AS member_id,
                 UNNEST(r.member_types) AS member_type
             FROM osm_relations r
             WHERE element_at(r.tags, 'addr:housenumber')[1] IS NOT NULL
-        ),
-        member_nodes AS (
-            SELECT
-                rm.relation_id,
-                rm.housenumber,
-                rm.street,
-                rm.city,
-                rm.postcode,
-                UNNEST(w.node_ids) AS node_id
-            FROM rel_members rm
-            JOIN osm_ways w ON rm.member_id = w.way_id
-            WHERE rm.member_type = 'way'
         )
+        SELECT
+            rm.relation_id,
+            rm.housenumber,
+            rm.street,
+            rm.city,
+            rm.postcode,
+            UNNEST(w.node_ids) AS node_id
+        FROM rel_members rm
+        JOIN osm_ways w ON rm.member_id = w.way_id
+        WHERE rm.member_type = 'way';
+
+        INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
         SELECT
             mn.relation_id AS osm_id,
             'relation' AS osm_type,
@@ -204,9 +213,11 @@ pub fn build_relation_geometries(conn: &Connection) -> Result<()> {
             mn.city,
             mn.postcode,
             ST_Point(AVG(n.lon), AVG(n.lat)) AS geom
-        FROM member_nodes mn
+        FROM rel_addr_member_nodes mn
         JOIN osm_nodes n ON mn.node_id = n.node_id
         GROUP BY mn.relation_id, mn.housenumber, mn.street, mn.city, mn.postcode;
+
+        DROP TABLE IF EXISTS rel_addr_member_nodes;
         ",
     )
     .context("Failed to build address geometries from relations")?;
