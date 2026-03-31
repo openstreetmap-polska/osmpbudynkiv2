@@ -15,6 +15,15 @@ pub fn import(conn: &Connection, file: Option<&Path>, url: &str) -> Result<()> {
 
     let pbf_str = pbf_path.to_str().context("PBF path is not valid UTF-8")?;
 
+    let has_data: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM osm_nodes LIMIT 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_data {
+        anyhow::bail!("OSM data already imported. Drop the database and reimport if needed.");
+    }
+
     info!(path = pbf_str, "Starting OSM import");
 
     import_nodes(conn, pbf_str)?;
@@ -82,43 +91,20 @@ fn import_address_nodes(conn: &Connection, pbf_path: &str) -> Result<()> {
 }
 
 fn import_ways(conn: &Connection, pbf_path: &str) -> Result<()> {
-    info!("Pass 3: Importing ways and way-node mappings");
+    info!("Pass 3: Importing ways");
 
-    // Import way-node mappings using unnest with generate_subscripts
     conn.execute_batch(&format!(
         "
-        INSERT INTO osm_way_nodes (way_id, node_id, position)
-        SELECT
-            id AS way_id,
-            UNNEST(refs) AS node_id,
-            UNNEST(generate_series(1, len(refs))) AS position
+        INSERT INTO osm_ways (way_id, node_ids, tags)
+        SELECT id, refs, tags
         FROM ST_ReadOSM('{pbf_path}')
         WHERE kind = 'way' AND refs IS NOT NULL AND len(refs) > 0;
         "
     ))
-    .context("Failed to import way-node mappings")?;
+    .context("Failed to import ways")?;
 
-    let wn_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM osm_way_nodes", [], |row| row.get(0))?;
-    info!(count = wn_count, "Way-node mappings imported");
-
-    // Store way tags we care about in a temp table for geometry construction
-    conn.execute_batch(&format!(
-        "
-        CREATE OR REPLACE TABLE osm_way_tags AS
-        SELECT
-            id AS way_id,
-            tags
-        FROM ST_ReadOSM('{pbf_path}')
-        WHERE kind = 'way'
-          AND (element_at(tags, 'building')[1] IS NOT NULL OR element_at(tags, 'addr:housenumber')[1] IS NOT NULL);
-        "
-    ))
-    .context("Failed to import way tags")?;
-
-    let tag_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM osm_way_tags", [], |row| row.get(0))?;
-    info!(count = tag_count, "Ways with relevant tags stored");
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM osm_ways", [], |row| row.get(0))?;
+    info!(count, "Ways imported");
 
     Ok(())
 }
@@ -128,48 +114,17 @@ fn import_relations(conn: &Connection, pbf_path: &str) -> Result<()> {
 
     conn.execute_batch(&format!(
         "
-        INSERT INTO osm_relations (relation_id, member_id, member_type, member_role, position)
-        SELECT
-            id AS relation_id,
-            UNNEST(refs) AS member_id,
-            UNNEST(ref_types::VARCHAR[]) AS member_type,
-            UNNEST(ref_roles) AS member_role,
-            UNNEST(generate_series(1, len(refs))) AS position
+        INSERT INTO osm_relations (relation_id, member_refs, member_types, member_roles, tags)
+        SELECT id, refs, ref_types::VARCHAR[], ref_roles, tags
         FROM ST_ReadOSM('{pbf_path}')
         WHERE kind = 'relation' AND refs IS NOT NULL AND len(refs) > 0;
         "
     ))
     .context("Failed to import relations")?;
 
-    let rel_count: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT relation_id) FROM osm_relations",
-        [],
-        |row| row.get(0),
-    )?;
-    info!(count = rel_count, "Relations imported");
-
-    // Store relation tags we care about
-    conn.execute_batch(&format!(
-        "
-        CREATE OR REPLACE TABLE osm_relation_tags AS
-        SELECT
-            id AS relation_id,
-            element_at(tags, 'building')[1] AS building,
-            element_at(tags, 'addr:housenumber')[1] AS housenumber,
-            element_at(tags, 'addr:street')[1] AS street,
-            element_at(tags, 'addr:city')[1] AS city,
-            element_at(tags, 'addr:postcode')[1] AS postcode
-        FROM ST_ReadOSM('{pbf_path}')
-        WHERE kind = 'relation'
-          AND (element_at(tags, 'building')[1] IS NOT NULL OR element_at(tags, 'addr:housenumber')[1] IS NOT NULL);
-        "
-    ))
-    .context("Failed to import relation tags")?;
-
-    let tag_count: i64 = conn.query_row("SELECT COUNT(*) FROM osm_relation_tags", [], |row| {
-        row.get(0)
-    })?;
-    info!(count = tag_count, "Relations with relevant tags stored");
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM osm_relations", [], |row| row.get(0))?;
+    info!(count, "Relations imported");
 
     Ok(())
 }
@@ -203,25 +158,6 @@ mod tests {
     fn setup_test_db() -> Result<Connection> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init_commands)?;
-
-        // Create the auxiliary tables that import creates
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS osm_way_tags (
-                way_id BIGINT,
-                tags MAP(VARCHAR, VARCHAR)
-            );
-            CREATE TABLE IF NOT EXISTS osm_relation_tags (
-                relation_id BIGINT,
-                building VARCHAR,
-                housenumber VARCHAR,
-                street VARCHAR,
-                city VARCHAR,
-                postcode VARCHAR
-            );
-            ",
-        )?;
-
         Ok(conn)
     }
 
@@ -522,15 +458,15 @@ mod tests {
             "Expected at least 48 nodes, got {node_count}"
         );
 
-        // Way-node mappings: 7 (way 947235698) + 25 (way 977731637) + 19 (way 977731638) = 51
-        let wn_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM osm_way_nodes", [], |row| row.get(0))?;
-        assert_eq!(wn_count, 51, "Expected 51 way-node mappings");
+        // Ways: 3 ways in the fixture
+        let way_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM osm_ways", [], |row| row.get(0))?;
+        assert_eq!(way_count, 3, "Expected 3 ways");
 
-        // Relations: 2 members (outer + inner way) for relation 1891415
+        // Relations: 1 relation in the fixture
         let rel_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM osm_relations", [], |row| row.get(0))?;
-        assert_eq!(rel_count, 2, "Expected 2 relation members");
+        assert_eq!(rel_count, 1, "Expected 1 relation");
 
         Ok(())
     }
