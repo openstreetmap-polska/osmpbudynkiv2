@@ -173,13 +173,7 @@ mod tests {
             INSERT INTO osm_nodes VALUES (3, 20.001, 50.001);
             INSERT INTO osm_nodes VALUES (4, 20.0, 50.001);
 
-            INSERT INTO osm_way_nodes VALUES (100, 1, 1);
-            INSERT INTO osm_way_nodes VALUES (100, 2, 2);
-            INSERT INTO osm_way_nodes VALUES (100, 3, 3);
-            INSERT INTO osm_way_nodes VALUES (100, 4, 4);
-            INSERT INTO osm_way_nodes VALUES (100, 1, 5);
-
-            INSERT INTO osm_way_tags VALUES (100, MAP {'building': 'yes'});
+            INSERT INTO osm_ways VALUES (100, [1, 2, 3, 4, 1], MAP {'building': 'yes'});
             ",
         )?;
 
@@ -211,10 +205,7 @@ mod tests {
             INSERT INTO osm_nodes VALUES (1, 20.0, 50.0);
             INSERT INTO osm_nodes VALUES (2, 20.002, 50.0);
 
-            INSERT INTO osm_way_nodes VALUES (200, 1, 1);
-            INSERT INTO osm_way_nodes VALUES (200, 2, 2);
-
-            INSERT INTO osm_way_tags VALUES (200, MAP {
+            INSERT INTO osm_ways VALUES (200, [1, 2], MAP {
                 'addr:housenumber': '42',
                 'addr:street': 'ul. Testowa',
                 'addr:city': 'Warszawa',
@@ -262,25 +253,12 @@ mod tests {
             INSERT INTO osm_nodes VALUES (7, 20.007, 50.007);
             INSERT INTO osm_nodes VALUES (8, 20.003, 50.007);
 
-            -- Outer way (way_id=10)
-            INSERT INTO osm_way_nodes VALUES (10, 1, 1);
-            INSERT INTO osm_way_nodes VALUES (10, 2, 2);
-            INSERT INTO osm_way_nodes VALUES (10, 3, 3);
-            INSERT INTO osm_way_nodes VALUES (10, 4, 4);
-            INSERT INTO osm_way_nodes VALUES (10, 1, 5);
-
-            -- Inner way (way_id=11)
-            INSERT INTO osm_way_nodes VALUES (11, 5, 1);
-            INSERT INTO osm_way_nodes VALUES (11, 6, 2);
-            INSERT INTO osm_way_nodes VALUES (11, 7, 3);
-            INSERT INTO osm_way_nodes VALUES (11, 8, 4);
-            INSERT INTO osm_way_nodes VALUES (11, 5, 5);
+            -- Outer way (way_id=10) and inner way (way_id=11)
+            INSERT INTO osm_ways VALUES (10, [1, 2, 3, 4, 1], NULL);
+            INSERT INTO osm_ways VALUES (11, [5, 6, 7, 8, 5], NULL);
 
             -- Relation 300 references both ways
-            INSERT INTO osm_relations VALUES (300, 10, 'way', 'outer', 1);
-            INSERT INTO osm_relations VALUES (300, 11, 'way', 'inner', 2);
-
-            INSERT INTO osm_relation_tags VALUES (300, 'yes', NULL, NULL, NULL, NULL);
+            INSERT INTO osm_relations VALUES (300, [10, 11], ['way', 'way'], ['outer', 'inner'], MAP {'building': 'yes'});
             ",
         )?;
 
