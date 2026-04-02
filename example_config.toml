@@ -1,6 +1,16 @@
 # Path to DuckDB database file
 db_path = "./osmpbudynkiv2.duckdb"
 
+# Path to RocksDB directory (used to store raw OSM node coordinates and
+# structural mappings — way node refs, relation members, reverse indexes)
+rocksdb_path = "./osmpbudynkiv2.rocksdb"
+
+# RocksDB block cache size in MB (shared across all column families)
+rocksdb_block_cache_mb = 512
+
+# RocksDB write buffer size in MB (per column family)
+rocksdb_write_buffer_mb = 64
+
 # Log verbosity: trace, debug, info, warn, error
 # Can be overridden by RUST_LOG environment variable
 log_level = "info"

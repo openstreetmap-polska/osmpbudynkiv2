@@ -7,16 +7,22 @@ fn cmd() -> Command {
     cmd
 }
 
-fn memory_config() -> tempfile::NamedTempFile {
+fn memory_config() -> (tempfile::NamedTempFile, tempfile::TempDir) {
+    let rocksdb_dir = tempfile::TempDir::new().unwrap();
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
     use std::io::Write;
-    write!(tmp, "db_path = \":memory:\"\n").unwrap();
-    tmp
+    write!(
+        tmp,
+        "db_path = \":memory:\"\nrocksdb_path = \"{}\"\n",
+        rocksdb_dir.path().display()
+    )
+    .unwrap();
+    (tmp, rocksdb_dir)
 }
 
 #[test]
 fn test_import_egib_from_fixture() {
-    let cfg = memory_config();
+    let (cfg, _rocksdb_dir) = memory_config();
     cmd()
         .args([
             "--config",
@@ -36,7 +42,7 @@ fn test_import_egib_from_fixture() {
 
 #[test]
 fn test_import_egib_missing_file() {
-    let cfg = memory_config();
+    let (cfg, _rocksdb_dir) = memory_config();
     cmd()
         .args([
             "--config",

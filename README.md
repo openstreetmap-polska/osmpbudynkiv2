@@ -6,7 +6,7 @@ Narzędzie do porównywania uwolnionych danych państwowych (adresy, budynki) do
 
 ## Building
 
-Requires Rust toolchain (install via [rustup](https://rustup.rs/)). No external DuckDB installation needed — it's compiled from source as part of the build (first build takes a while due to C++ compilation).
+Requires Rust toolchain (install via [rustup](https://rustup.rs/)). No external DuckDB or RocksDB installation needed — both are compiled from source as part of the build (first build takes a while due to C++ compilation).
 
 ```bash
 cargo build             # debug build
@@ -35,6 +35,9 @@ If no `--config` is provided, built-in defaults are used (database at `./osmpbud
 
 The config file controls:
 - **`db_path`** — location of the DuckDB database file
+- **`rocksdb_path`** — location of the RocksDB directory (stores raw OSM node coordinates and structural mappings used to build geometries)
+- **`rocksdb_block_cache_mb`** — RocksDB block cache size in MB (default: 512)
+- **`rocksdb_write_buffer_mb`** — RocksDB write buffer size in MB per column family (default: 64)
 - **`log_level`** — log verbosity (`trace`, `debug`, `info`, `warn`, `error`)
 - **`duckdb_init_commands`** — SQL statements run on database initialization
 - **`download_urls`** — URLs for downloading data sources

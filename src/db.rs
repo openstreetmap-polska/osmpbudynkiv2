@@ -2,10 +2,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use duckdb::Connection;
+use duckdb::vtab::arrow::ArrowVTab;
 
 pub fn init_db(path: &Path, init_commands: &[String]) -> Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("Failed to open database at {path:?}"))?;
+
+    conn.register_table_function::<ArrowVTab>("arrow")
+        .context("Failed to register arrow vtab")?;
 
     for cmd in init_commands {
         conn.execute_batch(cmd)
@@ -23,27 +27,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS metadata (
             key VARCHAR,
             value VARCHAR
-        );
-
-        -- OSM raw data
-        CREATE TABLE IF NOT EXISTS osm_nodes (
-            node_id BIGINT,
-            lon DOUBLE,
-            lat DOUBLE
-        );
-
-        CREATE TABLE IF NOT EXISTS osm_ways (
-            way_id BIGINT,
-            node_ids BIGINT[],
-            tags MAP(VARCHAR, VARCHAR)
-        );
-
-        CREATE TABLE IF NOT EXISTS osm_relations (
-            relation_id BIGINT,
-            member_refs BIGINT[],
-            member_types VARCHAR[],
-            member_roles VARCHAR[],
-            tags MAP(VARCHAR, VARCHAR)
         );
 
         -- Processed OSM data with geometry
@@ -80,14 +63,7 @@ mod tests {
         let conn = init_db(Path::new(":memory:"), &init_commands)?;
 
         // Verify all tables exist by querying them
-        let tables = [
-            "metadata",
-            "osm_nodes",
-            "osm_ways",
-            "osm_relations",
-            "osm_addresses",
-            "osm_buildings",
-        ];
+        let tables = ["metadata", "osm_addresses", "osm_buildings"];
         for table in tables {
             let count: i64 =
                 conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {

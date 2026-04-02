@@ -24,12 +24,21 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.log_level));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    info!(db_path = %config.db_path, "Initializing database");
+    info!(db_path = %config.db_path, rocksdb_path = %config.rocksdb_path, "Initializing databases");
     let conn = db::init_db(Path::new(&config.db_path), &config.duckdb_init_commands)?;
+    let kv = osm::kvstore::open(
+        Path::new(&config.rocksdb_path),
+        config.rocksdb_block_cache_mb,
+        config.rocksdb_write_buffer_mb,
+    )?;
 
     match cli.command {
-        Command::Import { source } => import::run(&conn, source, &config.download_urls)?,
-        Command::Update { source } => update::run(&conn, source, &config.download_urls)?,
+        Command::Import { source } => {
+            import::run(&conn, &kv, source, &config, &config.download_urls)?
+        }
+        Command::Update { source } => {
+            update::run(&conn, &kv, source, &config, &config.download_urls)?
+        }
         Command::Run => {
             anyhow::bail!("Run command is not yet implemented");
         }
