@@ -146,8 +146,6 @@ fn stream_nodes_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> R
 fn stream_ways_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Result<()> {
     info!("Pass 2: Streaming ways to RocksDB");
 
-    const CHUNK_SIZE: usize = 500_000;
-
     let sql = format!(
         "SELECT id, refs FROM ST_ReadOSM('{pbf_path}') WHERE kind = 'way' AND refs IS NOT NULL AND len(refs) > 0"
     );
@@ -156,9 +154,6 @@ fn stream_ways_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Re
     let mut batch = kvstore::new_batch();
     let mut count = 0u64;
 
-    // Accumulate node_id → [way_ids] in memory, flush in chunks.
-    let mut node_to_ways: HashMap<i64, Vec<i64>> = HashMap::with_capacity(CHUNK_SIZE);
-
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let refs_value: Value = row.get(1)?;
@@ -166,7 +161,7 @@ fn stream_ways_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Re
         kvstore::batch_put_way(kv, &mut batch, id, &refs);
 
         for &node_id in &refs {
-            node_to_ways.entry(node_id).or_default().push(id);
+            kvstore::batch_merge_node_to_way(kv, &mut batch, node_id, id);
         }
 
         count += 1;
@@ -174,37 +169,13 @@ fn stream_ways_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Re
             kvstore::write_batch(kv, batch)?;
             batch = kvstore::new_batch();
         }
-
-        if node_to_ways.len() >= CHUNK_SIZE {
-            flush_node_to_ways(kv, &mut node_to_ways)?;
-        }
     }
 
     if count % 10000 != 0 {
         kvstore::write_batch(kv, batch)?;
     }
-    if !node_to_ways.is_empty() {
-        flush_node_to_ways(kv, &mut node_to_ways)?;
-    }
 
     info!(count, "Ways streamed to RocksDB");
-    Ok(())
-}
-
-/// Merge accumulated node→ways mappings with existing RocksDB data and write as a single batch.
-fn flush_node_to_ways(kv: &RocksDB, map: &mut HashMap<i64, Vec<i64>>) -> Result<()> {
-    let mut batch = kvstore::new_batch();
-    for (&node_id, new_way_ids) in map.iter() {
-        let mut existing = kvstore::get_node_to_ways(kv, node_id)?;
-        for &wid in new_way_ids {
-            if !existing.contains(&wid) {
-                existing.push(wid);
-            }
-        }
-        kvstore::batch_put_node_to_ways(kv, &mut batch, node_id, &existing);
-    }
-    kvstore::write_batch(kv, batch)?;
-    map.clear();
     Ok(())
 }
 
