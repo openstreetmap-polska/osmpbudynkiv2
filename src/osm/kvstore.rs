@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rocksdb::{
-    BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded,
-    Options, WriteBatch,
+    BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode,
+    MergeOperands, MultiThreaded, Options, WriteBatch,
 };
 
 use super::encoding;
@@ -25,6 +25,44 @@ const ALL_CFS: &[&str] = &[
 ];
 
 pub type RocksDB = DBWithThreadMode<MultiThreaded>;
+
+/// Full merge for reverse-index CFs.
+/// Existing value (if any) is an encoded id-list: 4-byte LE count + N * 8-byte LE i64s.
+/// Each operand is a single 8-byte LE i64 to append.
+fn id_list_full_merge(
+    _key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    let mut ids: Vec<u8> = match existing {
+        Some(val) if val.len() >= 4 => val[4..].to_vec(),
+        _ => Vec::new(),
+    };
+
+    for operand in operands {
+        ids.extend_from_slice(operand);
+    }
+
+    let count = (ids.len() / 8) as u32;
+    let mut result = Vec::with_capacity(4 + ids.len());
+    result.extend_from_slice(&count.to_le_bytes());
+    result.extend_from_slice(&ids);
+    Some(result)
+}
+
+/// Partial merge: operands are bare 8-byte i64s. Just concatenate.
+fn id_list_partial_merge(
+    _key: &[u8],
+    _existing: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    let total_len: usize = operands.iter().map(|op| op.len()).sum();
+    let mut result = Vec::with_capacity(total_len);
+    for operand in operands {
+        result.extend_from_slice(operand);
+    }
+    Some(result)
+}
 
 pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<RocksDB> {
     let mut db_opts = Options::default();
@@ -50,6 +88,13 @@ pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<Ro
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
             cf_opts.set_write_buffer_size(write_buffer_bytes);
+            if *name == CF_NODE_TO_WAYS || *name == CF_WAY_TO_RELATIONS {
+                cf_opts.set_merge_operator(
+                    "id_list_merge",
+                    id_list_full_merge,
+                    id_list_partial_merge,
+                );
+            }
             ColumnFamilyDescriptor::new(*name, cf_opts)
         })
         .collect();
@@ -225,6 +270,24 @@ pub fn remove_way_to_relations(db: &RocksDB, way_id: i64, relation_id: i64) -> R
     Ok(())
 }
 
+pub fn merge_node_to_way(db: &RocksDB, node_id: i64, way_id: i64) -> Result<()> {
+    db.merge_cf(
+        &cf(db, CF_NODE_TO_WAYS),
+        encoding::encode_key(node_id),
+        way_id.to_le_bytes(),
+    )?;
+    Ok(())
+}
+
+pub fn merge_way_to_relation(db: &RocksDB, way_id: i64, relation_id: i64) -> Result<()> {
+    db.merge_cf(
+        &cf(db, CF_WAY_TO_RELATIONS),
+        encoding::encode_key(way_id),
+        relation_id.to_le_bytes(),
+    )?;
+    Ok(())
+}
+
 // --- WriteBatch for atomic operations ---
 
 pub fn new_batch() -> WriteBatch {
@@ -260,12 +323,7 @@ pub fn batch_put_relation(
     );
 }
 
-pub fn batch_put_node_to_ways(
-    db: &RocksDB,
-    batch: &mut WriteBatch,
-    node_id: i64,
-    way_ids: &[i64],
-) {
+pub fn batch_put_node_to_ways(db: &RocksDB, batch: &mut WriteBatch, node_id: i64, way_ids: &[i64]) {
     if way_ids.is_empty() {
         batch.delete_cf(&cf(db, CF_NODE_TO_WAYS), encoding::encode_key(node_id));
     } else {
@@ -292,6 +350,27 @@ pub fn batch_put_way_to_relations(
             encoding::encode_id_list(relation_ids),
         );
     }
+}
+
+pub fn batch_merge_node_to_way(db: &RocksDB, batch: &mut WriteBatch, node_id: i64, way_id: i64) {
+    batch.merge_cf(
+        &cf(db, CF_NODE_TO_WAYS),
+        encoding::encode_key(node_id),
+        way_id.to_le_bytes(),
+    );
+}
+
+pub fn batch_merge_way_to_relation(
+    db: &RocksDB,
+    batch: &mut WriteBatch,
+    way_id: i64,
+    relation_id: i64,
+) {
+    batch.merge_cf(
+        &cf(db, CF_WAY_TO_RELATIONS),
+        encoding::encode_key(way_id),
+        relation_id.to_le_bytes(),
+    );
 }
 
 pub fn write_batch(db: &RocksDB, batch: WriteBatch) -> Result<()> {
@@ -392,5 +471,31 @@ mod tests {
         write_batch(&db, batch).unwrap();
 
         assert_eq!(get_way_to_relations(&db, 20).unwrap(), vec![300, 301]);
+    }
+
+    #[test]
+    fn test_merge_node_to_ways() {
+        let (_tmp, db) = open_tmp_db();
+        merge_node_to_way(&db, 10, 100).unwrap();
+        merge_node_to_way(&db, 10, 101).unwrap();
+        merge_node_to_way(&db, 10, 102).unwrap();
+        assert_eq!(get_node_to_ways(&db, 10).unwrap(), vec![100, 101, 102]);
+    }
+
+    #[test]
+    fn test_merge_way_to_relation() {
+        let (_tmp, db) = open_tmp_db();
+        merge_way_to_relation(&db, 20, 200).unwrap();
+        merge_way_to_relation(&db, 20, 201).unwrap();
+        assert_eq!(get_way_to_relations(&db, 20).unwrap(), vec![200, 201]);
+    }
+
+    #[test]
+    fn test_merge_on_top_of_existing_put() {
+        let (_tmp, db) = open_tmp_db();
+        put_node_to_ways(&db, 10, &[100, 101]).unwrap();
+        merge_node_to_way(&db, 10, 102).unwrap();
+        merge_node_to_way(&db, 10, 103).unwrap();
+        assert_eq!(get_node_to_ways(&db, 10).unwrap(), vec![100, 101, 102, 103]);
     }
 }
