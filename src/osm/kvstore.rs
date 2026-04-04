@@ -260,6 +260,40 @@ pub fn batch_put_relation(
     );
 }
 
+pub fn batch_put_node_to_ways(
+    db: &RocksDB,
+    batch: &mut WriteBatch,
+    node_id: i64,
+    way_ids: &[i64],
+) {
+    if way_ids.is_empty() {
+        batch.delete_cf(&cf(db, CF_NODE_TO_WAYS), encoding::encode_key(node_id));
+    } else {
+        batch.put_cf(
+            &cf(db, CF_NODE_TO_WAYS),
+            encoding::encode_key(node_id),
+            encoding::encode_id_list(way_ids),
+        );
+    }
+}
+
+pub fn batch_put_way_to_relations(
+    db: &RocksDB,
+    batch: &mut WriteBatch,
+    way_id: i64,
+    relation_ids: &[i64],
+) {
+    if relation_ids.is_empty() {
+        batch.delete_cf(&cf(db, CF_WAY_TO_RELATIONS), encoding::encode_key(way_id));
+    } else {
+        batch.put_cf(
+            &cf(db, CF_WAY_TO_RELATIONS),
+            encoding::encode_key(way_id),
+            encoding::encode_id_list(relation_ids),
+        );
+    }
+}
+
 pub fn write_batch(db: &RocksDB, batch: WriteBatch) -> Result<()> {
     db.write(batch).context("Failed to write RocksDB batch")?;
     Ok(())
@@ -336,5 +370,27 @@ mod tests {
         assert_eq!(get_way_to_relations(&db, 20).unwrap(), vec![200, 201]);
         remove_way_to_relations(&db, 20, 200).unwrap();
         assert_eq!(get_way_to_relations(&db, 20).unwrap(), vec![201]);
+    }
+
+    #[test]
+    fn test_batch_put_node_to_ways() {
+        let (_tmp, db) = open_tmp_db();
+        let mut batch = new_batch();
+        batch_put_node_to_ways(&db, &mut batch, 10, &[100, 101]);
+        batch_put_node_to_ways(&db, &mut batch, 11, &[200]);
+        write_batch(&db, batch).unwrap();
+
+        assert_eq!(get_node_to_ways(&db, 10).unwrap(), vec![100, 101]);
+        assert_eq!(get_node_to_ways(&db, 11).unwrap(), vec![200]);
+    }
+
+    #[test]
+    fn test_batch_put_way_to_relations() {
+        let (_tmp, db) = open_tmp_db();
+        let mut batch = new_batch();
+        batch_put_way_to_relations(&db, &mut batch, 20, &[300, 301]);
+        write_batch(&db, batch).unwrap();
+
+        assert_eq!(get_way_to_relations(&db, 20).unwrap(), vec![300, 301]);
     }
 }
