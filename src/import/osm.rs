@@ -71,7 +71,7 @@ pub fn import(
     stream_nodes_to_rocksdb(conn, kv, pbf_str)?;
     import_address_nodes(conn, pbf_str)?;
     stream_ways_to_rocksdb(conn, kv, pbf_str)?;
-    batch_geometry::build_way_geometries(conn, kv, pbf_str)?;
+    import_way_buildings_and_addresses(conn, pbf_str)?;
     stream_relations_to_rocksdb(conn, kv, pbf_str)?;
     batch_geometry::build_relation_geometries(conn, kv, pbf_str)?;
     create_spatial_indexes(conn)?;
@@ -177,6 +177,56 @@ fn stream_ways_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Re
     Ok(())
 }
 
+fn import_way_buildings_and_addresses(conn: &Connection, pbf_path: &str) -> Result<()> {
+    info!("Importing way buildings");
+    conn.execute_batch(&format!(
+        "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
+         SELECT id, 'way', element_at(tags, 'building')[1],
+                ST_MakePolygon(ST_GeomFromWKB(resolve_node_coords(refs)))
+         FROM ST_ReadOSM('{pbf_path}')
+         WHERE kind = 'way'
+           AND refs IS NOT NULL
+           AND len(refs) >= 4
+           AND element_at(tags, 'building')[1] IS NOT NULL
+           AND resolve_node_coords(refs) IS NOT NULL"
+    ))
+    .context("Failed to import way buildings")?;
+
+    let building_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM osm_buildings WHERE osm_type = 'way'",
+        [],
+        |row| row.get(0),
+    )?;
+    info!(count = building_count, "Way buildings imported");
+
+    info!("Importing way addresses");
+    conn.execute_batch(&format!(
+        "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
+         SELECT id, 'way',
+                element_at(tags, 'addr:housenumber')[1],
+                element_at(tags, 'addr:street')[1],
+                COALESCE(element_at(tags, 'addr:city')[1], element_at(tags, 'addr:place')[1]),
+                element_at(tags, 'addr:postcode')[1],
+                ST_Centroid(ST_GeomFromWKB(resolve_node_coords(refs)))
+         FROM ST_ReadOSM('{pbf_path}')
+         WHERE kind = 'way'
+           AND refs IS NOT NULL
+           AND len(refs) > 0
+           AND element_at(tags, 'addr:housenumber')[1] IS NOT NULL
+           AND resolve_node_coords(refs) IS NOT NULL"
+    ))
+    .context("Failed to import way addresses")?;
+
+    let addr_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM osm_addresses WHERE osm_type = 'way'",
+        [],
+        |row| row.get(0),
+    )?;
+    info!(count = addr_count, "Way addresses imported");
+
+    Ok(())
+}
+
 fn string_to_member_type(member_type: &str) -> u8 {
     match member_type {
         "node" => 0,
@@ -272,6 +322,8 @@ fn log_import_stats(conn: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::Config;
     use crate::db::init_db;
@@ -285,7 +337,8 @@ mod tests {
 
     fn run_import_with_fixture(conn: &Connection, pbf_path: &Path) -> Result<()> {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let kv = kvstore::open(tmp_dir.path(), 512, 64)?;
+        let kv = Arc::new(kvstore::open(tmp_dir.path(), 512, 64)?);
+        crate::osm::udf::register_udfs(conn, kv.clone())?;
         let config = Config::default();
         import(conn, &kv, &config, Some(pbf_path), "")?;
         Ok(())
