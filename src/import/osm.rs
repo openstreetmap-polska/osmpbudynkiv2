@@ -74,6 +74,10 @@ pub fn import(
     import_way_buildings_and_addresses(conn, pbf_str)?;
     stream_relations_to_rocksdb(conn, kv, pbf_str)?;
     import_relation_buildings_and_addresses(conn, pbf_str)?;
+
+    info!("Compacting reverse indexes");
+    kvstore::compact_reverse_indexes(kv);
+
     create_spatial_indexes(conn)?;
 
     log_import_stats(conn)?;

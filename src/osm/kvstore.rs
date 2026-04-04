@@ -378,6 +378,13 @@ pub fn write_batch(db: &RocksDB, batch: WriteBatch) -> Result<()> {
     Ok(())
 }
 
+/// Compact the reverse-index column families to collapse merge operands.
+/// Call after bulk import to optimize read performance.
+pub fn compact_reverse_indexes(db: &RocksDB) {
+    db.compact_range_cf(&cf(db, CF_NODE_TO_WAYS), None::<&[u8]>, None::<&[u8]>);
+    db.compact_range_cf(&cf(db, CF_WAY_TO_RELATIONS), None::<&[u8]>, None::<&[u8]>);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
