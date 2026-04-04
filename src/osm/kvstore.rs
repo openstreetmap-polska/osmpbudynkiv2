@@ -30,7 +30,6 @@ pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<Ro
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
-    db_opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
 
     let mut bbt = BlockBasedOptions::default();
     let cache = rocksdb::Cache::new_lru_cache(
@@ -40,22 +39,17 @@ pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<Ro
     );
     bbt.set_block_cache(&cache);
     db_opts.set_block_based_table_factory(&bbt);
-    db_opts.set_write_buffer_size(
-        (write_buffer_mb * 1024 * 1024)
-            .try_into()
-            .context("write_buffer_mb overflow")?,
-    );
+
+    let write_buffer_bytes: usize = (write_buffer_mb * 1024 * 1024)
+        .try_into()
+        .context("write_buffer_mb overflow")?;
 
     let cfs: Vec<ColumnFamilyDescriptor> = ALL_CFS
         .iter()
         .map(|name| {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
-            cf_opts.set_write_buffer_size(
-                (write_buffer_mb * 1024 * 1024)
-                    .try_into()
-                    .expect("write_buffer_mb overflow"),
-            );
+            cf_opts.set_write_buffer_size(write_buffer_bytes);
             ColumnFamilyDescriptor::new(*name, cf_opts)
         })
         .collect();
