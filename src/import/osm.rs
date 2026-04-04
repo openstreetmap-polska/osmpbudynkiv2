@@ -7,7 +7,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::download::download_file;
 use crate::osm::kvstore::RocksDB;
-use crate::osm::{batch_geometry, kvstore};
+use crate::osm::kvstore;
 
 fn value_to_i64_list(value: Value) -> Result<Vec<i64>> {
     match value {
@@ -73,7 +73,7 @@ pub fn import(
     stream_ways_to_rocksdb(conn, kv, pbf_str)?;
     import_way_buildings_and_addresses(conn, pbf_str)?;
     stream_relations_to_rocksdb(conn, kv, pbf_str)?;
-    batch_geometry::build_relation_geometries(conn, kv, pbf_str)?;
+    import_relation_buildings_and_addresses(conn, pbf_str)?;
     create_spatial_indexes(conn)?;
 
     log_import_stats(conn)?;
@@ -223,6 +223,110 @@ fn import_way_buildings_and_addresses(conn: &Connection, pbf_path: &str) -> Resu
         |row| row.get(0),
     )?;
     info!(count = addr_count, "Way addresses imported");
+
+    Ok(())
+}
+
+fn import_relation_buildings_and_addresses(conn: &Connection, pbf_path: &str) -> Result<()> {
+    info!("Importing relation buildings");
+    conn.execute_batch(&format!(
+        "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
+         WITH rel_members AS (
+             SELECT
+                 id AS relation_id,
+                 element_at(tags, 'building')[1] AS building,
+                 unnest(refs) AS ref_id,
+                 unnest(ref_types) AS ref_type,
+                 unnest(ref_roles) AS ref_role
+             FROM ST_ReadOSM('{pbf_path}')
+             WHERE kind = 'relation'
+               AND refs IS NOT NULL
+               AND len(refs) > 0
+               AND element_at(tags, 'building')[1] IS NOT NULL
+         ),
+         way_geoms AS (
+             SELECT
+                 relation_id, building, ref_role,
+                 ST_GeomFromWKB(resolve_way_coords(ref_id)) AS line_geom
+             FROM rel_members
+             WHERE ref_type = 'way'
+               AND resolve_way_coords(ref_id) IS NOT NULL
+         ),
+         outer_polys AS (
+             SELECT relation_id, building,
+                    ST_Union_Agg(ST_MakePolygon(line_geom)) AS outer_geom
+             FROM way_geoms
+             WHERE (ref_role = 'outer' OR ref_role = '')
+               AND ST_NPoints(line_geom) >= 4
+             GROUP BY relation_id, building
+         ),
+         inner_polys AS (
+             SELECT relation_id,
+                    ST_Union_Agg(ST_MakePolygon(line_geom)) AS inner_geom
+             FROM way_geoms
+             WHERE ref_role = 'inner'
+               AND ST_NPoints(line_geom) >= 4
+             GROUP BY relation_id
+         )
+         SELECT
+             o.relation_id, 'relation', o.building,
+             CASE
+                 WHEN i.inner_geom IS NOT NULL THEN ST_Difference(o.outer_geom, i.inner_geom)
+                 ELSE o.outer_geom
+             END AS geom
+         FROM outer_polys o
+         LEFT JOIN inner_polys i ON o.relation_id = i.relation_id
+         WHERE o.outer_geom IS NOT NULL"
+    ))
+    .context("Failed to import relation buildings")?;
+
+    let building_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM osm_buildings WHERE osm_type = 'relation'",
+        [],
+        |row| row.get(0),
+    )?;
+    info!(count = building_count, "Relation buildings imported");
+
+    info!("Importing relation addresses");
+    conn.execute_batch(&format!(
+        "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
+         WITH rel_members AS (
+             SELECT
+                 id AS relation_id,
+                 element_at(tags, 'addr:housenumber')[1] AS housenumber,
+                 element_at(tags, 'addr:street')[1] AS street,
+                 COALESCE(element_at(tags, 'addr:city')[1], element_at(tags, 'addr:place')[1]) AS city,
+                 element_at(tags, 'addr:postcode')[1] AS postcode,
+                 unnest(refs) AS ref_id,
+                 unnest(ref_types) AS ref_type
+             FROM ST_ReadOSM('{pbf_path}')
+             WHERE kind = 'relation'
+               AND refs IS NOT NULL
+               AND len(refs) > 0
+               AND element_at(tags, 'addr:housenumber')[1] IS NOT NULL
+         ),
+         way_geoms AS (
+             SELECT
+                 relation_id, housenumber, street, city, postcode,
+                 ST_GeomFromWKB(resolve_way_coords(ref_id)) AS line_geom
+             FROM rel_members
+             WHERE ref_type = 'way'
+               AND resolve_way_coords(ref_id) IS NOT NULL
+         )
+         SELECT
+             relation_id, 'relation', housenumber, street, city, postcode,
+             ST_Centroid(ST_Collect(list(line_geom)))
+         FROM way_geoms
+         GROUP BY relation_id, housenumber, street, city, postcode"
+    ))
+    .context("Failed to import relation addresses")?;
+
+    let addr_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM osm_addresses WHERE osm_type = 'relation'",
+        [],
+        |row| row.get(0),
+    )?;
+    info!(count = addr_count, "Relation addresses imported");
 
     Ok(())
 }
