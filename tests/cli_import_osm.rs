@@ -60,16 +60,16 @@ fn test_import_osm_missing_file() {
 #[test]
 fn test_import_osm_twice_fails_on_duplicates() {
     // This test needs a persistent database between two CLI invocations
-    let db_path = "target/test_cli_import_twice.duckdb";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{db_path}.wal"));
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.duckdb");
     let rocksdb_dir = tempfile::TempDir::new().unwrap();
 
     let mut cfg_file = tempfile::NamedTempFile::new().unwrap();
     use std::io::Write;
     write!(
         cfg_file,
-        "db_path = \"{db_path}\"\nrocksdb_path = \"{}\"\n",
+        "db_path = \"{}\"\nrocksdb_path = \"{}\"\n",
+        db_path.display(),
         rocksdb_dir.path().display()
     )
     .unwrap();
@@ -101,7 +101,4 @@ fn test_import_osm_twice_fails_on_duplicates() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("already imported"));
-
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{db_path}.wal"));
 }
