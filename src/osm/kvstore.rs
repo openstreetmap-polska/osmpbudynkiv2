@@ -48,7 +48,16 @@ pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<Ro
 
     let cfs: Vec<ColumnFamilyDescriptor> = ALL_CFS
         .iter()
-        .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+        .map(|name| {
+            let mut cf_opts = Options::default();
+            cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+            cf_opts.set_write_buffer_size(
+                (write_buffer_mb * 1024 * 1024)
+                    .try_into()
+                    .expect("write_buffer_mb overflow"),
+            );
+            ColumnFamilyDescriptor::new(*name, cf_opts)
+        })
         .collect();
 
     let db = DBWithThreadMode::open_cf_descriptors(&db_opts, path, cfs)
