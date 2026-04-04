@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rocksdb::{
-    BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode,
-    MergeOperands, MultiThreaded, Options, WriteBatch,
+    BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MergeOperands,
+    MultiThreaded, Options, WriteBatch,
 };
 
 use super::encoding;

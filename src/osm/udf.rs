@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
-use duckdb::vtab::arrow::WritableVector;
-use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::Connection;
+use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
+use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
+use duckdb::vtab::arrow::WritableVector;
 
 use super::encoding;
 use super::kvstore::{self, RocksDB};
@@ -165,16 +165,10 @@ impl VScalar for ResolveWayCoords {
 /// Register UDFs on the given connection. Call once after opening the DB.
 pub fn register_udfs(conn: &Connection, kv: Arc<RocksDB>) -> Result<()> {
     let state = KvState { kv };
-    conn.register_scalar_function_with_state::<ResolveNodeCoords>(
-        "resolve_node_coords",
-        &state,
-    )
-    .context("Failed to register resolve_node_coords UDF")?;
-    conn.register_scalar_function_with_state::<ResolveWayCoords>(
-        "resolve_way_coords",
-        &state,
-    )
-    .context("Failed to register resolve_way_coords UDF")?;
+    conn.register_scalar_function_with_state::<ResolveNodeCoords>("resolve_node_coords", &state)
+        .context("Failed to register resolve_node_coords UDF")?;
+    conn.register_scalar_function_with_state::<ResolveWayCoords>("resolve_way_coords", &state)
+        .context("Failed to register resolve_way_coords UDF")?;
     Ok(())
 }
 
@@ -251,11 +245,9 @@ mod tests {
         let (_tmp, conn, _kv) = setup();
 
         let result: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT resolve_node_coords([1]::BIGINT[])",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT resolve_node_coords([1]::BIGINT[])", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         assert!(result.is_none());
@@ -286,10 +278,7 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 100);
-        assert_eq!(
-            rows[0].1,
-            "LINESTRING (20 50, 21 50, 21 51, 20 51, 20 50)"
-        );
+        assert_eq!(rows[0].1, "LINESTRING (20 50, 21 50, 21 51, 20 51, 20 50)");
         assert_eq!(rows[1].0, 101);
         assert_eq!(rows[1].1, "LINESTRING (20 50, 21 50, 21 51)");
     }
@@ -354,11 +343,9 @@ mod tests {
         let (_tmp, conn, _kv) = setup();
 
         let result: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT resolve_way_coords(999::BIGINT)",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT resolve_way_coords(999::BIGINT)", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         assert!(result.is_none());

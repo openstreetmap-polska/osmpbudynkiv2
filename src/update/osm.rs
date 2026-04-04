@@ -273,10 +273,9 @@ fn rebuild_way_geometry(
     way_id: i64,
     way_changes: &[WayChange],
 ) -> Result<()> {
-    let node_ids = match kvstore::get_way(kv, way_id)? {
-        Some(ids) => ids,
-        None => return Ok(()),
-    };
+    if kvstore::get_way(kv, way_id)?.is_none() {
+        return Ok(());
+    }
 
     // Determine tags: from the change if directly affected, else from DuckDB existence.
     // For indirectly affected ways, check DuckDB BEFORE deleting old entries.
@@ -339,42 +338,25 @@ fn rebuild_way_geometry(
         [way_id],
     )?;
 
-    let mut lons = Vec::with_capacity(node_ids.len());
-    let mut lats = Vec::with_capacity(node_ids.len());
-    for &nid in &node_ids {
-        match kvstore::get_node(kv, nid)? {
-            Some((lon, lat)) => {
-                lons.push(lon);
-                lats.push(lat);
-            }
-            None => return Ok(()),
-        }
-    }
-
-    if building_tag.is_some() && lons.len() >= 4 {
+    if building_tag.is_some() {
         let building = building_tag.as_deref().unwrap_or("yes");
         let building_sql = building.replace('\'', "''");
-        let point_list: String = lons
-            .iter()
-            .zip(lats.iter())
-            .map(|(lon, lat)| format!("ST_Point({lon}, {lat})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
         conn.execute_batch(&format!(
             "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
              SELECT {way_id}, 'way', '{building_sql}',
-                    ST_MakePolygon(ST_MakeLine(list_value({point_list})))"
+                    ST_MakePolygon(ST_GeomFromWKB(resolve_way_coords({way_id})))
+             WHERE resolve_way_coords({way_id}) IS NOT NULL
+               AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords({way_id}))) >= 4"
         ))?;
     }
 
     if housenumber.is_some() {
-        let avg_lon = lons.iter().sum::<f64>() / lons.len() as f64;
-        let avg_lat = lats.iter().sum::<f64>() / lats.len() as f64;
         conn.execute(
             "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
-             VALUES (?, 'way', ?, ?, ?, ?, ST_Point(?, ?))",
-            duckdb::params![way_id, housenumber, street, city, postcode, avg_lon, avg_lat],
+             SELECT ?, 'way', ?, ?, ?, ?,
+                    ST_Centroid(ST_GeomFromWKB(resolve_way_coords(?)))
+             WHERE resolve_way_coords(?) IS NOT NULL",
+            duckdb::params![way_id, housenumber, street, city, postcode, way_id, way_id],
         )?;
     }
 
@@ -453,131 +435,60 @@ fn rebuild_relation_geometry(
         [relation_id],
     )?;
 
-    // Flat schema: one row per (way, node) pair
-    let mut flat_way_ids: Vec<i64> = Vec::new();
-    let mut flat_roles: Vec<String> = Vec::new();
-    let mut flat_lons: Vec<f64> = Vec::new();
-    let mut flat_lats: Vec<f64> = Vec::new();
+    // Build a VALUES list of way members: (way_id, role)
+    let way_members: Vec<(i64, &str)> = members
+        .iter()
+        .filter(|(_, member_type, _)| *member_type == encoding::encode_member_type("way"))
+        .map(|(ref_id, _, role)| (*ref_id, encoding::decode_member_role(*role)))
+        .collect();
 
-    for &(ref_id, member_type, role) in &members {
-        if member_type != encoding::encode_member_type("way") {
-            continue;
-        }
-
-        let node_ids = match kvstore::get_way(kv, ref_id)? {
-            Some(ids) => ids,
-            None => continue,
-        };
-
-        let mut lons = Vec::with_capacity(node_ids.len());
-        let mut lats = Vec::with_capacity(node_ids.len());
-        let mut all_found = true;
-
-        for &nid in &node_ids {
-            match kvstore::get_node(kv, nid)? {
-                Some((lon, lat)) => {
-                    lons.push(lon);
-                    lats.push(lat);
-                }
-                None => {
-                    all_found = false;
-                    break;
-                }
-            }
-        }
-
-        if !all_found || lons.len() < 2 {
-            continue;
-        }
-
-        let role_str = encoding::decode_member_role(role).to_string();
-        for k in 0..lons.len() {
-            flat_way_ids.push(ref_id);
-            flat_roles.push(role_str.clone());
-            flat_lons.push(lons[k]);
-            flat_lats.push(lats[k]);
-        }
-    }
-
-    if flat_way_ids.is_empty() {
+    if way_members.is_empty() {
         return Ok(());
     }
 
-    use duckdb::arrow::array::{Float64Array, Int64Array, StringBuilder};
-    use duckdb::arrow::datatypes::{DataType, Field, Schema};
-    use duckdb::arrow::record_batch::RecordBatch;
-    use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
-    use std::sync::Arc;
-
-    let n = flat_way_ids.len();
-    let mut role_builder = StringBuilder::new();
-    for r in &flat_roles {
-        role_builder.append_value(r);
-    }
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("relation_id", DataType::Int64, false),
-        Field::new("way_id", DataType::Int64, false),
-        Field::new("member_role", DataType::Utf8, false),
-        Field::new("lon", DataType::Float64, false),
-        Field::new("lat", DataType::Float64, false),
-    ]));
-
-    let rb = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(vec![relation_id; n])),
-            Arc::new(Int64Array::from(flat_way_ids)),
-            Arc::new(role_builder.finish()),
-            Arc::new(Float64Array::from(flat_lons)),
-            Arc::new(Float64Array::from(flat_lats)),
-        ],
-    )?;
+    let values_sql: String = way_members
+        .iter()
+        .map(|(wid, role)| format!("({wid}, '{role}')"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     if building_tag.is_some() {
         let building = building_tag.as_deref().unwrap_or("yes");
         let building_sql = building.replace('\'', "''");
-        let params = arrow_recordbatch_to_query_params(rb.clone());
-        conn.execute(
-            &format!(
-                "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
-                 WITH way_lines AS (
-                     SELECT way_id, member_role,
-                            ST_MakeLine(list(ST_Point(lon, lat))) AS line_geom
-                     FROM arrow(?, ?)
-                     GROUP BY way_id, member_role
-                     HAVING COUNT(*) >= 2
-                 ),
-                 outer_polys AS (
-                     SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS outer_geom
-                     FROM way_lines
-                     WHERE (member_role = 'outer' OR member_role = '')
-                       AND ST_NPoints(line_geom) >= 4
-                 ),
-                 inner_polys AS (
-                     SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS inner_geom
-                     FROM way_lines
-                     WHERE member_role = 'inner'
-                       AND ST_NPoints(line_geom) >= 4
-                 )
-                 SELECT
-                     {relation_id} AS osm_id,
-                     'relation' AS osm_type,
-                     '{building_sql}' AS building,
-                     CASE
-                         WHEN i.inner_geom IS NOT NULL THEN ST_Difference(o.outer_geom, i.inner_geom)
-                         ELSE o.outer_geom
-                     END AS geom
-                 FROM outer_polys o
-                 LEFT JOIN inner_polys i ON true
-                 WHERE o.outer_geom IS NOT NULL"
-            ),
-            params,
-        )?;
+        conn.execute_batch(&format!(
+            "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
+             WITH way_members(way_id, member_role) AS (VALUES {values_sql}),
+             way_geoms AS (
+                 SELECT way_id, member_role,
+                        ST_GeomFromWKB(resolve_way_coords(way_id)) AS line_geom
+                 FROM way_members
+                 WHERE resolve_way_coords(way_id) IS NOT NULL
+             ),
+             outer_polys AS (
+                 SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS outer_geom
+                 FROM way_geoms
+                 WHERE (member_role = 'outer' OR member_role = '')
+                   AND ST_NPoints(line_geom) >= 4
+             ),
+             inner_polys AS (
+                 SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS inner_geom
+                 FROM way_geoms
+                 WHERE member_role = 'inner'
+                   AND ST_NPoints(line_geom) >= 4
+             )
+             SELECT
+                 {relation_id}, 'relation', '{building_sql}',
+                 CASE
+                     WHEN i.inner_geom IS NOT NULL THEN ST_Difference(o.outer_geom, i.inner_geom)
+                     ELSE o.outer_geom
+                 END
+             FROM outer_polys o
+             LEFT JOIN inner_polys i ON true
+             WHERE o.outer_geom IS NOT NULL"
+        ))?;
     }
 
     if housenumber.is_some() {
-        let params = arrow_recordbatch_to_query_params(rb);
         let hn_sql = housenumber
             .as_deref()
             .map(|v| format!("'{}'", v.replace('\'', "''")))
@@ -595,15 +506,18 @@ fn rebuild_relation_geometry(
             .map(|v| format!("'{}'", v.replace('\'', "''")))
             .unwrap_or_else(|| "NULL".to_string());
 
-        conn.execute(
-            &format!(
-                "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
-                 SELECT {relation_id}, 'relation', {hn_sql}, {street_sql}, {city_sql}, {postcode_sql},
-                        ST_Point(AVG(lon), AVG(lat))
-                 FROM arrow(?, ?)"
-            ),
-            params,
-        )?;
+        conn.execute_batch(&format!(
+            "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
+             WITH way_members(way_id, member_role) AS (VALUES {values_sql}),
+             way_geoms AS (
+                 SELECT ST_GeomFromWKB(resolve_way_coords(way_id)) AS line_geom
+                 FROM way_members
+                 WHERE resolve_way_coords(way_id) IS NOT NULL
+             )
+             SELECT {relation_id}, 'relation', {hn_sql}, {street_sql}, {city_sql}, {postcode_sql},
+                    ST_Centroid(ST_Collect(list(line_geom)))
+             FROM way_geoms"
+        ))?;
     }
 
     Ok(())
@@ -611,16 +525,18 @@ fn rebuild_relation_geometry(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::db::init_db;
     use crate::osm::kvstore;
     use crate::osm::replication::NodeChange;
 
-    fn setup_test_db_and_kv() -> Result<(Connection, RocksDB, tempfile::TempDir)> {
-        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
+    fn setup_test_db_and_kv() -> Result<(Connection, Arc<RocksDB>, tempfile::TempDir)> {
         let tmpdir = tempfile::tempdir()?;
-        let kv = kvstore::open(tmpdir.path(), 8, 4)?;
+        let kv = Arc::new(kvstore::open(tmpdir.path(), 8, 4)?);
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, Some(kv.clone()))?;
 
         // Seed KV store with test data
         kvstore::put_node(&kv, 1, 20.0, 50.0)?;

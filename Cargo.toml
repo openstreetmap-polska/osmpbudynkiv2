@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-duckdb = { version = "1.10501.0", features = ["bundled", "vtab", "vtab-arrow"] }
+duckdb = { version = "1.10501.0", features = ["bundled", "vtab", "vtab-arrow", "vscalar"] }
 flate2 = "1"
 prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.6.4", default-features = false }
 quick-xml = "0.37"

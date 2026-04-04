@@ -68,21 +68,70 @@ pub fn import(
 
     info!(path = pbf_str, "Starting OSM import");
 
+    let total = std::time::Instant::now();
+
+    let t = std::time::Instant::now();
     stream_nodes_to_rocksdb(conn, kv, pbf_str)?;
+    info!(
+        elapsed_s = t.elapsed().as_secs_f64(),
+        "Step done: stream nodes to RocksDB"
+    );
+
+    let t = std::time::Instant::now();
     import_address_nodes(conn, pbf_str)?;
+    info!(
+        elapsed_s = t.elapsed().as_secs_f64(),
+        "Step done: import address nodes"
+    );
+
+    let t = std::time::Instant::now();
     stream_ways_to_rocksdb(conn, kv, pbf_str)?;
+    info!(
+        elapsed_s = t.elapsed().as_secs_f64(),
+        "Step done: stream ways to RocksDB"
+    );
+
+    let t = std::time::Instant::now();
     import_way_buildings_and_addresses(conn, pbf_str)?;
+    info!(
+        elapsed_s = t.elapsed().as_secs_f64(),
+        "Step done: import way buildings and addresses"
+    );
+
+    let t = std::time::Instant::now();
     stream_relations_to_rocksdb(conn, kv, pbf_str)?;
+    info!(
+        elapsed_s = t.elapsed().as_secs_f64(),
+        "Step done: stream relations to RocksDB"
+    );
+
+    let t = std::time::Instant::now();
     import_relation_buildings_and_addresses(conn, pbf_str)?;
+    info!(
+        elapsed_s = t.elapsed().as_secs_f64(),
+        "Step done: import relation buildings and addresses"
+    );
 
-    info!("Compacting reverse indexes");
+    let t = std::time::Instant::now();
     kvstore::compact_reverse_indexes(kv);
+    info!(
+        elapsed_s = t.elapsed().as_secs_f64(),
+        "Step done: compact reverse indexes"
+    );
 
+    let t = std::time::Instant::now();
     create_spatial_indexes(conn)?;
+    info!(
+        elapsed_s = t.elapsed().as_secs_f64(),
+        "Step done: create spatial indexes"
+    );
 
     log_import_stats(conn)?;
 
-    info!("OSM import complete");
+    info!(
+        total_s = total.elapsed().as_secs_f64(),
+        "OSM import complete"
+    );
     Ok(())
 }
 
@@ -192,6 +241,7 @@ fn import_way_buildings_and_addresses(conn: &Connection, pbf_path: &str) -> Resu
          WHERE kind = 'way'
            AND refs IS NOT NULL
            AND len(refs) >= 4
+           AND refs[1] = refs[len(refs)]
            AND element_at(tags, 'building')[1] IS NOT NULL
            AND resolve_node_coords(refs) IS NOT NULL"
     ))
