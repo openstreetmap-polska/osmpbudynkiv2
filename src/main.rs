@@ -7,6 +7,7 @@ mod osm;
 mod update;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -25,11 +26,15 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     info!(db_path = %config.db_path, rocksdb_path = %config.rocksdb_path, "Initializing databases");
-    let conn = db::init_db(Path::new(&config.db_path), &config.duckdb_init_commands)?;
-    let kv = osm::kvstore::open(
+    let kv = Arc::new(osm::kvstore::open(
         Path::new(&config.rocksdb_path),
         config.rocksdb_block_cache_mb,
         config.rocksdb_write_buffer_mb,
+    )?);
+    let conn = db::init_db(
+        Path::new(&config.db_path),
+        &config.duckdb_init_commands,
+        Some(kv.clone()),
     )?;
 
     match cli.command {

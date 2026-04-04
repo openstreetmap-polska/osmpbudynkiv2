@@ -618,7 +618,7 @@ mod tests {
 
     fn setup_test_db_and_kv() -> Result<(Connection, RocksDB, tempfile::TempDir)> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
         let tmpdir = tempfile::tempdir()?;
         let kv = kvstore::open(tmpdir.path(), 8, 4)?;
 

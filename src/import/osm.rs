@@ -279,7 +279,7 @@ mod tests {
 
     fn setup_test_db() -> Result<Connection> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
         Ok(conn)
     }
 
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn test_import_fixture_pbf() -> Result<()> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
         run_import_with_fixture(&conn, Path::new("fixtures/osm.pbf"))?;
 
         // 2 buildings: way 947235698 (apartments) + relation 1891415 (school)
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn test_import_fixture_building_details() -> Result<()> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
         run_import_with_fixture(&conn, Path::new("fixtures/osm.pbf"))?;
 
         // Way building: apartments
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn test_import_fixture_address_details() -> Result<()> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
         run_import_with_fixture(&conn, Path::new("fixtures/osm.pbf"))?;
 
         // Node address: housenumber 32, Ludwika Narbutta
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn test_import_fixture_address_geometries() -> Result<()> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
         run_import_with_fixture(&conn, Path::new("fixtures/osm.pbf"))?;
 
         // All addresses should have geometry in the Warsaw area (~21.01 lon, ~52.20 lat)

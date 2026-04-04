@@ -1,15 +1,27 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use duckdb::vtab::arrow::ArrowVTab;
 
-pub fn init_db(path: &Path, init_commands: &[String]) -> Result<Connection> {
+use crate::osm::kvstore::RocksDB;
+use crate::osm::udf;
+
+pub fn init_db(
+    path: &Path,
+    init_commands: &[String],
+    kv: Option<Arc<RocksDB>>,
+) -> Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("Failed to open database at {path:?}"))?;
 
     conn.register_table_function::<ArrowVTab>("arrow")
         .context("Failed to register arrow vtab")?;
+
+    if let Some(kv) = kv {
+        udf::register_udfs(&conn, kv)?;
+    }
 
     for cmd in init_commands {
         conn.execute_batch(cmd)
@@ -60,7 +72,7 @@ mod tests {
     #[test]
     fn test_init_db_creates_tables() -> Result<()> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
 
         // Verify all tables exist by querying them
         let tables = ["metadata", "osm_addresses", "osm_buildings"];
@@ -78,7 +90,7 @@ mod tests {
     #[test]
     fn test_init_db_is_idempotent() -> Result<()> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands)?;
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
         // Re-run schema creation — should not fail
         create_schema(&conn)?;
         Ok(())
