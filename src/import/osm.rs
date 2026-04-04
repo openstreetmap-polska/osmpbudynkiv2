@@ -313,6 +313,7 @@ fn import_relation_buildings_and_addresses(conn: &Connection, pbf_path: &str) ->
              FROM way_geoms
              WHERE (ref_role = 'outer' OR ref_role = '')
                AND ST_NPoints(line_geom) >= 4
+               AND ST_IsClosed(line_geom)
              GROUP BY relation_id, building
          ),
          inner_polys AS (
@@ -321,6 +322,7 @@ fn import_relation_buildings_and_addresses(conn: &Connection, pbf_path: &str) ->
              FROM way_geoms
              WHERE ref_role = 'inner'
                AND ST_NPoints(line_geom) >= 4
+               AND ST_IsClosed(line_geom)
              GROUP BY relation_id
          )
          SELECT

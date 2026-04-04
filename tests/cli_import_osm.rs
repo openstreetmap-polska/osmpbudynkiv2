@@ -63,10 +63,16 @@ fn test_import_osm_twice_fails_on_duplicates() {
     let db_path = "target/test_cli_import_twice.duckdb";
     let _ = std::fs::remove_file(db_path);
     let _ = std::fs::remove_file(format!("{db_path}.wal"));
+    let rocksdb_dir = tempfile::TempDir::new().unwrap();
 
     let mut cfg_file = tempfile::NamedTempFile::new().unwrap();
     use std::io::Write;
-    write!(cfg_file, "db_path = \"{db_path}\"\n").unwrap();
+    write!(
+        cfg_file,
+        "db_path = \"{db_path}\"\nrocksdb_path = \"{}\"\n",
+        rocksdb_dir.path().display()
+    )
+    .unwrap();
     let cfg_path = cfg_file.path().to_str().unwrap().to_string();
 
     // First import succeeds

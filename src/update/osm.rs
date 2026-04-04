@@ -346,7 +346,8 @@ fn rebuild_way_geometry(
              SELECT {way_id}, 'way', '{building_sql}',
                     ST_MakePolygon(ST_GeomFromWKB(resolve_way_coords({way_id})))
              WHERE resolve_way_coords({way_id}) IS NOT NULL
-               AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords({way_id}))) >= 4"
+               AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords({way_id}))) >= 4
+               AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords({way_id})))"
         ))?;
     }
 
@@ -469,12 +470,14 @@ fn rebuild_relation_geometry(
                  FROM way_geoms
                  WHERE (member_role = 'outer' OR member_role = '')
                    AND ST_NPoints(line_geom) >= 4
+                   AND ST_IsClosed(line_geom)
              ),
              inner_polys AS (
                  SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS inner_geom
                  FROM way_geoms
                  WHERE member_role = 'inner'
                    AND ST_NPoints(line_geom) >= 4
+                   AND ST_IsClosed(line_geom)
              )
              SELECT
                  {relation_id}, 'relation', '{building_sql}',
