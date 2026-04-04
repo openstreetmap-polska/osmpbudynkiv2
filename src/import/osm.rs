@@ -7,8 +7,8 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::download::download_file;
-use crate::osm::kvstore::RocksDB;
 use crate::osm::kvstore;
+use crate::osm::kvstore::RocksDB;
 
 fn value_to_i64_list(value: Value) -> Result<Vec<i64>> {
     match value {
@@ -382,6 +382,8 @@ fn string_to_member_role(role: &str) -> u8 {
 fn stream_relations_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Result<()> {
     info!("Pass 3: Streaming relations to RocksDB");
 
+    const CHUNK_SIZE: usize = 100_000;
+
     let sql = format!(
         "SELECT id, refs, ref_types, ref_roles FROM ST_ReadOSM('{pbf_path}') WHERE kind = 'relation' AND refs IS NOT NULL AND len(refs) > 0"
     );
@@ -389,6 +391,10 @@ fn stream_relations_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) 
     let mut rows = stmt.query([])?;
     let mut batch = kvstore::new_batch();
     let mut count = 0u64;
+
+    // Accumulate way_id → [relation_ids] in memory, flush in chunks.
+    let mut way_to_relations: HashMap<i64, Vec<i64>> = HashMap::with_capacity(CHUNK_SIZE);
+
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let refs = value_to_i64_list(row.get::<_, Value>(1)?)?;
@@ -410,13 +416,9 @@ fn stream_relations_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) 
 
         kvstore::batch_put_relation(kv, &mut batch, id, &members);
 
-        for (way_id, ref_type, _) in &members {
-            if *ref_type == 1 {
-                let mut rels = kvstore::get_way_to_relations(kv, *way_id)?;
-                if !rels.contains(&id) {
-                    rels.push(id);
-                    kvstore::put_way_to_relations(kv, *way_id, &rels)?;
-                }
+        for &(way_id, ref_type, _) in &members {
+            if ref_type == 1 {
+                way_to_relations.entry(way_id).or_default().push(id);
             }
         }
 
@@ -425,12 +427,37 @@ fn stream_relations_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) 
             kvstore::write_batch(kv, batch)?;
             batch = kvstore::new_batch();
         }
+
+        if way_to_relations.len() >= CHUNK_SIZE {
+            flush_way_to_relations(kv, &mut way_to_relations)?;
+        }
     }
+
     if count % 1000 != 0 {
         kvstore::write_batch(kv, batch)?;
     }
+    if !way_to_relations.is_empty() {
+        flush_way_to_relations(kv, &mut way_to_relations)?;
+    }
 
     info!(count, "Relations streamed to RocksDB");
+    Ok(())
+}
+
+/// Merge accumulated way→relations mappings with existing RocksDB data and write as a single batch.
+fn flush_way_to_relations(kv: &RocksDB, map: &mut HashMap<i64, Vec<i64>>) -> Result<()> {
+    let mut batch = kvstore::new_batch();
+    for (&way_id, new_rel_ids) in map.iter() {
+        let mut existing = kvstore::get_way_to_relations(kv, way_id)?;
+        for &rid in new_rel_ids {
+            if !existing.contains(&rid) {
+                existing.push(rid);
+            }
+        }
+        kvstore::batch_put_way_to_relations(kv, &mut batch, way_id, &existing);
+    }
+    kvstore::write_batch(kv, batch)?;
+    map.clear();
     Ok(())
 }
 
