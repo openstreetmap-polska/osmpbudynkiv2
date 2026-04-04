@@ -82,6 +82,15 @@ pub fn get_node(db: &RocksDB, node_id: i64) -> Result<Option<(f64, f64)>> {
     }
 }
 
+/// Get raw encoded node bytes (16 bytes: lon LE f64 || lat LE f64).
+/// Returns the raw bytes without decoding — useful for building WKB directly.
+pub fn get_node_raw(db: &RocksDB, node_id: i64) -> Result<Option<Vec<u8>>> {
+    match db.get_cf(&cf(db, CF_NODES), encoding::encode_key(node_id))? {
+        Some(value) => Ok(Some(value)),
+        None => Ok(None),
+    }
+}
+
 pub fn delete_node(db: &RocksDB, node_id: i64) -> Result<()> {
     db.delete_cf(&cf(db, CF_NODES), encoding::encode_key(node_id))?;
     Ok(())
@@ -271,6 +280,18 @@ mod tests {
         assert_eq!(get_node(&db, 1).unwrap(), Some((20.0, 50.0)));
         delete_node(&db, 1).unwrap();
         assert_eq!(get_node(&db, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn test_node_raw_roundtrip() {
+        let (_tmp, db) = open_tmp_db();
+        put_node(&db, 1, 20.0, 50.0).unwrap();
+        let raw = get_node_raw(&db, 1).unwrap().unwrap();
+        assert_eq!(raw.len(), encoding::NODE_BYTE_LEN);
+        let lon = f64::from_le_bytes(raw[..8].try_into().unwrap());
+        let lat = f64::from_le_bytes(raw[8..16].try_into().unwrap());
+        assert!((lon - 20.0).abs() < 1e-15);
+        assert!((lat - 50.0).abs() < 1e-15);
     }
 
     #[test]

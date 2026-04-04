@@ -8,6 +8,9 @@
 /// all multi-byte integers and floats. Endianness does not affect correctness here; little-endian
 /// is native on x86 and avoids unnecessary byte-swapping.
 
+/// Byte length of an encoded node value (lon: 8 bytes LE f64 + lat: 8 bytes LE f64).
+pub const NODE_BYTE_LEN: usize = 16;
+
 /// Encode an i64 as 8-byte big-endian (used for all keys).
 pub fn encode_key(id: i64) -> [u8; 8] {
     id.to_be_bytes()
