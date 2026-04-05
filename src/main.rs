@@ -5,6 +5,7 @@ mod download;
 mod import;
 mod osm;
 mod update;
+mod utils;
 
 use std::path::Path;
 use std::sync::Arc;
