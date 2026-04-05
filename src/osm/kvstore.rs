@@ -64,6 +64,22 @@ fn id_list_partial_merge(
     Some(result)
 }
 
+fn make_cf_opts(name: &str, write_buffer_bytes: usize) -> Options {
+    let mut cf_opts = Options::default();
+    cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+    if write_buffer_bytes > 0 {
+        cf_opts.set_write_buffer_size(write_buffer_bytes);
+    }
+    if name == CF_NODE_TO_WAYS || name == CF_WAY_TO_RELATIONS {
+        cf_opts.set_merge_operator(
+            "id_list_merge",
+            id_list_full_merge,
+            id_list_partial_merge,
+        );
+    }
+    cf_opts
+}
+
 pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<RocksDB> {
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
@@ -84,25 +100,24 @@ pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<Ro
 
     let cfs: Vec<ColumnFamilyDescriptor> = ALL_CFS
         .iter()
-        .map(|name| {
-            let mut cf_opts = Options::default();
-            cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
-            cf_opts.set_write_buffer_size(write_buffer_bytes);
-            if *name == CF_NODE_TO_WAYS || *name == CF_WAY_TO_RELATIONS {
-                cf_opts.set_merge_operator(
-                    "id_list_merge",
-                    id_list_full_merge,
-                    id_list_partial_merge,
-                );
-            }
-            ColumnFamilyDescriptor::new(*name, cf_opts)
-        })
+        .map(|name| ColumnFamilyDescriptor::new(*name, make_cf_opts(name, write_buffer_bytes)))
         .collect();
 
     let db = DBWithThreadMode::open_cf_descriptors(&db_opts, path, cfs)
         .context("Failed to open RocksDB")?;
 
     Ok(db)
+}
+
+/// Drop and recreate all column families, effectively clearing all data.
+pub fn clear(db: &RocksDB) -> Result<()> {
+    for name in ALL_CFS {
+        db.drop_cf(name)
+            .with_context(|| format!("Failed to drop CF {name}"))?;
+        db.create_cf(*name, &make_cf_opts(name, 0))
+            .with_context(|| format!("Failed to recreate CF {name}"))?;
+    }
+    Ok(())
 }
 
 fn cf<'a>(db: &'a RocksDB, name: &str) -> Arc<BoundColumnFamily<'a>> {

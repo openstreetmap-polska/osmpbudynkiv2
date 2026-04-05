@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::download::download_file;
 use crate::osm::kvstore;
 use crate::osm::kvstore::RocksDB;
+use crate::utils::format_duration;
 
 fn value_to_i64_list(value: Value) -> Result<Vec<i64>> {
     match value {
@@ -43,6 +44,33 @@ fn value_to_string_list(value: Value) -> Result<Vec<String>> {
     }
 }
 
+fn reset_osm_tables(conn: &Connection, kv: &RocksDB) -> Result<()> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS osm_addresses;
+        DROP TABLE IF EXISTS osm_buildings;
+        CREATE TABLE osm_addresses (
+            osm_id BIGINT,
+            osm_type VARCHAR,
+            housenumber VARCHAR,
+            street VARCHAR,
+            city VARCHAR,
+            postcode VARCHAR,
+            geom GEOMETRY
+        );
+        CREATE TABLE osm_buildings (
+            osm_id BIGINT,
+            osm_type VARCHAR,
+            building VARCHAR,
+            geom GEOMETRY
+        );
+        ",
+    )
+    .context("Failed to reset OSM tables")?;
+    kvstore::clear(kv).context("Failed to clear RocksDB")?;
+    Ok(())
+}
+
 pub fn import(
     conn: &Connection,
     kv: &RocksDB,
@@ -57,14 +85,7 @@ pub fn import(
 
     let pbf_str = pbf_path.to_str().context("PBF path is not valid UTF-8")?;
 
-    let has_data: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM osm_buildings LIMIT 1)",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_data {
-        anyhow::bail!("OSM data already imported. Drop the database and reimport if needed.");
-    }
+    reset_osm_tables(conn, kv)?;
 
     info!(path = pbf_str, "Starting OSM import");
 
@@ -73,63 +94,63 @@ pub fn import(
     let t = std::time::Instant::now();
     stream_nodes_to_rocksdb(conn, kv, pbf_str)?;
     info!(
-        elapsed_s = t.elapsed().as_secs_f64(),
+        elapsed = %format_duration(t.elapsed()),
         "Step done: stream nodes to RocksDB"
     );
 
     let t = std::time::Instant::now();
     import_address_nodes(conn, pbf_str)?;
     info!(
-        elapsed_s = t.elapsed().as_secs_f64(),
+        elapsed = %format_duration(t.elapsed()),
         "Step done: import address nodes"
     );
 
     let t = std::time::Instant::now();
     stream_ways_to_rocksdb(conn, kv, pbf_str)?;
     info!(
-        elapsed_s = t.elapsed().as_secs_f64(),
+        elapsed = %format_duration(t.elapsed()),
         "Step done: stream ways to RocksDB"
     );
 
     let t = std::time::Instant::now();
     import_way_buildings_and_addresses(conn, pbf_str)?;
     info!(
-        elapsed_s = t.elapsed().as_secs_f64(),
+        elapsed = %format_duration(t.elapsed()),
         "Step done: import way buildings and addresses"
     );
 
     let t = std::time::Instant::now();
     stream_relations_to_rocksdb(conn, kv, pbf_str)?;
     info!(
-        elapsed_s = t.elapsed().as_secs_f64(),
+        elapsed = %format_duration(t.elapsed()),
         "Step done: stream relations to RocksDB"
     );
 
     let t = std::time::Instant::now();
     import_relation_buildings_and_addresses(conn, pbf_str)?;
     info!(
-        elapsed_s = t.elapsed().as_secs_f64(),
+        elapsed = %format_duration(t.elapsed()),
         "Step done: import relation buildings and addresses"
     );
 
     let t = std::time::Instant::now();
     kvstore::compact_reverse_indexes(kv);
     info!(
-        elapsed_s = t.elapsed().as_secs_f64(),
+        elapsed = %format_duration(t.elapsed()),
         "Step done: compact reverse indexes"
     );
 
     let t = std::time::Instant::now();
     create_spatial_indexes(conn)?;
     info!(
-        elapsed_s = t.elapsed().as_secs_f64(),
+        elapsed = %format_duration(t.elapsed()),
         "Step done: create spatial indexes"
     );
 
     log_import_stats(conn)?;
 
     info!(
-        total_s = total.elapsed().as_secs_f64(),
+        elapsed = %format_duration(total.elapsed()),
         "OSM import complete"
     );
     Ok(())

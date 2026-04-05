@@ -58,7 +58,7 @@ fn test_import_osm_missing_file() {
 }
 
 #[test]
-fn test_import_osm_twice_fails_on_duplicates() {
+fn test_import_osm_twice_reimports_cleanly() {
     // This test needs a persistent database between two CLI invocations
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let db_path = tmp_dir.path().join("test.duckdb");
@@ -75,30 +75,22 @@ fn test_import_osm_twice_fails_on_duplicates() {
     .unwrap();
     let cfg_path = cfg_file.path().to_str().unwrap().to_string();
 
-    // First import succeeds
-    cmd()
-        .args([
-            "--config",
-            &cfg_path,
-            "import",
-            "osm",
-            "--file",
-            "fixtures/osm.pbf",
-        ])
-        .assert()
-        .success();
+    let args = [
+        "--config",
+        &cfg_path,
+        "import",
+        "osm",
+        "--file",
+        "fixtures/osm.pbf",
+    ];
 
-    // Second import fails — data already exists
-    cmd()
-        .args([
-            "--config",
-            &cfg_path,
-            "import",
-            "osm",
-            "--file",
-            "fixtures/osm.pbf",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("already imported"));
+    // First import succeeds
+    cmd().args(args.iter()).assert().success().stdout(
+        predicate::str::contains("buildings=2").and(predicate::str::contains("addresses=3")),
+    );
+
+    // Second import also succeeds — tables are dropped and recreated, counts stay the same
+    cmd().args(args.iter()).assert().success().stdout(
+        predicate::str::contains("buildings=2").and(predicate::str::contains("addresses=3")),
+    );
 }
