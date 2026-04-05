@@ -104,12 +104,20 @@ pub fn import(
 
     let total = std::time::Instant::now();
 
+    let check_shutdown = || -> Result<()> {
+        if crate::shutdown::is_requested() {
+            anyhow::bail!("Shutdown requested");
+        }
+        Ok(())
+    };
+
     let t = std::time::Instant::now();
     stream_nodes_to_rocksdb(conn, kv, pbf_str)?;
     info!(
         elapsed = %format_duration(t.elapsed()),
         "Step done: stream nodes to RocksDB"
     );
+    check_shutdown()?;
 
     let t = std::time::Instant::now();
     import_address_nodes(conn, pbf_str)?;
@@ -117,6 +125,7 @@ pub fn import(
         elapsed = %format_duration(t.elapsed()),
         "Step done: import address nodes"
     );
+    check_shutdown()?;
 
     let t = std::time::Instant::now();
     stream_ways_to_rocksdb(conn, kv, pbf_str)?;
@@ -124,6 +133,7 @@ pub fn import(
         elapsed = %format_duration(t.elapsed()),
         "Step done: stream ways to RocksDB"
     );
+    check_shutdown()?;
 
     let t = std::time::Instant::now();
     import_way_buildings_and_addresses(conn, pbf_str)?;
@@ -131,6 +141,7 @@ pub fn import(
         elapsed = %format_duration(t.elapsed()),
         "Step done: import way buildings and addresses"
     );
+    check_shutdown()?;
 
     let t = std::time::Instant::now();
     stream_relations_to_rocksdb(conn, kv, pbf_str)?;
@@ -138,6 +149,7 @@ pub fn import(
         elapsed = %format_duration(t.elapsed()),
         "Step done: stream relations to RocksDB"
     );
+    check_shutdown()?;
 
     let t = std::time::Instant::now();
     import_relation_buildings_and_addresses(conn, pbf_str)?;
@@ -145,6 +157,7 @@ pub fn import(
         elapsed = %format_duration(t.elapsed()),
         "Step done: import relation buildings and addresses"
     );
+    check_shutdown()?;
 
     let t = std::time::Instant::now();
     kvstore::compact_reverse_indexes(kv);
@@ -152,6 +165,7 @@ pub fn import(
         elapsed = %format_duration(t.elapsed()),
         "Step done: compact reverse indexes"
     );
+    check_shutdown()?;
 
     let t = std::time::Instant::now();
     create_spatial_indexes(conn)?;

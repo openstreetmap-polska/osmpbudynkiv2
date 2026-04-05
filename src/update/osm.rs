@@ -37,6 +37,11 @@ pub fn update(
     info!(pending, "Sequences to apply");
 
     for seq in (current_seq + 1)..=latest_seq {
+        if crate::shutdown::is_requested() {
+            info!("Shutdown requested, stopping update");
+            return Ok(());
+        }
+
         apply_sequence(conn, kv, seq, replication_base_url)?;
 
         if (seq - current_seq) % 100 == 0 {
@@ -82,6 +87,7 @@ fn apply_sequence(
     seq: u64,
     replication_base_url: &str,
 ) -> Result<()> {
+    // Download and parse everything before starting any writes.
     let path = sequence_to_path(seq);
     let url = format!("{replication_base_url}/{path}");
 
@@ -90,22 +96,45 @@ fn apply_sequence(
     let _ = std::fs::remove_file(&osc_gz_path);
 
     let changes = parse_osc(&osc_xml)?;
-    apply_changes(conn, kv, &changes)?;
 
-    // Fetch the state.txt for this sequence to get the authoritative timestamp.
-    let state_url = format!("{replication_base_url}/{}", sequence_to_path(seq).replace(".osc.gz", ".state.txt"));
+    let state_url = format!(
+        "{replication_base_url}/{}",
+        sequence_to_path(seq).replace(".osc.gz", ".state.txt")
+    );
     let state_path = download_file(&state_url, Path::new("./data/replication"))?;
-    let state_text = std::fs::read_to_string(&state_path).context("Failed to read sequence state.txt")?;
+    let state_text =
+        std::fs::read_to_string(&state_path).context("Failed to read sequence state.txt")?;
     let _ = std::fs::remove_file(&state_path);
     let (_, timestamp) = parse_state_txt(&state_text)?;
 
-    conn.execute_batch(&format!(
-        "DELETE FROM metadata WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp');
-         INSERT INTO metadata VALUES ('osm_replication_sequence', '{seq}');
-         INSERT INTO metadata VALUES ('osm_replication_timestamp', '{timestamp}');"
-    ))?;
+    // Apply within a DuckDB transaction for atomicity.
+    // RocksDB writes happen immediately but are idempotent: if we fail and retry
+    // the same sequence (metadata not yet committed), re-applying produces the
+    // same KV state.
+    conn.execute_batch("BEGIN TRANSACTION")?;
 
-    Ok(())
+    let result = (|| -> Result<()> {
+        apply_changes(conn, kv, &changes)?;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM metadata WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp');
+             INSERT INTO metadata VALUES ('osm_replication_sequence', '{seq}');
+             INSERT INTO metadata VALUES ('osm_replication_timestamp', '{timestamp}');"
+        ))?;
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 fn decompress_gz(path: &Path) -> Result<String> {
