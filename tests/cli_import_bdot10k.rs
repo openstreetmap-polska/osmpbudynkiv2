@@ -35,7 +35,7 @@ fn test_import_bdot10k_from_fixture() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("BDOT10k buildings imported")
+            predicate::str::contains("BDOT10k import complete")
                 .and(predicate::str::contains("count=74")),
         );
 }

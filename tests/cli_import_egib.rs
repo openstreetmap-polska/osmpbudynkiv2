@@ -35,7 +35,7 @@ fn test_import_egib_from_fixture() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("EGIB buildings imported")
+            predicate::str::contains("EGIB import complete")
                 .and(predicate::str::contains("count=74")),
         );
 }
