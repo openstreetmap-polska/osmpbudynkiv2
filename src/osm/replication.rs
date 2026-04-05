@@ -446,6 +446,54 @@ timestamp=2025-03-10T12\\:00\\:00Z";
     }
 
     #[test]
+    fn test_parse_state_txt_fixture() -> Result<()> {
+        let text = std::fs::read_to_string("fixtures/osm.state.txt")
+            .expect("fixtures/osm.state.txt should exist");
+        let (seq, timestamp) = parse_state_txt(&text)?;
+        assert_eq!(seq, 7028130);
+        assert_eq!(timestamp, "2026-03-15T16:32:56Z");
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_osc_fixture() -> Result<()> {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let file = std::fs::File::open("fixtures/osm.osc.gz")
+            .expect("fixtures/osm.osc.gz should exist");
+        let mut decoder = GzDecoder::new(file);
+        let mut xml = String::new();
+        decoder.read_to_string(&mut xml)?;
+
+        let change = parse_osc(&xml)?;
+
+        assert_eq!(change.nodes.len(), 173);
+        assert_eq!(change.ways.len(), 49);
+        assert_eq!(change.relations.len(), 3);
+
+        // Verify action counts
+        let created = change.nodes.iter().filter(|n| n.action == ChangeAction::Create).count()
+            + change.ways.iter().filter(|w| w.action == ChangeAction::Create).count()
+            + change.relations.iter().filter(|r| r.action == ChangeAction::Create).count();
+        assert!(created > 0, "Should have some creates");
+
+        let deleted = change.nodes.iter().filter(|n| n.action == ChangeAction::Delete).count()
+            + change.ways.iter().filter(|w| w.action == ChangeAction::Delete).count()
+            + change.relations.iter().filter(|r| r.action == ChangeAction::Delete).count();
+        assert!(deleted > 0, "Should have some deletes");
+
+        let modified = change.nodes.iter().filter(|n| n.action == ChangeAction::Modify).count()
+            + change.ways.iter().filter(|w| w.action == ChangeAction::Modify).count()
+            + change.relations.iter().filter(|r| r.action == ChangeAction::Modify).count();
+        assert!(modified > 0, "Should have some modifies");
+
+        assert_eq!(created + deleted + modified, 173 + 49 + 3);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_sequence_to_path() {
         assert_eq!(sequence_to_path(6543210), "006/543/210.osc.gz");
         assert_eq!(sequence_to_path(1), "000/000/001.osc.gz");
