@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::download::download_file;
 use crate::osm::kvstore;
 use crate::osm::kvstore::RocksDB;
+use crate::osm::pbf_header::read_replication_info;
 use crate::utils::format_duration;
 
 fn value_to_i64_list(value: Value) -> Result<Vec<i64>> {
@@ -84,6 +85,18 @@ pub fn import(
     };
 
     let pbf_str = pbf_path.to_str().context("PBF path is not valid UTF-8")?;
+
+    if let Some((seq, timestamp)) = read_replication_info(&pbf_path)? {
+        conn.execute_batch(&format!(
+            "DELETE FROM metadata WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp');
+             INSERT INTO metadata VALUES ('osm_replication_sequence', '{seq}');
+             INSERT INTO metadata VALUES ('osm_replication_timestamp', '{timestamp}');"
+        ))
+        .context("Failed to store replication metadata")?;
+        info!(sequence = seq, timestamp, "OSM replication metadata from PBF header");
+    } else {
+        tracing::warn!("PBF header has no replication metadata — update start point unknown");
+    }
 
     reset_osm_tables(conn, kv)?;
 

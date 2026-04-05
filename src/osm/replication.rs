@@ -298,15 +298,24 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
     Ok(change)
 }
 
-/// Parse replication state.txt to get the sequence number.
-pub fn parse_state_txt(text: &str) -> Result<u64> {
+/// Parse replication state.txt, returning (sequence_number, timestamp).
+/// The timestamp colons are escaped in state files (`\:`) and are unescaped here.
+pub fn parse_state_txt(text: &str) -> Result<(u64, String)> {
+    let mut seq = None;
+    let mut timestamp = None;
     for line in text.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("sequenceNumber=") {
-            return value.parse().context("Failed to parse sequence number");
+            seq = Some(value.parse::<u64>().context("Failed to parse sequence number")?);
+        } else if let Some(value) = line.strip_prefix("timestamp=") {
+            timestamp = Some(value.replace("\\:", ":"));
         }
     }
-    bail!("No sequenceNumber found in state.txt")
+    match (seq, timestamp) {
+        (Some(s), Some(t)) => Ok((s, t)),
+        (None, _) => bail!("No sequenceNumber found in state.txt"),
+        (_, None) => bail!("No timestamp found in state.txt"),
+    }
 }
 
 /// Construct the URL for an OsmChange file given a base URL and sequence number.
@@ -430,8 +439,9 @@ mod tests {
 sequenceNumber=6543210
 timestamp=2025-03-10T12\\:00\\:00Z";
 
-        let seq = parse_state_txt(state)?;
+        let (seq, timestamp) = parse_state_txt(state)?;
         assert_eq!(seq, 6543210);
+        assert_eq!(timestamp, "2025-03-10T12:00:00Z");
         Ok(())
     }
 

@@ -72,7 +72,8 @@ fn fetch_latest_sequence(replication_base_url: &str) -> Result<u64> {
     let state_path = download_file(&url, Path::new("./data/replication"))?;
     let text = std::fs::read_to_string(&state_path).context("Failed to read state.txt")?;
     let _ = std::fs::remove_file(&state_path);
-    parse_state_txt(&text)
+    let (seq, _) = parse_state_txt(&text)?;
+    Ok(seq)
 }
 
 fn apply_sequence(
@@ -91,14 +92,18 @@ fn apply_sequence(
     let changes = parse_osc(&osc_xml)?;
     apply_changes(conn, kv, &changes)?;
 
-    conn.execute(
-        "DELETE FROM metadata WHERE key = 'osm_replication_sequence'",
-        [],
-    )?;
-    conn.execute(
-        "INSERT INTO metadata (key, value) VALUES ('osm_replication_sequence', ?)",
-        [&seq.to_string()],
-    )?;
+    // Fetch the state.txt for this sequence to get the authoritative timestamp.
+    let state_url = format!("{replication_base_url}/{}", sequence_to_path(seq).replace(".osc.gz", ".state.txt"));
+    let state_path = download_file(&state_url, Path::new("./data/replication"))?;
+    let state_text = std::fs::read_to_string(&state_path).context("Failed to read sequence state.txt")?;
+    let _ = std::fs::remove_file(&state_path);
+    let (_, timestamp) = parse_state_txt(&state_text)?;
+
+    conn.execute_batch(&format!(
+        "DELETE FROM metadata WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp');
+         INSERT INTO metadata VALUES ('osm_replication_sequence', '{seq}');
+         INSERT INTO metadata VALUES ('osm_replication_timestamp', '{timestamp}');"
+    ))?;
 
     Ok(())
 }
