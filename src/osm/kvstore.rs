@@ -71,11 +71,7 @@ fn make_cf_opts(name: &str, write_buffer_bytes: usize) -> Options {
         cf_opts.set_write_buffer_size(write_buffer_bytes);
     }
     if name == CF_NODE_TO_WAYS || name == CF_WAY_TO_RELATIONS {
-        cf_opts.set_merge_operator(
-            "id_list_merge",
-            id_list_full_merge,
-            id_list_partial_merge,
-        );
+        cf_opts.set_merge_operator("id_list_merge", id_list_full_merge, id_list_partial_merge);
     }
     cf_opts
 }

@@ -4,15 +4,20 @@ use anyhow::{Context, Result};
 use duckdb::Connection;
 use tracing::info;
 
+use crate::config::Config;
 use crate::download::download_file;
 use crate::utils::format_duration;
 
 const PARQUET_ENTRY: &str = "OT_BUBD_A.parquet";
 
-pub fn import(conn: &Connection, file: Option<&Path>, url: &str) -> Result<()> {
-    let parquet_path = match file {
-        Some(path) => PathBuf::from(path),
-        None => download_and_extract(url)?,
+pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str) -> Result<()> {
+    let (parquet_path, cleanup_paths) = match file {
+        Some(path) => (PathBuf::from(path), vec![]),
+        None => {
+            let download_dir = config.download_dir();
+            let (path, cleanup) = download_and_extract(url, &download_dir)?;
+            (path, cleanup)
+        }
     };
 
     let parquet_str = parquet_path
@@ -46,8 +51,10 @@ pub fn import(conn: &Connection, file: Option<&Path>, url: &str) -> Result<()> {
     );
 
     let t = std::time::Instant::now();
-    conn.execute_batch("CREATE INDEX bdot10k_buildings_geom_idx ON bdot10k_buildings USING RTREE (geom);")
-        .context("Failed to create spatial index on bdot10k_buildings")?;
+    conn.execute_batch(
+        "CREATE INDEX bdot10k_buildings_geom_idx ON bdot10k_buildings USING RTREE (geom);",
+    )
+    .context("Failed to create spatial index on bdot10k_buildings")?;
     info!(
         elapsed = %format_duration(t.elapsed()),
         "Step done: create spatial index"
@@ -56,6 +63,16 @@ pub fn import(conn: &Connection, file: Option<&Path>, url: &str) -> Result<()> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM bdot10k_buildings", [], |row| {
         row.get(0)
     })?;
+    for path in &cleanup_paths {
+        if path.is_dir() {
+            info!(path = %path.display(), "Cleaning up extracted directory");
+            let _ = std::fs::remove_dir_all(path);
+        } else if path.is_file() {
+            info!(path = %path.display(), "Cleaning up downloaded file");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     info!(
         count,
         elapsed = %format_duration(total.elapsed()),
@@ -65,15 +82,16 @@ pub fn import(conn: &Connection, file: Option<&Path>, url: &str) -> Result<()> {
     Ok(())
 }
 
-fn download_and_extract(url: &str) -> Result<PathBuf> {
-    let zip_path = download_file(url, Path::new("./data"))?;
-    let extract_dir = Path::new("./data/bdot10k");
-    std::fs::create_dir_all(extract_dir)?;
+fn download_and_extract(url: &str, download_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let zip_path = download_file(url, download_dir)?;
+    let extract_dir = download_dir.join("bdot10k");
+    std::fs::create_dir_all(&extract_dir)?;
 
     let target_path = extract_dir.join(PARQUET_ENTRY);
+    let cleanup_paths = vec![zip_path.clone(), extract_dir.to_path_buf()];
     if target_path.exists() {
         info!(path = %target_path.display(), "Parquet file already extracted");
-        return Ok(target_path);
+        return Ok((target_path, cleanup_paths));
     }
 
     info!("Extracting {} from ZIP", PARQUET_ENTRY);
@@ -87,7 +105,7 @@ fn download_and_extract(url: &str) -> Result<PathBuf> {
             let mut outfile = std::fs::File::create(&target_path)?;
             std::io::copy(&mut entry, &mut outfile)?;
             info!(path = %target_path.display(), "Extracted parquet file");
-            return Ok(target_path);
+            return Ok((target_path, cleanup_paths));
         }
     }
 

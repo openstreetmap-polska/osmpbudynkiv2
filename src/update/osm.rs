@@ -19,13 +19,14 @@ use crate::osm::{encoding, kvstore};
 pub fn update(
     conn: &Connection,
     kv: &RocksDB,
-    _config: &Config,
+    config: &Config,
     replication_base_url: &str,
 ) -> Result<()> {
+    let download_dir = config.download_dir();
     let current_seq = get_current_sequence(conn)?;
     info!(current_seq, "Current replication sequence");
 
-    let latest_seq = fetch_latest_sequence(replication_base_url)?;
+    let latest_seq = fetch_latest_sequence(replication_base_url, &download_dir)?;
     info!(latest_seq, "Latest available sequence");
 
     if current_seq >= latest_seq {
@@ -42,7 +43,7 @@ pub fn update(
             return Ok(());
         }
 
-        apply_sequence(conn, kv, seq, replication_base_url)?;
+        apply_sequence(conn, kv, seq, replication_base_url, &download_dir)?;
 
         if (seq - current_seq) % 100 == 0 {
             info!(
@@ -72,9 +73,9 @@ fn get_current_sequence(conn: &Connection) -> Result<u64> {
     }
 }
 
-fn fetch_latest_sequence(replication_base_url: &str) -> Result<u64> {
+fn fetch_latest_sequence(replication_base_url: &str, download_dir: &Path) -> Result<u64> {
     let url = format!("{replication_base_url}/state.txt");
-    let state_path = download_file(&url, Path::new("./data/replication"))?;
+    let state_path = download_file(&url, download_dir)?;
     let text = std::fs::read_to_string(&state_path).context("Failed to read state.txt")?;
     let _ = std::fs::remove_file(&state_path);
     let (seq, _) = parse_state_txt(&text)?;
@@ -86,12 +87,13 @@ fn apply_sequence(
     kv: &RocksDB,
     seq: u64,
     replication_base_url: &str,
+    download_dir: &Path,
 ) -> Result<()> {
     // Download and parse everything before starting any writes.
     let path = sequence_to_path(seq);
     let url = format!("{replication_base_url}/{path}");
 
-    let osc_gz_path = download_file(&url, Path::new("./data/replication"))?;
+    let osc_gz_path = download_file(&url, download_dir)?;
     let osc_xml = decompress_gz(&osc_gz_path)?;
     let _ = std::fs::remove_file(&osc_gz_path);
 
@@ -101,7 +103,7 @@ fn apply_sequence(
         "{replication_base_url}/{}",
         sequence_to_path(seq).replace(".osc.gz", ".state.txt")
     );
-    let state_path = download_file(&state_url, Path::new("./data/replication"))?;
+    let state_path = download_file(&state_url, download_dir)?;
     let state_text =
         std::fs::read_to_string(&state_path).context("Failed to read sequence state.txt")?;
     let _ = std::fs::remove_file(&state_path);

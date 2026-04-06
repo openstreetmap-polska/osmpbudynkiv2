@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -12,6 +12,7 @@ pub struct Config {
     pub rocksdb_block_cache_mb: u64,
     pub rocksdb_write_buffer_mb: u64,
     pub log_level: String,
+    pub download_dir: Option<String>,
     pub duckdb_init_commands: Vec<String>,
     pub download_urls: DownloadUrls,
 }
@@ -34,6 +35,7 @@ impl Default for Config {
             rocksdb_block_cache_mb: 512,
             rocksdb_write_buffer_mb: 64,
             log_level: "info".to_string(),
+            download_dir: None,
             duckdb_init_commands: vec![
                 "INSTALL spatial".to_string(),
                 "LOAD spatial".to_string(),
@@ -65,6 +67,16 @@ impl Default for DownloadUrls {
     }
 }
 
+impl Config {
+    /// Returns the effective download directory: the configured path, or the system temp dir.
+    pub fn download_dir(&self) -> PathBuf {
+        match &self.download_dir {
+            Some(dir) => PathBuf::from(dir),
+            None => std::env::temp_dir(),
+        }
+    }
+}
+
 pub fn load_config(path: Option<&Path>) -> Result<Config> {
     match path {
         Some(p) => {
@@ -91,6 +103,8 @@ mod tests {
         assert_eq!(config.rocksdb_block_cache_mb, 512);
         assert_eq!(config.rocksdb_write_buffer_mb, 64);
         assert_eq!(config.log_level, "info");
+        assert!(config.download_dir.is_none());
+        assert_eq!(config.download_dir(), std::env::temp_dir());
         assert_eq!(config.duckdb_init_commands.len(), 7);
         assert_eq!(
             config.download_urls.osm_pbf,
@@ -159,6 +173,19 @@ osm_replication = "https://example.com/replication"
         let result = load_config(Some(tmp.path()));
         assert!(result.is_err());
     }
+    #[test]
+    fn test_download_dir_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "download_dir = \"/my/downloads\"\n").unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert_eq!(config.download_dir.as_deref(), Some("/my/downloads"));
+        assert_eq!(
+            config.download_dir(),
+            std::path::PathBuf::from("/my/downloads")
+        );
+    }
+
     #[test]
     fn test_rocksdb_config_defaults() {
         let config = load_config(None).unwrap();

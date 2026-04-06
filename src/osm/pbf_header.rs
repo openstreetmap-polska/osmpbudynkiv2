@@ -23,13 +23,19 @@ fn read_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
 
 fn skip_field(data: &[u8], pos: &mut usize, wire_type: u64) -> Option<()> {
     match wire_type {
-        0 => { read_varint(data, pos)?; }
-        1 => { *pos = pos.checked_add(8)?; }
+        0 => {
+            read_varint(data, pos)?;
+        }
+        1 => {
+            *pos = pos.checked_add(8)?;
+        }
         2 => {
             let len = read_varint(data, pos)? as usize;
             *pos = pos.checked_add(len)?;
         }
-        5 => { *pos = pos.checked_add(4)?; }
+        5 => {
+            *pos = pos.checked_add(4)?;
+        }
         _ => return None,
     }
     Some(())
@@ -86,7 +92,9 @@ fn parse_header_block_replication(data: &[u8]) -> (Option<i64>, Option<i64>) {
     let mut seq = None;
     let mut ts_secs = None;
     while pos < data.len() {
-        let Some(tag) = read_varint(data, &mut pos) else { break };
+        let Some(tag) = read_varint(data, &mut pos) else {
+            break;
+        };
         match (tag >> 3, tag & 0x7) {
             (32, 0) => {
                 ts_secs = Some(read_varint(data, &mut pos).unwrap_or(0) as i64);

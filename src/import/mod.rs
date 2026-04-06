@@ -18,8 +18,10 @@ pub fn run(
 ) -> Result<()> {
     match source {
         ImportSource::Osm { file } => osm::import(conn, kv, config, file.as_deref(), &urls.osm_pbf),
-        ImportSource::Bdot10k { file } => bdot10k::import(conn, file.as_deref(), &urls.bdot10k),
-        ImportSource::Egib { file } => egib::import(conn, file.as_deref(), &urls.egib),
+        ImportSource::Bdot10k { file } => {
+            bdot10k::import(conn, config, file.as_deref(), &urls.bdot10k)
+        }
+        ImportSource::Egib { file } => egib::import(conn, config, file.as_deref(), &urls.egib),
         ImportSource::Prg { .. } => bail!("PRG import is not yet implemented"),
         ImportSource::Full => {
             bail!("Full import is not yet implemented");

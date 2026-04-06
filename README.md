@@ -39,6 +39,7 @@ The config file controls:
 - **`rocksdb_block_cache_mb`** — RocksDB block cache size in MB (default: 512)
 - **`rocksdb_write_buffer_mb`** — RocksDB write buffer size in MB per column family (default: 64)
 - **`log_level`** — log verbosity (`trace`, `debug`, `info`, `warn`, `error`)
+- **`download_dir`** — directory for downloaded files (default: system temp directory; files are cleaned up after processing)
 - **`duckdb_init_commands`** — SQL statements run on database initialization
 - **`download_urls`** — URLs for downloading data sources
 

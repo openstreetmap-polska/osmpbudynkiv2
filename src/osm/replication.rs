@@ -306,7 +306,11 @@ pub fn parse_state_txt(text: &str) -> Result<(u64, String)> {
     for line in text.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("sequenceNumber=") {
-            seq = Some(value.parse::<u64>().context("Failed to parse sequence number")?);
+            seq = Some(
+                value
+                    .parse::<u64>()
+                    .context("Failed to parse sequence number")?,
+            );
         } else if let Some(value) = line.strip_prefix("timestamp=") {
             timestamp = Some(value.replace("\\:", ":"));
         }
@@ -460,8 +464,8 @@ timestamp=2025-03-10T12\\:00\\:00Z";
         use flate2::read::GzDecoder;
         use std::io::Read;
 
-        let file = std::fs::File::open("fixtures/osm.osc.gz")
-            .expect("fixtures/osm.osc.gz should exist");
+        let file =
+            std::fs::File::open("fixtures/osm.osc.gz").expect("fixtures/osm.osc.gz should exist");
         let mut decoder = GzDecoder::new(file);
         let mut xml = String::new();
         decoder.read_to_string(&mut xml)?;
@@ -473,19 +477,55 @@ timestamp=2025-03-10T12\\:00\\:00Z";
         assert_eq!(change.relations.len(), 3);
 
         // Verify action counts
-        let created = change.nodes.iter().filter(|n| n.action == ChangeAction::Create).count()
-            + change.ways.iter().filter(|w| w.action == ChangeAction::Create).count()
-            + change.relations.iter().filter(|r| r.action == ChangeAction::Create).count();
+        let created = change
+            .nodes
+            .iter()
+            .filter(|n| n.action == ChangeAction::Create)
+            .count()
+            + change
+                .ways
+                .iter()
+                .filter(|w| w.action == ChangeAction::Create)
+                .count()
+            + change
+                .relations
+                .iter()
+                .filter(|r| r.action == ChangeAction::Create)
+                .count();
         assert!(created > 0, "Should have some creates");
 
-        let deleted = change.nodes.iter().filter(|n| n.action == ChangeAction::Delete).count()
-            + change.ways.iter().filter(|w| w.action == ChangeAction::Delete).count()
-            + change.relations.iter().filter(|r| r.action == ChangeAction::Delete).count();
+        let deleted = change
+            .nodes
+            .iter()
+            .filter(|n| n.action == ChangeAction::Delete)
+            .count()
+            + change
+                .ways
+                .iter()
+                .filter(|w| w.action == ChangeAction::Delete)
+                .count()
+            + change
+                .relations
+                .iter()
+                .filter(|r| r.action == ChangeAction::Delete)
+                .count();
         assert!(deleted > 0, "Should have some deletes");
 
-        let modified = change.nodes.iter().filter(|n| n.action == ChangeAction::Modify).count()
-            + change.ways.iter().filter(|w| w.action == ChangeAction::Modify).count()
-            + change.relations.iter().filter(|r| r.action == ChangeAction::Modify).count();
+        let modified = change
+            .nodes
+            .iter()
+            .filter(|n| n.action == ChangeAction::Modify)
+            .count()
+            + change
+                .ways
+                .iter()
+                .filter(|w| w.action == ChangeAction::Modify)
+                .count()
+            + change
+                .relations
+                .iter()
+                .filter(|r| r.action == ChangeAction::Modify)
+                .count();
         assert!(modified > 0, "Should have some modifies");
 
         assert_eq!(created + deleted + modified, 173 + 49 + 3);

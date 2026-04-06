@@ -75,13 +75,13 @@ fn reset_osm_tables(conn: &Connection, kv: &RocksDB) -> Result<()> {
 pub fn import(
     conn: &Connection,
     kv: &RocksDB,
-    _config: &Config,
+    config: &Config,
     file: Option<&Path>,
     url: &str,
 ) -> Result<()> {
-    let pbf_path = match file {
-        Some(path) => PathBuf::from(path),
-        None => download_file(url, Path::new("./data"))?,
+    let (pbf_path, was_downloaded) = match file {
+        Some(path) => (PathBuf::from(path), false),
+        None => (download_file(url, &config.download_dir())?, true),
     };
 
     let pbf_str = pbf_path.to_str().context("PBF path is not valid UTF-8")?;
@@ -93,7 +93,10 @@ pub fn import(
              INSERT INTO metadata VALUES ('osm_replication_timestamp', '{timestamp}');"
         ))
         .context("Failed to store replication metadata")?;
-        info!(sequence = seq, timestamp, "OSM replication metadata from PBF header");
+        info!(
+            sequence = seq,
+            timestamp, "OSM replication metadata from PBF header"
+        );
     } else {
         tracing::warn!("PBF header has no replication metadata — update start point unknown");
     }
@@ -175,6 +178,11 @@ pub fn import(
     );
 
     log_import_stats(conn)?;
+
+    if was_downloaded {
+        info!(path = %pbf_path.display(), "Cleaning up downloaded file");
+        let _ = std::fs::remove_file(&pbf_path);
+    }
 
     info!(
         elapsed = %format_duration(total.elapsed()),
