@@ -1,4 +1,5 @@
 mod cli;
+mod compare;
 mod config;
 mod db;
 mod download;
@@ -48,6 +49,7 @@ fn main() -> Result<()> {
         Command::Update { source } => {
             update::run(&conn, &kv, source, &config, &config.download_urls)?
         }
+        Command::Compare { target } => compare::run(&conn, target)?,
         Command::Run => {
             anyhow::bail!("Run command is not yet implemented");
         }

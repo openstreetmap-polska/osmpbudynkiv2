@@ -28,8 +28,30 @@ pub enum Command {
         #[command(subcommand)]
         source: UpdateSource,
     },
+    /// Compare government data against OSM
+    Compare {
+        #[command(subcommand)]
+        target: CompareTarget,
+    },
     /// Run HTTP service with background data updates
     Run,
+}
+
+#[derive(Subcommand)]
+pub enum CompareTarget {
+    /// Compare building datasets against OSM buildings
+    Buildings {
+        #[command(subcommand)]
+        source: Option<BuildingsSource>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BuildingsSource {
+    /// Compare only BDOT10k buildings against OSM
+    Bdot10k,
+    /// Compare only EGIB buildings against OSM
+    Egib,
 }
 
 #[derive(Subcommand)]
