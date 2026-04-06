@@ -7,7 +7,11 @@ fn cmd() -> Command {
     cmd
 }
 
-fn persistent_config() -> (tempfile::NamedTempFile, tempfile::TempDir, tempfile::TempDir) {
+fn persistent_config() -> (
+    tempfile::NamedTempFile,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
     let db_dir = tempfile::TempDir::new().unwrap();
     let rocksdb_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("test.duckdb");
@@ -25,15 +29,36 @@ fn persistent_config() -> (tempfile::NamedTempFile, tempfile::TempDir, tempfile:
 
 fn import_all(cfg_path: &str) {
     cmd()
-        .args(["--config", cfg_path, "import", "osm", "--file", "fixtures/osm.pbf"])
+        .args([
+            "--config",
+            cfg_path,
+            "import",
+            "osm",
+            "--file",
+            "fixtures/osm.pbf",
+        ])
         .assert()
         .success();
     cmd()
-        .args(["--config", cfg_path, "import", "bdot10k", "--file", "fixtures/bdot10k.parquet"])
+        .args([
+            "--config",
+            cfg_path,
+            "import",
+            "bdot10k",
+            "--file",
+            "fixtures/bdot10k.parquet",
+        ])
         .assert()
         .success();
     cmd()
-        .args(["--config", cfg_path, "import", "egib", "--file", "fixtures/egib.parquet"])
+        .args([
+            "--config",
+            cfg_path,
+            "import",
+            "egib",
+            "--file",
+            "fixtures/egib.parquet",
+        ])
         .assert()
         .success();
 }
@@ -53,4 +78,50 @@ fn test_compare_buildings_both() {
                 .and(predicate::str::contains("total=74"))
                 .and(predicate::str::contains("EGIB comparison complete")),
         );
+}
+
+#[test]
+fn test_compare_buildings_bdot10k_only() {
+    let (cfg, _db_dir, _rocksdb_dir) = persistent_config();
+    let cfg_path = cfg.path().to_str().unwrap().to_string();
+    import_all(&cfg_path);
+
+    cmd()
+        .args(["--config", &cfg_path, "compare", "buildings", "bdot10k"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("BDOT10k comparison complete")
+                .and(predicate::str::contains("total=74"))
+                .and(predicate::str::contains("EGIB comparison complete").not()),
+        );
+}
+
+#[test]
+fn test_compare_buildings_egib_only() {
+    let (cfg, _db_dir, _rocksdb_dir) = persistent_config();
+    let cfg_path = cfg.path().to_str().unwrap().to_string();
+    import_all(&cfg_path);
+
+    cmd()
+        .args(["--config", &cfg_path, "compare", "buildings", "egib"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("EGIB comparison complete")
+                .and(predicate::str::contains("total=74"))
+                .and(predicate::str::contains("BDOT10k comparison complete").not()),
+        );
+}
+
+#[test]
+fn test_compare_buildings_without_imported_data_fails() {
+    let (cfg, _db_dir, _rocksdb_dir) = persistent_config();
+    let cfg_path = cfg.path().to_str().unwrap().to_string();
+
+    // No imports — comparison should fail because source tables don't exist
+    cmd()
+        .args(["--config", &cfg_path, "compare", "buildings"])
+        .assert()
+        .failure();
 }
