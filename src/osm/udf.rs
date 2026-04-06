@@ -107,13 +107,13 @@ impl VScalar for ResolveWayCoords {
         let way_ids = way_ids_vec.as_slice::<i64>();
         let mut out = output.flat_vector();
 
-        for i in 0..num_rows {
+        for (i, &way_id) in way_ids.iter().enumerate().take(num_rows) {
             if way_ids_vec.row_is_null(i as u64) {
                 out.set_null(i);
                 continue;
             }
 
-            let node_ids = match kvstore::get_way(&state.kv, way_ids[i]) {
+            let node_ids = match kvstore::get_way(&state.kv, way_id) {
                 Ok(Some(ids)) => ids,
                 Ok(None) => {
                     out.set_null(i);

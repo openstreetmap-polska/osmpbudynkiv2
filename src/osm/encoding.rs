@@ -2,7 +2,7 @@
 ///
 /// Everything is little-endian (native on x86/ARM). We only do point lookups in RocksDB,
 /// so lexicographic key order doesn't matter.
-
+///
 /// Byte length of an encoded node value (lon: 8 bytes LE f64 + lat: 8 bytes LE f64).
 pub const NODE_BYTE_LEN: usize = 16;
 
@@ -12,6 +12,7 @@ pub fn encode_key(id: i64) -> [u8; 8] {
 }
 
 /// Decode a little-endian key back to i64.
+#[allow(dead_code)]
 pub fn decode_key(bytes: &[u8]) -> i64 {
     i64::from_le_bytes(bytes.try_into().expect("key must be 8 bytes"))
 }
@@ -25,6 +26,7 @@ pub fn encode_node(lon: f64, lat: f64) -> [u8; 16] {
 }
 
 /// Decode node coordinates from 16 bytes.
+#[allow(dead_code)]
 pub fn decode_node(bytes: &[u8]) -> (f64, f64) {
     let lon = f64::from_le_bytes(bytes[..8].try_into().unwrap());
     let lat = f64::from_le_bytes(bytes[8..16].try_into().unwrap());
@@ -68,6 +70,7 @@ pub fn encode_member_type(t: &str) -> u8 {
     }
 }
 
+#[allow(dead_code)]
 pub fn decode_member_type(b: u8) -> &'static str {
     match b {
         0 => "node",

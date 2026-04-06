@@ -132,6 +132,7 @@ pub fn put_node(db: &RocksDB, node_id: i64, lon: f64, lat: f64) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn get_node(db: &RocksDB, node_id: i64) -> Result<Option<(f64, f64)>> {
     if let Some(value) = db.get_cf(&cf(db, CF_NODES), encoding::encode_key(node_id))? {
         let coords = encoding::decode_node(&value);
@@ -281,6 +282,7 @@ pub fn remove_way_to_relations(db: &RocksDB, way_id: i64, relation_id: i64) -> R
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn merge_node_to_way(db: &RocksDB, node_id: i64, way_id: i64) -> Result<()> {
     db.merge_cf(
         &cf(db, CF_NODE_TO_WAYS),
@@ -290,6 +292,7 @@ pub fn merge_node_to_way(db: &RocksDB, node_id: i64, way_id: i64) -> Result<()> 
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn merge_way_to_relation(db: &RocksDB, way_id: i64, relation_id: i64) -> Result<()> {
     db.merge_cf(
         &cf(db, CF_WAY_TO_RELATIONS),

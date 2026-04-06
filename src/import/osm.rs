@@ -239,12 +239,12 @@ fn stream_nodes_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> R
         let lat: f64 = row.get(2)?;
         kvstore::batch_put_node(kv, &mut batch, id, lon, lat);
         count += 1;
-        if count % 10000 == 0 {
+        if count.is_multiple_of(10000) {
             kvstore::write_batch(kv, batch)?;
             batch = kvstore::new_batch();
         }
     }
-    if count % 10000 != 0 {
+    if !count.is_multiple_of(10000) {
         kvstore::write_batch(kv, batch)?;
     }
     info!(count, "Nodes streamed to RocksDB");
@@ -273,13 +273,13 @@ fn stream_ways_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Re
         }
 
         count += 1;
-        if count % 10000 == 0 {
+        if count.is_multiple_of(10000) {
             kvstore::write_batch(kv, batch)?;
             batch = kvstore::new_batch();
         }
     }
 
-    if count % 10000 != 0 {
+    if !count.is_multiple_of(10000) {
         kvstore::write_batch(kv, batch)?;
     }
 
@@ -500,13 +500,13 @@ fn stream_relations_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) 
         }
 
         count += 1;
-        if count % 1000 == 0 {
+        if count.is_multiple_of(1000) {
             kvstore::write_batch(kv, batch)?;
             batch = kvstore::new_batch();
         }
     }
 
-    if count % 1000 != 0 {
+    if !count.is_multiple_of(1000) {
         kvstore::write_batch(kv, batch)?;
     }
 
