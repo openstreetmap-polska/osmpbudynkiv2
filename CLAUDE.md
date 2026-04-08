@@ -18,16 +18,21 @@ cargo fmt             # Format code
 cargo fmt -- --check  # Check formatting without modifying
 ```
 
-Note: The `duckdb` dependency uses the `bundled` feature, so no external DuckDB installation is needed, but C++ compilation of DuckDB takes significant time on first build.
+Note: Both `duckdb` and `rocksdb` dependencies use bundled C++ compilation, so no external installations are needed, but first build takes significant time.
 
 ## Architecture
 
-**Tech stack:** Rust + DuckDB (embedded, file-based). Goal is a single binary that's easy to deploy.
+**Tech stack:** Rust + DuckDB (embedded, file-based) + RocksDB (KV store). Goal is a single binary that's easy to deploy.
 
-**Planned CLI commands:**
-- `import` — bulk-load data (OSM from PBF, PRG addresses from ZIP, BDOT10k/EGIB buildings from GeoParquet)
-- `update` — apply incremental updates (OSM minutely replication, re-download gov datasets)
-- `run` — HTTP service with background data updates; serves vector tiles, GeoJSON data packages, and a web map
+**CLI commands** (`cargo run -- <command>`):
+- `import <source>` — bulk-load data (OSM from PBF, PRG addresses from ZIP, BDOT10k/EGIB buildings from GeoParquet)
+- `update <source>` — apply incremental updates (OSM minutely replication, re-download gov datasets)
+- `compare <target>` — compare government data against OSM (e.g. `compare buildings`)
+- `run` — HTTP service with background data updates (not yet implemented)
+
+**Storage:**
+- **DuckDB** — main analytical database for geospatial queries, stores processed OSM data and government datasets
+- **RocksDB** — KV store for raw OSM node coordinates and structural mappings (way node refs, relation members, reverse indexes)
 
 **Key design decisions (see `adr/`):**
 - DuckDB chosen for its geospatial support and file-based storage (ADR-002)
@@ -40,3 +45,15 @@ Note: The `duckdb` dependency uses the `bundled` feature, so no external DuckDB 
 - **PRG:** Government address registry (ZIP, parsed via [prg_convert](https://github.com/ttomasz/prg_convert/) library)
 - **BDOT10k:** Government building registry (GeoParquet)
 - **EGIB:** Government building registry (GeoParquet)
+
+## Configuration
+
+The binary accepts `--config <path>` pointing to a TOML file (see `example_config.toml`). Without it, defaults are used. The `RUST_LOG` env var overrides the config's `log_level`.
+
+**Gotcha:** The `duckdb_init_commands` config replaces the entire default list — if you override it, include everything you need (spatial extension, memory limits, etc.).
+
+## Testing
+
+- **Unit tests:** Inline `#[cfg(test)]` modules within source files
+- **Integration tests:** `tests/` directory, using `assert_cmd` to test CLI behavior with `tempfile` for isolated DB instances
+- Run a single integration test: `cargo test --test cli_import_osm`
