@@ -44,6 +44,8 @@ pub enum CompareTarget {
         #[command(subcommand)]
         source: Option<BuildingsSource>,
     },
+    /// Run all available comparisons
+    Full,
 }
 
 #[derive(Subcommand)]
@@ -52,6 +54,8 @@ pub enum BuildingsSource {
     Bdot10k,
     /// Compare only EGIB buildings against OSM
     Egib,
+    /// Compare all building sources against OSM
+    All,
 }
 
 #[derive(Subcommand)]

@@ -125,3 +125,37 @@ fn test_compare_buildings_without_imported_data_fails() {
         .assert()
         .failure();
 }
+
+#[test]
+fn test_compare_full() {
+    let (cfg, _db_dir, _rocksdb_dir) = persistent_config();
+    let cfg_path = cfg.path().to_str().unwrap().to_string();
+    import_all(&cfg_path);
+
+    cmd()
+        .args(["--config", &cfg_path, "compare", "full"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("BDOT10k comparison complete")
+                .and(predicate::str::contains("total=74"))
+                .and(predicate::str::contains("EGIB comparison complete")),
+        );
+}
+
+#[test]
+fn test_compare_buildings_all() {
+    let (cfg, _db_dir, _rocksdb_dir) = persistent_config();
+    let cfg_path = cfg.path().to_str().unwrap().to_string();
+    import_all(&cfg_path);
+
+    cmd()
+        .args(["--config", &cfg_path, "compare", "buildings", "all"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("BDOT10k comparison complete")
+                .and(predicate::str::contains("total=74"))
+                .and(predicate::str::contains("EGIB comparison complete")),
+        );
+}
