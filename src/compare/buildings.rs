@@ -149,3 +149,143 @@ fn compare_chunked(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::db::init_db;
+
+    /// Spin up an in-memory DuckDB with spatial loaded and a custom
+    /// `test_source` table. `osm_buildings` is created by `init_db` and
+    /// is seeded with a single polygon unless the caller overrides.
+    fn setup() -> Connection {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE test_source (src_id VARCHAR, geom GEOMETRY);
+             INSERT INTO osm_buildings VALUES
+                 (1, 'way', NULL, ST_MakeEnvelope(20.0, 52.0, 20.001, 52.001));",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn counts(conn: &Connection, table: &str) -> (i64, i64) {
+        conn.query_row(
+            &format!("SELECT COUNT(*), COUNT(*) FILTER (WHERE matched) FROM {table}"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// A source centroid that lies inside an OSM polygon must be matched,
+    /// and the result row must carry the matching osm_id/osm_type.
+    #[test]
+    fn compare_chunked_matches_contained_centroid() {
+        let conn = setup();
+        // Source envelope wholly inside the seeded osm_buildings polygon.
+        conn.execute_batch(
+            "INSERT INTO test_source VALUES
+                 ('inside', ST_MakeEnvelope(20.0002, 52.0002, 20.0008, 52.0008));",
+        )
+        .unwrap();
+
+        compare_chunked(&conn, "test_source", "src_id", "src_id", "test_result").unwrap();
+
+        assert_eq!(counts(&conn, "test_result"), (1, 1));
+
+        let (src_id, osm_id, osm_type): (String, i64, String) = conn
+            .query_row(
+                "SELECT src_id, matched_osm_id, matched_osm_type
+                 FROM test_result WHERE matched",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(src_id, "inside");
+        assert_eq!(osm_id, 1);
+        assert_eq!(osm_type, "way");
+    }
+
+    /// A source centroid with no containing OSM building produces an
+    /// unmatched row with NULL osm_id/osm_type — the source row is NOT
+    /// dropped from the result table.
+    #[test]
+    fn compare_chunked_emits_null_row_for_unmatched_source() {
+        let conn = setup();
+        // Source somewhere else in Poland, well away from the seeded polygon.
+        conn.execute_batch(
+            "INSERT INTO test_source VALUES
+                 ('lonely', ST_MakeEnvelope(21.0, 52.2, 21.001, 52.201));",
+        )
+        .unwrap();
+
+        compare_chunked(&conn, "test_source", "src_id", "src_id", "test_result").unwrap();
+
+        assert_eq!(counts(&conn, "test_result"), (1, 0));
+
+        let (osm_id, osm_type): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT matched_osm_id, matched_osm_type FROM test_result",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(osm_id.is_none());
+        assert!(osm_type.is_none());
+    }
+
+    /// `compare_chunked` iterates a fixed grid over Poland's bounding box
+    /// (14..25 E, 49..55 N). Source buildings whose centroids fall outside
+    /// that extent are silently dropped from the result table. This test
+    /// documents that behavior; if the grid coverage changes (or becomes
+    /// data-driven) this test must change too.
+    #[test]
+    fn compare_chunked_silently_drops_source_outside_poland_extent() {
+        let conn = setup();
+        // Longitude 30°E — outside the 14..25 grid.
+        conn.execute_batch(
+            "INSERT INTO test_source VALUES
+                 ('far_east', ST_MakeEnvelope(30.0, 52.0, 30.001, 52.001));",
+        )
+        .unwrap();
+
+        compare_chunked(&conn, "test_source", "src_id", "src_id", "test_result").unwrap();
+
+        assert_eq!(counts(&conn, "test_result"), (0, 0));
+    }
+
+    /// Known edge case: a source centroid that lands *exactly* on a cell
+    /// boundary is processed by both adjacent cells, because ST_Intersects
+    /// returns true on touch. The source row ends up duplicated in the
+    /// result table. This is vanishingly rare in practice (centroids are
+    /// float-valued) but this test locks the behavior in so future changes
+    /// are deliberate. If you ever switch to a half-open cell convention
+    /// (e.g. `ST_Within` with lower-closed / upper-open ranges), this test
+    /// will need updating.
+    #[test]
+    fn compare_chunked_duplicates_source_on_cell_boundary() {
+        let conn = setup();
+        // x = 14.5 is the boundary between the first and second grid
+        // columns (GRID_STEP = 0.5 starting at 14.0). y = 52.25 is safely
+        // inside one row.
+        conn.execute_batch(
+            "INSERT INTO test_source VALUES
+                 ('boundary', ST_Point(14.5, 52.25));",
+        )
+        .unwrap();
+
+        compare_chunked(&conn, "test_source", "src_id", "src_id", "test_result").unwrap();
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM test_result", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            total, 2,
+            "source centroid on a cell boundary is processed by both adjacent cells"
+        );
+    }
+}
