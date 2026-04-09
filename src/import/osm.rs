@@ -544,12 +544,6 @@ mod tests {
     use crate::db::init_db;
     use crate::osm::kvstore;
 
-    fn setup_test_db() -> Result<Connection> {
-        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
-        Ok(conn)
-    }
-
     fn run_import_with_fixture(conn: &Connection, pbf_path: &Path) -> Result<()> {
         let tmp_dir = tempfile::tempdir().unwrap();
         let kv = Arc::new(kvstore::open(tmp_dir.path(), 512, 64)?);

@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn test_load_config_partial_file() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        write!(tmp, "db_path = \"/custom/path.duckdb\"\n").unwrap();
+        writeln!(tmp, "db_path = \"/custom/path.duckdb\"").unwrap();
 
         let config = load_config(Some(tmp.path())).unwrap();
         assert_eq!(config.db_path, "/custom/path.duckdb");
@@ -176,7 +176,7 @@ osm_replication = "https://example.com/replication"
     #[test]
     fn test_download_dir_override() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        write!(tmp, "download_dir = \"/my/downloads\"\n").unwrap();
+        writeln!(tmp, "download_dir = \"/my/downloads\"").unwrap();
 
         let config = load_config(Some(tmp.path())).unwrap();
         assert_eq!(config.download_dir.as_deref(), Some("/my/downloads"));
