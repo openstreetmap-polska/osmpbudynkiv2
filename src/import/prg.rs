@@ -65,7 +65,7 @@ pub fn import(
     let t = std::time::Instant::now();
     let terc = if let Some(ref path) = terc_file_path {
         let terc_str = path.to_str().context("TERC path is not valid UTF-8")?;
-        info!(path = terc_str, "Loading TERYT mapping from file");
+        info!(path = terc_str, "Loading TERC mapping from file");
         get_teryt_mapping(false, &None, &None, &Some(path.clone()))
             .with_context(|| format!("Failed to load TERC mapping from {terc_str}"))?
     } else {
