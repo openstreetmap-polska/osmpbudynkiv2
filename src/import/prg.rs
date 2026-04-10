@@ -15,6 +15,8 @@ use crate::config::Config;
 use crate::download::download_file_as;
 use crate::utils::format_duration;
 
+const PRG_DOWNLOAD_FILENAME: &str = "PRG-punkty_adresowe.zip";
+
 /// Import PRG addresses (2021 GML schema) from a local zip file into the
 /// `prg_addresses` DuckDB table.
 ///
@@ -33,8 +35,6 @@ pub fn import(
     terc_file: Option<&Path>,
     url: &str,
 ) -> Result<()> {
-    const PRG_DOWNLOAD_FILENAME: &str = "PRG-punkty_adresowe.zip";
-
     let zip_path = match file {
         Some(p) => PathBuf::from(p),
         None => {
@@ -69,6 +69,14 @@ pub fn import(
         get_teryt_mapping(false, &None, &None, &Some(path.clone()))
             .with_context(|| format!("Failed to load TERC mapping from {terc_str}"))?
     } else {
+        // No file path provided — check if download is enabled
+        if !config.teryt.download {
+            bail!(
+                "PRG 2021 import requires a TERYT dictionary; \
+                 pass --terc-file <PATH>, set teryt.file_path in config, \
+                 or set teryt.download = true to fetch from the API"
+            );
+        }
         // Auto-download from TERYT API
         let username = config
             .teryt
@@ -88,7 +96,7 @@ pub fn import(
                 "TERYT API password required: set teryt.api_password in config \
                  or TERYT_API_PASSWORD env var",
             )?;
-        info!("Downloading TERYT mapping from API");
+        info!("Downloading TERC mapping from TERYT API");
         get_teryt_mapping(true, &Some(username), &Some(password), &None)
             .context("Failed to download TERC mapping from TERYT API")?
     };
