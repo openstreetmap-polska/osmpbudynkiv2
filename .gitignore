@@ -29,3 +29,6 @@ example_data/
 # default location of database when running this project
 osmpbudynkiv2.duckdb*
 osmpbudynkiv2.rocksdb*
+
+# .env file with environment variables for TERYT API credentials
+.env
