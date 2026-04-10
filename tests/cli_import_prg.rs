@@ -125,8 +125,77 @@ fn test_import_prg_missing_terc_fails() {
     let (cfg, _db_dir, _rocksdb_dir, _db_path) = persistent_config();
     let cfg_path = cfg.path().to_str().unwrap().to_string();
 
-    // No --terc-file and no terc_path in config → should fail.
+    // Append teryt config that disables download but provides no file
+    use std::io::Write;
+    let mut cfg_file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(cfg.path())
+        .unwrap();
+    writeln!(cfg_file, "\n[teryt]\ndownload = false").unwrap();
+
+    // No --terc-file and teryt.download = false with no file_path → should fail
     cmd()
+        .args([
+            "--config",
+            &cfg_path,
+            "import",
+            "prg",
+            "--file",
+            "fixtures/prg.zip",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_import_prg_teryt_from_config_file_path() {
+    let (cfg, _db_dir, _rocksdb_dir, db_path) = persistent_config();
+    let cfg_path = cfg.path().to_str().unwrap().to_string();
+
+    // Set teryt.file_path in config instead of using --terc-file CLI flag
+    use std::io::Write;
+    let mut cfg_file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(cfg.path())
+        .unwrap();
+    writeln!(
+        cfg_file,
+        "\n[teryt]\ndownload = false\nfile_path = \"fixtures/teryt.zip\""
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--config",
+            &cfg_path,
+            "import",
+            "prg",
+            "--file",
+            "fixtures/prg.zip",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PRG import complete"));
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch("INSTALL spatial; LOAD spatial;")
+        .unwrap();
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prg_addresses", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn test_import_prg_download_teryt_missing_credentials_fails() {
+    let (cfg, _db_dir, _rocksdb_dir, _db_path) = persistent_config();
+    let cfg_path = cfg.path().to_str().unwrap().to_string();
+
+    // teryt.download defaults to true, but no credentials in config or env
+    cmd()
+        .env_remove("TERYT_API_USERNAME")
+        .env_remove("TERYT_API_PASSWORD")
         .args([
             "--config",
             &cfg_path,
