@@ -41,10 +41,10 @@ pub fn import(
 
     let terc_path = terc_file
         .map(PathBuf::from)
-        .or_else(|| config.terc_path.as_ref().map(PathBuf::from))
+        .or_else(|| config.teryt.file_path.as_ref().map(PathBuf::from))
         .context(
             "PRG 2021 import requires a TERC dictionary; \
-             pass --terc-file <PATH> or set `terc_path` in the config file",
+             pass --terc-file <PATH> or set `teryt.file_path` in the config file",
         )?;
 
     let zip_str = zip_path

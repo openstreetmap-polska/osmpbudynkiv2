@@ -6,6 +6,32 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
+pub struct TerytConfig {
+    /// When true, download TERYT dictionary from the government SOAP API.
+    /// When false, a local file must be provided via `file_path` or `--terc-file`.
+    pub download: bool,
+    /// Username for TERYT API. Falls back to TERYT_API_USERNAME env var.
+    pub api_username: Option<String>,
+    /// Password for TERYT API. Falls back to TERYT_API_PASSWORD env var.
+    pub api_password: Option<String>,
+    /// Path to a local TERC dictionary file (.zip or .xml).
+    /// Overridden by the --terc-file CLI flag.
+    pub file_path: Option<String>,
+}
+
+impl Default for TerytConfig {
+    fn default() -> Self {
+        Self {
+            download: true,
+            api_username: None,
+            api_password: None,
+            file_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub db_path: String,
     pub rocksdb_path: String,
@@ -13,11 +39,7 @@ pub struct Config {
     pub rocksdb_write_buffer_mb: u64,
     pub log_level: String,
     pub download_dir: Option<String>,
-    /// Path to a TERC (TERYT) dictionary file (`.zip` or `.xml`) used by the
-    /// PRG 2021 importer to resolve voivodeship/county/municipality names from
-    /// the TERYT codes embedded in the GML. Required for `import prg` unless
-    /// overridden via the `--terc-file` CLI flag.
-    pub terc_path: Option<String>,
+    pub teryt: TerytConfig,
     pub duckdb_init_commands: Vec<String>,
     pub download_urls: DownloadUrls,
 }
@@ -41,7 +63,7 @@ impl Default for Config {
             rocksdb_write_buffer_mb: 64,
             log_level: "info".to_string(),
             download_dir: None,
-            terc_path: None,
+            teryt: TerytConfig::default(),
             duckdb_init_commands: vec![
                 "INSTALL spatial".to_string(),
                 "LOAD spatial".to_string(),
@@ -217,5 +239,55 @@ rocksdb_write_buffer_mb = 32
         assert_eq!(config.rocksdb_path, "/custom/rocksdb");
         assert_eq!(config.rocksdb_block_cache_mb, 256);
         assert_eq!(config.rocksdb_write_buffer_mb, 32);
+    }
+
+    #[test]
+    fn test_teryt_config_defaults() {
+        let config = load_config(None).unwrap();
+        assert!(config.teryt.download);
+        assert!(config.teryt.api_username.is_none());
+        assert!(config.teryt.api_password.is_none());
+        assert!(config.teryt.file_path.is_none());
+    }
+
+    #[test]
+    fn test_teryt_config_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[teryt]
+download = false
+api_username = "testuser"
+api_password = "testpass"
+file_path = "/data/TERC.zip"
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert!(!config.teryt.download);
+        assert_eq!(config.teryt.api_username.as_deref(), Some("testuser"));
+        assert_eq!(config.teryt.api_password.as_deref(), Some("testpass"));
+        assert_eq!(config.teryt.file_path.as_deref(), Some("/data/TERC.zip"));
+    }
+
+    #[test]
+    fn test_teryt_partial_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[teryt]
+download = false
+file_path = "/data/TERC.zip"
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert!(!config.teryt.download);
+        assert!(config.teryt.api_username.is_none());
+        assert_eq!(config.teryt.file_path.as_deref(), Some("/data/TERC.zip"));
     }
 }
