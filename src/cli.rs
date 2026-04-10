@@ -44,8 +44,21 @@ pub enum CompareTarget {
         #[command(subcommand)]
         source: Option<BuildingsSource>,
     },
+    /// Compare address datasets against OSM addresses
+    Addresses {
+        #[command(subcommand)]
+        source: Option<AddressesSource>,
+    },
     /// Run all available comparisons
     Full,
+}
+
+#[derive(Subcommand)]
+pub enum AddressesSource {
+    /// Compare only PRG addresses against OSM
+    Prg,
+    /// Compare all address sources against OSM
+    All,
 }
 
 #[derive(Subcommand)]
@@ -83,6 +96,10 @@ pub enum ImportSource {
         /// Path to local file (skips download)
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Path to a TERC (TERYT) dictionary file (.zip or .xml). Required for
+        /// the 2021 schema; overrides `terc_path` from the config file.
+        #[arg(long)]
+        terc_file: Option<PathBuf>,
     },
     /// Run all imports in sequence
     Full,

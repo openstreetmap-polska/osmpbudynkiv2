@@ -19,6 +19,12 @@ log_level = "info"
 # and files are cleaned up automatically after processing.
 # download_dir = "./data"
 
+# Path to a TERC (TERYT) dictionary file (.zip or .xml) used by the PRG 2021
+# importer to resolve voivodeship/county/municipality names from the TERYT
+# codes embedded in the GML. Required for `import prg` unless overridden via
+# the `--terc-file` CLI flag.
+# terc_path = "./data/TERC_Urzedowy.zip"
+
 # SQL statements executed on DuckDB initialization (after opening the database).
 # These run before schema creation.
 # WARNING: replacing this list removes the defaults — include everything you need.

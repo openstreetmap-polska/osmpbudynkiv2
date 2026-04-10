@@ -1,6 +1,7 @@
 pub mod bdot10k;
 pub mod egib;
 pub mod osm;
+pub mod prg;
 
 use anyhow::{Result, bail};
 use duckdb::Connection;
@@ -22,7 +23,13 @@ pub fn run(
             bdot10k::import(conn, config, file.as_deref(), &urls.bdot10k)
         }
         ImportSource::Egib { file } => egib::import(conn, config, file.as_deref(), &urls.egib),
-        ImportSource::Prg { .. } => bail!("PRG import is not yet implemented"),
+        ImportSource::Prg { file, terc_file } => prg::import(
+            conn,
+            config,
+            file.as_deref(),
+            terc_file.as_deref(),
+            &urls.prg,
+        ),
         ImportSource::Full => {
             bail!("Full import is not yet implemented");
         }

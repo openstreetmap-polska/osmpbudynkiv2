@@ -1,9 +1,10 @@
+pub mod addresses;
 pub mod buildings;
 
 use anyhow::Result;
 use duckdb::Connection;
 
-use crate::cli::{BuildingsSource, CompareTarget};
+use crate::cli::{AddressesSource, BuildingsSource, CompareTarget};
 
 pub fn run(conn: &Connection, target: CompareTarget) -> Result<()> {
     match target {
@@ -15,10 +16,14 @@ pub fn run(conn: &Connection, target: CompareTarget) -> Result<()> {
             Some(BuildingsSource::Bdot10k) => buildings::compare_bdot10k(conn)?,
             Some(BuildingsSource::Egib) => buildings::compare_egib(conn)?,
         },
-        // When new comparison targets are added, fan out to them here.
+        CompareTarget::Addresses { source } => match source {
+            None | Some(AddressesSource::All) => addresses::compare_prg(conn)?,
+            Some(AddressesSource::Prg) => addresses::compare_prg(conn)?,
+        },
         CompareTarget::Full => {
             buildings::compare_bdot10k(conn)?;
             buildings::compare_egib(conn)?;
+            addresses::compare_prg(conn)?;
         }
     }
     Ok(())

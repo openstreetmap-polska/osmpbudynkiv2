@@ -73,10 +73,27 @@ fn import_egib(cfg_path: &str) {
         .success();
 }
 
+fn import_prg(cfg_path: &str) {
+    cmd()
+        .args([
+            "--config",
+            cfg_path,
+            "import",
+            "prg",
+            "--file",
+            "fixtures/prg.zip",
+            "--terc-file",
+            "fixtures/teryt.zip",
+        ])
+        .assert()
+        .success();
+}
+
 fn import_all(cfg_path: &str) {
     import_osm(cfg_path);
     import_bdot10k(cfg_path);
     import_egib(cfg_path);
+    import_prg(cfg_path);
 }
 
 /// Query `(total, matched)` counts from a comparison table.
@@ -179,7 +196,8 @@ fn test_compare_full() {
         .stdout(
             predicate::str::contains("BDOT10k comparison complete")
                 .and(predicate::str::contains("total=74"))
-                .and(predicate::str::contains("EGIB comparison complete")),
+                .and(predicate::str::contains("EGIB comparison complete"))
+                .and(predicate::str::contains("PRG comparison complete")),
         );
 }
 

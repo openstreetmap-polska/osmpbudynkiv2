@@ -13,6 +13,11 @@ pub struct Config {
     pub rocksdb_write_buffer_mb: u64,
     pub log_level: String,
     pub download_dir: Option<String>,
+    /// Path to a TERC (TERYT) dictionary file (`.zip` or `.xml`) used by the
+    /// PRG 2021 importer to resolve voivodeship/county/municipality names from
+    /// the TERYT codes embedded in the GML. Required for `import prg` unless
+    /// overridden via the `--terc-file` CLI flag.
+    pub terc_path: Option<String>,
     pub duckdb_init_commands: Vec<String>,
     pub download_urls: DownloadUrls,
 }
@@ -36,6 +41,7 @@ impl Default for Config {
             rocksdb_write_buffer_mb: 64,
             log_level: "info".to_string(),
             download_dir: None,
+            terc_path: None,
             duckdb_init_commands: vec![
                 "INSTALL spatial".to_string(),
                 "LOAD spatial".to_string(),

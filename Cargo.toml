@@ -9,7 +9,8 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 duckdb = { version = "1.10501.0", features = ["bundled", "vtab", "vtab-arrow", "vscalar"] }
 flate2 = "1"
-prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.6.4", default-features = false }
+geoarrow = "0.8.0"
+prg_convert = { git = "https://github.com/ttomasz/prg_convert", rev = "de879ab983690170e147aeb4069e0947e720977a", default-features = false }
 quick-xml = "0.37"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -18,7 +19,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zip = "2"
+zip = "6"
 rocksdb = { version = "0.24", default-features = false, features = ["zstd"] }
 
 [dev-dependencies]

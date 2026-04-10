@@ -25,9 +25,9 @@ Note: Both `duckdb` and `rocksdb` dependencies use bundled C++ compilation, so n
 **Tech stack:** Rust + DuckDB (embedded, file-based) + RocksDB (KV store). Goal is a single binary that's easy to deploy.
 
 **CLI commands** (`cargo run -- <command>`):
-- `import <source>` — bulk-load data (OSM from PBF, PRG addresses from ZIP, BDOT10k/EGIB buildings from GeoParquet)
+- `import <source>` — bulk-load data (OSM from PBF, PRG addresses from ZIP via `--file <ZIP> --terc-file <TERC>`, BDOT10k/EGIB buildings from GeoParquet)
 - `update <source>` — apply incremental updates (OSM minutely replication, re-download gov datasets)
-- `compare <target>` — compare government data against OSM. Targets: `buildings` (optionally `bdot10k`, `egib`, or `all` — default runs all), `full` (runs every comparison)
+- `compare <target>` — compare government data against OSM. Targets: `buildings` (optionally `bdot10k`, `egib`, or `all` — default runs all), `addresses` (optionally `prg` or `all` — default runs all), `full` (runs every comparison)
 - `run` — HTTP service with background data updates (not yet implemented)
 
 **Storage:**
