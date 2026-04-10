@@ -55,7 +55,11 @@ pub fn import(
 
     info!(
         path = zip_str,
-        teryt_source = if terc_file_path.is_some() { "file" } else { "api" },
+        teryt_source = if terc_file_path.is_some() {
+            "file"
+        } else {
+            "api"
+        },
         "Importing PRG addresses (2021 schema)"
     );
 
