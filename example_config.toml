@@ -19,6 +19,19 @@ log_level = "info"
 # and files are cleaned up automatically after processing.
 # download_dir = "./data"
 
+# SQL statements executed on DuckDB initialization (after opening the database).
+# These run before schema creation.
+# WARNING: replacing this list removes the defaults — include everything you need.
+duckdb_init_commands = [
+    "INSTALL spatial",
+    "LOAD spatial",
+    "SET preserve_insertion_order = false",
+    "SET geometry_always_xy = true",
+    "SET temp_directory = './osmpbudynkiv2.duckdb.tmp'",
+    "SET memory_limit = '4GB'",
+    "SET threads = 8",
+]
+
 # TERYT dictionary configuration for PRG address imports.
 # The TERYT (TERC) dictionary maps administrative unit codes to names.
 [teryt]
@@ -34,19 +47,6 @@ download = true
 # Path to a local TERC dictionary file (.zip or .xml). Used when download = false.
 # Can be overridden by the --terc-file CLI flag.
 # file_path = "./data/TERC_Urzedowy.zip"
-
-# SQL statements executed on DuckDB initialization (after opening the database).
-# These run before schema creation.
-# WARNING: replacing this list removes the defaults — include everything you need.
-duckdb_init_commands = [
-    "INSTALL spatial",
-    "LOAD spatial",
-    "SET preserve_insertion_order = false",
-    "SET geometry_always_xy = true",
-    "SET temp_directory = './osmpbudynkiv2.duckdb.tmp'",
-    "SET memory_limit = '4GB'",
-    "SET threads = 8",
-]
 
 # Download URLs for data sources
 [download_urls]
