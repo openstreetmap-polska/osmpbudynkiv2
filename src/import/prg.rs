@@ -12,6 +12,7 @@ use tracing::info;
 use zip::ZipArchive;
 
 use crate::config::Config;
+use crate::download::download_file_as;
 use crate::utils::format_duration;
 
 /// Import PRG addresses (2021 GML schema) from a local zip file into the
@@ -23,37 +24,38 @@ use crate::utils::format_duration;
 /// (case-insensitive) and ignore the rest.
 ///
 /// A TERC mapping is required to resolve voivodeship/county/municipality names
-/// from the TERYT codes embedded in the 2021 GML. The path is taken from the
-/// `--terc-file` CLI flag, falling back to `terc_path` in the config file.
-///
-/// Network downloads are not implemented yet — `--file` is required.
+/// from the TERYT codes embedded in the 2021 GML. Resolution priority:
+/// `--terc-file` CLI flag > `teryt.file_path` in config > TERYT API download.
 pub fn import(
     conn: &Connection,
     config: &Config,
     file: Option<&Path>,
     terc_file: Option<&Path>,
-    _url: &str,
+    url: &str,
 ) -> Result<()> {
+    const PRG_DOWNLOAD_FILENAME: &str = "PRG-punkty_adresowe.zip";
+
     let zip_path = match file {
         Some(p) => PathBuf::from(p),
-        None => bail!("PRG download is not yet implemented; pass --file <ZIP>"),
+        None => {
+            info!(url, "Downloading PRG data");
+            download_file_as(url, &config.download_dir(), PRG_DOWNLOAD_FILENAME)
+                .context("Failed to download PRG data")?
+        }
     };
-
-    let terc_path = terc_file
-        .map(PathBuf::from)
-        .or_else(|| config.teryt.file_path.as_ref().map(PathBuf::from))
-        .context(
-            "PRG 2021 import requires a TERC dictionary; \
-             pass --terc-file <PATH> or set `teryt.file_path` in the config file",
-        )?;
 
     let zip_str = zip_path
         .to_str()
         .context("PRG zip path is not valid UTF-8")?;
-    let terc_str = terc_path.to_str().context("TERC path is not valid UTF-8")?;
+
+    // Resolve TERYT: CLI flag takes priority, then config file_path, then API download
+    let terc_file_path = terc_file
+        .map(PathBuf::from)
+        .or_else(|| config.teryt.file_path.as_ref().map(PathBuf::from));
+
     info!(
         path = zip_str,
-        terc = terc_str,
+        teryt_source = if terc_file_path.is_some() { "file" } else { "api" },
         "Importing PRG addresses (2021 schema)"
     );
 
@@ -61,8 +63,35 @@ pub fn import(
 
     // Build TERC mapping (small, ~3000 entries — fits comfortably in memory).
     let t = std::time::Instant::now();
-    let terc = get_teryt_mapping(false, &None, &None, &Some(terc_path.clone()))
-        .with_context(|| format!("Failed to load TERC mapping from {terc_str}"))?;
+    let terc = if let Some(ref path) = terc_file_path {
+        let terc_str = path.to_str().context("TERC path is not valid UTF-8")?;
+        info!(path = terc_str, "Loading TERYT mapping from file");
+        get_teryt_mapping(false, &None, &None, &Some(path.clone()))
+            .with_context(|| format!("Failed to load TERC mapping from {terc_str}"))?
+    } else {
+        // Auto-download from TERYT API
+        let username = config
+            .teryt
+            .api_username
+            .clone()
+            .or_else(|| std::env::var("TERYT_API_USERNAME").ok())
+            .context(
+                "TERYT API username required: set teryt.api_username in config \
+                 or TERYT_API_USERNAME env var",
+            )?;
+        let password = config
+            .teryt
+            .api_password
+            .clone()
+            .or_else(|| std::env::var("TERYT_API_PASSWORD").ok())
+            .context(
+                "TERYT API password required: set teryt.api_password in config \
+                 or TERYT_API_PASSWORD env var",
+            )?;
+        info!("Downloading TERYT mapping from API");
+        get_teryt_mapping(true, &Some(username), &Some(password), &None)
+            .context("Failed to download TERC mapping from TERYT API")?
+    };
     info!(
         entries = terc.len(),
         elapsed = %format_duration(t.elapsed()),

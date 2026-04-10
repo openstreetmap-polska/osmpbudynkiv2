@@ -97,7 +97,7 @@ pub enum ImportSource {
         #[arg(long)]
         file: Option<PathBuf>,
         /// Path to a TERC (TERYT) dictionary file (.zip or .xml). Required for
-        /// the 2021 schema; overrides `terc_path` from the config file.
+        /// the 2021 schema; overrides `teryt.file_path` from the config file.
         #[arg(long)]
         terc_file: Option<PathBuf>,
     },
