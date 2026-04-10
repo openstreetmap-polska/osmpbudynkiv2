@@ -29,6 +29,25 @@ pub fn download_file(url: &str, dest_dir: &Path) -> Result<PathBuf> {
     Ok(dest_path)
 }
 
+/// Download a file from `url` to `dest_dir` with an explicit `file_name`.
+/// Useful when the URL doesn't contain a clean filename (e.g. query-string URLs).
+pub fn download_file_as(url: &str, dest_dir: &Path, file_name: &str) -> Result<PathBuf> {
+    let dest_path = dest_dir.join(file_name);
+
+    if dest_path.exists() {
+        info!(path = %dest_path.display(), "File already exists, skipping download");
+        return Ok(dest_path);
+    }
+
+    std::fs::create_dir_all(dest_dir)
+        .with_context(|| format!("Failed to create directory {dest_dir:?}"))?;
+
+    let rt = Runtime::new().context("Failed to create tokio runtime")?;
+    rt.block_on(download_with_retry(url, &dest_path))?;
+
+    Ok(dest_path)
+}
+
 async fn download_with_retry(url: &str, dest_path: &Path) -> Result<()> {
     let client = reqwest::Client::new();
     let mut last_error = None;
