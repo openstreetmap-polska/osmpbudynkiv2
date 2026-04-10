@@ -19,11 +19,21 @@ log_level = "info"
 # and files are cleaned up automatically after processing.
 # download_dir = "./data"
 
-# Path to a TERC (TERYT) dictionary file (.zip or .xml) used by the PRG 2021
-# importer to resolve voivodeship/county/municipality names from the TERYT
-# codes embedded in the GML. Required for `import prg` unless overridden via
-# the `--terc-file` CLI flag.
-# terc_path = "./data/TERC_Urzedowy.zip"
+# TERYT dictionary configuration for PRG address imports.
+# The TERYT (TERC) dictionary maps administrative unit codes to names.
+[teryt]
+# When true, download TERYT dictionary from the government SOAP API automatically.
+# When false, a local file must be provided via `file_path` below or `--terc-file` CLI flag.
+download = true
+
+# Credentials for the TERYT SOAP API (https://api.stat.gov.pl/Home/TerytApi).
+# Falls back to TERYT_API_USERNAME / TERYT_API_PASSWORD environment variables when not set.
+# api_username = "myuser"
+# api_password = "mypass"
+
+# Path to a local TERC dictionary file (.zip or .xml). Used when download = false.
+# Can be overridden by the --terc-file CLI flag.
+# file_path = "./data/TERC_Urzedowy.zip"
 
 # SQL statements executed on DuckDB initialization (after opening the database).
 # These run before schema creation.
