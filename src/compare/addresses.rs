@@ -4,16 +4,11 @@ use tracing::info;
 
 use crate::utils::format_duration;
 
-/// Grid cell size in degrees for chunked spatial comparison.
-/// Same as buildings — 0.5 degrees is roughly 35x55 km, yielding ~264 cells
-/// over Poland.
-const GRID_STEP: f64 = 0.5;
-
-/// Buffer added to each side of the OSM-side bounding box to catch
-/// cross-cell-boundary matches. A PRG address inside cell C can match an OSM
-/// address up to 50 m outside C. 0.001° is ≥ 64 m at all Polish latitudes,
-/// so no real match is lost.
-const OSM_BBOX_BUFFER: f64 = 0.001;
+/// Grid cell size in degrees for the spatial grid-key matching strategy.
+/// 0.005° ≈ 340 m east-west at 52 °N and ≈ 556 m north-south — both well above
+/// the 50 m match distance. Any two addresses within 50 m therefore fall in the
+/// same or adjacent grid cells, so a ±1 cell neighbourhood is always sufficient.
+const GRID_KEY_DEG: f64 = 0.005;
 
 /// Two address points are considered matching when their (trimmed, uppercased)
 /// housenumbers are equal AND they are within this distance in meters.
@@ -23,9 +18,10 @@ pub fn compare_prg(conn: &Connection) -> Result<()> {
     info!("Comparing PRG addresses against OSM");
     let t = std::time::Instant::now();
 
-    compare_addresses_chunked(
+    compare_addresses(
         conn,
         "prg_addresses",
+        "lokalny_id",
         "numer_porzadkowy",
         "prg_import_candidates",
     )
@@ -48,81 +44,74 @@ pub fn compare_prg(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Compare addresses using a spatial grid to keep memory usage bounded.
+/// Compare addresses in a single parallel pass using a spatial grid-key strategy.
 ///
-/// Unlike the buildings comparison (which stores every source row with a
-/// `matched` flag), this stores only the **unmatched** source rows — i.e. the
-/// import candidates. Two addresses match when:
+/// The naive grid-chunked approach suffers from an O(n²) fan-out: common short
+/// housenumbers (1, 2, 3 …) appear thousands of times within a 0.5° cell, producing
+/// hundreds of millions of distance calculations per cell. The Warsaw cell alone had
+/// ~591 million intermediate pairs, taking ~52 s; the full dataset of 264 cells
+/// took several hours.
 ///
-/// 1. `UPPER(TRIM(housenumber))` is equal on both sides, AND
-/// 2. `ST_Distance_Sphere(osm.geom, prg.geom) <= 50 m`.
-///
-/// The grid + buffer strategy is the same as `compare_chunked` in buildings:
-/// the PRG side is filtered by the exact cell bbox, and the OSM side is
-/// filtered by a slightly larger bbox (cell + BUFFER) so cross-boundary
-/// matches within 50 m are not missed.
-fn compare_addresses_chunked(
+/// This function avoids that by assigning each address an integer (gx, gy) key
+/// derived from `floor(coord / GRID_KEY_DEG)`. Each source address is expanded to
+/// its 3×3 neighbourhood (9 rows) and equality-joined against OSM on
+/// (normalised_housenumber, gx, gy). Because GRID_KEY_DEG ≈ 340 m >> 50 m match
+/// distance, any genuine within-50-m match is guaranteed to land in the same or an
+/// adjacent cell — no valid match is missed. DuckDB parallelises the hash join
+/// across all available threads in a single pass; no Rust-level loop is needed.
+fn compare_addresses(
     conn: &Connection,
     source_table: &str,
+    id_col: &str,
     housenumber_col: &str,
     candidates_table: &str,
 ) -> Result<()> {
-    // Create an empty candidates table with the same schema as the source
-    // (including the geom column added during PRG import).
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS {candidates_table};
          CREATE TABLE {candidates_table} AS SELECT * FROM {source_table} LIMIT 0;"
     ))?;
 
-    // Fixed grid covering Poland's extent (EPSG:4326).
-    let (min_x, min_y, max_x, max_y) = (14.0, 49.0, 25.0, 55.0);
-
-    let cols_count = ((max_x - min_x) / GRID_STEP).ceil() as u32;
-    let rows_count = ((max_y - min_y) / GRID_STEP).ceil() as u32;
-    let total_cells = cols_count * rows_count;
-    info!(
-        grid_step = GRID_STEP,
-        cells = total_cells,
-        "Processing comparison in grid cells"
-    );
-
-    let mut cell = 0u32;
-    let mut y = min_y;
-    while y < max_y {
-        let mut x = min_x;
-        while x < max_x {
-            cell += 1;
-            let x2 = x + GRID_STEP;
-            let y2 = y + GRID_STEP;
-
-            // OSM-side bbox is expanded by BUFFER so addresses up to 50 m
-            // outside the cell boundary can still match a PRG row inside it.
-            let bx = x - OSM_BBOX_BUFFER;
-            let by = y - OSM_BBOX_BUFFER;
-            let bx2 = x2 + OSM_BBOX_BUFFER;
-            let by2 = y2 + OSM_BBOX_BUFFER;
-
-            conn.execute_batch(&format!(
-                "INSERT INTO {candidates_table}
-                 WITH cell_src AS (
-                     SELECT * FROM {source_table}
-                     WHERE ST_Intersects(geom, ST_MakeEnvelope({x}, {y}, {x2}, {y2}))
-                 )
-                 SELECT p.*
-                 FROM cell_src p
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM osm_addresses osm
-                     WHERE ST_Intersects(osm.geom, ST_MakeEnvelope({bx}, {by}, {bx2}, {by2}))
-                       AND UPPER(TRIM(osm.housenumber)) = UPPER(TRIM(p.{housenumber_col}))
-                       AND ST_Distance_Sphere(osm.geom, p.geom) <= {MATCH_DISTANCE_METERS}
-                 );"
-            ))
-            .with_context(|| format!("Failed at grid cell {cell}/{total_cells}"))?;
-
-            x += GRID_STEP;
-        }
-        y += GRID_STEP;
-    }
+    conn.execute_batch(&format!(
+        "INSERT INTO {candidates_table}
+         WITH
+         neighbor_offsets(dx, dy) AS (
+             VALUES (-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)
+         ),
+         src_norm AS (
+             SELECT {id_col},
+                    UPPER(TRIM({housenumber_col}))              AS _hn,
+                    FLOOR(ST_X(geom) / {GRID_KEY_DEG})::BIGINT AS _gx,
+                    FLOOR(ST_Y(geom) / {GRID_KEY_DEG})::BIGINT AS _gy,
+                    geom
+             FROM {source_table}
+         ),
+         osm_norm AS (
+             SELECT UPPER(TRIM(housenumber))                    AS _hn,
+                    FLOOR(ST_X(geom) / {GRID_KEY_DEG})::BIGINT AS _gx,
+                    FLOOR(ST_Y(geom) / {GRID_KEY_DEG})::BIGINT AS _gy,
+                    geom
+             FROM osm_addresses
+         ),
+         src_expanded AS (
+             SELECT s.{id_col}, s._hn, s.geom,
+                    s._gx + o.dx AS _sgx,
+                    s._gy + o.dy AS _sgy
+             FROM src_norm s CROSS JOIN neighbor_offsets o
+         ),
+         matched_ids AS (
+             SELECT DISTINCT s.{id_col}
+             FROM src_expanded s
+             JOIN osm_norm o
+               ON  s._hn  = o._hn
+               AND s._sgx = o._gx
+               AND s._sgy = o._gy
+               AND ST_Distance_Sphere(o.geom, s.geom) <= {MATCH_DISTANCE_METERS}
+         )
+         SELECT s.*
+         FROM {source_table} s
+         WHERE NOT EXISTS (SELECT 1 FROM matched_ids m WHERE m.{id_col} = s.{id_col});"
+    ))
+    .context("Failed to run address comparison query")?;
 
     Ok(())
 }
@@ -134,8 +123,6 @@ mod tests {
     use super::*;
     use crate::db::init_db;
 
-    /// Set up an in-memory DuckDB with spatial loaded, `osm_addresses`
-    /// (created by init_db), and a minimal `test_src` table.
     fn setup() -> Connection {
         let init = vec![
             "INSTALL spatial".to_string(),
@@ -160,14 +147,14 @@ mod tests {
     }
 
     fn run(conn: &Connection) {
-        compare_addresses_chunked(conn, "test_src", "numer_porzadkowy", "test_candidates").unwrap();
+        compare_addresses(conn, "test_src", "lokalny_id", "numer_porzadkowy", "test_candidates")
+            .unwrap();
     }
 
     /// Same housenumber, ~22 m apart → match → 0 candidates.
     #[test]
     fn matched_within_50m_excluded_from_candidates() {
         let conn = setup();
-        // 21.01 and 52.21 are safely inside a cell (not on a boundary).
         conn.execute_batch(
             "INSERT INTO test_src VALUES ('p1', '12', ST_Point(21.01, 52.21));
              INSERT INTO osm_addresses VALUES (1, 'node', '12', NULL, NULL, NULL, ST_Point(21.01, 52.2102));",
@@ -220,8 +207,7 @@ mod tests {
         assert_eq!(candidate_count(&conn), 0);
     }
 
-    /// NULL housenumbers on both sides → SQL NULL = NULL is NULL, not TRUE →
-    /// no match → candidate.
+    /// NULL housenumbers on both sides → SQL NULL ≠ NULL in joins → no match → candidate.
     #[test]
     fn null_housenumbers_dont_match() {
         let conn = setup();
@@ -235,18 +221,13 @@ mod tests {
         assert_eq!(candidate_count(&conn), 1);
     }
 
-    /// PRG just inside cell boundary, OSM just outside → the OSM-side buffer
-    /// of 0.001° allows the match to succeed across the cell boundary.
+    /// PRG and OSM points straddle a grid-cell boundary but are within 50 m.
+    /// PRG at lon=14.4997 → gx=floor(14.4997/0.005)=2899
+    /// OSM at lon=14.5003 → gx=floor(14.5003/0.005)=2900  (adjacent cell)
+    /// Separation ≈ 41 m — within the 50 m threshold → should match → 0 candidates.
     #[test]
-    fn osm_buffer_catches_cross_boundary_match() {
+    fn adjacent_grid_cells_within_50m_match() {
         let conn = setup();
-        // PRG at (14.4997, 52.25) — just west of the x=14.5 cell boundary
-        // (falls in cell [14.0, 14.5]).
-        // OSM at (14.5003, 52.25) — just east (in cell [14.5, 15.0]).
-        // Separation: 0.0006° lon at lat 52.25° ≈ 0.0006 * 111320 * cos(52.25°)
-        //           ≈ 0.0006 * 68027 ≈ 41 m — within 50 m threshold.
-        // Without the OSM bbox buffer, the OSM point wouldn't be in the
-        // PRG cell's bbox and the match would be missed.
         conn.execute_batch(
             "INSERT INTO test_src VALUES ('p1', '5', ST_Point(14.4997, 52.25));
              INSERT INTO osm_addresses VALUES (1, 'node', '5', NULL, NULL, NULL, ST_Point(14.5003, 52.25));",
@@ -257,19 +238,18 @@ mod tests {
         assert_eq!(
             candidate_count(&conn),
             0,
-            "OSM buffer should allow cross-boundary match within 50 m"
+            "addresses in adjacent grid cells within 50 m should match"
         );
     }
 
-    /// Known edge case: a source point exactly on a cell boundary is picked
-    /// up by both adjacent cells, producing a duplicate in the candidates
-    /// table when unmatched. Mirrors the buildings test at
-    /// `compare_chunked_duplicates_source_on_cell_boundary`.
+    /// An unmatched source address produces exactly one candidate row.
+    /// The single-pass approach never duplicates rows, even when an address
+    /// falls exactly on a grid-cell boundary (unlike the old chunked approach
+    /// which emitted boundary rows twice).
     #[test]
-    fn boundary_duplication_documented() {
+    fn unmatched_address_produces_exactly_one_candidate() {
         let conn = setup();
-        // x = 14.5 is the boundary between the first and second grid columns.
-        // No matching OSM address → both cells emit the row.
+        // lon=14.5 lands exactly on a grid boundary (14.5/0.005=2900.0).
         conn.execute_batch(
             "INSERT INTO test_src VALUES ('boundary', '99', ST_Point(14.5, 52.25));",
         )
@@ -278,8 +258,8 @@ mod tests {
         run(&conn);
         assert_eq!(
             candidate_count(&conn),
-            2,
-            "source on cell boundary is processed by both adjacent cells"
+            1,
+            "each source address should appear at most once in the candidates table"
         );
     }
 }
