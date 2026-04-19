@@ -51,7 +51,7 @@ download = true
 # Download URLs for data sources
 [download_urls]
 osm_pbf = "https://download.openstreetmap.fr/extracts/europe/poland-latest.osm.pbf"
-bdot10k = "https://opendata.geoportal.gov.pl/bdot10k/schemat2021/GeoParquet/Polska_BDOT10k_GeoParquet.zip"
+bdot10k = "https://opendata.geoportal.gov.pl/bdot10k/schemat2021/GeoParquet/OT_BUBD_A.parquet"
 egib = "https://opendata.geoportal.gov.pl/InneDane/latest_exports/eziudp_wfs/PARQUET/0_budynki.parquet"
 prg = "https://integracja.gugik.gov.pl/PRG/pobierz.php?adresy_zbiorcze_gml"
 osm_replication = "https://download.openstreetmap.fr/replication/europe/poland/minute"

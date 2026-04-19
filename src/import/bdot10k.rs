@@ -8,16 +8,10 @@ use crate::config::Config;
 use crate::download::download_file;
 use crate::utils::format_duration;
 
-const PARQUET_ENTRY: &str = "OT_BUBD_A.parquet";
-
 pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str) -> Result<()> {
-    let (parquet_path, cleanup_paths) = match file {
-        Some(path) => (PathBuf::from(path), vec![]),
-        None => {
-            let download_dir = config.download_dir();
-            let (path, cleanup) = download_and_extract(url, &download_dir)?;
-            (path, cleanup)
-        }
+    let (parquet_path, was_downloaded) = match file {
+        Some(path) => (PathBuf::from(path), false),
+        None => (download_file(url, &config.download_dir())?, true),
     };
 
     let parquet_str = parquet_path
@@ -63,14 +57,9 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM bdot10k_buildings", [], |row| {
         row.get(0)
     })?;
-    for path in &cleanup_paths {
-        if path.is_dir() {
-            info!(path = %path.display(), "Cleaning up extracted directory");
-            let _ = std::fs::remove_dir_all(path);
-        } else if path.is_file() {
-            info!(path = %path.display(), "Cleaning up downloaded file");
-            let _ = std::fs::remove_file(path);
-        }
+    if was_downloaded {
+        info!(path = %parquet_path.display(), "Cleaning up downloaded file");
+        let _ = std::fs::remove_file(&parquet_path);
     }
 
     info!(
@@ -80,34 +69,4 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
     );
 
     Ok(())
-}
-
-fn download_and_extract(url: &str, download_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
-    let zip_path = download_file(url, download_dir)?;
-    let extract_dir = download_dir.join("bdot10k");
-    std::fs::create_dir_all(&extract_dir)?;
-
-    let target_path = extract_dir.join(PARQUET_ENTRY);
-    let cleanup_paths = vec![zip_path.clone(), extract_dir.to_path_buf()];
-    if target_path.exists() {
-        info!(path = %target_path.display(), "Parquet file already extracted");
-        return Ok((target_path, cleanup_paths));
-    }
-
-    info!("Extracting {} from ZIP", PARQUET_ENTRY);
-    let file = std::fs::File::open(&zip_path)?;
-    let mut archive = zip::ZipArchive::new(file).context("Failed to open ZIP archive")?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_string();
-        if name.ends_with(PARQUET_ENTRY) {
-            let mut outfile = std::fs::File::create(&target_path)?;
-            std::io::copy(&mut entry, &mut outfile)?;
-            info!(path = %target_path.display(), "Extracted parquet file");
-            return Ok((target_path, cleanup_paths));
-        }
-    }
-
-    anyhow::bail!("Could not find {PARQUET_ENTRY} in ZIP archive")
 }

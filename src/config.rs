@@ -83,7 +83,7 @@ impl Default for DownloadUrls {
         Self {
             osm_pbf: "https://download.openstreetmap.fr/extracts/europe/poland-latest.osm.pbf"
                 .to_string(),
-            bdot10k: "https://opendata.geoportal.gov.pl/bdot10k/schemat2021/GeoParquet/Polska_BDOT10k_GeoParquet.zip"
+            bdot10k: "https://opendata.geoportal.gov.pl/bdot10k/schemat2021/GeoParquet/OT_BUBD_A.parquet"
                 .to_string(),
             egib: "https://opendata.geoportal.gov.pl/InneDane/latest_exports/eziudp_wfs/PARQUET/0_budynki.parquet"
                 .to_string(),
