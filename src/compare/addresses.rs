@@ -147,8 +147,14 @@ mod tests {
     }
 
     fn run(conn: &Connection) {
-        compare_addresses(conn, "test_src", "lokalny_id", "numer_porzadkowy", "test_candidates")
-            .unwrap();
+        compare_addresses(
+            conn,
+            "test_src",
+            "lokalny_id",
+            "numer_porzadkowy",
+            "test_candidates",
+        )
+        .unwrap();
     }
 
     /// Same housenumber, ~22 m apart → match → 0 candidates.
