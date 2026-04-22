@@ -26,7 +26,8 @@ pub fn update(
     let current_seq = get_current_sequence(conn)?;
     info!(current_seq, "Current replication sequence");
 
-    let latest_seq = fetch_latest_sequence(replication_base_url, &download_dir)?;
+    let (latest_seq, latest_timestamp) =
+        fetch_latest_sequence(replication_base_url, &download_dir)?;
     info!(latest_seq, "Latest available sequence");
 
     if current_seq >= latest_seq {
@@ -43,7 +44,7 @@ pub fn update(
             return Ok(());
         }
 
-        apply_sequence(conn, kv, seq, replication_base_url, &download_dir)?;
+        apply_sequence(conn, kv, seq, replication_base_url, &download_dir, &latest_timestamp)?;
 
         if (seq - current_seq) % 100 == 0 {
             info!(
@@ -73,13 +74,15 @@ fn get_current_sequence(conn: &Connection) -> Result<u64> {
     }
 }
 
-fn fetch_latest_sequence(replication_base_url: &str, download_dir: &Path) -> Result<u64> {
+fn fetch_latest_sequence(
+    replication_base_url: &str,
+    download_dir: &Path,
+) -> Result<(u64, String)> {
     let url = format!("{replication_base_url}/state.txt");
     let state_path = download_file(&url, download_dir)?;
     let text = std::fs::read_to_string(&state_path).context("Failed to read state.txt")?;
     let _ = std::fs::remove_file(&state_path);
-    let (seq, _) = parse_state_txt(&text)?;
-    Ok(seq)
+    parse_state_txt(&text)
 }
 
 fn apply_sequence(
@@ -88,6 +91,7 @@ fn apply_sequence(
     seq: u64,
     replication_base_url: &str,
     download_dir: &Path,
+    timestamp: &str,
 ) -> Result<()> {
     // Download and parse everything before starting any writes.
     let path = sequence_to_path(seq);
@@ -98,16 +102,6 @@ fn apply_sequence(
     let _ = std::fs::remove_file(&osc_gz_path);
 
     let changes = parse_osc(&osc_xml)?;
-
-    let state_url = format!(
-        "{replication_base_url}/{}",
-        sequence_to_path(seq).replace(".osc.gz", ".state.txt")
-    );
-    let state_path = download_file(&state_url, download_dir)?;
-    let state_text =
-        std::fs::read_to_string(&state_path).context("Failed to read sequence state.txt")?;
-    let _ = std::fs::remove_file(&state_path);
-    let (_, timestamp) = parse_state_txt(&state_text)?;
 
     // Apply within a DuckDB transaction for atomicity.
     // RocksDB writes happen immediately but are idempotent: if we fail and retry
