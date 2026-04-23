@@ -26,3 +26,10 @@ rocksdb = { version = "0.24", default-features = false, features = ["zstd"] }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+
+# Release-optimized build with debug symbols kept for profilers (samply, perf).
+# Use via `cargo run --profile profiling -- ...` or `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"

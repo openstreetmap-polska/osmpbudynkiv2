@@ -50,25 +50,15 @@ impl VScalar for ResolveNodeCoords {
 
             let child = list_vec.child(offset + length);
             let refs = child.as_slice::<i64>();
+            let slice = &refs[offset..offset + length];
 
-            let mut raw_coords: Vec<u8> = Vec::with_capacity(length * encoding::NODE_BYTE_LEN);
-            let mut all_found = true;
-
-            for j in 0..length {
-                match kvstore::get_node_raw(&state.kv, refs[offset + j]) {
-                    Ok(Some(bytes)) => raw_coords.extend_from_slice(&bytes),
-                    Ok(None) => {
-                        all_found = false;
-                        break;
-                    }
-                    Err(e) => return Err(e.into()),
+            let raw_coords = match kvstore::multi_get_nodes_concat(&state.kv, slice)? {
+                Some(bytes) => bytes,
+                None => {
+                    out.set_null(i);
+                    continue;
                 }
-            }
-
-            if !all_found {
-                out.set_null(i);
-                continue;
-            }
+            };
 
             let wkb = encode_wkb_linestring_raw(length, &raw_coords);
             out.insert(i, &wkb);
@@ -127,25 +117,13 @@ impl VScalar for ResolveWayCoords {
                 continue;
             }
 
-            let mut raw_coords: Vec<u8> =
-                Vec::with_capacity(node_ids.len() * encoding::NODE_BYTE_LEN);
-            let mut all_found = true;
-
-            for &nid in &node_ids {
-                match kvstore::get_node_raw(&state.kv, nid) {
-                    Ok(Some(bytes)) => raw_coords.extend_from_slice(&bytes),
-                    Ok(None) => {
-                        all_found = false;
-                        break;
-                    }
-                    Err(e) => return Err(e.into()),
+            let raw_coords = match kvstore::multi_get_nodes_concat(&state.kv, &node_ids)? {
+                Some(bytes) => bytes,
+                None => {
+                    out.set_null(i);
+                    continue;
                 }
-            }
-
-            if !all_found {
-                out.set_null(i);
-                continue;
-            }
+            };
 
             let wkb = encode_wkb_linestring_raw(node_ids.len(), &raw_coords);
             out.insert(i, &wkb);

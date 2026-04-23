@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use rocksdb::{
     BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MergeOperands,
-    MultiThreaded, Options, WriteBatch,
+    MultiThreaded, Options, WriteBatch, WriteOptions,
 };
 
 use super::encoding;
@@ -70,6 +70,13 @@ fn make_cf_opts(name: &str, write_buffer_bytes: usize) -> Options {
     if write_buffer_bytes > 0 {
         cf_opts.set_write_buffer_size(write_buffer_bytes);
     }
+    // Allow several memtables to exist at once so writers don't block while an
+    // earlier memtable is still being flushed to L0.
+    cf_opts.set_max_write_buffer_number(4);
+    cf_opts.set_min_write_buffer_number_to_merge(1);
+    // Use dynamic level sizing so the LSM tree stays well-shaped under bulk
+    // inserts instead of needing a huge pre-known key count.
+    cf_opts.set_level_compaction_dynamic_level_bytes(true);
     if name == CF_NODE_TO_WAYS || name == CF_WAY_TO_RELATIONS {
         cf_opts.set_merge_operator("id_list_merge", id_list_full_merge, id_list_partial_merge);
     }
@@ -80,6 +87,17 @@ pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<Ro
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
+    // Bulk-load tuning: give RocksDB enough background threads to flush
+    // memtables and run compactions in parallel with foreground writes, and
+    // hint async fsync of SST data as it's written so the final flush is
+    // cheap. None of this changes correctness — only throughput.
+    let bg_jobs = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4)
+        .max(4);
+    db_opts.set_max_background_jobs(bg_jobs);
+    db_opts.set_bytes_per_sync(1 << 20);
+    db_opts.set_wal_bytes_per_sync(1 << 20);
 
     let mut bbt = BlockBasedOptions::default();
     let cache = rocksdb::Cache::new_lru_cache(
@@ -142,13 +160,22 @@ pub fn get_node(db: &RocksDB, node_id: i64) -> Result<Option<(f64, f64)>> {
     }
 }
 
-/// Get raw encoded node bytes (16 bytes: lon LE f64 || lat LE f64).
-/// Returns the raw bytes without decoding — useful for building WKB directly.
-pub fn get_node_raw(db: &RocksDB, node_id: i64) -> Result<Option<Vec<u8>>> {
-    match db.get_cf(&cf(db, CF_NODES), encoding::encode_key(node_id))? {
-        Some(value) => Ok(Some(value)),
-        None => Ok(None),
+/// Batch-look-up raw node coordinates for many node IDs, concatenating the
+/// results into a single buffer suitable for direct WKB emission.
+/// Returns `Ok(None)` if *any* node is missing (callers treat missing refs
+/// as "cannot build geometry").
+pub fn multi_get_nodes_concat(db: &RocksDB, node_ids: &[i64]) -> Result<Option<Vec<u8>>> {
+    let keys: Vec<[u8; 8]> = node_ids.iter().map(|id| encoding::encode_key(*id)).collect();
+    let handle = cf(db, CF_NODES);
+    let results = db.batched_multi_get_cf(&handle, &keys, false);
+    let mut out: Vec<u8> = Vec::with_capacity(node_ids.len() * encoding::NODE_BYTE_LEN);
+    for r in results {
+        match r.context("batched_multi_get_cf for nodes failed")? {
+            Some(slice) => out.extend_from_slice(&slice),
+            None => return Ok(None),
+        }
     }
+    Ok(Some(out))
 }
 
 pub fn delete_node(db: &RocksDB, node_id: i64) -> Result<()> {
@@ -359,7 +386,12 @@ pub fn batch_merge_way_to_relation(
 }
 
 pub fn write_batch(db: &RocksDB, batch: WriteBatch) -> Result<()> {
-    db.write(batch).context("Failed to write RocksDB batch")?;
+    // Bulk import: skip the WAL. If the process dies mid-import the DB is
+    // thrown away and restarted from the PBF anyway.
+    let mut wo = WriteOptions::new();
+    wo.disable_wal(true);
+    db.write_opt(batch, &wo)
+        .context("Failed to write RocksDB batch")?;
     Ok(())
 }
 
@@ -391,15 +423,21 @@ mod tests {
     }
 
     #[test]
-    fn test_node_raw_roundtrip() {
+    fn test_multi_get_nodes_concat() {
         let (_tmp, db) = open_tmp_db();
         put_node(&db, 1, 20.0, 50.0).unwrap();
-        let raw = get_node_raw(&db, 1).unwrap().unwrap();
-        assert_eq!(raw.len(), encoding::NODE_BYTE_LEN);
+        put_node(&db, 2, 21.0, 51.0).unwrap();
+
+        let raw = multi_get_nodes_concat(&db, &[1, 2]).unwrap().unwrap();
+        assert_eq!(raw.len(), 2 * encoding::NODE_BYTE_LEN);
         let lon = f64::from_le_bytes(raw[..8].try_into().unwrap());
         let lat = f64::from_le_bytes(raw[8..16].try_into().unwrap());
         assert!((lon - 20.0).abs() < 1e-15);
         assert!((lat - 50.0).abs() < 1e-15);
+
+        // A missing node anywhere in the list yields None.
+        let res = multi_get_nodes_concat(&db, &[1, 999]).unwrap();
+        assert!(res.is_none());
     }
 
     #[test]

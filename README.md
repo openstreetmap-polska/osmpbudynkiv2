@@ -110,3 +110,12 @@ RUST_LOG=debug cargo run -- import osm
 cargo run -- --config config.toml import osm  # uses log_level from config
 ```
 
+### Profiling
+```bash
+samply record --save-only -o osm_import_before.json.gz \
+  ./target/profiling/osmpbudynkiv2 \
+  --config ./example_config.toml \
+  import osm --file ./example_data/OSM/poland-latest.osm.pbf
+```
+
+Then `samply load osm_import_before.json.gz` to inspect.
