@@ -25,9 +25,11 @@ log_level = "info"
 duckdb_init_commands = [
     "INSTALL spatial",
     "LOAD spatial",
+    "SET enable_progress_bar = false",
     "SET preserve_insertion_order = false",
     "SET geometry_always_xy = true",
     "SET temp_directory = './osmpbudynkiv2.duckdb.tmp'",
+    "SET max_temp_directory_size = '8GB'",
     "SET memory_limit = '4GB'",
     "SET threads = 8",
 ]
