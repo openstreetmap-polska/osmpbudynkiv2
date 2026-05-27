@@ -5,6 +5,7 @@ mod db;
 mod download;
 mod import;
 mod osm;
+mod server;
 mod shutdown;
 mod update;
 mod utils;
@@ -51,7 +52,8 @@ fn main() -> Result<()> {
         }
         Command::Compare { target } => compare::run(&conn, target)?,
         Command::Run => {
-            anyhow::bail!("Run command is not yet implemented");
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(server::run(conn, &config))?;
         }
     }
 

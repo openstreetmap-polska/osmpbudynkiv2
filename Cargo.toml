@@ -5,9 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
-duckdb = { version = "1.10502.0", features = ["bundled", "vtab", "vtab-arrow", "vscalar"] }
+duckdb = { version = "1.10502.0", features = ["bundled", "vtab", "vtab-arrow", "vscalar", "r2d2"] }
+r2d2 = "0.8"
 flate2 = "1"
 geoarrow = "0.8.0"
 prg_convert = { git = "https://github.com/ttomasz/prg_convert", rev = "de879ab983690170e147aeb4069e0947e720977a", default-features = false }
@@ -19,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toml = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = "6"

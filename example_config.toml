@@ -15,6 +15,9 @@ rocksdb_write_buffer_mb = 64
 # Can be overridden by RUST_LOG environment variable
 log_level = "info"
 
+# Address and port the HTTP server listens on (used by the `run` command)
+http_listen_addr = "127.0.0.1:3000"
+
 # Directory for downloaded files. When not set, the system temp directory is used
 # and files are cleaned up automatically after processing.
 # download_dir = "./data"

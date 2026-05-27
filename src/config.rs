@@ -38,6 +38,7 @@ pub struct Config {
     pub rocksdb_block_cache_mb: u64,
     pub rocksdb_write_buffer_mb: u64,
     pub log_level: String,
+    pub http_listen_addr: String,
     pub download_dir: Option<String>,
     pub teryt: TerytConfig,
     pub duckdb_init_commands: Vec<String>,
@@ -62,6 +63,7 @@ impl Default for Config {
             rocksdb_block_cache_mb: 512,
             rocksdb_write_buffer_mb: 64,
             log_level: "info".to_string(),
+            http_listen_addr: "127.0.0.1:3000".to_string(),
             download_dir: None,
             teryt: TerytConfig::default(),
             duckdb_init_commands: vec![
