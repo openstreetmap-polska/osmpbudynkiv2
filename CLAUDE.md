@@ -16,6 +16,7 @@ cargo run             # Run the binary
 cargo clippy          # Lint
 cargo fmt             # Format code
 cargo fmt -- --check  # Check formatting without modifying
+cargo build --profile profiling   # Release build with debug symbols for samply/perf
 ```
 
 Note: Both `duckdb` and `rocksdb` dependencies use bundled C++ compilation, so no external installations are needed, but first build takes significant time.
@@ -57,3 +58,4 @@ The binary accepts `--config <path>` pointing to a TOML file (see `example_confi
 - **Unit tests:** Inline `#[cfg(test)]` modules within source files
 - **Integration tests:** `tests/` directory, using `assert_cmd` to test CLI behavior with `tempfile` for isolated DB instances
 - Run a single integration test: `cargo test --test cli_import_osm`
+- **Fixtures:** Regenerate with `fixtures/scripts/prepare_fixtures.sh` (uses local OSM PBF + GeoParquet inputs)
