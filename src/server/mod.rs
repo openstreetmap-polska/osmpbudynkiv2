@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use axum::Router;
+use axum::{Router, http::StatusCode};
 use duckdb::{AccessMode, Config, Connection, DuckdbConnectionManager};
 use r2d2::Pool;
 use tokio::net::TcpListener;
@@ -29,6 +29,7 @@ pub async fn run(conn: Connection, config: &AppConfig) -> Result<()> {
     };
 
     let app = Router::new()
+        .route("/health", axum::routing::get(|| async { StatusCode::OK }))
         .route("/tiles/{z}/{x}/{y}", axum::routing::get(tiles::serve_tile))
         .with_state(state);
 
@@ -47,6 +48,32 @@ pub async fn run(conn: Connection, config: &AppConfig) -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn health_returns_200() {
+        let app = Router::new()
+            .route("/health", axum::routing::get(|| async { StatusCode::OK }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 fn build_read_pool(db_path: &Path, init_commands: &[String]) -> Result<Pool<DuckdbConnectionManager>> {
