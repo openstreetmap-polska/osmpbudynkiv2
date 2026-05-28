@@ -43,6 +43,31 @@ pub struct Config {
     pub teryt: TerytConfig,
     pub duckdb_init_commands: Vec<String>,
     pub download_urls: DownloadUrls,
+    pub jobs: JobsConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct JobConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+}
+
+impl Default for JobConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 60,
+            timeout_seconds: 600,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct JobsConfig {
+    pub osm_update: JobConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +101,7 @@ impl Default for Config {
                 "SET threads = 8".to_string(),
             ],
             download_urls: DownloadUrls::default(),
+            jobs: JobsConfig::default(),
         }
     }
 }
@@ -272,6 +298,54 @@ file_path = "/data/TERC.zip"
         assert_eq!(config.teryt.api_username.as_deref(), Some("testuser"));
         assert_eq!(config.teryt.api_password.as_deref(), Some("testpass"));
         assert_eq!(config.teryt.file_path.as_deref(), Some("/data/TERC.zip"));
+    }
+
+    #[test]
+    fn test_jobs_config_defaults() {
+        let config = load_config(None).unwrap();
+        assert!(config.jobs.osm_update.enabled);
+        assert_eq!(config.jobs.osm_update.interval_seconds, 60);
+        assert_eq!(config.jobs.osm_update.timeout_seconds, 600);
+    }
+
+    #[test]
+    fn test_jobs_config_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[jobs.osm_update]
+enabled = false
+interval_seconds = 30
+timeout_seconds = 120
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert!(!config.jobs.osm_update.enabled);
+        assert_eq!(config.jobs.osm_update.interval_seconds, 30);
+        assert_eq!(config.jobs.osm_update.timeout_seconds, 120);
+    }
+
+    #[test]
+    fn test_jobs_config_partial_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[jobs.osm_update]
+interval_seconds = 120
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        // overridden
+        assert_eq!(config.jobs.osm_update.interval_seconds, 120);
+        // defaults preserved
+        assert!(config.jobs.osm_update.enabled);
+        assert_eq!(config.jobs.osm_update.timeout_seconds, 600);
     }
 
     #[test]

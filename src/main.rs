@@ -53,7 +53,8 @@ fn main() -> Result<()> {
         Command::Compare { target } => compare::run(&conn, target)?,
         Command::Run => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(server::run(conn, &config))?;
+            let config = Arc::new(config);
+            rt.block_on(server::run(conn, kv.clone(), config))?;
         }
     }
 
