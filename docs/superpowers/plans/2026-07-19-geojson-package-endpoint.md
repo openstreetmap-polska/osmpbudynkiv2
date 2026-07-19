@@ -1,0 +1,1772 @@
+# GeoJSON Data Package Endpoint Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add `GET/POST /package` to the HTTP server, returning a GeoJSON FeatureCollection of government-registry records missing from OSM in a requested area, with OSM-ready tags for direct JOSM import.
+
+**Architecture:** A new `src/server/package.rs` module holds everything: request parsing/validation, read-only per-request comparison queries (mirroring `src/compare/` semantics, scoped to the request area), OSM tag mapping, and axum handlers. Queries run on the read-only pool inside `spawn_blocking`, following the `tiles.rs` pattern. A new `[package]` config section provides the area cap.
+
+**Tech Stack:** Rust (edition 2024), axum 0.8, DuckDB spatial (bundled), serde_json (needs `raw_value` feature added), r2d2 pool, tower `oneshot` for handler tests.
+
+**Spec:** `docs/superpowers/specs/2026-07-19-geojson-package-endpoint-design.md`
+
+## Global Constraints
+
+- All `/package` database work MUST be pure `SELECT` — it runs on the read-only pool. No `CREATE`/`INSERT`/temp tables.
+- Matching semantics MUST mirror `src/compare/`: addresses match on `UPPER(TRIM(housenumber))` equality AND `ST_Distance_Sphere <= 50.0` meters; buildings match when an OSM building `ST_Contains` the source building's centroid. NULL housenumbers never match.
+- Address anti-join scan envelope is the request envelope expanded by `0.001` degrees (constant `MATCH_BUFFER_DEG`).
+- Config default: `package.max_area_sq_deg = 0.04`. The cap applies to the bounding-box area of the request geometry, for both GET and POST.
+- Tags: `source:addr` = `gugik.gov.pl`; buildings get exactly `building` = `yes` and `source:building` = `geoportal.gov.pl`. Empty/NULL columns are omitted, never emitted as empty tags.
+- Success responses: `Content-Type: application/geo+json`, `Content-Disposition: attachment; filename="package.geojson"`. Errors: JSON `{"error": "..."}` — `400` for validation, `500` (generic message, details logged) for query failures.
+- Datasets param: case-insensitive subset of `prg`, `bdot10k`, `egib`, `all` (union semantics); default all three; output order is always Prg, Bdot10k, Egib.
+- Envelope bounds (validated finite f64s) are formatted directly into SQL text — the established pattern in `src/compare/buildings.rs`. The user-supplied polygon is ALWAYS a bound parameter (and is itself a re-serialization of parsed JSON, never raw input).
+- Before every commit: `cargo fmt` and `cargo clippy --all-targets`. Until Task 6 wires the route, `dead_code` warnings for `package.rs` items are expected — ignore them, do NOT add `#[allow(dead_code)]`.
+- Commit messages end with the trailer: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
+
+## File Structure
+
+- **Modify `src/config.rs`** — add `PackageConfig` (one field: `max_area_sq_deg`) and a `package` field on `Config`.
+- **Modify `example_config.toml`** — document the `[package]` section.
+- **Create `src/server/package.rs`** — the whole endpoint: `Dataset`, `RequestArea`, parsing/validation, `AddressRow`, tag mapping, `Feature`/`FeatureCollection`, the two SQL query functions, handlers, and all unit + handler tests. (~450 lines with tests; comparable to `jobs/mod.rs`, fits the codebase's module style.)
+- **Modify `src/server/mod.rs`** — `mod package;`, `/package` route, `config` field on `AppState`.
+- **Modify `Cargo.toml`** — `serde_json` gains the `raw_value` feature.
+- **Modify `README.md`, `CLAUDE.md`** — roadmap tick, endpoint docs, stale-text fixes.
+
+---
+
+### Task 1: `[package]` config section
+
+**Files:**
+- Modify: `src/config.rs`
+- Modify: `example_config.toml`
+
+**Interfaces:**
+- Produces: `config.package.max_area_sq_deg: f64` (default `0.04`), used by Task 6's handlers via `AppState`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to the `tests` module at the bottom of `src/config.rs`:
+
+```rust
+    #[test]
+    fn test_package_config_defaults() {
+        let config = load_config(None).unwrap();
+        assert_eq!(config.package.max_area_sq_deg, 0.04);
+    }
+
+    #[test]
+    fn test_package_config_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[package]
+max_area_sq_deg = 0.1
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert_eq!(config.package.max_area_sq_deg, 0.1);
+    }
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test config::tests::test_package_config`
+Expected: compile error `no field 'package' on type 'Config'` (a compile failure is the red state in Rust TDD).
+
+- [ ] **Step 3: Implement the config struct**
+
+In `src/config.rs`, after the `JobsConfig` struct (around line 71), add:
+
+```rust
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct PackageConfig {
+    /// Maximum allowed area of a /package request bounding box, in square degrees.
+    pub max_area_sq_deg: f64,
+}
+
+impl Default for PackageConfig {
+    fn default() -> Self {
+        Self {
+            max_area_sq_deg: 0.04,
+        }
+    }
+}
+```
+
+Add the field to `Config` (after `pub jobs: JobsConfig,`):
+
+```rust
+    pub package: PackageConfig,
+```
+
+And to `impl Default for Config` (after `jobs: JobsConfig::default(),`):
+
+```rust
+            package: PackageConfig::default(),
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test config::tests`
+Expected: all config tests PASS (including the two new ones).
+
+- [ ] **Step 5: Document in example_config.toml**
+
+Append to the end of `example_config.toml`:
+
+```toml
+
+# GeoJSON data package endpoint (GET/POST /package, served by the `run` subcommand).
+[package]
+# Maximum allowed area of a request's bounding box, in square degrees.
+# 0.04 = 0.2° x 0.2° which is roughly 14 x 22 km in Poland.
+max_area_sq_deg = 0.04
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+cargo fmt && cargo clippy --all-targets
+git add src/config.rs example_config.toml
+git commit -m "feat: add [package] config section with max_area_sq_deg
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 2: Request parsing and validation (bbox, datasets, area cap)
+
+**Files:**
+- Create: `src/server/package.rs`
+- Modify: `src/server/mod.rs` (module declaration only)
+
+**Interfaces:**
+- Produces:
+  - `pub enum Dataset { Prg, Bdot10k, Egib }` and `pub const ALL_DATASETS: [Dataset; 3]`
+  - `pub struct RequestArea { pub min_lon: f64, pub min_lat: f64, pub max_lon: f64, pub max_lat: f64, pub polygon_geojson: String }` — `polygon_geojson` ALWAYS holds the exact request geometry as GeoJSON; for bbox requests it is the envelope itself as a Polygon, so later queries have a single code path.
+  - `pub fn parse_bbox(s: &str) -> Result<RequestArea, String>`
+  - `pub fn parse_datasets(s: Option<&str>) -> Result<Vec<Dataset>, String>`
+  - `pub fn check_area(area: &RequestArea, max_sq_deg: f64) -> Result<(), String>`
+
+- [ ] **Step 1: Declare the module**
+
+In `src/server/mod.rs`, after `pub mod jobs;` add:
+
+```rust
+mod package;
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `src/server/package.rs`:
+
+```rust
+//! GeoJSON data package endpoint: returns government-registry records missing
+//! from OSM within a requested area, tagged for direct JOSM import.
+//!
+//! See docs/superpowers/specs/2026-07-19-geojson-package-endpoint-design.md.
+//! Matching semantics mirror src/compare/ but run as pure SELECTs scoped to
+//! the request area, so they work on the read-only connection pool.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bbox_valid() {
+        let area = parse_bbox("20.9, 52.1,21.0,52.2").unwrap();
+        assert_eq!(area.min_lon, 20.9);
+        assert_eq!(area.min_lat, 52.1);
+        assert_eq!(area.max_lon, 21.0);
+        assert_eq!(area.max_lat, 52.2);
+        // The envelope is materialized as a GeoJSON Polygon for the query path.
+        assert!(area.polygon_geojson.contains("\"Polygon\""));
+        assert!(area.polygon_geojson.contains("20.9"));
+    }
+
+    #[test]
+    fn parse_bbox_rejects_wrong_count() {
+        assert!(parse_bbox("1,2,3").is_err());
+        assert!(parse_bbox("").is_err());
+        assert!(parse_bbox("1,2,3,4,5").is_err());
+    }
+
+    #[test]
+    fn parse_bbox_rejects_non_numeric_and_non_finite() {
+        assert!(parse_bbox("a,2,3,4").is_err());
+        assert!(parse_bbox("NaN,2,3,4").is_err());
+        assert!(parse_bbox("inf,2,3,4").is_err());
+    }
+
+    #[test]
+    fn parse_bbox_rejects_min_not_below_max() {
+        assert!(parse_bbox("21.0,52.1,20.9,52.2").is_err()); // min_lon >= max_lon
+        assert!(parse_bbox("20.9,52.2,21.0,52.1").is_err()); // min_lat >= max_lat
+        assert!(parse_bbox("20.9,52.1,20.9,52.2").is_err()); // equal lon
+    }
+
+    #[test]
+    fn parse_bbox_rejects_out_of_range() {
+        assert!(parse_bbox("-181,52.1,21.0,52.2").is_err());
+        assert!(parse_bbox("20.9,-91,21.0,52.2").is_err());
+        assert!(parse_bbox("20.9,52.1,181,52.2").is_err());
+    }
+
+    #[test]
+    fn parse_datasets_default_is_all() {
+        assert_eq!(parse_datasets(None).unwrap(), ALL_DATASETS.to_vec());
+        assert_eq!(parse_datasets(Some("  ")).unwrap(), ALL_DATASETS.to_vec());
+    }
+
+    #[test]
+    fn parse_datasets_subset_in_fixed_order() {
+        assert_eq!(parse_datasets(Some("prg")).unwrap(), vec![Dataset::Prg]);
+        // Input order does not matter; output order is always Prg, Bdot10k, Egib.
+        assert_eq!(
+            parse_datasets(Some("egib,prg")).unwrap(),
+            vec![Dataset::Prg, Dataset::Egib]
+        );
+    }
+
+    #[test]
+    fn parse_datasets_all_alias_and_case_insensitive() {
+        assert_eq!(parse_datasets(Some("ALL")).unwrap(), ALL_DATASETS.to_vec());
+        assert_eq!(parse_datasets(Some("all,prg")).unwrap(), ALL_DATASETS.to_vec());
+        assert_eq!(parse_datasets(Some("Bdot10K")).unwrap(), vec![Dataset::Bdot10k]);
+    }
+
+    #[test]
+    fn parse_datasets_rejects_unknown() {
+        let err = parse_datasets(Some("prg,foo")).unwrap_err();
+        assert!(err.contains("foo"));
+    }
+
+    #[test]
+    fn check_area_enforces_cap() {
+        // 0.1 x 0.2 = 0.02 square degrees; do not test the exact boundary
+        // (floating point) — only clearly-under and clearly-over.
+        let small = parse_bbox("20.9,52.0,21.0,52.2").unwrap();
+        assert!(check_area(&small, 0.04).is_ok());
+
+        let big = parse_bbox("14.0,49.0,25.0,55.0").unwrap();
+        let err = check_area(&big, 0.04).unwrap_err();
+        assert!(err.contains("exceeds"));
+    }
+}
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `cargo test server::package`
+Expected: compile errors — `cannot find function parse_bbox`, etc.
+
+- [ ] **Step 4: Implement parsing and validation**
+
+Insert above the `tests` module in `src/server/package.rs`:
+
+```rust
+/// Datasets that can be included in a package. Output order is fixed:
+/// Prg, Bdot10k, Egib.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dataset {
+    Prg,
+    Bdot10k,
+    Egib,
+}
+
+pub const ALL_DATASETS: [Dataset; 3] = [Dataset::Prg, Dataset::Bdot10k, Dataset::Egib];
+
+/// A validated request area. `polygon_geojson` always holds the exact request
+/// geometry as a GeoJSON string — for bbox (GET) requests it is the envelope
+/// itself as a Polygon — so the query layer has a single code path.
+#[derive(Clone, Debug)]
+pub struct RequestArea {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+    pub polygon_geojson: String,
+}
+
+impl RequestArea {
+    fn from_envelope(min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) -> Self {
+        let polygon_geojson = serde_json::json!({
+            "type": "Polygon",
+            "coordinates": [[
+                [min_lon, min_lat],
+                [max_lon, min_lat],
+                [max_lon, max_lat],
+                [min_lon, max_lat],
+                [min_lon, min_lat],
+            ]],
+        })
+        .to_string();
+        Self {
+            min_lon,
+            min_lat,
+            max_lon,
+            max_lat,
+            polygon_geojson,
+        }
+    }
+
+    fn bbox_area_sq_deg(&self) -> f64 {
+        (self.max_lon - self.min_lon) * (self.max_lat - self.min_lat)
+    }
+}
+
+pub fn parse_bbox(s: &str) -> Result<RequestArea, String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if parts.len() != 4 {
+        return Err(format!(
+            "bbox must be 4 comma-separated numbers (minLon,minLat,maxLon,maxLat), got {} values",
+            parts.len()
+        ));
+    }
+    let mut nums = [0f64; 4];
+    for (i, part) in parts.iter().enumerate() {
+        let n: f64 = part
+            .parse()
+            .map_err(|_| format!("bbox value '{part}' is not a number"))?;
+        if !n.is_finite() {
+            return Err(format!("bbox value '{part}' is not finite"));
+        }
+        nums[i] = n;
+    }
+    let [min_lon, min_lat, max_lon, max_lat] = nums;
+    if !(-180.0..=180.0).contains(&min_lon) || !(-180.0..=180.0).contains(&max_lon) {
+        return Err("bbox longitudes must be within -180..180".to_string());
+    }
+    if !(-90.0..=90.0).contains(&min_lat) || !(-90.0..=90.0).contains(&max_lat) {
+        return Err("bbox latitudes must be within -90..90".to_string());
+    }
+    if min_lon >= max_lon || min_lat >= max_lat {
+        return Err("bbox must satisfy minLon < maxLon and minLat < maxLat".to_string());
+    }
+    Ok(RequestArea::from_envelope(min_lon, min_lat, max_lon, max_lat))
+}
+
+pub fn parse_datasets(s: Option<&str>) -> Result<Vec<Dataset>, String> {
+    let s = match s {
+        None => return Ok(ALL_DATASETS.to_vec()),
+        Some(s) if s.trim().is_empty() => return Ok(ALL_DATASETS.to_vec()),
+        Some(s) => s,
+    };
+    let (mut prg, mut bdot10k, mut egib) = (false, false, false);
+    for name in s.split(',') {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "prg" => prg = true,
+            "bdot10k" => bdot10k = true,
+            "egib" => egib = true,
+            "all" => {
+                prg = true;
+                bdot10k = true;
+                egib = true;
+            }
+            other => {
+                return Err(format!(
+                    "unknown dataset '{other}' (expected prg, bdot10k, egib, or all)"
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if prg {
+        out.push(Dataset::Prg);
+    }
+    if bdot10k {
+        out.push(Dataset::Bdot10k);
+    }
+    if egib {
+        out.push(Dataset::Egib);
+    }
+    Ok(out)
+}
+
+pub fn check_area(area: &RequestArea, max_sq_deg: f64) -> Result<(), String> {
+    let a = area.bbox_area_sq_deg();
+    if a > max_sq_deg {
+        return Err(format!(
+            "requested area {a:.4} square degrees exceeds maximum {max_sq_deg} square degrees"
+        ));
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `cargo test server::package`
+Expected: all Task 2 tests PASS. (`dead_code` warnings are expected — the route isn't wired until Task 6.)
+
+- [ ] **Step 6: Commit**
+
+```bash
+cargo fmt && cargo clippy --all-targets
+git add src/server/package.rs src/server/mod.rs
+git commit -m "feat: package request parsing and validation (bbox, datasets, area cap)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 3: POST polygon body parsing
+
+**Files:**
+- Modify: `src/server/package.rs`
+- Test: same file, `tests` module
+
+**Interfaces:**
+- Consumes: `RequestArea` from Task 2.
+- Produces: `pub fn parse_polygon_body(body: &str) -> Result<RequestArea, String>` — accepts a GeoJSON `Polygon`/`MultiPolygon` geometry or a `Feature` wrapping one; the returned `polygon_geojson` is the re-serialized geometry object (never the raw input, never the Feature wrapper), and the envelope fields are its bounding box.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to the `tests` module in `src/server/package.rs`:
+
+```rust
+    #[test]
+    fn parse_polygon_body_polygon() {
+        let body = r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#;
+        let area = parse_polygon_body(body).unwrap();
+        assert_eq!(area.min_lon, 21.0);
+        assert_eq!(area.min_lat, 52.2);
+        assert_eq!(area.max_lon, 21.01);
+        assert_eq!(area.max_lat, 52.21);
+        assert!(area.polygon_geojson.contains("\"Polygon\""));
+    }
+
+    #[test]
+    fn parse_polygon_body_multipolygon() {
+        let body = r#"{"type":"MultiPolygon","coordinates":[[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]],[[[22.0,53.0],[22.01,53.0],[22.0,53.01],[22.0,53.0]]]]}"#;
+        let area = parse_polygon_body(body).unwrap();
+        // Envelope spans both polygons.
+        assert_eq!(area.min_lon, 21.0);
+        assert_eq!(area.max_lon, 22.01);
+        assert_eq!(area.max_lat, 53.01);
+    }
+
+    #[test]
+    fn parse_polygon_body_unwraps_feature() {
+        let body = r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}}"#;
+        let area = parse_polygon_body(body).unwrap();
+        assert_eq!(area.max_lon, 21.01);
+        // The stored geometry is the unwrapped Polygon, not the Feature.
+        assert!(!area.polygon_geojson.contains("Feature"));
+    }
+
+    #[test]
+    fn parse_polygon_body_rejects_bad_input() {
+        assert!(parse_polygon_body("not json").is_err());
+        assert!(parse_polygon_body(r#"{"type":"Point","coordinates":[21.0,52.2]}"#).is_err());
+        assert!(parse_polygon_body(r#"{"type":"Polygon"}"#).is_err()); // no coordinates
+        assert!(parse_polygon_body(r#"{"type":"Polygon","coordinates":[]}"#).is_err()); // empty
+        assert!(parse_polygon_body(r#"{"type":"Feature","properties":{}}"#).is_err()); // no geometry
+        // Out-of-range coordinate.
+        assert!(
+            parse_polygon_body(
+                r#"{"type":"Polygon","coordinates":[[[210.0,52.2],[21.01,52.2],[21.0,52.21],[210.0,52.2]]]}"#
+            )
+            .is_err()
+        );
+        // Degenerate: all points identical → zero-area envelope.
+        assert!(
+            parse_polygon_body(
+                r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.0,52.2],[21.0,52.2]]]}"#
+            )
+            .is_err()
+        );
+    }
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test server::package`
+Expected: compile error — `cannot find function parse_polygon_body`.
+
+- [ ] **Step 3: Implement polygon parsing**
+
+Add to `src/server/package.rs` (below `check_area`):
+
+```rust
+/// Parse a POST body as a GeoJSON Polygon/MultiPolygon geometry, optionally
+/// wrapped in a Feature. The returned area's `polygon_geojson` is the
+/// re-serialized geometry object and the envelope is its bounding box.
+pub fn parse_polygon_body(body: &str) -> Result<RequestArea, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    let geometry = match value.get("type").and_then(|t| t.as_str()) {
+        Some("Feature") => value
+            .get("geometry")
+            .filter(|g| !g.is_null())
+            .ok_or_else(|| "Feature has no geometry".to_string())?
+            .clone(),
+        _ => value,
+    };
+    match geometry.get("type").and_then(|t| t.as_str()) {
+        Some("Polygon") | Some("MultiPolygon") => {}
+        Some(other) => {
+            return Err(format!(
+                "geometry type must be Polygon or MultiPolygon, got '{other}'"
+            ));
+        }
+        None => return Err("body has no GeoJSON type".to_string()),
+    }
+    let coordinates = geometry
+        .get("coordinates")
+        .ok_or_else(|| "geometry has no coordinates".to_string())?;
+    let mut positions = Vec::new();
+    collect_positions(coordinates, &mut positions)?;
+    if positions.is_empty() {
+        return Err("geometry has no coordinate positions".to_string());
+    }
+    let (mut min_lon, mut min_lat) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_lon, mut max_lat) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (lon, lat) in &positions {
+        min_lon = min_lon.min(*lon);
+        min_lat = min_lat.min(*lat);
+        max_lon = max_lon.max(*lon);
+        max_lat = max_lat.max(*lat);
+    }
+    if min_lon >= max_lon || min_lat >= max_lat {
+        return Err("polygon envelope is degenerate (zero width or height)".to_string());
+    }
+    Ok(RequestArea {
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+        polygon_geojson: geometry.to_string(),
+    })
+}
+
+/// Recursively walk nested GeoJSON coordinate arrays, collecting
+/// (lon, lat) positions and validating each.
+fn collect_positions(v: &serde_json::Value, out: &mut Vec<(f64, f64)>) -> Result<(), String> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "coordinates must be arrays".to_string())?;
+    if arr.is_empty() {
+        return Ok(());
+    }
+    if arr[0].is_number() {
+        if arr.len() < 2 {
+            return Err("coordinate position must have at least 2 numbers".to_string());
+        }
+        let lon = arr[0]
+            .as_f64()
+            .ok_or_else(|| "invalid longitude".to_string())?;
+        let lat = arr[1]
+            .as_f64()
+            .ok_or_else(|| "invalid latitude".to_string())?;
+        if !lon.is_finite() || !lat.is_finite() {
+            return Err("coordinates must be finite numbers".to_string());
+        }
+        if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
+            return Err(format!("coordinate ({lon}, {lat}) out of lon/lat range"));
+        }
+        out.push((lon, lat));
+        return Ok(());
+    }
+    for item in arr {
+        collect_positions(item, out)?;
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test server::package`
+Expected: all tests PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cargo fmt && cargo clippy --all-targets
+git add src/server/package.rs
+git commit -m "feat: parse GeoJSON polygon bodies for POST /package
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 4: OSM tag mapping and GeoJSON feature assembly
+
+**Files:**
+- Modify: `Cargo.toml` (serde_json `raw_value` feature)
+- Modify: `src/server/package.rs`
+- Test: same file, `tests` module
+
+**Interfaces:**
+- Produces:
+  - `pub struct AddressRow { pub geometry_geojson: String, pub housenumber: Option<String>, pub street: Option<String>, pub city: Option<String>, pub postcode: Option<String>, pub simc: Option<String> }` — produced by Task 5's address query, consumed here.
+  - `pub fn address_tags(row: &AddressRow) -> BTreeMap<String, String>`
+  - `pub fn building_tags() -> BTreeMap<String, String>`
+  - `pub struct Feature` / `pub struct FeatureCollection` (serde `Serialize`; `kind` field renamed to `type`)
+  - `pub fn feature(geometry_geojson: String, properties: BTreeMap<String, String>) -> anyhow::Result<Feature>`
+
+- [ ] **Step 1: Enable serde_json raw_value**
+
+In `Cargo.toml`, change:
+
+```toml
+serde_json = "1"
+```
+
+to:
+
+```toml
+serde_json = { version = "1", features = ["raw_value"] }
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+Add to the `tests` module in `src/server/package.rs`:
+
+```rust
+    fn addr_row() -> AddressRow {
+        AddressRow {
+            geometry_geojson: r#"{"type":"Point","coordinates":[21.001,52.201]}"#.to_string(),
+            housenumber: Some(" 12A ".to_string()),
+            street: Some("Marszałkowska".to_string()),
+            city: Some("Warszawa".to_string()),
+            postcode: Some("00-590".to_string()),
+            simc: Some("0918123".to_string()),
+        }
+    }
+
+    #[test]
+    fn address_tags_with_street_uses_city() {
+        let tags = address_tags(&addr_row());
+        assert_eq!(tags.get("addr:housenumber").unwrap(), "12A"); // trimmed
+        assert_eq!(tags.get("addr:street").unwrap(), "Marszałkowska");
+        assert_eq!(tags.get("addr:city").unwrap(), "Warszawa");
+        assert_eq!(tags.get("addr:postcode").unwrap(), "00-590");
+        assert_eq!(tags.get("addr:city:simc").unwrap(), "0918123");
+        assert_eq!(tags.get("source:addr").unwrap(), "gugik.gov.pl");
+        assert!(!tags.contains_key("addr:place"));
+    }
+
+    #[test]
+    fn address_tags_without_street_uses_place() {
+        let mut row = addr_row();
+        row.street = None;
+        let tags = address_tags(&row);
+        assert_eq!(tags.get("addr:place").unwrap(), "Warszawa");
+        assert!(!tags.contains_key("addr:street"));
+        assert!(!tags.contains_key("addr:city"));
+    }
+
+    #[test]
+    fn address_tags_whitespace_street_treated_as_absent() {
+        let mut row = addr_row();
+        row.street = Some("   ".to_string());
+        let tags = address_tags(&row);
+        assert!(tags.contains_key("addr:place"));
+        assert!(!tags.contains_key("addr:street"));
+    }
+
+    #[test]
+    fn address_tags_omits_empty_optionals() {
+        let mut row = addr_row();
+        row.housenumber = None;
+        row.postcode = None;
+        row.simc = Some(String::new());
+        let tags = address_tags(&row);
+        assert!(!tags.contains_key("addr:housenumber"));
+        assert!(!tags.contains_key("addr:postcode"));
+        assert!(!tags.contains_key("addr:city:simc"));
+    }
+
+    #[test]
+    fn building_tags_are_fixed() {
+        let tags = building_tags();
+        assert_eq!(tags.get("building").unwrap(), "yes");
+        assert_eq!(tags.get("source:building").unwrap(), "geoportal.gov.pl");
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn feature_collection_serializes_valid_geojson() {
+        let f = feature(
+            r#"{"type":"Point","coordinates":[21.0,52.2]}"#.to_string(),
+            building_tags(),
+        )
+        .unwrap();
+        let fc = FeatureCollection {
+            kind: "FeatureCollection",
+            features: vec![f],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&fc).unwrap()).unwrap();
+        assert_eq!(json["type"], "FeatureCollection");
+        assert_eq!(json["features"][0]["type"], "Feature");
+        assert_eq!(json["features"][0]["geometry"]["type"], "Point");
+        assert_eq!(json["features"][0]["geometry"]["coordinates"][0], 21.0);
+        assert_eq!(json["features"][0]["properties"]["building"], "yes");
+    }
+
+    #[test]
+    fn feature_rejects_invalid_geometry_json() {
+        assert!(feature("not json".to_string(), building_tags()).is_err());
+    }
+
+    #[test]
+    fn empty_feature_collection_serializes() {
+        let fc = FeatureCollection {
+            kind: "FeatureCollection",
+            features: vec![],
+        };
+        assert_eq!(
+            serde_json::to_string(&fc).unwrap(),
+            r#"{"type":"FeatureCollection","features":[]}"#
+        );
+    }
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `cargo test server::package`
+Expected: compile errors — `cannot find struct AddressRow`, etc.
+
+- [ ] **Step 4: Implement tag mapping and feature types**
+
+Add at the top of `src/server/package.rs` (below the module doc comment):
+
+```rust
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+use serde_json::value::RawValue;
+```
+
+Add below `collect_positions`:
+
+```rust
+/// One unmatched PRG address row, as returned by the package address query.
+#[derive(Debug)]
+pub struct AddressRow {
+    pub geometry_geojson: String,
+    pub housenumber: Option<String>,
+    pub street: Option<String>,
+    pub city: Option<String>,
+    pub postcode: Option<String>,
+    pub simc: Option<String>,
+}
+
+const SOURCE_ADDR: &str = "gugik.gov.pl";
+const SOURCE_BUILDING: &str = "geoportal.gov.pl";
+
+fn non_empty(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Map a PRG address row to OSM tags following Polish community conventions:
+/// with a street the settlement goes to addr:city, without one to addr:place.
+pub fn address_tags(row: &AddressRow) -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    if let Some(hn) = non_empty(&row.housenumber) {
+        tags.insert("addr:housenumber".to_string(), hn.to_string());
+    }
+    if let Some(street) = non_empty(&row.street) {
+        tags.insert("addr:street".to_string(), street.to_string());
+        if let Some(city) = non_empty(&row.city) {
+            tags.insert("addr:city".to_string(), city.to_string());
+        }
+    } else if let Some(city) = non_empty(&row.city) {
+        tags.insert("addr:place".to_string(), city.to_string());
+    }
+    if let Some(postcode) = non_empty(&row.postcode) {
+        tags.insert("addr:postcode".to_string(), postcode.to_string());
+    }
+    if let Some(simc) = non_empty(&row.simc) {
+        tags.insert("addr:city:simc".to_string(), simc.to_string());
+    }
+    tags.insert("source:addr".to_string(), SOURCE_ADDR.to_string());
+    tags
+}
+
+/// Building type mapping from BDOT10k function codes is a separate roadmap
+/// item; packages currently emit a plain building=yes.
+pub fn building_tags() -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    tags.insert("building".to_string(), "yes".to_string());
+    tags.insert("source:building".to_string(), SOURCE_BUILDING.to_string());
+    tags
+}
+
+#[derive(Serialize)]
+pub struct Feature {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub geometry: Box<RawValue>,
+    pub properties: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+pub struct FeatureCollection {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub features: Vec<Feature>,
+}
+
+/// Build a Feature embedding the ST_AsGeoJSON output without re-parsing it
+/// into a serde_json::Value (RawValue still validates it is well-formed JSON).
+pub fn feature(
+    geometry_geojson: String,
+    properties: BTreeMap<String, String>,
+) -> anyhow::Result<Feature> {
+    Ok(Feature {
+        kind: "Feature",
+        geometry: RawValue::from_string(geometry_geojson)?,
+        properties,
+    })
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `cargo test server::package`
+Expected: all tests PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cargo fmt && cargo clippy --all-targets
+git add Cargo.toml Cargo.lock src/server/package.rs
+git commit -m "feat: OSM tag mapping and GeoJSON feature assembly for packages
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 5: Per-request comparison queries
+
+**Files:**
+- Modify: `src/server/package.rs`
+- Test: same file, `tests` module
+
+**Interfaces:**
+- Consumes: `RequestArea` (Task 2), `parse_bbox`/`parse_polygon_body` (Tasks 2–3), `AddressRow` (Task 4).
+- Produces:
+  - `pub fn unmatched_addresses(conn: &duckdb::Connection, area: &RequestArea) -> anyhow::Result<Vec<AddressRow>>`
+  - `pub fn unmatched_buildings(conn: &duckdb::Connection, source_table: &str, area: &RequestArea) -> anyhow::Result<Vec<String>>` — returns `ST_AsGeoJSON` geometry strings; called with `"bdot10k_buildings"` or `"egib_buildings"`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to the `tests` module in `src/server/package.rs`:
+
+```rust
+    use std::path::Path;
+
+    use crate::db::init_db;
+
+    /// In-memory DuckDB with spatial loaded; init_db creates osm_addresses
+    /// and osm_buildings, we add the government source tables (only the
+    /// columns the package queries touch).
+    fn setup_db() -> duckdb::Connection {
+        let init = vec![
+            "INSTALL spatial".to_string(),
+            "LOAD spatial".to_string(),
+            "SET geometry_always_xy = true".to_string(),
+        ];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 geom GEOMETRY);
+             CREATE TABLE bdot10k_buildings (lokalnyid VARCHAR, geom GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn test_area() -> RequestArea {
+        parse_bbox("21.0,52.2,21.01,52.21").unwrap()
+    }
+
+    #[test]
+    fn unmatched_addresses_excludes_matched_includes_unmatched() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // 'a1' has no OSM counterpart → candidate.
+            "INSERT INTO prg_addresses VALUES
+                 ('a1', '12', 'Długa', 'Warszawa', '00-263', '0918123', ST_Point(21.001, 52.201));
+             -- 'a2' matches OSM housenumber '7' about 22 m away → excluded.
+             INSERT INTO prg_addresses VALUES
+                 ('a2', '7', NULL, 'Zalesie', NULL, NULL, ST_Point(21.003, 52.203));
+             INSERT INTO osm_addresses VALUES
+                 (1, 'node', '7', NULL, NULL, NULL, ST_Point(21.003, 52.2032));",
+        )
+        .unwrap();
+
+        let rows = unmatched_addresses(&conn, &test_area()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.housenumber.as_deref(), Some("12"));
+        assert_eq!(row.street.as_deref(), Some("Długa"));
+        assert_eq!(row.city.as_deref(), Some("Warszawa"));
+        assert_eq!(row.postcode.as_deref(), Some("00-263"));
+        assert_eq!(row.simc.as_deref(), Some("0918123"));
+        assert!(row.geometry_geojson.contains("\"Point\""));
+    }
+
+    #[test]
+    fn unmatched_addresses_same_number_too_far_is_candidate() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // Same housenumber but ~220 m apart → no match → candidate.
+            "INSERT INTO prg_addresses VALUES
+                 ('a1', '12', NULL, 'Zalesie', NULL, NULL, ST_Point(21.005, 52.205));
+             INSERT INTO osm_addresses VALUES
+                 (1, 'node', '12', NULL, NULL, NULL, ST_Point(21.005, 52.207));",
+        )
+        .unwrap();
+
+        assert_eq!(unmatched_addresses(&conn, &test_area()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unmatched_addresses_osm_match_outside_bbox_still_suppresses() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // PRG inside the bbox; the matching OSM address sits just west of
+            // the bbox edge (lon 20.9998 < 21.0) about 27 m away. The buffered
+            // anti-join envelope must still find it → no candidate.
+            "INSERT INTO prg_addresses VALUES
+                 ('a1', '5', NULL, 'Zalesie', NULL, NULL, ST_Point(21.0002, 52.2002));
+             INSERT INTO osm_addresses VALUES
+                 (1, 'node', '5', NULL, NULL, NULL, ST_Point(20.9998, 52.2002));",
+        )
+        .unwrap();
+
+        assert_eq!(unmatched_addresses(&conn, &test_area()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn unmatched_addresses_respects_polygon_not_just_envelope() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // Both addresses are unmatched and inside the triangle's envelope,
+            // but only 'a1' is inside the triangle itself.
+            "INSERT INTO prg_addresses VALUES
+                 ('a1', '1', NULL, 'Zalesie', NULL, NULL, ST_Point(21.001, 52.201));
+             INSERT INTO prg_addresses VALUES
+                 ('a2', '2', NULL, 'Zalesie', NULL, NULL, ST_Point(21.008, 52.208));",
+        )
+        .unwrap();
+
+        let triangle = parse_polygon_body(
+            r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#,
+        )
+        .unwrap();
+        let rows = unmatched_addresses(&conn, &triangle).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].housenumber.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn unmatched_buildings_centroid_containment() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // 'b1' has no OSM building over its centroid → candidate.
+            "INSERT INTO bdot10k_buildings VALUES
+                 ('b1', ST_MakeEnvelope(21.0060, 52.2060, 21.0062, 52.2062));
+             -- 'b2' centroid is covered by an OSM building → excluded.
+             INSERT INTO bdot10k_buildings VALUES
+                 ('b2', ST_MakeEnvelope(21.0070, 52.2070, 21.0072, 52.2072));
+             INSERT INTO osm_buildings VALUES
+                 (10, 'way', 'yes', ST_MakeEnvelope(21.0069, 52.2069, 21.0073, 52.2073));",
+        )
+        .unwrap();
+
+        let geoms = unmatched_buildings(&conn, "bdot10k_buildings", &test_area()).unwrap();
+        assert_eq!(geoms.len(), 1);
+        assert!(geoms[0].contains("\"Polygon\""));
+    }
+
+    #[test]
+    fn unmatched_buildings_respects_polygon_via_centroid() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // Unmatched, centroid (21.0081, 52.2081) is inside the triangle's
+            // envelope but outside the triangle → excluded.
+            "INSERT INTO egib_buildings VALUES
+                 ('e1', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082));",
+        )
+        .unwrap();
+
+        let triangle = parse_polygon_body(
+            r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unmatched_buildings(&conn, "egib_buildings", &triangle)
+                .unwrap()
+                .len(),
+            0
+        );
+        // Sanity check: the plain bbox does include it.
+        assert_eq!(
+            unmatched_buildings(&conn, "egib_buildings", &test_area())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test server::package`
+Expected: compile errors — `cannot find function unmatched_addresses` / `unmatched_buildings`.
+
+- [ ] **Step 3: Implement the queries**
+
+Add near the top of `src/server/package.rs` (with the other `use` items):
+
+```rust
+use anyhow::{Context, Result};
+use duckdb::Connection;
+```
+
+Add below the feature-assembly code:
+
+```rust
+/// Envelope expansion for the OSM-address anti-join scan, in degrees.
+/// Must exceed the 50 m match distance at Polish latitudes (0.001° is
+/// ~111 m of latitude and ~68 m of longitude at 52°N) so that OSM
+/// addresses just outside the requested area still suppress candidates.
+const MATCH_BUFFER_DEG: f64 = 0.001;
+/// Same matching distance as compare::addresses.
+const MATCH_DISTANCE_METERS: f64 = 50.0;
+
+/// PRG addresses in the request area with no matching OSM address.
+/// Match rule mirrors compare::addresses: equal normalized housenumber
+/// within MATCH_DISTANCE_METERS; NULL housenumbers never match.
+pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<AddressRow>> {
+    let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
+    let (ex1, ey1) = (x1 - MATCH_BUFFER_DEG, y1 - MATCH_BUFFER_DEG);
+    let (ex2, ey2) = (x2 + MATCH_BUFFER_DEG, y2 + MATCH_BUFFER_DEG);
+    // Envelope bounds are validated finite f64s formatted into the SQL text
+    // (constant predicates enable R-tree index scans — same pattern as
+    // compare::buildings). The polygon stays a bound parameter.
+    let sql = format!(
+        "SELECT ST_AsGeoJSON(a.geom),
+                a.numer_porzadkowy,
+                a.ulica,
+                a.miejscowosc,
+                a.kod_pocztowy,
+                a.teryt_miejscowosc
+         FROM prg_addresses a
+         WHERE ST_Intersects(a.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+           AND ST_Intersects(a.geom, ST_GeomFromGeoJSON(?))
+           AND NOT EXISTS (
+               SELECT 1 FROM osm_addresses o
+               WHERE ST_Intersects(o.geom, ST_MakeEnvelope({ex1}, {ey1}, {ex2}, {ey2}))
+                 AND UPPER(TRIM(o.housenumber)) = UPPER(TRIM(a.numer_porzadkowy))
+                 AND ST_Distance_Sphere(o.geom, a.geom) <= {MATCH_DISTANCE_METERS}
+           )"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare package address query")?;
+    let rows = stmt
+        .query_map([area.polygon_geojson.as_str()], |row| {
+            Ok(AddressRow {
+                geometry_geojson: row.get(0)?,
+                housenumber: row.get(1)?,
+                street: row.get(2)?,
+                city: row.get(3)?,
+                postcode: row.get(4)?,
+                simc: row.get(5)?,
+            })
+        })
+        .context("Failed to run package address query")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("Failed to read package address row")?);
+    }
+    Ok(out)
+}
+
+/// Government buildings in the request area (by centroid) with no OSM
+/// building containing their centroid — mirrors compare::buildings.
+/// `source_table` is "bdot10k_buildings" or "egib_buildings" (a code-level
+/// constant, never user input). Returns ST_AsGeoJSON geometry strings.
+pub fn unmatched_buildings(
+    conn: &Connection,
+    source_table: &str,
+    area: &RequestArea,
+) -> Result<Vec<String>> {
+    let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
+    let sql = format!(
+        "SELECT ST_AsGeoJSON(b.geom)
+         FROM {source_table} b
+         WHERE ST_Intersects(b.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+           AND ST_Intersects(ST_Centroid(b.geom), ST_GeomFromGeoJSON(?))
+           AND NOT EXISTS (
+               SELECT 1 FROM osm_buildings osm
+               WHERE ST_Intersects(osm.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+                 AND ST_Contains(osm.geom, ST_Centroid(b.geom))
+           )"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .with_context(|| format!("Failed to prepare package building query for {source_table}"))?;
+    let rows = stmt
+        .query_map([area.polygon_geojson.as_str()], |row| row.get(0))
+        .with_context(|| format!("Failed to run package building query for {source_table}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.with_context(|| format!("Failed to read package building row from {source_table}"))?);
+    }
+    Ok(out)
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test server::package`
+Expected: all tests PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cargo fmt && cargo clippy --all-targets
+git add src/server/package.rs
+git commit -m "feat: read-only per-area comparison queries for packages
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 6: HTTP handlers, route wiring, AppState config
+
+**Files:**
+- Modify: `src/server/package.rs`
+- Modify: `src/server/mod.rs`
+- Test: `src/server/package.rs` `tests` module
+
+**Interfaces:**
+- Consumes: everything from Tasks 1–5; `AppState` from `server/mod.rs`; `JobRegistry::new_for_tests` for the test state.
+- Produces:
+  - `pub async fn get_package(State<AppState>, Query<PackageParams>) -> Response`
+  - `pub async fn post_package(State<AppState>, Query<PackageParams>, String) -> Response`
+  - `AppState` gains `pub config: Arc<AppConfig>`.
+  - Route `GET/POST /package` on the server router.
+
+- [ ] **Step 1: Add `config` to AppState (route comes in Step 4)**
+
+In `src/server/mod.rs`:
+
+1. Add to `AppState` (after `pub registry: Arc<jobs::JobRegistry>,`):
+
+```rust
+    pub config: Arc<AppConfig>,
+```
+
+2. In `run()`, add the field when constructing the state (`config` is already an `Arc<AppConfig>` in scope):
+
+```rust
+    let state = AppState {
+        write,
+        read_pool,
+        registry,
+        config: config.clone(),
+    };
+```
+
+3. In the `tests` module, fix `make_test_state` — add to the `AppState` literal:
+
+```rust
+            config: Arc::new(crate::config::Config::default()),
+```
+
+- [ ] **Step 2: Verify existing tests still compile and pass**
+
+Run: `cargo test server::`
+Expected: PASS — this validates the `AppState` change before any handler work.
+
+- [ ] **Step 3: Write the failing handler tests**
+
+Add to the `tests` module in `src/server/package.rs`:
+
+```rust
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::super::AppState;
+
+    /// Shared seed: an unmatched address with street tags, a matched address,
+    /// an unmatched + a matched BDOT10k building, an unmatched EGIB building.
+    /// Everything lives inside bbox 21.0,52.2,21.01,52.21.
+    const SEED: &str = "
+        CREATE TABLE prg_addresses (
+            lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+            miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+            geom GEOMETRY);
+        CREATE TABLE osm_addresses (
+            osm_id BIGINT, osm_type VARCHAR, housenumber VARCHAR, street VARCHAR,
+            city VARCHAR, postcode VARCHAR, geom GEOMETRY);
+        CREATE TABLE bdot10k_buildings (lokalnyid VARCHAR, geom GEOMETRY);
+        CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+        CREATE TABLE osm_buildings (
+            osm_id BIGINT, osm_type VARCHAR, building VARCHAR, geom GEOMETRY);
+
+        INSERT INTO prg_addresses VALUES
+            ('a1', '12', 'Marszałkowska', 'Warszawa', '00-590', '0918123',
+             ST_Point(21.001, 52.201));
+        INSERT INTO prg_addresses VALUES
+            ('a2', '7', NULL, 'Zalesie', NULL, NULL, ST_Point(21.003, 52.203));
+        INSERT INTO osm_addresses VALUES
+            (1, 'node', '7', NULL, NULL, NULL, ST_Point(21.003, 52.2032));
+        INSERT INTO bdot10k_buildings VALUES
+            ('b1', ST_MakeEnvelope(21.0060, 52.2060, 21.0062, 52.2062));
+        INSERT INTO bdot10k_buildings VALUES
+            ('b2', ST_MakeEnvelope(21.0070, 52.2070, 21.0072, 52.2072));
+        INSERT INTO osm_buildings VALUES
+            (10, 'way', 'yes', ST_MakeEnvelope(21.0069, 52.2069, 21.0073, 52.2073));
+        INSERT INTO egib_buildings VALUES
+            ('e1', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082));
+    ";
+
+    /// File-backed DB (the read pool requires a real file) seeded via a
+    /// writable connection, then opened read-only — like production.
+    fn make_seeded_state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("package_test.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
+                .unwrap();
+            conn.execute_batch(SEED).unwrap();
+        }
+        let read_cfg = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .unwrap();
+        let manager =
+            duckdb::DuckdbConnectionManager::file_with_flags(&db_path, read_cfg).unwrap();
+        let read_pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        read_pool
+            .get()
+            .unwrap()
+            .execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
+            .unwrap();
+        let state = AppState {
+            write: std::sync::Arc::new(std::sync::Mutex::new(
+                Connection::open_in_memory().unwrap(),
+            )),
+            read_pool,
+            registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(
+                vec![],
+            )),
+            config: std::sync::Arc::new(crate::config::Config::default()),
+        };
+        (state, dir)
+    }
+
+    fn package_app(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/package",
+                axum::routing::get(get_package).post(post_package),
+            )
+            .with_state(state)
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_package_returns_missing_features_with_tags() {
+        let (state, _dir) = make_seeded_state();
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/geo+json"
+        );
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"package.geojson\""
+        );
+
+        let json = body_json(response).await;
+        assert_eq!(json["type"], "FeatureCollection");
+        let features = json["features"].as_array().unwrap();
+        // a1 (unmatched address) + b1 (unmatched bdot10k) + e1 (unmatched egib);
+        // a2 and b2 are matched → excluded. Order: Prg, Bdot10k, Egib.
+        assert_eq!(features.len(), 3);
+        let addr = &features[0];
+        assert_eq!(addr["geometry"]["type"], "Point");
+        assert_eq!(addr["properties"]["addr:housenumber"], "12");
+        assert_eq!(addr["properties"]["addr:street"], "Marszałkowska");
+        assert_eq!(addr["properties"]["addr:city"], "Warszawa");
+        assert_eq!(addr["properties"]["addr:postcode"], "00-590");
+        assert_eq!(addr["properties"]["addr:city:simc"], "0918123");
+        assert_eq!(addr["properties"]["source:addr"], "gugik.gov.pl");
+        assert_eq!(features[1]["properties"]["building"], "yes");
+        assert_eq!(
+            features[1]["properties"]["source:building"],
+            "geoportal.gov.pl"
+        );
+        assert_eq!(features[2]["geometry"]["type"], "Polygon");
+    }
+
+    #[tokio::test]
+    async fn get_package_datasets_filter() {
+        let (state, _dir) = make_seeded_state();
+        let app = package_app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21&datasets=prg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(response).await;
+        assert_eq!(json["features"].as_array().unwrap().len(), 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21&datasets=bdot10k,egib")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(response).await;
+        assert_eq!(json["features"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_package_validation_errors() {
+        let (state, _dir) = make_seeded_state();
+        let app = package_app(state);
+
+        // Area over the 0.04 default cap.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=14,49,25,55")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert!(json["error"].as_str().unwrap().contains("exceeds"));
+
+        // Malformed bbox.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=1,2,3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        // Missing bbox.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        // Unknown dataset.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21&datasets=foo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_package_empty_area_returns_empty_collection() {
+        let (state, _dir) = make_seeded_state();
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=22.0,53.0,22.01,53.01")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["features"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn post_package_polygon_filters_exactly() {
+        let (state, _dir) = make_seeded_state();
+        // Triangle covering a1 but not b1/e1, although its envelope covers all.
+        let triangle = r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#;
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from(triangle))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json = body_json(response).await;
+        let features = json["features"].as_array().unwrap();
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0]["properties"]["addr:housenumber"], "12");
+    }
+
+    #[tokio::test]
+    async fn post_package_accepts_feature_wrapper() {
+        let (state, _dir) = make_seeded_state();
+        let body = r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}}"#;
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["features"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_package_rejects_bad_bodies() {
+        let (state, _dir) = make_seeded_state();
+        let app = package_app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from(r#"{"type":"Point","coordinates":[21.0,52.2]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+```
+
+- [ ] **Step 4: Run tests to verify they fail, then implement the handlers**
+
+Run: `cargo test server::package`
+Expected: compile errors — `cannot find function get_package` / `post_package`.
+
+Add near the top of `src/server/package.rs` (with the other `use` items):
+
+```rust
+use axum::extract::{Query, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+
+use super::AppState;
+```
+
+Add below the query functions:
+
+```rust
+#[derive(Debug, Deserialize)]
+pub struct PackageParams {
+    pub bbox: Option<String>,
+    pub datasets: Option<String>,
+}
+
+pub async fn get_package(
+    State(state): State<AppState>,
+    Query(params): Query<PackageParams>,
+) -> Response {
+    let bbox = match params.bbox.as_deref() {
+        Some(b) => b,
+        None => {
+            return error_response(StatusCode::BAD_REQUEST, "missing required parameter 'bbox'");
+        }
+    };
+    let area = match parse_bbox(bbox) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    let datasets = match parse_datasets(params.datasets.as_deref()) {
+        Ok(d) => d,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    serve_package(state, area, datasets).await
+}
+
+pub async fn post_package(
+    State(state): State<AppState>,
+    Query(params): Query<PackageParams>,
+    body: String,
+) -> Response {
+    let area = match parse_polygon_body(&body) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    let datasets = match parse_datasets(params.datasets.as_deref()) {
+        Ok(d) => d,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    serve_package(state, area, datasets).await
+}
+
+async fn serve_package(state: AppState, area: RequestArea, datasets: Vec<Dataset>) -> Response {
+    if let Err(e) = check_area(&area, state.config.package.max_area_sq_deg) {
+        return error_response(StatusCode::BAD_REQUEST, &e);
+    }
+    let result =
+        tokio::task::spawn_blocking(move || build_package(&state, &area, &datasets)).await;
+    match result {
+        Ok(Ok(body)) => {
+            let mut resp = body.into_response();
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/geo+json"),
+            );
+            resp.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"package.geojson\""),
+            );
+            resp
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "package query failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "package task panicked");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> Result<String> {
+    let conn = state
+        .read_pool
+        .get()
+        .context("Failed to acquire read connection")?;
+    let mut features = Vec::new();
+    for dataset in datasets {
+        match dataset {
+            Dataset::Prg => {
+                for row in unmatched_addresses(&conn, area)? {
+                    let properties = address_tags(&row);
+                    features.push(feature(row.geometry_geojson, properties)?);
+                }
+            }
+            Dataset::Bdot10k => {
+                for geometry in unmatched_buildings(&conn, "bdot10k_buildings", area)? {
+                    features.push(feature(geometry, building_tags())?);
+                }
+            }
+            Dataset::Egib => {
+                for geometry in unmatched_buildings(&conn, "egib_buildings", area)? {
+                    features.push(feature(geometry, building_tags())?);
+                }
+            }
+        }
+    }
+    let collection = FeatureCollection {
+        kind: "FeatureCollection",
+        features,
+    };
+    Ok(serde_json::to_string(&collection)?)
+}
+
+fn error_response(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({ "error": message }).to_string();
+    (
+        status,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+        body,
+    )
+        .into_response()
+}
+```
+
+Finally, register the route in `src/server/mod.rs`, after the `/status` route:
+
+```rust
+        .route(
+            "/package",
+            axum::routing::get(package::get_package).post(package::post_package),
+        )
+```
+
+- [ ] **Step 5: Run the full test suite**
+
+Run: `cargo test`
+Expected: everything PASSES, including the pre-existing server tests with the updated `make_test_state`. No remaining `dead_code` warnings for `package.rs`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cargo fmt && cargo clippy --all-targets
+git add src/server/package.rs src/server/mod.rs
+git commit -m "feat: GET/POST /package endpoint serving GeoJSON import packages
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 7: Documentation updates
+
+**Files:**
+- Modify: `README.md`
+- Modify: `CLAUDE.md`
+
+**Interfaces:** none (docs only).
+
+- [ ] **Step 1: Update the README roadmap**
+
+In `README.md`:
+
+1. In `## Implemented`, add after the vector-tile line:
+
+```markdown
+- [x] GeoJSON data package endpoint `GET/POST /package` — live comparison against current OSM data, OSM-ready tags for direct JOSM import (bbox in GET, polygon in POST)
+```
+
+2. In `## Not yet implemented`, remove the line:
+
+```markdown
+- [ ] GeoJSON data package download endpoint (bbox in GET / polygon in POST) — the core JOSM import deliverable
+```
+
+and add:
+
+```markdown
+- [ ] BDOT10k building-type mapping (function codes → `building=*` values; packages currently emit `building=yes`)
+```
+
+- [ ] **Step 2: Document the endpoint and config in the README**
+
+1. Replace the `### run — HTTP service (partially implemented)` section body:
+
+```markdown
+### run — HTTP service (partially implemented)
+
+```bash
+cargo run -- run
+```
+
+Currently serves:
+- `/health` — liveness check
+- `/status` — background job status as JSON
+- `/tiles/{z}/{x}/{y}` — Mapbox Vector Tiles (zoom 14 only)
+- `/package` — GeoJSON `FeatureCollection` of government-registry records missing
+  from OSM in the requested area, tagged for direct JOSM import. The comparison
+  runs live against the current OSM data. The request area (bounding box) is
+  capped by the `[package] max_area_sq_deg` config setting (default 0.04 sq deg).
+
+```bash
+# bbox: minLon,minLat,maxLon,maxLat; datasets: prg, bdot10k, egib, or all (default)
+curl 'http://127.0.0.1:3000/package?bbox=20.99,52.19,21.02,52.22&datasets=prg,bdot10k'
+
+# Or POST a GeoJSON Polygon/MultiPolygon for an exact area
+curl -X POST 'http://127.0.0.1:3000/package?datasets=all' \
+  -d '{"type":"Polygon","coordinates":[[[20.99,52.19],[21.02,52.19],[21.02,52.22],[20.99,52.19]]]}'
+```
+
+A periodic OSM update job runs in the background. A web map is planned — see the feature roadmap above.
+```
+
+2. In the `### Configuration` bullet list, add:
+
+```markdown
+- **`[package]`** — `/package` endpoint limits (`max_area_sq_deg`, default 0.04)
+```
+
+- [ ] **Step 3: Update CLAUDE.md**
+
+In `CLAUDE.md`, replace the stale `run` line in the CLI commands list:
+
+```markdown
+- `run` — HTTP service with background data updates (not yet implemented)
+```
+
+with:
+
+```markdown
+- `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package` GeoJSON import packages) with background OSM updates
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add README.md CLAUDE.md
+git commit -m "docs: document /package endpoint, update roadmap
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```

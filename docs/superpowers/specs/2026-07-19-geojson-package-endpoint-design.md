@@ -71,7 +71,7 @@ Empty or NULL columns are omitted entirely — never emitted as empty-valued tag
 
 - **New `src/server/package.rs`** containing:
   - Axum handlers `get_package` (query extractor) and `post_package` (JSON body).
-  - A `RequestArea` type holding the envelope `(min_lon, min_lat, max_lon, max_lat)` and an optional polygon GeoJSON string (present only for POST).
+  - A `RequestArea` type holding the envelope `(min_lon, min_lat, max_lon, max_lat)` and the request geometry as a GeoJSON string — for bbox (GET) requests this is the envelope itself as a Polygon, so the query layer has a single code path.
   - Pure, unit-testable parsing/validation functions: bbox parsing, datasets parsing, area-cap check, polygon parsing + envelope computation.
   - The three query functions returning row structs.
   - Tag-mapping functions (address row → properties map, building row → properties map).
