@@ -74,3 +74,9 @@ interval_seconds = 60
 # recorded as TimedOut and the cancel flag is set; the blocking task
 # is allowed to drain to keep DuckDB writes ordered.
 timeout_seconds = 600
+
+# GeoJSON data package endpoint (GET/POST /package, served by the `run` subcommand).
+[package]
+# Maximum allowed area of a request's bounding box, in square degrees.
+# 0.04 = 0.2° x 0.2° which is roughly 14 x 22 km in Poland.
+max_area_sq_deg = 0.04

@@ -44,6 +44,7 @@ pub struct Config {
     pub duckdb_init_commands: Vec<String>,
     pub download_urls: DownloadUrls,
     pub jobs: JobsConfig,
+    pub package: PackageConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -68,6 +69,21 @@ impl Default for JobConfig {
 #[serde(default)]
 pub struct JobsConfig {
     pub osm_update: JobConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct PackageConfig {
+    /// Maximum allowed area of a /package request bounding box, in square degrees.
+    pub max_area_sq_deg: f64,
+}
+
+impl Default for PackageConfig {
+    fn default() -> Self {
+        Self {
+            max_area_sq_deg: 0.04,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +118,7 @@ impl Default for Config {
             ],
             download_urls: DownloadUrls::default(),
             jobs: JobsConfig::default(),
+            package: PackageConfig::default(),
         }
     }
 }
@@ -346,6 +363,28 @@ interval_seconds = 120
         // defaults preserved
         assert!(config.jobs.osm_update.enabled);
         assert_eq!(config.jobs.osm_update.timeout_seconds, 600);
+    }
+
+    #[test]
+    fn test_package_config_defaults() {
+        let config = load_config(None).unwrap();
+        assert_eq!(config.package.max_area_sq_deg, 0.04);
+    }
+
+    #[test]
+    fn test_package_config_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[package]
+max_area_sq_deg = 0.1
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert_eq!(config.package.max_area_sq_deg, 0.1);
     }
 
     #[test]
