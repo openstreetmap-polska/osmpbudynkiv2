@@ -4,6 +4,38 @@ _ENG: Tool that prepares packages for JOSM (OpenStreetMap data editor) for easy 
 
 Narzędzie do porównywania uwolnionych danych państwowych (adresy, budynki) do danych OpenStreetMap (OSM) i przygotowywania paczek danych ułatwiających dodawanie i aktualizację danych w OSM. Kontynuacja (przepisanie na nowo) poprzedniej wersji: https://github.com/openstreetmap-polska/gugik2osm
 
+# Feature roadmap
+
+Current implementation status against the planned scope (see [`docs/project_ideas.md`](docs/project_ideas.md)):
+
+## Implemented
+
+- [x] CLI with TOML configuration (`--config`), built-in defaults, `RUST_LOG` override
+- [x] Storage layer: embedded DuckDB (geospatial/analytical queries) + RocksDB (raw OSM node coordinates and way/relation structure)
+- [x] `import osm` — Poland PBF extract (auto-download or local file)
+- [x] `import prg` — address registry ZIP parsed via [prg_convert](https://github.com/ttomasz/prg_convert/), with TERC dictionary support
+- [x] `import bdot10k` / `import egib` — building registries from GeoParquet (auto-download or local file)
+- [x] `update osm` — incremental updates from the minutely OSM replication feed
+- [x] `compare buildings` (BDOT10k, EGIB) — spatial matching of government buildings against OSM buildings
+- [x] `compare addresses` (PRG) — matching government addresses against OSM, producing import candidate tables
+- [x] `run` HTTP server basics: `/health`, `/status` (background job status), startup checks, graceful shutdown, read-only connection pool + single writer
+- [x] Background job scheduler with a periodic OSM update job (no overlapping runs, timeout handling)
+- [x] Vector tile endpoint `/tiles/{z}/{x}/{y}` (MVT; zoom 14 only, serving raw address and building layers)
+
+## Not yet implemented
+
+- [ ] `import full` — running all imports in one command (individual imports work)
+- [ ] `update prg` / `update bdot10k` / `update egib` — re-downloading government datasets
+- [ ] Background refresh jobs for government datasets (only the OSM update job exists)
+- [ ] GeoJSON data package download endpoint (bbox in GET / polygon in POST) — the core JOSM import deliverable
+- [ ] Serving comparison results via the API (tiles currently show raw datasets, not comparison output)
+- [ ] Vector tiles for lower zoom levels with aggregation/clustering (DBSCAN or H3) and tile caching
+- [ ] Web map frontend for browsing data status and downloading packages
+- [ ] Endpoint for reporting records to exclude (bad source data, comparison mismatches)
+- [ ] Random location endpoint (jump to an area with data to review)
+- [ ] Street name corrections for addresses to match the osm conventions
+- [ ] Mappings of building types in egib/bdot10k to osm tags
+
 ## Building
 
 Requires Rust toolchain (install via [rustup](https://rustup.rs/)). No external DuckDB or RocksDB installation needed — both are compiled from source as part of the build (first build takes a while due to C++ compilation).
@@ -50,7 +82,7 @@ All fields are optional — only specify what you want to override. Note that `d
 ### import — bulk-load data
 
 ```bash
-# Import everything (OSM, BDOT10k, EGIB, PRG) in sequence
+# Import everything (OSM, BDOT10k, EGIB, PRG) in sequence (not yet implemented)
 cargo run -- import full
 
 # Import OpenStreetMap data (downloads Poland PBF extract automatically)
@@ -80,19 +112,35 @@ cargo run -- import prg --file prg.zip
 # Update OSM data from minutely replication feed
 cargo run -- update osm
 
-# Update government datasets
+# Update government datasets (not yet implemented)
 cargo run -- update bdot10k
 cargo run -- update egib
 cargo run -- update prg
 ```
 
-### run — HTTP service (not yet implemented)
+### compare — compare government data against OSM
+
+```bash
+# Run every comparison
+cargo run -- compare full
+
+# Compare buildings (all sources, or just one)
+cargo run -- compare buildings
+cargo run -- compare buildings bdot10k
+cargo run -- compare buildings egib
+
+# Compare addresses
+cargo run -- compare addresses
+cargo run -- compare addresses prg
+```
+
+### run — HTTP service (partially implemented)
 
 ```bash
 cargo run -- run
 ```
 
-Will serve vector tiles, GeoJSON data packages, and a web map with background data updates.
+Currently serves `/health`, `/status` (background job status as JSON), and `/tiles/{z}/{x}/{y}` (Mapbox Vector Tiles, zoom 14 only), and runs a periodic OSM update job in the background. GeoJSON data packages and a web map are planned — see the feature roadmap above.
 
 ## Development
 
