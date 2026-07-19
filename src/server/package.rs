@@ -5,6 +5,11 @@
 //! Matching semantics mirror src/compare/ but run as pure SELECTs scoped to
 //! the request area, so they work on the read-only connection pool.
 
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+use serde_json::value::RawValue;
+
 /// Datasets that can be included in a package. Output order is fixed:
 /// Prg, Bdot10k, Egib.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +225,86 @@ fn collect_positions(v: &serde_json::Value, out: &mut Vec<(f64, f64)>) -> Result
     Ok(())
 }
 
+/// One unmatched PRG address row, as returned by the package address query.
+#[derive(Debug)]
+pub struct AddressRow {
+    pub geometry_geojson: String,
+    pub housenumber: Option<String>,
+    pub street: Option<String>,
+    pub city: Option<String>,
+    pub postcode: Option<String>,
+    pub simc: Option<String>,
+}
+
+const SOURCE_ADDR: &str = "gugik.gov.pl";
+const SOURCE_BUILDING: &str = "geoportal.gov.pl";
+
+fn non_empty(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Map a PRG address row to OSM tags following Polish community conventions:
+/// with a street the settlement goes to addr:city, without one to addr:place.
+pub fn address_tags(row: &AddressRow) -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    if let Some(hn) = non_empty(&row.housenumber) {
+        tags.insert("addr:housenumber".to_string(), hn.to_string());
+    }
+    if let Some(street) = non_empty(&row.street) {
+        tags.insert("addr:street".to_string(), street.to_string());
+        if let Some(city) = non_empty(&row.city) {
+            tags.insert("addr:city".to_string(), city.to_string());
+        }
+    } else if let Some(city) = non_empty(&row.city) {
+        tags.insert("addr:place".to_string(), city.to_string());
+    }
+    if let Some(postcode) = non_empty(&row.postcode) {
+        tags.insert("addr:postcode".to_string(), postcode.to_string());
+    }
+    if let Some(simc) = non_empty(&row.simc) {
+        tags.insert("addr:city:simc".to_string(), simc.to_string());
+    }
+    tags.insert("source:addr".to_string(), SOURCE_ADDR.to_string());
+    tags
+}
+
+/// Building type mapping from BDOT10k function codes is a separate roadmap
+/// item; packages currently emit a plain building=yes.
+pub fn building_tags() -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    tags.insert("building".to_string(), "yes".to_string());
+    tags.insert("source:building".to_string(), SOURCE_BUILDING.to_string());
+    tags
+}
+
+#[derive(Serialize)]
+pub struct Feature {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub geometry: Box<RawValue>,
+    pub properties: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+pub struct FeatureCollection {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub features: Vec<Feature>,
+}
+
+/// Build a Feature embedding the ST_AsGeoJSON output without re-parsing it
+/// into a serde_json::Value (RawValue still validates it is well-formed JSON).
+pub fn feature(
+    geometry_geojson: String,
+    properties: BTreeMap<String, String>,
+) -> anyhow::Result<Feature> {
+    Ok(Feature {
+        kind: "Feature",
+        geometry: RawValue::from_string(geometry_geojson)?,
+        properties,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +434,105 @@ mod tests {
                 r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.0,52.2],[21.0,52.2]]]}"#
             )
             .is_err()
+        );
+    }
+
+    fn addr_row() -> AddressRow {
+        AddressRow {
+            geometry_geojson: r#"{"type":"Point","coordinates":[21.001,52.201]}"#.to_string(),
+            housenumber: Some(" 12A ".to_string()),
+            street: Some("Marszałkowska".to_string()),
+            city: Some("Warszawa".to_string()),
+            postcode: Some("00-590".to_string()),
+            simc: Some("0918123".to_string()),
+        }
+    }
+
+    #[test]
+    fn address_tags_with_street_uses_city() {
+        let tags = address_tags(&addr_row());
+        assert_eq!(tags.get("addr:housenumber").unwrap(), "12A"); // trimmed
+        assert_eq!(tags.get("addr:street").unwrap(), "Marszałkowska");
+        assert_eq!(tags.get("addr:city").unwrap(), "Warszawa");
+        assert_eq!(tags.get("addr:postcode").unwrap(), "00-590");
+        assert_eq!(tags.get("addr:city:simc").unwrap(), "0918123");
+        assert_eq!(tags.get("source:addr").unwrap(), "gugik.gov.pl");
+        assert!(!tags.contains_key("addr:place"));
+    }
+
+    #[test]
+    fn address_tags_without_street_uses_place() {
+        let mut row = addr_row();
+        row.street = None;
+        let tags = address_tags(&row);
+        assert_eq!(tags.get("addr:place").unwrap(), "Warszawa");
+        assert!(!tags.contains_key("addr:street"));
+        assert!(!tags.contains_key("addr:city"));
+    }
+
+    #[test]
+    fn address_tags_whitespace_street_treated_as_absent() {
+        let mut row = addr_row();
+        row.street = Some("   ".to_string());
+        let tags = address_tags(&row);
+        assert!(tags.contains_key("addr:place"));
+        assert!(!tags.contains_key("addr:street"));
+    }
+
+    #[test]
+    fn address_tags_omits_empty_optionals() {
+        let mut row = addr_row();
+        row.housenumber = None;
+        row.postcode = None;
+        row.simc = Some(String::new());
+        let tags = address_tags(&row);
+        assert!(!tags.contains_key("addr:housenumber"));
+        assert!(!tags.contains_key("addr:postcode"));
+        assert!(!tags.contains_key("addr:city:simc"));
+    }
+
+    #[test]
+    fn building_tags_are_fixed() {
+        let tags = building_tags();
+        assert_eq!(tags.get("building").unwrap(), "yes");
+        assert_eq!(tags.get("source:building").unwrap(), "geoportal.gov.pl");
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn feature_collection_serializes_valid_geojson() {
+        let f = feature(
+            r#"{"type":"Point","coordinates":[21.0,52.2]}"#.to_string(),
+            building_tags(),
+        )
+        .unwrap();
+        let fc = FeatureCollection {
+            kind: "FeatureCollection",
+            features: vec![f],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&fc).unwrap()).unwrap();
+        assert_eq!(json["type"], "FeatureCollection");
+        assert_eq!(json["features"][0]["type"], "Feature");
+        assert_eq!(json["features"][0]["geometry"]["type"], "Point");
+        assert_eq!(json["features"][0]["geometry"]["coordinates"][0], 21.0);
+        assert_eq!(json["features"][0]["properties"]["building"], "yes");
+    }
+
+    #[test]
+    fn feature_rejects_invalid_geometry_json() {
+        assert!(feature("not json".to_string(), building_tags()).is_err());
+    }
+
+    #[test]
+    fn empty_feature_collection_serializes() {
+        let fc = FeatureCollection {
+            kind: "FeatureCollection",
+            features: vec![],
+        };
+        assert_eq!(
+            serde_json::to_string(&fc).unwrap(),
+            r#"{"type":"FeatureCollection","features":[]}"#
         );
     }
 
