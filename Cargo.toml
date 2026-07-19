@@ -11,8 +11,7 @@ ctrlc = { version = "3", features = ["termination"] }
 duckdb = { version = "1.10502.0", features = ["bundled", "vtab", "vtab-arrow", "vscalar", "r2d2"] }
 r2d2 = "0.8"
 flate2 = "1"
-geoarrow = "0.8.0"
-prg_convert = { git = "https://github.com/ttomasz/prg_convert", rev = "de879ab983690170e147aeb4069e0947e720977a", default-features = false }
+prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.7.0", default-features = false, features = ["download"] }
 quick-xml = "0.37"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream"], default-features = false }
 indicatif = "0.17"

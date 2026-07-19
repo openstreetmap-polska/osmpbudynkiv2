@@ -6,8 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;
 use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
-use prg_convert::common::SCHEMA_CSV;
-use prg_convert::{CRS, OutputFormat, get_address_parser_2021_zip, get_teryt_mapping};
+use prg_convert::{get_address_parser_2021_zip, get_teryt_mapping};
 use tracing::info;
 use zip::ZipArchive;
 
@@ -104,6 +103,7 @@ pub fn import(
         get_teryt_mapping(true, &Some(username), &Some(password), &None)
             .context("Failed to download TERC mapping from TERYT API")?
     };
+    let terc = Arc::new(terc);
     info!(
         entries = terc.len(),
         elapsed = %format_duration(t.elapsed()),
@@ -131,11 +131,6 @@ pub fn import(
     conn.execute_batch("DROP TABLE IF EXISTS prg_addresses_raw")
         .context("Failed to drop existing prg_addresses_raw")?;
 
-    // The PointType arg is only consumed by the GeoParquet output writer.
-    // We use OutputFormat::CSV so it never gets read, but the API still
-    // requires us to pass one.
-    let dummy_point_type = make_dummy_point_type();
-
     let t = std::time::Instant::now();
     let mut table_created = false;
     let mut total_rows: usize = 0;
@@ -149,12 +144,8 @@ pub fn import(
         let parser = get_address_parser_2021_zip(
             &mut archive,
             &2048, // STANDARD_VECTOR_SIZE; arrow vtab panics on larger batches
-            &OutputFormat::CSV,
             &terc,
             idx,
-            &CRS::Epsg4326,
-            SCHEMA_CSV.clone(),
-            &dummy_point_type,
         )
         .with_context(|| format!("Failed to build PRG 2021 parser for zip entry {idx}"))?;
 
@@ -250,15 +241,4 @@ fn collect_gml_indices(archive: &mut ZipArchive<File>) -> Result<Vec<usize>> {
         }
     }
     Ok(indices)
-}
-
-/// Construct a dummy PointType for the `geoarrow_geom_type` argument.
-/// Only the GeoParquet writer uses this; with `OutputFormat::CSV` it is
-/// unused, but the parser's constructor requires it.
-fn make_dummy_point_type() -> geoarrow::datatypes::PointType {
-    use geoarrow::datatypes::{Crs, Dimension, Metadata, PointType};
-    PointType::new(
-        Dimension::XY,
-        Arc::new(Metadata::new(Crs::from_srid("4326".to_string()), None)),
-    )
 }
