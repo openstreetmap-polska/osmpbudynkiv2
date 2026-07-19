@@ -135,6 +135,91 @@ pub fn check_area(area: &RequestArea, max_sq_deg: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse a POST body as a GeoJSON Polygon/MultiPolygon geometry, optionally
+/// wrapped in a Feature. The returned area's `polygon_geojson` is the
+/// re-serialized geometry object and the envelope is its bounding box.
+pub fn parse_polygon_body(body: &str) -> Result<RequestArea, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    let geometry = match value.get("type").and_then(|t| t.as_str()) {
+        Some("Feature") => value
+            .get("geometry")
+            .filter(|g| !g.is_null())
+            .ok_or_else(|| "Feature has no geometry".to_string())?
+            .clone(),
+        _ => value,
+    };
+    match geometry.get("type").and_then(|t| t.as_str()) {
+        Some("Polygon") | Some("MultiPolygon") => {}
+        Some(other) => {
+            return Err(format!(
+                "geometry type must be Polygon or MultiPolygon, got '{other}'"
+            ));
+        }
+        None => return Err("body has no GeoJSON type".to_string()),
+    }
+    let coordinates = geometry
+        .get("coordinates")
+        .ok_or_else(|| "geometry has no coordinates".to_string())?;
+    let mut positions = Vec::new();
+    collect_positions(coordinates, &mut positions)?;
+    if positions.is_empty() {
+        return Err("geometry has no coordinate positions".to_string());
+    }
+    let (mut min_lon, mut min_lat) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_lon, mut max_lat) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (lon, lat) in &positions {
+        min_lon = min_lon.min(*lon);
+        min_lat = min_lat.min(*lat);
+        max_lon = max_lon.max(*lon);
+        max_lat = max_lat.max(*lat);
+    }
+    if min_lon >= max_lon || min_lat >= max_lat {
+        return Err("polygon envelope is degenerate (zero width or height)".to_string());
+    }
+    Ok(RequestArea {
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+        polygon_geojson: geometry.to_string(),
+    })
+}
+
+/// Recursively walk nested GeoJSON coordinate arrays, collecting
+/// (lon, lat) positions and validating each.
+fn collect_positions(v: &serde_json::Value, out: &mut Vec<(f64, f64)>) -> Result<(), String> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "coordinates must be arrays".to_string())?;
+    if arr.is_empty() {
+        return Ok(());
+    }
+    if arr[0].is_number() {
+        if arr.len() < 2 {
+            return Err("coordinate position must have at least 2 numbers".to_string());
+        }
+        let lon = arr[0]
+            .as_f64()
+            .ok_or_else(|| "invalid longitude".to_string())?;
+        let lat = arr[1]
+            .as_f64()
+            .ok_or_else(|| "invalid latitude".to_string())?;
+        if !lon.is_finite() || !lat.is_finite() {
+            return Err("coordinates must be finite numbers".to_string());
+        }
+        if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
+            return Err(format!("coordinate ({lon}, {lat}) out of lon/lat range"));
+        }
+        out.push((lon, lat));
+        return Ok(());
+    }
+    for item in arr {
+        collect_positions(item, out)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +297,59 @@ mod tests {
     fn parse_datasets_rejects_unknown() {
         let err = parse_datasets(Some("prg,foo")).unwrap_err();
         assert!(err.contains("foo"));
+    }
+
+    #[test]
+    fn parse_polygon_body_polygon() {
+        let body = r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#;
+        let area = parse_polygon_body(body).unwrap();
+        assert_eq!(area.min_lon, 21.0);
+        assert_eq!(area.min_lat, 52.2);
+        assert_eq!(area.max_lon, 21.01);
+        assert_eq!(area.max_lat, 52.21);
+        assert!(area.polygon_geojson.contains("\"Polygon\""));
+    }
+
+    #[test]
+    fn parse_polygon_body_multipolygon() {
+        let body = r#"{"type":"MultiPolygon","coordinates":[[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]],[[[22.0,53.0],[22.01,53.0],[22.0,53.01],[22.0,53.0]]]]}"#;
+        let area = parse_polygon_body(body).unwrap();
+        // Envelope spans both polygons.
+        assert_eq!(area.min_lon, 21.0);
+        assert_eq!(area.max_lon, 22.01);
+        assert_eq!(area.max_lat, 53.01);
+    }
+
+    #[test]
+    fn parse_polygon_body_unwraps_feature() {
+        let body = r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}}"#;
+        let area = parse_polygon_body(body).unwrap();
+        assert_eq!(area.max_lon, 21.01);
+        // The stored geometry is the unwrapped Polygon, not the Feature.
+        assert!(!area.polygon_geojson.contains("Feature"));
+    }
+
+    #[test]
+    fn parse_polygon_body_rejects_bad_input() {
+        assert!(parse_polygon_body("not json").is_err());
+        assert!(parse_polygon_body(r#"{"type":"Point","coordinates":[21.0,52.2]}"#).is_err());
+        assert!(parse_polygon_body(r#"{"type":"Polygon"}"#).is_err()); // no coordinates
+        assert!(parse_polygon_body(r#"{"type":"Polygon","coordinates":[]}"#).is_err()); // empty
+        assert!(parse_polygon_body(r#"{"type":"Feature","properties":{}}"#).is_err()); // no geometry
+        // Out-of-range coordinate.
+        assert!(
+            parse_polygon_body(
+                r#"{"type":"Polygon","coordinates":[[[210.0,52.2],[21.01,52.2],[21.0,52.21],[210.0,52.2]]]}"#
+            )
+            .is_err()
+        );
+        // Degenerate: all points identical → zero-area envelope.
+        assert!(
+            parse_polygon_body(
+                r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.0,52.2],[21.0,52.2]]]}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
