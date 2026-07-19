@@ -108,10 +108,7 @@ async fn do_download(client: &reqwest::Client, url: &str, dest_path: &Path) -> R
     };
     pb.set_message(format!(
         "Downloading {}",
-        dest_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
+        dest_path.file_name().unwrap_or_default().to_string_lossy()
     ));
 
     let file = std::fs::File::create(dest_path)
@@ -133,10 +130,7 @@ async fn do_download(client: &reqwest::Client, url: &str, dest_path: &Path) -> R
 
     pb.finish_with_message(format!(
         "Downloaded {}",
-        dest_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
+        dest_path.file_name().unwrap_or_default().to_string_lossy()
     ));
     info!(path = %dest_path.display(), "Download complete");
     Ok(())

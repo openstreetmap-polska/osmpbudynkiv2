@@ -165,7 +165,10 @@ pub fn get_node(db: &RocksDB, node_id: i64) -> Result<Option<(f64, f64)>> {
 /// Returns `Ok(None)` if *any* node is missing (callers treat missing refs
 /// as "cannot build geometry").
 pub fn multi_get_nodes_concat(db: &RocksDB, node_ids: &[i64]) -> Result<Option<Vec<u8>>> {
-    let keys: Vec<[u8; 8]> = node_ids.iter().map(|id| encoding::encode_key(*id)).collect();
+    let keys: Vec<[u8; 8]> = node_ids
+        .iter()
+        .map(|id| encoding::encode_key(*id))
+        .collect();
     let handle = cf(db, CF_NODES);
     let results = db.batched_multi_get_cf(&handle, &keys, false);
     let mut out: Vec<u8> = Vec::with_capacity(node_ids.len() * encoding::NODE_BYTE_LEN);

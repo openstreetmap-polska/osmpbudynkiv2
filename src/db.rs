@@ -2,8 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use duckdb::{Config, Connection};
 use duckdb::vtab::arrow::ArrowVTab;
+use duckdb::{Config, Connection};
 
 use crate::osm::kvstore::RocksDB;
 use crate::osm::udf;
@@ -13,8 +13,13 @@ pub fn init_db(
     init_commands: &[String],
     kv: Option<Arc<RocksDB>>,
 ) -> Result<Connection> {
-    let conn =
-        Connection::open_with_flags(path, Config::default().with("storage_compatibility_version", "latest").unwrap()).with_context(|| format!("Failed to open database at {path:?}"))?;
+    let conn = Connection::open_with_flags(
+        path,
+        Config::default()
+            .with("storage_compatibility_version", "latest")
+            .unwrap(),
+    )
+    .with_context(|| format!("Failed to open database at {path:?}"))?;
 
     conn.register_table_function::<ArrowVTab>("arrow")
         .context("Failed to register arrow vtab")?;

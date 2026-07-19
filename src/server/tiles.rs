@@ -52,7 +52,10 @@ pub async fn serve_tile(
     let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = state.read_pool.get().context("Failed to acquire read connection")?;
+        let conn = state
+            .read_pool
+            .get()
+            .context("Failed to acquire read connection")?;
         let bbox = duckdb::params![min_lon, min_lat, max_lon, max_lat];
         let addresses = query_mvt_layer(&conn, ADDRESSES_MVT_SQL, bbox)?;
         let buildings = query_mvt_layer(&conn, BUILDINGS_MVT_SQL, bbox)?;

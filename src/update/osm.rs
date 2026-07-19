@@ -44,7 +44,14 @@ pub fn update(
             return Ok(());
         }
 
-        apply_sequence(conn, kv, seq, replication_base_url, &download_dir, &latest_timestamp)?;
+        apply_sequence(
+            conn,
+            kv,
+            seq,
+            replication_base_url,
+            &download_dir,
+            &latest_timestamp,
+        )?;
 
         if (seq - current_seq) % 100 == 0 {
             info!(
@@ -74,10 +81,7 @@ fn get_current_sequence(conn: &Connection) -> Result<u64> {
     }
 }
 
-fn fetch_latest_sequence(
-    replication_base_url: &str,
-    download_dir: &Path,
-) -> Result<(u64, String)> {
+fn fetch_latest_sequence(replication_base_url: &str, download_dir: &Path) -> Result<(u64, String)> {
     let url = format!("{replication_base_url}/state.txt");
     let state_path = download_file(&url, download_dir)?;
     let text = std::fs::read_to_string(&state_path).context("Failed to read state.txt")?;
