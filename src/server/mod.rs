@@ -42,10 +42,21 @@ pub async fn run(
     let write = Arc::new(Mutex::new(conn));
 
     let osm_cfg = jobs::JobConfigResolved::from(&config.jobs.osm_update);
-    let job_list: Vec<(Arc<dyn jobs::Job>, jobs::JobConfigResolved)> = vec![(
-        Arc::new(jobs::osm_update::OsmUpdateJob) as Arc<dyn jobs::Job>,
-        osm_cfg,
-    )];
+    let export_prune_cfg = jobs::JobConfigResolved {
+        enabled: config.jobs.export_log_prune.enabled,
+        interval: std::time::Duration::from_secs(config.jobs.export_log_prune.interval_seconds),
+        timeout: std::time::Duration::from_secs(config.jobs.export_log_prune.timeout_seconds),
+    };
+    let job_list: Vec<(Arc<dyn jobs::Job>, jobs::JobConfigResolved)> = vec![
+        (
+            Arc::new(jobs::osm_update::OsmUpdateJob) as Arc<dyn jobs::Job>,
+            osm_cfg,
+        ),
+        (
+            Arc::new(jobs::export_log_prune::ExportLogPruneJob) as Arc<dyn jobs::Job>,
+            export_prune_cfg,
+        ),
+    ];
     let scheduler = jobs::Scheduler::start(job_list, write.clone(), kv, config.clone());
     let registry = scheduler.registry.clone();
     let shutdown_notify = scheduler.shutdown_notify();
