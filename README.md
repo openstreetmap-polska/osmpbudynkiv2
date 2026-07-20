@@ -21,13 +21,13 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] `run` HTTP server basics: `/health`, `/status` (background job status), startup checks, graceful shutdown, read-only connection pool + single writer
 - [x] Background job scheduler with a periodic OSM update job (no overlapping runs, timeout handling)
 - [x] Vector tile endpoint `/tiles/{z}/{x}/{y}` (MVT; zoom 14 only, serving raw address and building layers)
+- [x] GeoJSON data package endpoint `GET/POST /package` — live comparison against current OSM data, OSM-ready tags for direct JOSM import (bbox in GET, polygon in POST)
 
 ## Not yet implemented
 
 - [ ] `import full` — running all imports in one command (individual imports work)
 - [ ] `update prg` / `update bdot10k` / `update egib` — re-downloading government datasets
 - [ ] Background refresh jobs for government datasets (only the OSM update job exists)
-- [ ] GeoJSON data package download endpoint (bbox in GET / polygon in POST) — the core JOSM import deliverable
 - [ ] Serving comparison results via the API (tiles currently show raw datasets, not comparison output)
 - [ ] Vector tiles for lower zoom levels with aggregation/clustering (DBSCAN or H3) and tile caching
 - [ ] Web map frontend for browsing data status and downloading packages
@@ -74,6 +74,7 @@ The config file controls:
 - **`download_dir`** — directory for downloaded files (default: system temp directory; files are cleaned up after processing)
 - **`duckdb_init_commands`** — SQL statements run on database initialization
 - **`download_urls`** — URLs for downloading data sources
+- **`[package]`** — `/package` endpoint limits (`max_area_sq_deg`, default 0.04)
 
 All fields are optional — only specify what you want to override. Note that `duckdb_init_commands` is fully replaced if specified (not merged with defaults).
 
@@ -140,7 +141,25 @@ cargo run -- compare addresses prg
 cargo run -- run
 ```
 
-Currently serves `/health`, `/status` (background job status as JSON), and `/tiles/{z}/{x}/{y}` (Mapbox Vector Tiles, zoom 14 only), and runs a periodic OSM update job in the background. GeoJSON data packages and a web map are planned — see the feature roadmap above.
+Currently serves:
+- `/health` — liveness check
+- `/status` — background job status as JSON
+- `/tiles/{z}/{x}/{y}` — Mapbox Vector Tiles (zoom 14 only)
+- `/package` — GeoJSON `FeatureCollection` of government-registry records missing
+  from OSM in the requested area, tagged for direct JOSM import. The comparison
+  runs live against the current OSM data. The request area (bounding box) is
+  capped by the `[package] max_area_sq_deg` config setting (default 0.04 sq deg).
+
+```bash
+# bbox: minLon,minLat,maxLon,maxLat; datasets: prg, bdot10k, egib, or all (default)
+curl 'http://127.0.0.1:3000/package?bbox=20.99,52.19,21.02,52.22&datasets=prg,bdot10k'
+
+# Or POST a GeoJSON Polygon/MultiPolygon for an exact area
+curl -X POST 'http://127.0.0.1:3000/package?datasets=all' \
+  -d '{"type":"Polygon","coordinates":[[[20.99,52.19],[21.02,52.19],[21.02,52.22],[20.99,52.19]]]}'
+```
+
+A periodic OSM update job runs in the background. A web map is planned — see the feature roadmap above.
 
 ## Development
 
