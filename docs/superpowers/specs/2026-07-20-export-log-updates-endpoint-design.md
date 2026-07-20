@@ -14,6 +14,7 @@ These were confirmed by direct testing against the project's own bundled DuckDB 
 - **`LIST` types (`VARCHAR[]`) cannot be bound as query parameters** in this version of the Rust `duckdb` crate — binding a `duckdb::types::Value::List` panics with "not implemented" (`value_ref.rs`). Consequently:
   - Writing a list column requires inlining a SQL list literal (e.g. `['prg','bdot10k']`) directly into the statement text. This is safe here because the values are drawn from the closed 3-variant `Dataset` enum, never raw request text — the same trust boundary already used for inlining `source_table` names in `src/compare/buildings.rs`.
   - Reading a list column back works via SQL-side `to_json(column)`, which returns a ready JSON-array string (e.g. `["prg","bdot10k"]`) that can be embedded directly as a `RawValue`, exactly like the `/package` endpoint already embeds `ST_AsGeoJSON` output.
+- **`AppState.read_pool` never observes writes made by `AppState.write` while the server keeps running** — a separately-opened, long-lived `Connection` in DuckDB does not see another connection's commits, not even after `CHECKPOINT`; see `docs/duckdb_connection_visibility_investigation.md` for the full investigation and root cause. This is a pre-existing issue (it already affects `/tiles` and `/package`'s reads of OSM data) and is **out of scope to fix here**. The only consequence for this feature: `/updates` cannot use `read_pool` — see below.
 
 ## Data model: `package_exports` table
 
@@ -109,7 +110,7 @@ pub struct ExportLogPruneConfig {
   default_minutes = 60
   max_minutes = 1440
   ```
-- **Query** (read pool, same pattern as `/package`/`/tiles`):
+- **Query runs via `state.write` (locked briefly), not `read_pool`.** Because `read_pool` never observes writes made through `write` while the server is running (see the DuckDB findings above), reading `package_exports` through it would always return empty. `/updates` instead locks `state.write`, runs the `SELECT`, and releases the lock — same connection the export-log insert and the retention job already use. This is a narrow, scoped workaround for this one endpoint; it does not touch `read_pool` or fix `/tiles`/`/package`'s pre-existing staleness.
   ```sql
   SELECT ST_AsGeoJSON(area),
          strftime(exported_at AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ'),
