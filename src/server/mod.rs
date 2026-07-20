@@ -27,6 +27,7 @@ pub struct AppState {
     pub write: Arc<Mutex<Connection>>,
     pub read_pool: Pool<DuckdbConnectionManager>,
     pub registry: Arc<jobs::JobRegistry>,
+    pub config: Arc<AppConfig>,
 }
 
 pub async fn run(
@@ -53,6 +54,7 @@ pub async fn run(
         write,
         read_pool,
         registry,
+        config: config.clone(),
     };
 
     let app = Router::new()
@@ -62,6 +64,10 @@ pub async fn run(
             axum::routing::get(jobs::status_handler::get_status),
         )
         .route("/tiles/{z}/{x}/{y}", axum::routing::get(tiles::serve_tile))
+        .route(
+            "/package",
+            axum::routing::get(package::get_package).post(package::post_package),
+        )
         .with_state(state);
 
     let listener = TcpListener::bind(&config.http_listen_addr).await?;
@@ -197,6 +203,7 @@ mod tests {
             write: Arc::new(StdMutex::new(conn)),
             read_pool,
             registry: Arc::new(JobRegistry::new_for_tests(initial)),
+            config: Arc::new(crate::config::Config::default()),
         };
         (state, dir)
     }

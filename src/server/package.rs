@@ -8,9 +8,14 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
+use axum::extract::{Query, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use duckdb::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+
+use super::AppState;
 
 /// Datasets that can be included in a package. Output order is fixed:
 /// Prg, Bdot10k, Egib.
@@ -402,6 +407,124 @@ pub fn unmatched_buildings(
     Ok(out)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PackageParams {
+    pub bbox: Option<String>,
+    pub datasets: Option<String>,
+}
+
+pub async fn get_package(
+    State(state): State<AppState>,
+    Query(params): Query<PackageParams>,
+) -> Response {
+    let bbox = match params.bbox.as_deref() {
+        Some(b) => b,
+        None => {
+            return error_response(StatusCode::BAD_REQUEST, "missing required parameter 'bbox'");
+        }
+    };
+    let area = match parse_bbox(bbox) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    let datasets = match parse_datasets(params.datasets.as_deref()) {
+        Ok(d) => d,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    serve_package(state, area, datasets).await
+}
+
+pub async fn post_package(
+    State(state): State<AppState>,
+    Query(params): Query<PackageParams>,
+    body: String,
+) -> Response {
+    let area = match parse_polygon_body(&body) {
+        Ok(a) => a,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    let datasets = match parse_datasets(params.datasets.as_deref()) {
+        Ok(d) => d,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    serve_package(state, area, datasets).await
+}
+
+async fn serve_package(state: AppState, area: RequestArea, datasets: Vec<Dataset>) -> Response {
+    if let Err(e) = check_area(&area, state.config.package.max_area_sq_deg) {
+        return error_response(StatusCode::BAD_REQUEST, &e);
+    }
+    let result = tokio::task::spawn_blocking(move || build_package(&state, &area, &datasets)).await;
+    match result {
+        Ok(Ok(body)) => {
+            let mut resp = body.into_response();
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/geo+json"),
+            );
+            resp.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"package.geojson\""),
+            );
+            resp
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "package query failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "package task panicked");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> Result<String> {
+    let conn = state
+        .read_pool
+        .get()
+        .context("Failed to acquire read connection")?;
+    let mut features = Vec::new();
+    for dataset in datasets {
+        match dataset {
+            Dataset::Prg => {
+                for row in unmatched_addresses(&conn, area)? {
+                    let properties = address_tags(&row);
+                    features.push(feature(row.geometry_geojson, properties)?);
+                }
+            }
+            Dataset::Bdot10k => {
+                for geometry in unmatched_buildings(&conn, "bdot10k_buildings", area)? {
+                    features.push(feature(geometry, building_tags())?);
+                }
+            }
+            Dataset::Egib => {
+                for geometry in unmatched_buildings(&conn, "egib_buildings", area)? {
+                    features.push(feature(geometry, building_tags())?);
+                }
+            }
+        }
+    }
+    let collection = FeatureCollection {
+        kind: "FeatureCollection",
+        features,
+    };
+    Ok(serde_json::to_string(&collection)?)
+}
+
+fn error_response(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({ "error": message }).to_string();
+    (
+        status,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        body,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -533,6 +656,312 @@ mod tests {
         let geoms = unmatched_buildings(&conn, "bdot10k_buildings", &test_area()).unwrap();
         assert_eq!(geoms.len(), 1);
         assert!(geoms[0].contains("\"Polygon\""));
+    }
+
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::super::AppState;
+
+    /// Shared seed: an unmatched address with street tags, a matched address,
+    /// an unmatched + a matched BDOT10k building, an unmatched EGIB building.
+    /// Everything lives inside bbox 21.0,52.2,21.01,52.21.
+    const SEED: &str = "
+        CREATE TABLE prg_addresses (
+            lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+            miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+            geom GEOMETRY);
+        CREATE TABLE osm_addresses (
+            osm_id BIGINT, osm_type VARCHAR, housenumber VARCHAR, street VARCHAR,
+            city VARCHAR, postcode VARCHAR, geom GEOMETRY);
+        CREATE TABLE bdot10k_buildings (lokalnyid VARCHAR, geom GEOMETRY);
+        CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+        CREATE TABLE osm_buildings (
+            osm_id BIGINT, osm_type VARCHAR, building VARCHAR, geom GEOMETRY);
+
+        INSERT INTO prg_addresses VALUES
+            ('a1', '12', 'Marszałkowska', 'Warszawa', '00-590', '0918123',
+             ST_Point(21.001, 52.201));
+        INSERT INTO prg_addresses VALUES
+            ('a2', '7', NULL, 'Zalesie', NULL, NULL, ST_Point(21.003, 52.203));
+        INSERT INTO osm_addresses VALUES
+            (1, 'node', '7', NULL, NULL, NULL, ST_Point(21.003, 52.2032));
+        INSERT INTO bdot10k_buildings VALUES
+            ('b1', ST_MakeEnvelope(21.0060, 52.2060, 21.0062, 52.2062));
+        INSERT INTO bdot10k_buildings VALUES
+            ('b2', ST_MakeEnvelope(21.0070, 52.2070, 21.0072, 52.2072));
+        INSERT INTO osm_buildings VALUES
+            (10, 'way', 'yes', ST_MakeEnvelope(21.0069, 52.2069, 21.0073, 52.2073));
+        INSERT INTO egib_buildings VALUES
+            ('e1', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082));
+    ";
+
+    /// File-backed DB (the read pool requires a real file) seeded via a
+    /// writable connection, then opened read-only — like production.
+    fn make_seeded_state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("package_test.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
+                .unwrap();
+            conn.execute_batch(SEED).unwrap();
+        }
+        let read_cfg = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .unwrap();
+        let manager = duckdb::DuckdbConnectionManager::file_with_flags(&db_path, read_cfg).unwrap();
+        let read_pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        read_pool
+            .get()
+            .unwrap()
+            .execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
+            .unwrap();
+        let state = AppState {
+            write: std::sync::Arc::new(std::sync::Mutex::new(
+                Connection::open_in_memory().unwrap(),
+            )),
+            read_pool,
+            registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
+            config: std::sync::Arc::new(crate::config::Config::default()),
+        };
+        (state, dir)
+    }
+
+    fn package_app(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/package",
+                axum::routing::get(get_package).post(post_package),
+            )
+            .with_state(state)
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_package_returns_missing_features_with_tags() {
+        let (state, _dir) = make_seeded_state();
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/geo+json");
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"package.geojson\""
+        );
+
+        let json = body_json(response).await;
+        assert_eq!(json["type"], "FeatureCollection");
+        let features = json["features"].as_array().unwrap();
+        // a1 (unmatched address) + b1 (unmatched bdot10k) + e1 (unmatched egib);
+        // a2 and b2 are matched → excluded. Order: Prg, Bdot10k, Egib.
+        assert_eq!(features.len(), 3);
+        let addr = &features[0];
+        assert_eq!(addr["geometry"]["type"], "Point");
+        assert_eq!(addr["properties"]["addr:housenumber"], "12");
+        assert_eq!(addr["properties"]["addr:street"], "Marszałkowska");
+        assert_eq!(addr["properties"]["addr:city"], "Warszawa");
+        assert_eq!(addr["properties"]["addr:postcode"], "00-590");
+        assert_eq!(addr["properties"]["addr:city:simc"], "0918123");
+        assert_eq!(addr["properties"]["source:addr"], "gugik.gov.pl");
+        assert_eq!(features[1]["properties"]["building"], "yes");
+        assert_eq!(
+            features[1]["properties"]["source:building"],
+            "geoportal.gov.pl"
+        );
+        assert_eq!(features[2]["geometry"]["type"], "Polygon");
+    }
+
+    #[tokio::test]
+    async fn get_package_datasets_filter() {
+        let (state, _dir) = make_seeded_state();
+        let app = package_app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21&datasets=prg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(response).await;
+        assert_eq!(json["features"].as_array().unwrap().len(), 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21&datasets=bdot10k,egib")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(response).await;
+        assert_eq!(json["features"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_package_validation_errors() {
+        let (state, _dir) = make_seeded_state();
+        let app = package_app(state);
+
+        // Area over the 0.04 default cap.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=14,49,25,55")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert!(json["error"].as_str().unwrap().contains("exceeds"));
+
+        // Malformed bbox.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=1,2,3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        // Missing bbox.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        // Unknown dataset.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21&datasets=foo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_package_empty_area_returns_empty_collection() {
+        let (state, _dir) = make_seeded_state();
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=22.0,53.0,22.01,53.01")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["features"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn post_package_polygon_filters_exactly() {
+        let (state, _dir) = make_seeded_state();
+        // Triangle covering a1 but not b1/e1, although its envelope covers all.
+        let triangle = r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#;
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from(triangle))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json = body_json(response).await;
+        let features = json["features"].as_array().unwrap();
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0]["properties"]["addr:housenumber"], "12");
+    }
+
+    #[tokio::test]
+    async fn post_package_accepts_feature_wrapper() {
+        let (state, _dir) = make_seeded_state();
+        let body = r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}}"#;
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["features"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_package_rejects_bad_bodies() {
+        let (state, _dir) = make_seeded_state();
+        let app = package_app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from(r#"{"type":"Point","coordinates":[21.0,52.2]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
