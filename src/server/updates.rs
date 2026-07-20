@@ -6,6 +6,9 @@
 //! state.write (not state.read_pool) -- read_pool never observes writes made
 //! through write while the server is running.
 
+// Not yet wired into a handler — the GET /updates route and its use of this
+// function land in the next task.
+#[allow(dead_code)]
 pub fn parse_minutes(
     s: Option<&str>,
     default_minutes: u64,
