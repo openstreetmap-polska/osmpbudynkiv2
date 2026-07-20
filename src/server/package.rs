@@ -784,8 +784,8 @@ mod tests {
         write_conn
             .execute_batch(
                 "CREATE TABLE package_exports (
-                    exported_at TIMESTAMP,
-                    area GEOMETRY,
+                    exported_at TIMESTAMP WITH TIME ZONE,
+                    area GEOMETRY('epsg:4326'),
                     datasets VARCHAR[],
                     address_count INTEGER,
                     building_count INTEGER
