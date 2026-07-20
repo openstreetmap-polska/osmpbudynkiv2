@@ -7,6 +7,8 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::{Context, Result};
+use duckdb::Connection;
 use serde::Serialize;
 use serde_json::value::RawValue;
 
@@ -305,9 +307,263 @@ pub fn feature(
     })
 }
 
+/// Envelope expansion for the OSM-address anti-join scan, in degrees.
+/// Must exceed the 50 m match distance at Polish latitudes (0.001° is
+/// ~111 m of latitude and ~68 m of longitude at 52°N) so that OSM
+/// addresses just outside the requested area still suppress candidates.
+const MATCH_BUFFER_DEG: f64 = 0.001;
+/// Same matching distance as compare::addresses.
+const MATCH_DISTANCE_METERS: f64 = 50.0;
+
+/// PRG addresses in the request area with no matching OSM address.
+/// Match rule mirrors compare::addresses: equal normalized housenumber
+/// within MATCH_DISTANCE_METERS; NULL housenumbers never match.
+pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<AddressRow>> {
+    let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
+    let (ex1, ey1) = (x1 - MATCH_BUFFER_DEG, y1 - MATCH_BUFFER_DEG);
+    let (ex2, ey2) = (x2 + MATCH_BUFFER_DEG, y2 + MATCH_BUFFER_DEG);
+    // Envelope bounds are validated finite f64s formatted into the SQL text
+    // (constant predicates enable R-tree index scans — same pattern as
+    // compare::buildings). The polygon stays a bound parameter.
+    let sql = format!(
+        "SELECT ST_AsGeoJSON(a.geom),
+                a.numer_porzadkowy,
+                a.ulica,
+                a.miejscowosc,
+                a.kod_pocztowy,
+                a.teryt_miejscowosc
+         FROM prg_addresses a
+         WHERE ST_Intersects(a.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+           AND ST_Intersects(a.geom, ST_GeomFromGeoJSON(?))
+           AND NOT EXISTS (
+               SELECT 1 FROM osm_addresses o
+               WHERE ST_Intersects(o.geom, ST_MakeEnvelope({ex1}, {ey1}, {ex2}, {ey2}))
+                 AND UPPER(TRIM(o.housenumber)) = UPPER(TRIM(a.numer_porzadkowy))
+                 AND ST_Distance_Sphere(o.geom, a.geom) <= {MATCH_DISTANCE_METERS}
+           )"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare package address query")?;
+    let rows = stmt
+        .query_map([area.polygon_geojson.as_str()], |row| {
+            Ok(AddressRow {
+                geometry_geojson: row.get(0)?,
+                housenumber: row.get(1)?,
+                street: row.get(2)?,
+                city: row.get(3)?,
+                postcode: row.get(4)?,
+                simc: row.get(5)?,
+            })
+        })
+        .context("Failed to run package address query")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("Failed to read package address row")?);
+    }
+    Ok(out)
+}
+
+/// Government buildings in the request area (by centroid) with no OSM
+/// building containing their centroid — mirrors compare::buildings.
+/// `source_table` is "bdot10k_buildings" or "egib_buildings" (a code-level
+/// constant, never user input). Returns ST_AsGeoJSON geometry strings.
+pub fn unmatched_buildings(
+    conn: &Connection,
+    source_table: &str,
+    area: &RequestArea,
+) -> Result<Vec<String>> {
+    let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
+    let sql = format!(
+        "SELECT ST_AsGeoJSON(b.geom)
+         FROM {source_table} b
+         WHERE ST_Intersects(b.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+           AND ST_Intersects(ST_Centroid(b.geom), ST_GeomFromGeoJSON(?))
+           AND NOT EXISTS (
+               SELECT 1 FROM osm_buildings osm
+               WHERE ST_Intersects(osm.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+                 AND ST_Contains(osm.geom, ST_Centroid(b.geom))
+           )"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .with_context(|| format!("Failed to prepare package building query for {source_table}"))?;
+    let rows = stmt
+        .query_map([area.polygon_geojson.as_str()], |row| row.get(0))
+        .with_context(|| format!("Failed to run package building query for {source_table}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(
+            row.with_context(|| {
+                format!("Failed to read package building row from {source_table}")
+            })?,
+        );
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::db::init_db;
+
+    /// In-memory DuckDB with spatial loaded; init_db creates osm_addresses
+    /// and osm_buildings, we add the government source tables (only the
+    /// columns the package queries touch).
+    fn setup_db() -> duckdb::Connection {
+        let init = vec![
+            "INSTALL spatial".to_string(),
+            "LOAD spatial".to_string(),
+            "SET geometry_always_xy = true".to_string(),
+        ];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 geom GEOMETRY);
+             CREATE TABLE bdot10k_buildings (lokalnyid VARCHAR, geom GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn test_area() -> RequestArea {
+        parse_bbox("21.0,52.2,21.01,52.21").unwrap()
+    }
+
+    #[test]
+    fn unmatched_addresses_excludes_matched_includes_unmatched() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // 'a1' has no OSM counterpart → candidate.
+            "INSERT INTO prg_addresses VALUES
+                 ('a1', '12', 'Długa', 'Warszawa', '00-263', '0918123', ST_Point(21.001, 52.201));
+             -- 'a2' matches OSM housenumber '7' about 22 m away → excluded.
+             INSERT INTO prg_addresses VALUES
+                 ('a2', '7', NULL, 'Zalesie', NULL, NULL, ST_Point(21.003, 52.203));
+             INSERT INTO osm_addresses VALUES
+                 (1, 'node', '7', NULL, NULL, NULL, ST_Point(21.003, 52.2032));",
+        )
+        .unwrap();
+
+        let rows = unmatched_addresses(&conn, &test_area()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.housenumber.as_deref(), Some("12"));
+        assert_eq!(row.street.as_deref(), Some("Długa"));
+        assert_eq!(row.city.as_deref(), Some("Warszawa"));
+        assert_eq!(row.postcode.as_deref(), Some("00-263"));
+        assert_eq!(row.simc.as_deref(), Some("0918123"));
+        assert!(row.geometry_geojson.contains("\"Point\""));
+    }
+
+    #[test]
+    fn unmatched_addresses_same_number_too_far_is_candidate() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // Same housenumber but ~220 m apart → no match → candidate.
+            "INSERT INTO prg_addresses VALUES
+                 ('a1', '12', NULL, 'Zalesie', NULL, NULL, ST_Point(21.005, 52.205));
+             INSERT INTO osm_addresses VALUES
+                 (1, 'node', '12', NULL, NULL, NULL, ST_Point(21.005, 52.207));",
+        )
+        .unwrap();
+
+        assert_eq!(unmatched_addresses(&conn, &test_area()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unmatched_addresses_osm_match_outside_bbox_still_suppresses() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // PRG inside the bbox; the matching OSM address sits just west of
+            // the bbox edge (lon 20.9998 < 21.0) about 27 m away. The buffered
+            // anti-join envelope must still find it → no candidate.
+            "INSERT INTO prg_addresses VALUES
+                 ('a1', '5', NULL, 'Zalesie', NULL, NULL, ST_Point(21.0002, 52.2002));
+             INSERT INTO osm_addresses VALUES
+                 (1, 'node', '5', NULL, NULL, NULL, ST_Point(20.9998, 52.2002));",
+        )
+        .unwrap();
+
+        assert_eq!(unmatched_addresses(&conn, &test_area()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn unmatched_addresses_respects_polygon_not_just_envelope() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // Both addresses are unmatched and inside the triangle's envelope,
+            // but only 'a1' is inside the triangle itself.
+            "INSERT INTO prg_addresses VALUES
+                 ('a1', '1', NULL, 'Zalesie', NULL, NULL, ST_Point(21.001, 52.201));
+             INSERT INTO prg_addresses VALUES
+                 ('a2', '2', NULL, 'Zalesie', NULL, NULL, ST_Point(21.008, 52.208));",
+        )
+        .unwrap();
+
+        let triangle = parse_polygon_body(
+            r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#,
+        )
+        .unwrap();
+        let rows = unmatched_addresses(&conn, &triangle).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].housenumber.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn unmatched_buildings_centroid_containment() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // 'b1' has no OSM building over its centroid → candidate.
+            "INSERT INTO bdot10k_buildings VALUES
+                 ('b1', ST_MakeEnvelope(21.0060, 52.2060, 21.0062, 52.2062));
+             -- 'b2' centroid is covered by an OSM building → excluded.
+             INSERT INTO bdot10k_buildings VALUES
+                 ('b2', ST_MakeEnvelope(21.0070, 52.2070, 21.0072, 52.2072));
+             INSERT INTO osm_buildings VALUES
+                 (10, 'way', 'yes', ST_MakeEnvelope(21.0069, 52.2069, 21.0073, 52.2073));",
+        )
+        .unwrap();
+
+        let geoms = unmatched_buildings(&conn, "bdot10k_buildings", &test_area()).unwrap();
+        assert_eq!(geoms.len(), 1);
+        assert!(geoms[0].contains("\"Polygon\""));
+    }
+
+    #[test]
+    fn unmatched_buildings_respects_polygon_via_centroid() {
+        let conn = setup_db();
+        conn.execute_batch(
+            // Unmatched, centroid (21.0081, 52.2081) is inside the triangle's
+            // envelope but outside the triangle → excluded.
+            "INSERT INTO egib_buildings VALUES
+                 ('e1', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082));",
+        )
+        .unwrap();
+
+        let triangle = parse_polygon_body(
+            r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unmatched_buildings(&conn, "egib_buildings", &triangle)
+                .unwrap()
+                .len(),
+            0
+        );
+        // Sanity check: the plain bbox does include it.
+        assert_eq!(
+            unmatched_buildings(&conn, "egib_buildings", &test_area())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn parse_bbox_valid() {
