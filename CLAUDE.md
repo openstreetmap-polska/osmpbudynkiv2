@@ -29,7 +29,7 @@ Note: Both `duckdb` and `rocksdb` dependencies use bundled C++ compilation, so n
 - `import <source>` — bulk-load data (OSM from PBF, PRG addresses from ZIP via `--file <ZIP> --terc-file <TERC>`, BDOT10k/EGIB buildings from GeoParquet)
 - `update <source>` — apply incremental updates (OSM minutely replication, re-download gov datasets)
 - `compare <target>` — compare government data against OSM. Targets: `buildings` (optionally `bdot10k`, `egib`, or `all` — default runs all), `addresses` (optionally `prg` or `all` — default runs all), `full` (runs every comparison)
-- `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package` GeoJSON import packages) with background OSM updates
+- `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package` GeoJSON import packages, `/updates` recent export activity) with background OSM updates and export log pruning
 
 **Storage:**
 - **DuckDB** — main analytical database for geospatial queries, stores processed OSM data and government datasets

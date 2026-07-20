@@ -22,6 +22,7 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] Background job scheduler with a periodic OSM update job (no overlapping runs, timeout handling)
 - [x] Vector tile endpoint `/tiles/{z}/{x}/{y}` (MVT; zoom 14 only, serving raw address and building layers)
 - [x] GeoJSON data package endpoint `GET/POST /package` — live comparison against current OSM data, OSM-ready tags for direct JOSM import (bbox in GET, polygon in POST)
+- [x] `GET /updates` — recent `/package` export activity as a GeoJSON `FeatureCollection`, browser-cacheable for 60 seconds (`?minutes=`, default 60, capped at 1440)
 
 ## Not yet implemented
 
@@ -75,6 +76,7 @@ The config file controls:
 - **`duckdb_init_commands`** — SQL statements run on database initialization
 - **`download_urls`** — URLs for downloading data sources
 - **`[package]`** — `/package` endpoint limits (`max_area_sq_deg`, default 0.04)
+- **`[updates]`** — `/updates` time window limits (`default_minutes`, `max_minutes`)
 
 All fields are optional — only specify what you want to override. Note that `duckdb_init_commands` is fully replaced if specified (not merged with defaults).
 
@@ -149,6 +151,7 @@ Currently serves:
   from OSM in the requested area, tagged for direct JOSM import. The comparison
   runs live against the current OSM data. The request area (bounding box) is
   capped by the `[package] max_area_sq_deg` config setting (default 0.04 sq deg).
+- `/updates` — recent `/package` export activity (timestamp, area, datasets, feature counts) as GeoJSON, `Cache-Control: public, max-age=60`. A background job prunes entries older than `[jobs.export_log_prune] retention_days` (default 365).
 
 ```bash
 # bbox: minLon,minLat,maxLon,maxLat; datasets: prg, bdot10k, egib, or all (default)
@@ -157,6 +160,10 @@ curl 'http://127.0.0.1:3000/package?bbox=20.99,52.19,21.02,52.22&datasets=prg,bd
 # Or POST a GeoJSON Polygon/MultiPolygon for an exact area
 curl -X POST 'http://127.0.0.1:3000/package?datasets=all' \
   -d '{"type":"Polygon","coordinates":[[[20.99,52.19],[21.02,52.19],[21.02,52.22],[20.99,52.19]]]}'
+
+# Recent export activity (default: last 60 minutes)
+curl 'http://127.0.0.1:3000/updates'
+curl 'http://127.0.0.1:3000/updates?minutes=1440'
 ```
 
 A periodic OSM update job runs in the background. A web map is planned — see the feature roadmap above.
