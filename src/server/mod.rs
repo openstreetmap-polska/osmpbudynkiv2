@@ -80,6 +80,7 @@ pub async fn run(
             "/package",
             axum::routing::get(package::get_package).post(package::post_package),
         )
+        .route("/updates", axum::routing::get(updates::get_updates))
         .with_state(state);
 
     let listener = TcpListener::bind(&config.http_listen_addr).await?;
