@@ -45,6 +45,7 @@ pub struct Config {
     pub download_urls: DownloadUrls,
     pub jobs: JobsConfig,
     pub package: PackageConfig,
+    pub updates: UpdatesConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -65,10 +66,48 @@ impl Default for JobConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ExportLogPruneConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    /// How long package_exports rows are kept before being pruned.
+    pub retention_days: u64,
+}
+
+impl Default for ExportLogPruneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 86400,
+            timeout_seconds: 60,
+            retention_days: 365,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    pub default_minutes: u64,
+    pub max_minutes: u64,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            default_minutes: 60,
+            max_minutes: 1440,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct JobsConfig {
     pub osm_update: JobConfig,
+    pub export_log_prune: ExportLogPruneConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -110,6 +149,8 @@ impl Default for Config {
             duckdb_init_commands: vec![
                 "INSTALL spatial".to_string(),
                 "LOAD spatial".to_string(),
+                "INSTALL icu".to_string(),
+                "LOAD icu".to_string(),
                 "SET preserve_insertion_order = false".to_string(),
                 "SET geometry_always_xy = true".to_string(),
                 "SET temp_directory = './osmpbudynkiv2.duckdb.tmp'".to_string(),
@@ -119,6 +160,7 @@ impl Default for Config {
             download_urls: DownloadUrls::default(),
             jobs: JobsConfig::default(),
             package: PackageConfig::default(),
+            updates: UpdatesConfig::default(),
         }
     }
 }
@@ -178,7 +220,7 @@ mod tests {
         assert_eq!(config.log_level, "info");
         assert!(config.download_dir.is_none());
         assert_eq!(config.download_dir(), std::env::temp_dir());
-        assert_eq!(config.duckdb_init_commands.len(), 7);
+        assert_eq!(config.duckdb_init_commands.len(), 9);
         assert_eq!(
             config.download_urls.osm_pbf,
             "https://download.openstreetmap.fr/extracts/europe/poland-latest.osm.pbf"
@@ -198,7 +240,7 @@ mod tests {
         assert_eq!(config.db_path, "/custom/path.duckdb");
         // Other fields should be defaults
         assert_eq!(config.log_level, "info");
-        assert_eq!(config.duckdb_init_commands.len(), 7);
+        assert_eq!(config.duckdb_init_commands.len(), 9);
     }
 
     #[test]
@@ -385,6 +427,62 @@ max_area_sq_deg = 0.1
 
         let config = load_config(Some(tmp.path())).unwrap();
         assert_eq!(config.package.max_area_sq_deg, 0.1);
+    }
+
+    #[test]
+    fn test_export_log_prune_config_defaults() {
+        let config = load_config(None).unwrap();
+        assert!(config.jobs.export_log_prune.enabled);
+        assert_eq!(config.jobs.export_log_prune.interval_seconds, 86400);
+        assert_eq!(config.jobs.export_log_prune.timeout_seconds, 60);
+        assert_eq!(config.jobs.export_log_prune.retention_days, 365);
+    }
+
+    #[test]
+    fn test_export_log_prune_config_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[jobs.export_log_prune]
+enabled = false
+interval_seconds = 3600
+timeout_seconds = 30
+retention_days = 30
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert!(!config.jobs.export_log_prune.enabled);
+        assert_eq!(config.jobs.export_log_prune.interval_seconds, 3600);
+        assert_eq!(config.jobs.export_log_prune.timeout_seconds, 30);
+        assert_eq!(config.jobs.export_log_prune.retention_days, 30);
+    }
+
+    #[test]
+    fn test_updates_config_defaults() {
+        let config = load_config(None).unwrap();
+        assert_eq!(config.updates.default_minutes, 60);
+        assert_eq!(config.updates.max_minutes, 1440);
+    }
+
+    #[test]
+    fn test_updates_config_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[updates]
+default_minutes = 30
+max_minutes = 720
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert_eq!(config.updates.default_minutes, 30);
+        assert_eq!(config.updates.max_minutes, 720);
     }
 
     #[test]

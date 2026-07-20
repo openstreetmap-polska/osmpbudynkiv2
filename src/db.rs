@@ -63,6 +63,18 @@ fn create_schema(conn: &Connection) -> Result<()> {
             building VARCHAR,
             geom GEOMETRY
         );
+
+        -- Export log for the /package endpoint (see GET /updates). Requires
+        -- the spatial extension to already be loaded (via duckdb_init_commands)
+        -- before this runs, since GEOMETRY('epsg:4326') needs spatial to
+        -- resolve the CRS string -- unlike the bare GEOMETRY columns above.
+        CREATE TABLE IF NOT EXISTS package_exports (
+            exported_at TIMESTAMP WITH TIME ZONE,
+            area GEOMETRY('epsg:4326'),
+            datasets VARCHAR[],
+            address_count INTEGER,
+            building_count INTEGER
+        );
         ",
     )
     .context("Failed to create schema")?;
@@ -80,7 +92,12 @@ mod tests {
         let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
 
         // Verify all tables exist by querying them
-        let tables = ["metadata", "osm_addresses", "osm_buildings"];
+        let tables = [
+            "metadata",
+            "osm_addresses",
+            "osm_buildings",
+            "package_exports",
+        ];
         for table in tables {
             let count: i64 =
                 conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -98,6 +115,33 @@ mod tests {
         let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
         // Re-run schema creation — should not fail
         create_schema(&conn)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_package_exports_column_types_round_trip() -> Result<()> {
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
+
+        conn.execute(
+            "INSERT INTO package_exports (exported_at, area, datasets, address_count, building_count)
+             VALUES (now(), ST_Point(21.0, 52.0), ['prg', 'bdot10k'], 3, 5)",
+            [],
+        )?;
+
+        let (geojson, datasets_json, address_count, building_count): (String, String, i32, i32) =
+            conn.query_row(
+                "SELECT ST_AsGeoJSON(area), to_json(datasets), address_count, building_count
+                 FROM package_exports",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+
+        assert!(geojson.contains("\"Point\""));
+        assert_eq!(datasets_json, r#"["prg","bdot10k"]"#);
+        assert_eq!(address_count, 3);
+        assert_eq!(building_count, 5);
+
         Ok(())
     }
 }

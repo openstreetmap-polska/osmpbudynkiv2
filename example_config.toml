@@ -28,6 +28,8 @@ http_listen_addr = "127.0.0.1:3000"
 duckdb_init_commands = [
     "INSTALL spatial",
     "LOAD spatial",
+    "INSTALL icu",
+    "LOAD icu",
     "SET enable_progress_bar = false",
     "SET preserve_insertion_order = false",
     "SET geometry_always_xy = true",
@@ -75,8 +77,23 @@ interval_seconds = 60
 # is allowed to drain to keep DuckDB writes ordered.
 timeout_seconds = 600
 
+# Prunes old rows from the /package export log (see [updates] and the
+# GET /updates endpoint below).
+[jobs.export_log_prune]
+enabled = true
+interval_seconds = 86400
+# How long package_exports rows are kept before being deleted.
+retention_days = 365
+
 # GeoJSON data package endpoint (GET/POST /package, served by the `run` subcommand).
 [package]
 # Maximum allowed area of a request's bounding box, in square degrees.
 # 0.04 = 0.2° x 0.2° which is roughly 14 x 22 km in Poland.
 max_area_sq_deg = 0.04
+
+# GET /updates endpoint (recent /package export activity as GeoJSON).
+[updates]
+# Time window used when the request omits ?minutes=.
+default_minutes = 60
+# Largest ?minutes= value accepted; larger requests get a 400.
+max_minutes = 1440
