@@ -1,6 +1,7 @@
 pub mod jobs;
 mod package;
 mod tiles;
+mod updates;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
