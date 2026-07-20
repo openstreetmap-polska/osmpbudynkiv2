@@ -28,6 +28,16 @@ pub enum Dataset {
 
 pub const ALL_DATASETS: [Dataset; 3] = [Dataset::Prg, Dataset::Bdot10k, Dataset::Egib];
 
+impl Dataset {
+    fn sql_name(self) -> &'static str {
+        match self {
+            Dataset::Prg => "prg",
+            Dataset::Bdot10k => "bdot10k",
+            Dataset::Egib => "egib",
+        }
+    }
+}
+
 /// A validated request area. `polygon_geojson` always holds the exact request
 /// geometry as a GeoJSON string — for bbox (GET) requests it is the envelope
 /// itself as a Polygon — so the query layer has a single code path.
@@ -485,31 +495,79 @@ fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> 
         .get()
         .context("Failed to acquire read connection")?;
     let mut features = Vec::new();
+    let mut address_count: i32 = 0;
+    let mut building_count: i32 = 0;
     for dataset in datasets {
         match dataset {
             Dataset::Prg => {
                 for row in unmatched_addresses(&conn, area)? {
                     let properties = address_tags(&row);
                     features.push(feature(row.geometry_geojson, properties)?);
+                    address_count += 1;
                 }
             }
             Dataset::Bdot10k => {
                 for geometry in unmatched_buildings(&conn, "bdot10k_buildings", area)? {
                     features.push(feature(geometry, building_tags())?);
+                    building_count += 1;
                 }
             }
             Dataset::Egib => {
                 for geometry in unmatched_buildings(&conn, "egib_buildings", area)? {
                     features.push(feature(geometry, building_tags())?);
+                    building_count += 1;
                 }
             }
         }
     }
+    drop(conn);
+    log_export(state, area, datasets, address_count, building_count);
     let collection = FeatureCollection {
         kind: "FeatureCollection",
         features,
     };
     Ok(serde_json::to_string(&collection)?)
+}
+
+/// Best-effort export logging: failures are logged via `tracing::warn!` and
+/// never affect the package response. `datasets` is drawn from the closed
+/// `Dataset` enum, so building the SQL list literal directly from it is safe
+/// -- no request text reaches this string. Runs via `state.write` (not
+/// `state.read_pool`), since a later read of this data through `/updates`
+/// must also go through `write` -- see
+/// docs/duckdb_connection_visibility_investigation.md.
+fn log_export(
+    state: &AppState,
+    area: &RequestArea,
+    datasets: &[Dataset],
+    address_count: i32,
+    building_count: i32,
+) {
+    let datasets_sql = format!(
+        "[{}]",
+        datasets
+            .iter()
+            .map(|d| format!("'{}'", d.sql_name()))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let conn = match state.write.lock() {
+        Ok(conn) => conn,
+        Err(_) => {
+            tracing::warn!("write mutex poisoned, skipping package export log");
+            return;
+        }
+    };
+    let sql = format!(
+        "INSERT INTO package_exports (exported_at, area, datasets, address_count, building_count)
+         VALUES (now(), ST_GeomFromGeoJSON(?), {datasets_sql}, ?, ?)"
+    );
+    if let Err(e) = conn.execute(
+        &sql,
+        duckdb::params![area.polygon_geojson, address_count, building_count],
+    ) {
+        tracing::warn!(error = %e, "failed to log package export");
+    }
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -719,10 +777,23 @@ mod tests {
             .unwrap()
             .execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
             .unwrap();
+        let write_conn = Connection::open_in_memory().unwrap();
+        write_conn
+            .execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
+            .unwrap();
+        write_conn
+            .execute_batch(
+                "CREATE TABLE package_exports (
+                    exported_at TIMESTAMP,
+                    area GEOMETRY,
+                    datasets VARCHAR[],
+                    address_count INTEGER,
+                    building_count INTEGER
+                )",
+            )
+            .unwrap();
         let state = AppState {
-            write: std::sync::Arc::new(std::sync::Mutex::new(
-                Connection::open_in_memory().unwrap(),
-            )),
+            write: std::sync::Arc::new(std::sync::Mutex::new(write_conn)),
             read_pool,
             registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
             config: std::sync::Arc::new(crate::config::Config::default()),
@@ -962,6 +1033,145 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_package_logs_export_with_counts_datasets_and_geometry() {
+        let (state, _dir) = make_seeded_state();
+        let write = state.write.clone();
+
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let conn = write.lock().unwrap();
+        let (address_count, building_count): (i32, i32) = conn
+            .query_row(
+                "SELECT address_count, building_count FROM package_exports
+                 ORDER BY exported_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(address_count, 1); // a1
+        assert_eq!(building_count, 2); // b1 + e1
+
+        let datasets_json: String = conn
+            .query_row(
+                "SELECT to_json(datasets) FROM package_exports ORDER BY exported_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(datasets_json, r#"["prg","bdot10k","egib"]"#);
+
+        let area_geojson: String = conn
+            .query_row(
+                "SELECT ST_AsGeoJSON(area) FROM package_exports ORDER BY exported_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(area_geojson.contains("\"Polygon\""));
+    }
+
+    #[tokio::test]
+    async fn get_package_logs_export_even_when_empty() {
+        let (state, _dir) = make_seeded_state();
+        let write = state.write.clone();
+
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=22.0,53.0,22.01,53.01")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let conn = write.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM package_exports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let (address_count, building_count): (i32, i32) = conn
+            .query_row(
+                "SELECT address_count, building_count FROM package_exports",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(address_count, 0);
+        assert_eq!(building_count, 0);
+    }
+
+    #[tokio::test]
+    async fn post_package_logs_the_submitted_polygon_not_its_envelope() {
+        let (state, _dir) = make_seeded_state();
+        let write = state.write.clone();
+        let triangle = r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#;
+
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from(triangle))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let conn = write.lock().unwrap();
+        let logged_geojson: String = conn
+            .query_row(
+                "SELECT ST_AsGeoJSON(area) FROM package_exports",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The logged area is the submitted triangle, a Polygon with 4 ring points
+        // (closed), not a rectangle envelope.
+        let parsed: serde_json::Value = serde_json::from_str(&logged_geojson).unwrap();
+        assert_eq!(parsed["type"], "Polygon");
+        assert_eq!(parsed["coordinates"][0].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn get_package_succeeds_even_if_write_mutex_is_poisoned() {
+        let (state, _dir) = make_seeded_state();
+        let write = state.write.clone();
+        // Poison the write mutex the same way a job panic would.
+        let _ = std::thread::spawn(move || {
+            let _guard = write.lock().unwrap();
+            panic!("simulated panic while holding the write lock");
+        })
+        .join();
+
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "logging failure must not fail the package response"
+        );
     }
 
     #[test]
