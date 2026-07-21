@@ -2,9 +2,10 @@
 //! browser-cacheable for 60 seconds.
 //!
 //! See docs/superpowers/specs/2026-07-20-export-log-updates-endpoint-design.md
-//! and docs/duckdb_connection_visibility_investigation.md. Reads run via
-//! state.write (not state.read_pool) -- read_pool never observes writes made
-//! through write while the server is running.
+//! and docs/duckdb_connection_visibility_investigation.md. Reads run via the
+//! shared state.pool, same as every other query -- every pooled connection is
+//! a try_clone() of one base connection, so it immediately sees writes
+//! committed through any other pooled connection.
 
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
@@ -42,10 +43,6 @@ pub struct UpdatesFeatureCollection {
 /// Recent package_exports rows within the last `minutes`, most recent first.
 /// `minutes` is a validated positive integer (see `parse_minutes`), safe to
 /// inline into the SQL text.
-///
-/// Runs on whatever connection it's given -- callers MUST pass a connection
-/// derived from `state.write`, not `state.read_pool` (see the module doc
-/// comment and docs/duckdb_connection_visibility_investigation.md).
 pub fn recent_exports(conn: &Connection, minutes: u64) -> Result<Vec<UpdateFeature>> {
     let sql = format!(
         "SELECT ST_AsGeoJSON(area),
@@ -139,9 +136,9 @@ pub async fn get_updates(
 fn build_updates(state: &AppState, minutes: u64) -> anyhow::Result<String> {
     let features = {
         let conn = state
-            .write
-            .lock()
-            .map_err(|_| anyhow::anyhow!("write mutex poisoned"))?;
+            .pool
+            .get()
+            .context("Failed to acquire pool connection")?;
         recent_exports(&conn, minutes)?
     };
     let collection = UpdatesFeatureCollection {
@@ -302,25 +299,13 @@ mod tests {
 
     use super::super::AppState;
 
-    fn make_state_with_write(conn: duckdb::Connection) -> (AppState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        // read_pool is unused by /updates but AppState requires it; a
-        // throwaway file-backed read-only pool satisfies the type.
-        let db_path = dir.path().join("updates_test.duckdb");
-        let _ = duckdb::Connection::open(&db_path).unwrap();
-        let read_cfg = duckdb::Config::default()
-            .access_mode(duckdb::AccessMode::ReadOnly)
-            .unwrap();
-        let manager = duckdb::DuckdbConnectionManager::file_with_flags(&db_path, read_cfg).unwrap();
-        let read_pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
-
-        let state = AppState {
-            write: std::sync::Arc::new(std::sync::Mutex::new(conn)),
-            read_pool,
+    fn make_state_with_write(conn: duckdb::Connection) -> AppState {
+        let pool = crate::server::build_pool(conn, 2).unwrap();
+        AppState {
+            pool,
             registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
             config: std::sync::Arc::new(crate::config::Config::default()),
-        };
-        (state, dir)
+        }
     }
 
     fn updates_app(state: AppState) -> Router {
@@ -338,7 +323,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let (state, _dir) = make_state_with_write(conn);
+        let state = make_state_with_write(conn);
 
         let response = updates_app(state)
             .oneshot(
@@ -376,7 +361,7 @@ mod tests {
              VALUES (now() - INTERVAL '120 minutes', ST_Point(21.0, 52.0), ['prg'], 2, 0);",
         )
         .unwrap();
-        let (state, _dir) = make_state_with_write(conn);
+        let state = make_state_with_write(conn);
         let app = updates_app(state);
 
         let response = app
@@ -413,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_updates_rejects_over_cap_minutes() {
-        let (state, _dir) = make_state_with_write(setup_db());
+        let state = make_state_with_write(setup_db());
         let response = updates_app(state)
             .oneshot(
                 Request::builder()
@@ -428,7 +413,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_updates_empty_window_returns_empty_collection() {
-        let (state, _dir) = make_state_with_write(setup_db());
+        let state = make_state_with_write(setup_db());
         let response = updates_app(state)
             .oneshot(
                 Request::builder()
@@ -446,73 +431,51 @@ mod tests {
 
     use crate::server::package::{get_package, post_package};
 
-    /// Seeds a file-backed read_pool with the government + OSM tables
-    /// `/package` needs (one unmatched PRG address, no buildings), and a
-    /// write connection with `package_exports` plus the icu extension
-    /// `/updates`' interval query requires -- exercising the real
-    /// `/package` -> `package_exports` -> `/updates` path end to end.
-    fn make_full_state() -> (AppState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("package_then_updates_test.duckdb");
-        {
-            let conn = duckdb::Connection::open(&db_path).unwrap();
-            conn.execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
-                .unwrap();
-            conn.execute_batch(
-                "CREATE TABLE prg_addresses (
-                     lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
-                     miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
-                     geom GEOMETRY);
-                 CREATE TABLE osm_addresses (
-                     osm_id BIGINT, osm_type VARCHAR, housenumber VARCHAR, street VARCHAR,
-                     city VARCHAR, postcode VARCHAR, geom GEOMETRY);
-                 CREATE TABLE bdot10k_buildings (lokalnyid VARCHAR, geom GEOMETRY);
-                 CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
-                 CREATE TABLE osm_buildings (
-                     osm_id BIGINT, osm_type VARCHAR, building VARCHAR, geom GEOMETRY);
-                 INSERT INTO prg_addresses VALUES
-                     ('a1', '12', 'Marszałkowska', 'Warszawa', '00-590', '0918123',
-                      ST_Point(21.001, 52.201));",
-            )
-            .unwrap();
-        }
-        let read_cfg = duckdb::Config::default()
-            .access_mode(duckdb::AccessMode::ReadOnly)
-            .unwrap();
-        let manager = duckdb::DuckdbConnectionManager::file_with_flags(&db_path, read_cfg).unwrap();
-        let read_pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
-        read_pool
-            .get()
-            .unwrap()
-            .execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
-            .unwrap();
+    /// Seeds an in-memory connection with the government + OSM tables
+    /// `/package` needs (one unmatched PRG address, no buildings) plus
+    /// `package_exports` and the icu extension `/updates`' interval query
+    /// requires, all on one pool -- exercising the real
+    /// `/package` -> `package_exports` -> `/updates` path end to end, with
+    /// both steps drawing from the same shared connection pool like
+    /// production does.
+    fn make_full_state() -> AppState {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "INSTALL spatial; LOAD spatial; INSTALL icu; LOAD icu;
+             SET GLOBAL geometry_always_xy = true;",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 geom GEOMETRY);
+             CREATE TABLE osm_addresses (
+                 osm_id BIGINT, osm_type VARCHAR, housenumber VARCHAR, street VARCHAR,
+                 city VARCHAR, postcode VARCHAR, geom GEOMETRY);
+             CREATE TABLE bdot10k_buildings (lokalnyid VARCHAR, geom GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+             CREATE TABLE osm_buildings (
+                 osm_id BIGINT, osm_type VARCHAR, building VARCHAR, geom GEOMETRY);
+             CREATE TABLE package_exports (
+                exported_at TIMESTAMP WITH TIME ZONE,
+                area GEOMETRY('epsg:4326'),
+                datasets VARCHAR[],
+                address_count INTEGER,
+                building_count INTEGER
+             );
+             INSERT INTO prg_addresses VALUES
+                 ('a1', '12', 'Marszałkowska', 'Warszawa', '00-590', '0918123',
+                  ST_Point(21.001, 52.201));",
+        )
+        .unwrap();
 
-        let write_conn = duckdb::Connection::open_in_memory().unwrap();
-        write_conn
-            .execute_batch(
-                "INSTALL spatial; LOAD spatial; INSTALL icu; LOAD icu;
-                 SET geometry_always_xy = true;",
-            )
-            .unwrap();
-        write_conn
-            .execute_batch(
-                "CREATE TABLE package_exports (
-                    exported_at TIMESTAMP WITH TIME ZONE,
-                    area GEOMETRY('epsg:4326'),
-                    datasets VARCHAR[],
-                    address_count INTEGER,
-                    building_count INTEGER
-                )",
-            )
-            .unwrap();
-
-        let state = AppState {
-            write: std::sync::Arc::new(std::sync::Mutex::new(write_conn)),
-            read_pool,
+        let pool = crate::server::build_pool(conn, 4).unwrap();
+        AppState {
+            pool,
             registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
             config: std::sync::Arc::new(crate::config::Config::default()),
-        };
-        (state, dir)
+        }
     }
 
     fn combined_app(state: AppState) -> Router {
@@ -527,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn package_export_appears_in_updates_with_correct_counts_and_geometry() {
-        let (state, _dir) = make_full_state();
+        let state = make_full_state();
         let app = combined_app(state);
 
         let package_response = app

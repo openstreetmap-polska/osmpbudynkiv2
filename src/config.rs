@@ -42,6 +42,13 @@ pub struct Config {
     pub download_dir: Option<String>,
     pub teryt: TerytConfig,
     pub duckdb_init_commands: Vec<String>,
+    /// Number of connections in the shared DuckDB pool used by the `run`
+    /// (HTTP server) command. All connections are `try_clone()`s of one base
+    /// connection (see `server::ClonedConnectionManager`), so they share live
+    /// MVCC state -- raising this increases how many queries (reads and
+    /// writes) can genuinely run concurrently instead of queueing behind a
+    /// single connection.
+    pub db_pool_size: u32,
     pub download_urls: DownloadUrls,
     pub jobs: JobsConfig,
     pub package: PackageConfig,
@@ -146,17 +153,30 @@ impl Default for Config {
             http_listen_addr: "127.0.0.1:3000".to_string(),
             download_dir: None,
             teryt: TerytConfig::default(),
+            // All SET commands use GLOBAL scope. The `run` server pools multiple
+            // connections that are try_clone()s of one base connection (see
+            // server::ClonedConnectionManager); most DuckDB settings default to
+            // GLOBAL scope and are automatically visible to every clone, but a
+            // few (e.g. geometry_always_xy, which the spatial extension
+            // registers as SESSION-scoped) are NOT and silently only apply to
+            // whichever single connection ran the bare `SET` -- verified
+            // empirically, see docs/duckdb_connection_visibility_investigation.md.
+            // Writing `SET GLOBAL` for all of them makes every setting behave
+            // the same way (apply once, visible to every pooled connection)
+            // instead of depending on which options happen to default to
+            // SESSION scope today.
             duckdb_init_commands: vec![
                 "INSTALL spatial".to_string(),
                 "LOAD spatial".to_string(),
                 "INSTALL icu".to_string(),
                 "LOAD icu".to_string(),
-                "SET preserve_insertion_order = false".to_string(),
-                "SET geometry_always_xy = true".to_string(),
-                "SET temp_directory = './osmpbudynkiv2.duckdb.tmp'".to_string(),
-                "SET memory_limit = '4GB'".to_string(),
-                "SET threads = 8".to_string(),
+                "SET GLOBAL preserve_insertion_order = false".to_string(),
+                "SET GLOBAL geometry_always_xy = true".to_string(),
+                "SET GLOBAL temp_directory = './osmpbudynkiv2.duckdb.tmp'".to_string(),
+                "SET GLOBAL memory_limit = '4GB'".to_string(),
+                "SET GLOBAL threads = 8".to_string(),
             ],
+            db_pool_size: 8,
             download_urls: DownloadUrls::default(),
             jobs: JobsConfig::default(),
             package: PackageConfig::default(),

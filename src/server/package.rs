@@ -491,9 +491,9 @@ async fn serve_package(state: AppState, area: RequestArea, datasets: Vec<Dataset
 
 fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> Result<String> {
     let conn = state
-        .read_pool
+        .pool
         .get()
-        .context("Failed to acquire read connection")?;
+        .context("Failed to acquire pool connection")?;
     let mut features = Vec::new();
     let mut address_count: i32 = 0;
     let mut building_count: i32 = 0;
@@ -532,10 +532,10 @@ fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> 
 /// Best-effort export logging: failures are logged via `tracing::warn!` and
 /// never affect the package response. `datasets` is drawn from the closed
 /// `Dataset` enum, so building the SQL list literal directly from it is safe
-/// -- no request text reaches this string. Runs via `state.write` (not
-/// `state.read_pool`), since a later read of this data through `/updates`
-/// must also go through `write` -- see
-/// docs/duckdb_connection_visibility_investigation.md.
+/// -- no request text reaches this string. Runs via `state.pool`, same as
+/// every other query -- see docs/duckdb_connection_visibility_investigation.md
+/// for why a single shared pool (rather than a separate read-only pool) makes
+/// this write immediately visible to `/updates`.
 fn log_export(
     state: &AppState,
     area: &RequestArea,
@@ -551,10 +551,10 @@ fn log_export(
             .collect::<Vec<_>>()
             .join(",")
     );
-    let conn = match state.write.lock() {
+    let conn = match state.pool.get() {
         Ok(conn) => conn,
-        Err(_) => {
-            tracing::warn!("write mutex poisoned, skipping package export log");
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to acquire pool connection, skipping package export log");
             return;
         }
     };
@@ -756,49 +756,30 @@ mod tests {
             ('e1', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082));
     ";
 
-    /// File-backed DB (the read pool requires a real file) seeded via a
-    /// writable connection, then opened read-only — like production.
-    fn make_seeded_state() -> (AppState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("package_test.duckdb");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
-                .unwrap();
-            conn.execute_batch(SEED).unwrap();
-        }
-        let read_cfg = duckdb::Config::default()
-            .access_mode(duckdb::AccessMode::ReadOnly)
+    /// One connection seeded with both the government/OSM tables and
+    /// `package_exports`, wrapped in a small pool — every handler and the
+    /// export log now share the same pool (see server::ClonedConnectionManager).
+    fn make_seeded_state() -> AppState {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("INSTALL spatial; LOAD spatial; SET GLOBAL geometry_always_xy = true;")
             .unwrap();
-        let manager = duckdb::DuckdbConnectionManager::file_with_flags(&db_path, read_cfg).unwrap();
-        let read_pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
-        read_pool
-            .get()
-            .unwrap()
-            .execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
-            .unwrap();
-        let write_conn = Connection::open_in_memory().unwrap();
-        write_conn
-            .execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
-            .unwrap();
-        write_conn
-            .execute_batch(
-                "CREATE TABLE package_exports (
-                    exported_at TIMESTAMP WITH TIME ZONE,
-                    area GEOMETRY('epsg:4326'),
-                    datasets VARCHAR[],
-                    address_count INTEGER,
-                    building_count INTEGER
-                )",
-            )
-            .unwrap();
-        let state = AppState {
-            write: std::sync::Arc::new(std::sync::Mutex::new(write_conn)),
-            read_pool,
+        conn.execute_batch(SEED).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE package_exports (
+                exported_at TIMESTAMP WITH TIME ZONE,
+                area GEOMETRY('epsg:4326'),
+                datasets VARCHAR[],
+                address_count INTEGER,
+                building_count INTEGER
+            )",
+        )
+        .unwrap();
+        let pool = crate::server::build_pool(conn, 2).unwrap();
+        AppState {
+            pool,
             registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
             config: std::sync::Arc::new(crate::config::Config::default()),
-        };
-        (state, dir)
+        }
     }
 
     fn package_app(state: AppState) -> Router {
@@ -817,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_package_returns_missing_features_with_tags() {
-        let (state, _dir) = make_seeded_state();
+        let state = make_seeded_state();
         let response = package_app(state)
             .oneshot(
                 Request::builder()
@@ -858,7 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_package_datasets_filter() {
-        let (state, _dir) = make_seeded_state();
+        let state = make_seeded_state();
         let app = package_app(state);
 
         let response = app
@@ -889,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_package_validation_errors() {
-        let (state, _dir) = make_seeded_state();
+        let state = make_seeded_state();
         let app = package_app(state);
 
         // Area over the 0.04 default cap.
@@ -948,7 +929,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_package_empty_area_returns_empty_collection() {
-        let (state, _dir) = make_seeded_state();
+        let state = make_seeded_state();
         let response = package_app(state)
             .oneshot(
                 Request::builder()
@@ -965,7 +946,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_package_polygon_filters_exactly() {
-        let (state, _dir) = make_seeded_state();
+        let state = make_seeded_state();
         // Triangle covering a1 but not b1/e1, although its envelope covers all.
         let triangle = r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#;
         let response = package_app(state)
@@ -987,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_package_accepts_feature_wrapper() {
-        let (state, _dir) = make_seeded_state();
+        let state = make_seeded_state();
         let body = r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}}"#;
         let response = package_app(state)
             .oneshot(
@@ -1006,7 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_package_rejects_bad_bodies() {
-        let (state, _dir) = make_seeded_state();
+        let state = make_seeded_state();
         let app = package_app(state);
 
         let response = app
@@ -1037,8 +1018,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_package_logs_export_with_counts_datasets_and_geometry() {
-        let (state, _dir) = make_seeded_state();
-        let write = state.write.clone();
+        let state = make_seeded_state();
+        let pool = state.pool.clone();
 
         let response = package_app(state)
             .oneshot(
@@ -1051,7 +1032,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
-        let conn = write.lock().unwrap();
+        let conn = pool.get().unwrap();
         let (address_count, building_count): (i32, i32) = conn
             .query_row(
                 "SELECT address_count, building_count FROM package_exports
@@ -1084,8 +1065,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_package_logs_export_even_when_empty() {
-        let (state, _dir) = make_seeded_state();
-        let write = state.write.clone();
+        let state = make_seeded_state();
+        let pool = state.pool.clone();
 
         let response = package_app(state)
             .oneshot(
@@ -1098,7 +1079,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
-        let conn = write.lock().unwrap();
+        let conn = pool.get().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM package_exports", [], |row| row.get(0))
             .unwrap();
@@ -1116,8 +1097,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_package_logs_the_submitted_polygon_not_its_envelope() {
-        let (state, _dir) = make_seeded_state();
-        let write = state.write.clone();
+        let state = make_seeded_state();
+        let pool = state.pool.clone();
         let triangle = r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#;
 
         let response = package_app(state)
@@ -1132,7 +1113,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
-        let conn = write.lock().unwrap();
+        let conn = pool.get().unwrap();
         let logged_geojson: String = conn
             .query_row(
                 "SELECT ST_AsGeoJSON(area) FROM package_exports",
@@ -1147,31 +1128,47 @@ mod tests {
         assert_eq!(parsed["coordinates"][0].as_array().unwrap().len(), 4);
     }
 
-    #[tokio::test]
-    async fn get_package_succeeds_even_if_write_mutex_is_poisoned() {
-        let (state, _dir) = make_seeded_state();
-        let write = state.write.clone();
-        // Poison the write mutex the same way a job panic would.
-        let _ = std::thread::spawn(move || {
-            let _guard = write.lock().unwrap();
-            panic!("simulated panic while holding the write lock");
-        })
-        .join();
-
-        let response = package_app(state)
-            .oneshot(
-                Request::builder()
-                    .uri("/package?bbox=21.0,52.2,21.01,52.21")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+    #[test]
+    fn log_export_does_not_panic_when_pool_is_exhausted() {
+        // log_export()'s signature has no Result -- callers structurally
+        // cannot observe a failure from it. What's worth verifying is that
+        // pool exhaustion (e.g. every connection busy under concurrent load)
+        // makes it return quietly instead of panicking on an unwrap.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("INSTALL spatial; LOAD spatial; SET GLOBAL geometry_always_xy = true;")
             .unwrap();
-        assert_eq!(
-            response.status(),
-            axum::http::StatusCode::OK,
-            "logging failure must not fail the package response"
-        );
+        conn.execute_batch(
+            "CREATE TABLE package_exports (
+                exported_at TIMESTAMP WITH TIME ZONE,
+                area GEOMETRY('epsg:4326'),
+                datasets VARCHAR[],
+                address_count INTEGER,
+                building_count INTEGER
+            )",
+        )
+        .unwrap();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_millis(10))
+            .build(crate::server::ClonedConnectionManager::new(conn))
+            .unwrap();
+        let state = AppState {
+            pool: pool.clone(),
+            registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
+            config: std::sync::Arc::new(crate::config::Config::default()),
+        };
+
+        // Hold the pool's only connection so log_export's own pool.get() call
+        // has nothing available and times out.
+        let held = pool.get().unwrap();
+        log_export(&state, &test_area(), &ALL_DATASETS, 1, 2);
+        drop(held);
+
+        let conn = pool.get().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM package_exports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no row should have been logged");
     }
 
     #[test]

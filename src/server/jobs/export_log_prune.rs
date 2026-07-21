@@ -1,7 +1,7 @@
 //! Background job that deletes package_exports rows older than
 //! `config.jobs.export_log_prune.retention_days`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::server::jobs::{Job, JobContext};
 
@@ -13,7 +13,10 @@ impl Job for ExportLogPruneJob {
     }
 
     fn run(&self, ctx: &JobContext) -> Result<()> {
-        let conn = ctx.write.lock().expect("write mutex poisoned");
+        let conn = ctx
+            .pool
+            .get()
+            .context("failed to acquire pool connection")?;
         let days = ctx.config.jobs.export_log_prune.retention_days;
         conn.execute(
             &format!(
@@ -29,7 +32,6 @@ impl Job for ExportLogPruneJob {
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicBool;
 
     use super::*;
@@ -42,9 +44,10 @@ mod tests {
             "LOAD spatial".to_string(),
             "INSTALL icu".to_string(),
             "LOAD icu".to_string(),
-            "SET geometry_always_xy = true".to_string(),
+            "SET GLOBAL geometry_always_xy = true".to_string(),
         ];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        let pool = crate::server::build_pool(conn, 2).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let kv = Arc::new(crate::osm::kvstore::open(dir.path(), 8, 4).unwrap());
 
@@ -52,7 +55,7 @@ mod tests {
         config.jobs.export_log_prune.retention_days = retention_days;
 
         let ctx = JobContext {
-            write: Arc::new(StdMutex::new(conn)),
+            pool,
             kv,
             config: Arc::new(config),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -64,7 +67,7 @@ mod tests {
     fn deletes_rows_older_than_retention_keeps_newer_ones() {
         let (ctx, _dir) = make_ctx(365);
         {
-            let conn = ctx.write.lock().unwrap();
+            let conn = ctx.pool.get().unwrap();
             conn.execute_batch(
                 "INSERT INTO package_exports (exported_at, area, datasets, address_count, building_count)
                  VALUES (now() - INTERVAL '400 days', ST_Point(21.0, 52.0), ['prg'], 1, 1);
@@ -76,7 +79,7 @@ mod tests {
 
         ExportLogPruneJob.run(&ctx).unwrap();
 
-        let conn = ctx.write.lock().unwrap();
+        let conn = ctx.pool.get().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM package_exports", [], |row| row.get(0))
             .unwrap();
@@ -93,7 +96,7 @@ mod tests {
     fn no_op_when_nothing_is_old_enough() {
         let (ctx, _dir) = make_ctx(365);
         {
-            let conn = ctx.write.lock().unwrap();
+            let conn = ctx.pool.get().unwrap();
             conn.execute(
                 "INSERT INTO package_exports (exported_at, area, datasets, address_count, building_count)
                  VALUES (now(), ST_Point(21.0, 52.0), ['prg'], 1, 1)",
@@ -104,7 +107,7 @@ mod tests {
 
         ExportLogPruneJob.run(&ctx).unwrap();
 
-        let conn = ctx.write.lock().unwrap();
+        let conn = ctx.pool.get().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM package_exports", [], |row| row.get(0))
             .unwrap();

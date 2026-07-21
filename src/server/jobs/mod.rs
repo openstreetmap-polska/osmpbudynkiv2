@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use duckdb::Connection;
 use serde::Serialize;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -25,6 +24,7 @@ use tracing::warn;
 
 use crate::config::{Config as AppConfig, JobConfig};
 use crate::osm::kvstore::RocksDB;
+use crate::server::DbPool;
 
 /// Per-job-run context handed to the blocking closure.
 ///
@@ -35,7 +35,7 @@ use crate::osm::kvstore::RocksDB;
 /// future jobs that want cooperative cancellation.
 #[derive(Clone)]
 pub struct JobContext {
-    pub write: Arc<StdMutex<Connection>>,
+    pub pool: DbPool,
     pub kv: Arc<RocksDB>,
     pub config: Arc<AppConfig>,
     #[allow(dead_code)]
@@ -163,7 +163,7 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn start(
         jobs: Vec<(Arc<dyn Job>, JobConfigResolved)>,
-        write: Arc<StdMutex<Connection>>,
+        pool: DbPool,
         kv: Arc<RocksDB>,
         config: Arc<AppConfig>,
     ) -> Self {
@@ -210,7 +210,7 @@ impl Scheduler {
                 shutdown_notify.clone(),
                 stop,
                 cancel,
-                write.clone(),
+                pool.clone(),
                 kv.clone(),
                 config.clone(),
             );
@@ -262,7 +262,7 @@ pub(crate) async fn supervise(
     shutdown_notify: Arc<Notify>,
     stop: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
-    write: Arc<StdMutex<Connection>>,
+    pool: DbPool,
     kv: Arc<RocksDB>,
     config: Arc<AppConfig>,
 ) {
@@ -299,7 +299,7 @@ pub(crate) async fn supervise(
         });
 
         let ctx = JobContext {
-            write: write.clone(),
+            pool: pool.clone(),
             kv: kv.clone(),
             config: config.clone(),
             cancel: cancel.clone(),
@@ -384,17 +384,13 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
 
-    fn make_parts() -> (
-        Arc<StdMutex<Connection>>,
-        Arc<RocksDB>,
-        Arc<AppConfig>,
-        tempfile::TempDir,
-    ) {
-        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+    fn make_parts() -> (DbPool, Arc<RocksDB>, Arc<AppConfig>, tempfile::TempDir) {
+        let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+        let pool = crate::server::build_pool(conn, 2).expect("build pool");
         let dir = tempfile::tempdir().expect("tempdir");
         let kv = Arc::new(crate::osm::kvstore::open(dir.path(), 8, 4).expect("kvstore open"));
         let cfg = Arc::new(AppConfig::default());
-        (Arc::new(StdMutex::new(conn)), kv, cfg, dir)
+        (pool, kv, cfg, dir)
     }
 
     // ---- pure-function tests ----

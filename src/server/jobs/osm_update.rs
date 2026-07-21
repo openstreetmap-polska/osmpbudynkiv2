@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::server::jobs::{Job, JobContext};
 
@@ -17,7 +17,10 @@ impl Job for OsmUpdateJob {
     }
 
     fn run(&self, ctx: &JobContext) -> Result<()> {
-        let conn = ctx.write.lock().expect("write mutex poisoned");
+        let conn = ctx
+            .pool
+            .get()
+            .context("failed to acquire pool connection")?;
         crate::update::osm::update(
             &conn,
             &ctx.kv,

@@ -3,12 +3,11 @@ mod package;
 mod tiles;
 mod updates;
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::{Router, http::StatusCode};
-use duckdb::{AccessMode, Config, Connection, DuckdbConnectionManager};
+use duckdb::Connection;
 use r2d2::Pool;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -16,17 +15,71 @@ use tracing::info;
 use crate::config::Config as AppConfig;
 use crate::shutdown;
 
-const READ_POOL_SIZE: u32 = 4;
+/// An `r2d2::ManageConnection` that hands out `try_clone()`s of one shared
+/// base connection instead of opening the database file itself.
+///
+/// `duckdb::DuckdbConnectionManager` (the crate's built-in r2d2 manager)
+/// always opens its own independent connection internally
+/// (`Connection::open`), which would create a second, unsynchronized DuckDB
+/// engine instance on the same file — see
+/// docs/duckdb_connection_visibility_investigation.md for the staleness bug
+/// this caused. Cloning from the app's one already-open, already-initialized
+/// connection instead means every pooled connection shares live MVCC state:
+/// a write committed through one pooled connection is immediately visible to
+/// every other one.
+///
+/// A clone inherits write capability (cloning does not downgrade to
+/// read-only), so this pool has no engine-enforced guarantee against writes
+/// from read-path handlers — same trust level the old single `write` mutex
+/// already relied on.
+#[derive(Debug)]
+pub struct ClonedConnectionManager {
+    base: Arc<Mutex<Connection>>,
+}
+
+impl ClonedConnectionManager {
+    pub fn new(base_conn: Connection) -> Self {
+        Self {
+            base: Arc::new(Mutex::new(base_conn)),
+        }
+    }
+}
+
+impl r2d2::ManageConnection for ClonedConnectionManager {
+    type Connection = Connection;
+    type Error = duckdb::Error;
+
+    fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
+        self.base.lock().unwrap().try_clone()
+    }
+
+    fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
+        conn.execute_batch("")
+    }
+
+    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
+        false
+    }
+}
+
+pub type DbPool = Pool<ClonedConnectionManager>;
+
+/// Builds the shared pool from an already-open, already-initialized base
+/// connection (extensions loaded, schema created, `duckdb_init_commands` run
+/// — see `db::init_db`). No further per-connection setup is needed: extension
+/// loads, custom table/scalar function registrations, and `SET GLOBAL`
+/// settings are all instance-wide and already visible to every `try_clone()`
+/// (verified empirically — docs/duckdb_connection_visibility_investigation.md).
+pub fn build_pool(base_conn: Connection, pool_size: u32) -> Result<DbPool> {
+    Pool::builder()
+        .max_size(pool_size)
+        .build(ClonedConnectionManager::new(base_conn))
+        .context("Failed to build DB connection pool")
+}
 
 #[derive(Clone)]
 pub struct AppState {
-    // Held by the AppState so write-path handlers can serialize against
-    // background jobs through the same DuckDB connection. No current
-    // handler exercises this, but it is part of the established server
-    // contract — see src/server/jobs/osm_update.rs.
-    #[allow(dead_code)]
-    pub write: Arc<Mutex<Connection>>,
-    pub read_pool: Pool<DuckdbConnectionManager>,
+    pub pool: DbPool,
     pub registry: Arc<jobs::JobRegistry>,
     pub config: Arc<AppConfig>,
 }
@@ -36,11 +89,9 @@ pub async fn run(
     kv: Arc<crate::osm::kvstore::RocksDB>,
     config: Arc<AppConfig>,
 ) -> Result<()> {
-    let read_pool = build_read_pool(Path::new(&config.db_path), &config.duckdb_init_commands)?;
+    let pool = build_pool(conn, config.db_pool_size)?;
 
-    check_startup_conditions(&conn, &read_pool)?;
-
-    let write = Arc::new(Mutex::new(conn));
+    check_startup_conditions(&pool)?;
 
     let osm_cfg = jobs::JobConfigResolved::from(&config.jobs.osm_update);
     let export_prune_cfg = jobs::JobConfigResolved {
@@ -58,13 +109,12 @@ pub async fn run(
             export_prune_cfg,
         ),
     ];
-    let scheduler = jobs::Scheduler::start(job_list, write.clone(), kv, config.clone());
+    let scheduler = jobs::Scheduler::start(job_list, pool.clone(), kv, config.clone());
     let registry = scheduler.registry.clone();
     let shutdown_notify = scheduler.shutdown_notify();
 
     let state = AppState {
-        write,
-        read_pool,
+        pool,
         registry,
         config: config.clone(),
     };
@@ -114,20 +164,16 @@ const REQUIRED_TABLES: &[&str] = &[
     "egib_buildings",
 ];
 
-fn check_startup_conditions(
-    write: &Connection,
-    read_pool: &Pool<DuckdbConnectionManager>,
-) -> Result<()> {
-    write
-        .query_row("SELECT 1", [], |_| Ok(()))
-        .context("Write connection health check failed")?;
-
-    let read_conn = read_pool
+fn check_startup_conditions(pool: &DbPool) -> Result<()> {
+    let conn = pool
         .get()
-        .context("Failed to get read connection for startup check")?;
+        .context("Failed to acquire a connection for startup checks")?;
+
+    conn.query_row("SELECT 1", [], |_| Ok(()))
+        .context("Startup health check failed")?;
 
     for table in REQUIRED_TABLES {
-        let exists: i64 = read_conn
+        let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM information_schema.tables \
                  WHERE table_schema = 'main' AND table_name = ?",
@@ -142,7 +188,7 @@ fn check_startup_conditions(
             );
         }
 
-        let rows: i64 = read_conn
+        let rows: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                 row.get(0)
             })
@@ -151,74 +197,31 @@ fn check_startup_conditions(
         info!("Table {} has {} rows.", table, rows);
     }
 
-    info!("Startup checks passed: write connection OK, all required tables present");
+    info!("Startup checks passed: pool connection OK, all required tables present");
     Ok(())
-}
-
-fn build_read_pool(
-    db_path: &Path,
-    init_commands: &[String],
-) -> Result<Pool<DuckdbConnectionManager>> {
-    let config = Config::default()
-        .access_mode(AccessMode::ReadOnly)
-        .context("Failed to set read-only access mode")?
-        .with("storage_compatibility_version", "latest")
-        .context("Failed to set storage compatibility version")?;
-
-    let manager = DuckdbConnectionManager::file_with_flags(db_path, config)
-        .context("Failed to create read connection manager")?;
-
-    let pool = Pool::builder()
-        .max_size(READ_POOL_SIZE)
-        .build(manager)
-        .context("Failed to build read connection pool")?;
-
-    let conn = pool
-        .get()
-        .context("Failed to get connection from read pool")?;
-    for cmd in init_commands {
-        conn.execute_batch(cmd)
-            .with_context(|| format!("Failed to execute init command on read pool: {cmd}"))?;
-    }
-
-    Ok(pool)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use axum::{Router, routing::get};
-    use duckdb::{AccessMode, Config as DuckConfig, Connection, DuckdbConnectionManager};
-    use r2d2::Pool;
+    use duckdb::Connection;
     use tower::ServiceExt;
 
     use super::jobs::{JobOutcome, JobRegistry, JobState, JobStatus};
-    use super::{AppState, jobs};
+    use super::{AppState, build_pool, jobs};
 
-    fn make_test_state(initial: Vec<JobStatus>) -> (AppState, tempfile::TempDir) {
-        // DuckDB rejects read-only on :memory:, so back the read pool with a
-        // throwaway file-backed DB. The /status handler never queries it.
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("status_test.duckdb");
-        // Create the file first via a writable connection, then drop.
-        let _ = Connection::open(&db_path).unwrap();
-        let read_cfg = DuckConfig::default()
-            .access_mode(AccessMode::ReadOnly)
-            .unwrap();
-        let manager = DuckdbConnectionManager::file_with_flags(&db_path, read_cfg).unwrap();
-        let read_pool = Pool::builder().max_size(1).build(manager).unwrap();
-
+    fn make_test_state(initial: Vec<JobStatus>) -> AppState {
         let conn = Connection::open_in_memory().unwrap();
-        let state = AppState {
-            write: Arc::new(StdMutex::new(conn)),
-            read_pool,
+        let pool = build_pool(conn, 2).unwrap();
+        AppState {
+            pool,
             registry: Arc::new(JobRegistry::new_for_tests(initial)),
             config: Arc::new(crate::config::Config::default()),
-        };
-        (state, dir)
+        }
     }
 
     #[tokio::test]
@@ -253,7 +256,7 @@ mod tests {
             next_run_at: Some("2026-05-28T12:01:03Z".to_string()),
             run_count: 7,
         };
-        let (state, _dir) = make_test_state(vec![preset]);
+        let state = make_test_state(vec![preset]);
 
         let app = Router::new()
             .route("/status", get(jobs::status_handler::get_status))

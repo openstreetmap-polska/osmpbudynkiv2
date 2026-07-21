@@ -25,19 +25,46 @@ http_listen_addr = "127.0.0.1:3000"
 # SQL statements executed on DuckDB initialization (after opening the database).
 # These run before schema creation.
 # WARNING: replacing this list removes the defaults — include everything you need.
+#
+# Most SET commands below use GLOBAL scope. This is necessary because the
+# `run` (HTTP server) command pools multiple DuckDB connections that are
+# try_clone()s of one base connection (see server::ClonedConnectionManager)
+# rather than separately-opened connections, to let concurrent requests
+# actually run in parallel instead of queueing behind a single connection.
+# Most DuckDB config options default to GLOBAL scope and are automatically
+# visible to every try_clone()'d connection once set on the base connection —
+# but a few (e.g. geometry_always_xy, which the spatial extension registers as
+# SESSION-scoped) are not, and a bare `SET` would then silently apply only to
+# whichever one connection happened to run it, leaving every other pooled
+# connection on the DuckDB default. Verified empirically — see
+# docs/duckdb_connection_visibility_investigation.md.
+# enable_progress_bar is the one exception: DuckDB rejects `SET GLOBAL` for it
+# ("cannot be set globally", verified against the duckdb CLI) — it stays
+# session-scoped, bare `SET`. That's fine here: it's a purely cosmetic setting
+# (whether DuckDB prints a progress bar for long-running queries), not one
+# that silently changes query results if a given pooled connection doesn't
+# have it, unlike geometry_always_xy.
 duckdb_init_commands = [
     "INSTALL spatial",
     "LOAD spatial",
     "INSTALL icu",
     "LOAD icu",
     "SET enable_progress_bar = false",
-    "SET preserve_insertion_order = false",
-    "SET geometry_always_xy = true",
-    "SET temp_directory = './osmpbudynkiv2.duckdb.tmp'",
-    "SET max_temp_directory_size = '8GB'",
-    "SET memory_limit = '4GB'",
-    "SET threads = 8",
+    "SET GLOBAL preserve_insertion_order = false",
+    "SET GLOBAL geometry_always_xy = true",
+    "SET GLOBAL temp_directory = './osmpbudynkiv2.duckdb.tmp'",
+    "SET GLOBAL max_temp_directory_size = '8GB'",
+    "SET GLOBAL memory_limit = '4GB'",
+    "SET GLOBAL threads = 8",
 ]
+
+# Number of connections in the shared DuckDB pool used by the `run` (HTTP
+# server) command. All connections are try_clone()s of one base connection, so
+# they share live MVCC state and see each other's committed writes immediately
+# (see docs/duckdb_connection_visibility_investigation.md) — raising this
+# increases how many queries (reads and writes) can genuinely run concurrently
+# instead of queueing behind a single connection.
+db_pool_size = 8
 
 # TERYT dictionary configuration for PRG address imports.
 # The TERYT (TERC) dictionary maps administrative unit codes to names.

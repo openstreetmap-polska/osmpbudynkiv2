@@ -53,9 +53,9 @@ pub async fn serve_tile(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state
-            .read_pool
+            .pool
             .get()
-            .context("Failed to acquire read connection")?;
+            .context("Failed to acquire pool connection")?;
         let bbox = duckdb::params![min_lon, min_lat, max_lon, max_lat];
         let addresses = query_mvt_layer(&conn, ADDRESSES_MVT_SQL, bbox)?;
         let buildings = query_mvt_layer(&conn, BUILDINGS_MVT_SQL, bbox)?;
