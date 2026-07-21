@@ -137,11 +137,13 @@ pub async fn get_updates(
 }
 
 fn build_updates(state: &AppState, minutes: u64) -> anyhow::Result<String> {
-    let conn = state
-        .write
-        .lock()
-        .map_err(|_| anyhow::anyhow!("write mutex poisoned"))?;
-    let features = recent_exports(&conn, minutes)?;
+    let features = {
+        let conn = state
+            .write
+            .lock()
+            .map_err(|_| anyhow::anyhow!("write mutex poisoned"))?;
+        recent_exports(&conn, minutes)?
+    };
     let collection = UpdatesFeatureCollection {
         kind: "FeatureCollection",
         features,
@@ -440,5 +442,129 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["features"].as_array().unwrap().len(), 0);
+    }
+
+    use crate::server::package::{get_package, post_package};
+
+    /// Seeds a file-backed read_pool with the government + OSM tables
+    /// `/package` needs (one unmatched PRG address, no buildings), and a
+    /// write connection with `package_exports` plus the icu extension
+    /// `/updates`' interval query requires -- exercising the real
+    /// `/package` -> `package_exports` -> `/updates` path end to end.
+    fn make_full_state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("package_then_updates_test.duckdb");
+        {
+            let conn = duckdb::Connection::open(&db_path).unwrap();
+            conn.execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE prg_addresses (
+                     lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                     miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                     geom GEOMETRY);
+                 CREATE TABLE osm_addresses (
+                     osm_id BIGINT, osm_type VARCHAR, housenumber VARCHAR, street VARCHAR,
+                     city VARCHAR, postcode VARCHAR, geom GEOMETRY);
+                 CREATE TABLE bdot10k_buildings (lokalnyid VARCHAR, geom GEOMETRY);
+                 CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+                 CREATE TABLE osm_buildings (
+                     osm_id BIGINT, osm_type VARCHAR, building VARCHAR, geom GEOMETRY);
+                 INSERT INTO prg_addresses VALUES
+                     ('a1', '12', 'Marszałkowska', 'Warszawa', '00-590', '0918123',
+                      ST_Point(21.001, 52.201));",
+            )
+            .unwrap();
+        }
+        let read_cfg = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .unwrap();
+        let manager = duckdb::DuckdbConnectionManager::file_with_flags(&db_path, read_cfg).unwrap();
+        let read_pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        read_pool
+            .get()
+            .unwrap()
+            .execute_batch("INSTALL spatial; LOAD spatial; SET geometry_always_xy = true;")
+            .unwrap();
+
+        let write_conn = duckdb::Connection::open_in_memory().unwrap();
+        write_conn
+            .execute_batch(
+                "INSTALL spatial; LOAD spatial; INSTALL icu; LOAD icu;
+                 SET geometry_always_xy = true;",
+            )
+            .unwrap();
+        write_conn
+            .execute_batch(
+                "CREATE TABLE package_exports (
+                    exported_at TIMESTAMP WITH TIME ZONE,
+                    area GEOMETRY('epsg:4326'),
+                    datasets VARCHAR[],
+                    address_count INTEGER,
+                    building_count INTEGER
+                )",
+            )
+            .unwrap();
+
+        let state = AppState {
+            write: std::sync::Arc::new(std::sync::Mutex::new(write_conn)),
+            read_pool,
+            registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
+            config: std::sync::Arc::new(crate::config::Config::default()),
+        };
+        (state, dir)
+    }
+
+    fn combined_app(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/package",
+                axum::routing::get(get_package).post(post_package),
+            )
+            .route("/updates", axum::routing::get(get_updates))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn package_export_appears_in_updates_with_correct_counts_and_geometry() {
+        let (state, _dir) = make_full_state();
+        let app = combined_app(state);
+
+        let package_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(package_response.status(), axum::http::StatusCode::OK);
+
+        let updates_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/updates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updates_response.status(), axum::http::StatusCode::OK);
+        let bytes = to_bytes(updates_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let features = json["features"].as_array().unwrap();
+        assert_eq!(features.len(), 1);
+        let props = &features[0]["properties"];
+        assert_eq!(props["address_count"], 1);
+        assert_eq!(props["building_count"], 0);
+        assert_eq!(
+            props["datasets"],
+            serde_json::json!(["prg", "bdot10k", "egib"])
+        );
+        assert_eq!(features[0]["geometry"]["type"], "Polygon");
     }
 }
