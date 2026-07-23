@@ -1,6 +1,7 @@
 mod cli;
 mod compare;
 mod config;
+mod dataset;
 mod db;
 mod download;
 mod import;
