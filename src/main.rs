@@ -7,6 +7,7 @@ mod import;
 mod osm;
 mod server;
 mod shutdown;
+mod tile_math;
 mod update;
 mod utils;
 

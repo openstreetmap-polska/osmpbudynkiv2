@@ -1,5 +1,3 @@
-use std::f64::consts::PI;
-
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -7,6 +5,7 @@ use axum::response::{IntoResponse, Response};
 use anyhow::Context;
 
 use super::AppState;
+use crate::tile_math::tile_to_bbox;
 
 // ST_AsMVTGeom's bounds argument is BOX_2D, not GEOMETRY -- ST_MakeEnvelope
 // returns GEOMETRY, so it must be narrowed via ST_Extent() first or DuckDB's
@@ -108,15 +107,6 @@ fn query_mvt_layer(
         }
         None => Ok(vec![]),
     }
-}
-
-fn tile_to_bbox(z: u32, x: u32, y: u32) -> (f64, f64, f64, f64) {
-    let n = 2f64.powi(z as i32);
-    let min_lon = x as f64 / n * 360.0 - 180.0;
-    let max_lon = (x + 1) as f64 / n * 360.0 - 180.0;
-    let max_lat = (PI * (1.0 - 2.0 * y as f64 / n)).sinh().atan() * 180.0 / PI;
-    let min_lat = (PI * (1.0 - 2.0 * (y + 1) as f64 / n)).sinh().atan() * 180.0 / PI;
-    (min_lon, min_lat, max_lon, max_lat)
 }
 
 #[cfg(test)]
