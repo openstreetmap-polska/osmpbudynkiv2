@@ -8,6 +8,25 @@ use crate::config::Config;
 use crate::download::download_file;
 use crate::utils::format_duration;
 
+/// Create `target_table` from an EGIB GeoParquet file, including the
+/// `_row_hash` column. Does NOT create an index.
+///
+/// Geometry is transformed from EPSG:2180 to EPSG:4326 for uniform spatial
+/// comparisons.
+pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> Result<()> {
+    let inner = format!(
+        "SELECT * EXCLUDE(geometry, geometry_bbox), \
+         ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom \
+         FROM '{parquet_path}'"
+    );
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {target_table};
+         CREATE TABLE {target_table} AS {};",
+        crate::dataset::hashed_select(&inner)
+    ))
+    .with_context(|| format!("Failed to load EGIB data into {target_table}"))
+}
+
 pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str) -> Result<()> {
     let (parquet_path, was_downloaded) = match file {
         Some(path) => (PathBuf::from(path), false),
@@ -22,18 +41,8 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
 
     let total = std::time::Instant::now();
 
-    // Geometry is transformed from EPSG:2180 to EPSG:4326 for uniform spatial comparisons.
     let t = std::time::Instant::now();
-    conn.execute_batch(&format!(
-        "
-        DROP TABLE IF EXISTS egib_buildings;
-        CREATE TABLE egib_buildings AS
-        SELECT * EXCLUDE(geometry, geometry_bbox),
-               ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom
-        FROM '{parquet_str}';
-        "
-    ))
-    .context("Failed to import EGIB data from GeoParquet")?;
+    load_into(conn, crate::dataset::EGIB.table, parquet_str)?;
     info!(
         elapsed = %format_duration(t.elapsed()),
         "Step done: load table"
