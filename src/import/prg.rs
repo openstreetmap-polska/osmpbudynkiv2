@@ -183,19 +183,7 @@ pub fn import(
     // Materialize the final table with a geometry column built from
     // EPSG:4326 lon/lat (the parser already reprojected from EPSG:2180).
     let t = std::time::Instant::now();
-    conn.execute_batch(
-        "
-        DROP TABLE IF EXISTS prg_addresses;
-        CREATE TABLE prg_addresses AS
-        SELECT *,
-               ST_Point(dlugosc_geograficzna, szerokosc_geograficzna) AS geom
-        FROM prg_addresses_raw
-        WHERE dlugosc_geograficzna IS NOT NULL
-          AND szerokosc_geograficzna IS NOT NULL;
-        DROP TABLE prg_addresses_raw;
-        ",
-    )
-    .context("Failed to materialize prg_addresses table")?;
+    materialize_into(conn, crate::dataset::PRG.table, "prg_addresses_raw")?;
     info!(
         elapsed = %format_duration(t.elapsed()),
         "Step done: build prg_addresses with geom column"
@@ -218,6 +206,26 @@ pub fn import(
     );
 
     Ok(())
+}
+
+/// Build `target_table` from the streamed `raw_table`, adding a geometry
+/// column built from EPSG:4326 lon/lat (the parser already reprojected from
+/// EPSG:2180) and the `_row_hash` column. Drops `raw_table` afterwards.
+/// Does NOT create an index.
+pub fn materialize_into(conn: &Connection, target_table: &str, raw_table: &str) -> Result<()> {
+    let inner = format!(
+        "SELECT *, ST_Point(dlugosc_geograficzna, szerokosc_geograficzna) AS geom \
+         FROM {raw_table} \
+         WHERE dlugosc_geograficzna IS NOT NULL \
+           AND szerokosc_geograficzna IS NOT NULL"
+    );
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {target_table};
+         CREATE TABLE {target_table} AS {};
+         DROP TABLE {raw_table};",
+        crate::dataset::hashed_select(&inner)
+    ))
+    .with_context(|| format!("Failed to materialize {target_table}"))
 }
 
 /// Walk the archive once and collect indices of entries whose name ends in
