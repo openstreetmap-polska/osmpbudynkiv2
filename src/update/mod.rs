@@ -1,3 +1,4 @@
+pub mod diff;
 pub mod osm;
 
 use anyhow::{Result, bail};
