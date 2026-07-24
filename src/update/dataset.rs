@@ -117,18 +117,31 @@ pub fn refresh(
     let t = std::time::Instant::now();
     let id = spec.id_column;
     let live = spec.table;
-    let snapshot_id: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM dataset_refreshes",
-            [],
-            |row| row.get(0),
-        )
-        .context("Failed to allocate snapshot_id")?;
 
     conn.execute_batch("BEGIN TRANSACTION")
         .context("Failed to begin apply transaction")?;
 
-    let applied = (|| -> Result<()> {
+    // snapshot_id is allocated inside the transaction: a concurrent refresh
+    // that started BEGIN first will hold this SELECT until it commits or
+    // rolls back, so two overlapping refreshes cannot allocate the same id.
+    let applied = (|| -> Result<i64> {
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM dataset_refreshes",
+                [],
+                |row| row.get(0),
+            )
+            .context("Failed to allocate snapshot_id")?;
+
+        // Change areas are computed BEFORE the delta is applied: they read
+        // the OLD geometry of removed/modified objects out of `live`. If
+        // this ran after the DELETE+INSERT below, a removed object's row
+        // would already be gone and a modified object's row would already
+        // hold its NEW geometry — losing the "cell it left" signal entirely
+        // (see the regression test `change_areas_capture_the_origin_cell_
+        // before_the_delta_is_applied`).
+        insert_change_areas(conn, spec, snapshot_id)?;
+
         conn.execute_batch(&format!(
             "DELETE FROM {live} WHERE {id} IN (
                  SELECT id FROM diff_removed UNION ALL SELECT id FROM diff_modified);
@@ -137,32 +150,42 @@ pub fn refresh(
         ))
         .with_context(|| format!("Failed to apply delta to {live}"))?;
 
-        let etag_sql = match source_etag {
-            Some(e) => format!("'{}'", e.replace('\'', "''")),
-            None => "NULL".to_string(),
-        };
-        conn.execute_batch(&format!(
+        conn.execute(
             "INSERT INTO dataset_refreshes
-             VALUES ({snapshot_id}, '{}', now(), now(), {etag_sql}, {}, {}, {});",
-            spec.name, counts.added, counts.modified, counts.removed
-        ))
+             (snapshot_id, source, started_at, finished_at, source_etag,
+              added, modified, removed)
+             VALUES (?, ?, now(), now(), ?, ?, ?, ?)",
+            duckdb::params![
+                snapshot_id,
+                spec.name,
+                source_etag,
+                counts.added,
+                counts.modified,
+                counts.removed,
+            ],
+        )
         .context("Failed to record refresh")?;
 
-        insert_change_areas(conn, spec, snapshot_id)?;
-        Ok(())
+        Ok(snapshot_id)
     })();
 
-    match applied {
-        Ok(()) => conn
-            .execute_batch("COMMIT")
-            .context("Failed to commit apply transaction")?,
+    let snapshot_id = match applied {
+        Ok(snapshot_id) => match conn.execute_batch("COMMIT") {
+            Ok(()) => snapshot_id,
+            Err(e) => {
+                if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                    warn!(error = %rb, "failed to roll back apply transaction after commit failure");
+                }
+                return Err(e).context("Failed to commit apply transaction");
+            }
+        },
         Err(e) => {
             if let Err(rb) = conn.execute_batch("ROLLBACK") {
                 warn!(error = %rb, "failed to roll back apply transaction");
             }
             return Err(e);
         }
-    }
+    };
 
     info!(
         source = spec.name,
@@ -187,13 +210,19 @@ pub fn refresh(
 /// changeset, so warn loudly and explain the cause — but do not block.
 #[allow(dead_code)]
 fn check_row_hash_version(conn: &Connection) -> Result<()> {
+    // `.optional()` turns `QueryReturnedNoRows` (first run, nothing stored
+    // yet) into `Ok(None)` while still propagating any genuine query error
+    // (e.g. the `metadata` table itself is missing) — `.ok()` would have
+    // silently swallowed both cases alike.
+    use duckdb::OptionalExt;
     let stored: Option<String> = conn
         .query_row(
             "SELECT value FROM metadata WHERE key = ?",
             duckdb::params![ROW_HASH_VERSION_KEY],
             |row| row.get(0),
         )
-        .ok();
+        .optional()
+        .context("Failed to read row hash version from metadata")?;
 
     match stored {
         Some(v) if v == ROW_HASH_VERSION.to_string() => {}
@@ -337,6 +366,43 @@ mod tests {
         assert!(cells > 0, "expected at least one change area row");
     }
 
+    /// The added/modified/removed columns in `dataset_refreshes` are written
+    /// positionally. Every other test in this module uses counts that are
+    /// tied (1,1,1 / 0,0,0 / 0,2,0), so none would catch e.g. `added` and
+    /// `removed` being transposed in the INSERT. Pin them with three
+    /// mutually distinct values instead, mirroring
+    /// `counts_land_in_their_own_columns` in `changeset.rs`.
+    #[test]
+    fn refresh_row_pins_added_modified_removed_to_their_own_columns() {
+        let live = "SELECT * FROM (VALUES
+            ('r1','v1',21.0,52.0), ('r2','v1',21.0,52.0), ('r3','v1',21.0,52.0),
+            ('m1','v1',21.0,52.0), ('m2','v1',21.0,52.0)
+          ) t(id,a,lon,lat)";
+        let conn = conn_with_live(live);
+        const NEW: &str = "SELECT * FROM (VALUES
+            ('m1','CHANGED',21.0,52.0), ('m2','CHANGED',21.0,52.0), ('a1','v1',21.0,52.0)
+          ) t(id,a,lon,lat)";
+
+        let counts = refresh(&conn, &TEST_SPEC, loader(NEW), None).unwrap();
+        assert_eq!(
+            counts,
+            DiffCounts {
+                added: 1,
+                modified: 2,
+                removed: 3
+            }
+        );
+
+        let (added, modified, removed): (i32, i32, i32) = conn
+            .query_row(
+                "SELECT added, modified, removed FROM dataset_refreshes",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((added, modified, removed), (1, 2, 3));
+    }
+
     /// snapshot_id is MAX + 1, so a second refresh does not collide.
     #[test]
     fn snapshot_ids_increment() {
@@ -453,6 +519,62 @@ mod tests {
         assert_eq!(changed, 2, "100% churn must still be applied");
     }
 
+    /// `insert_change_areas` reads the OLD geometry of removed/modified
+    /// objects out of the live table. If it runs AFTER the delta has already
+    /// been applied, the removed object's row is gone and the modified
+    /// object's row has already been overwritten with the NEW geometry — so
+    /// the cell it left never gets marked, and the destination cell gets
+    /// double-counted instead. This must go through `refresh()` end-to-end,
+    /// not `insert_change_areas` in isolation, because the isolated tests
+    /// build `live`/`staging` by hand and never see the reorder bug.
+    #[test]
+    fn change_areas_capture_the_origin_cell_before_the_delta_is_applied() {
+        use crate::tile_math::{CHANGE_CELL_ZOOM, lonlat_to_tile};
+
+        const BEFORE: &str = "SELECT * FROM (VALUES
+            ('del','v1',21.0,52.0), ('mov','v1',21.0,52.0)
+          ) t(id,a,lon,lat)";
+        // 'del' is gone; 'mov' moved to a different cell.
+        const AFTER: &str = "SELECT * FROM (VALUES
+            ('mov','v1',19.0,50.0)
+          ) t(id,a,lon,lat)";
+
+        let conn = conn_with_live(BEFORE);
+        refresh(&conn, &TEST_SPEC, loader(AFTER), None).unwrap();
+
+        let (origin_x, origin_y) = lonlat_to_tile(21.0, 52.0, CHANGE_CELL_ZOOM);
+        let (dest_x, dest_y) = lonlat_to_tile(19.0, 50.0, CHANGE_CELL_ZOOM);
+
+        let (origin_modified, origin_removed): (i32, i32) = conn
+            .query_row(
+                "SELECT modified, removed FROM dataset_change_areas
+                 WHERE cell_x = ? AND cell_y = ?",
+                duckdb::params![origin_x, origin_y],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            origin_removed, 1,
+            "origin cell must record the removed object"
+        );
+        assert_eq!(
+            origin_modified, 1,
+            "origin cell must record the moved object leaving"
+        );
+
+        let dest_modified: i32 = conn
+            .query_row(
+                "SELECT modified FROM dataset_change_areas WHERE cell_x = ? AND cell_y = ?",
+                duckdb::params![dest_x, dest_y],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dest_modified, 1,
+            "destination cell must record the moved object arriving, not double-counted"
+        );
+    }
+
     /// The whole point of the design: a concurrent reader must see the old
     /// snapshot or the new one, never a half-applied state. The delta below
     /// changes the row count (3 -> 4), so an intermediate would be visible
@@ -501,5 +623,96 @@ mod tests {
                  Observed sequence: {seen:?}"
             );
         }
+    }
+
+    /// A bare connection with the schema (including `metadata`) but no
+    /// `live`/`staging` tables — enough for `check_row_hash_version` alone.
+    fn bare_conn() -> Connection {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        init_db(Path::new(":memory:"), &init, None).unwrap()
+    }
+
+    #[test]
+    fn check_row_hash_version_matches_is_a_noop() {
+        let conn = bare_conn();
+        conn.execute(
+            "INSERT INTO metadata VALUES (?, ?)",
+            duckdb::params![ROW_HASH_VERSION_KEY, ROW_HASH_VERSION.to_string()],
+        )
+        .unwrap();
+
+        check_row_hash_version(&conn).unwrap();
+
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?",
+                duckdb::params![ROW_HASH_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, ROW_HASH_VERSION.to_string());
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "must not insert a duplicate row");
+    }
+
+    /// A version mismatch must warn, not error, and must not overwrite the
+    /// stored value — the whole point is to keep running with a full-rewrite
+    /// diagnostic, not to "fix" the discrepancy on its own.
+    #[test]
+    fn check_row_hash_version_mismatch_warns_but_does_not_block() {
+        let conn = bare_conn();
+        conn.execute(
+            "INSERT INTO metadata VALUES (?, ?)",
+            duckdb::params![ROW_HASH_VERSION_KEY, "999"],
+        )
+        .unwrap();
+
+        check_row_hash_version(&conn).unwrap();
+
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?",
+                duckdb::params![ROW_HASH_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            value, "999",
+            "mismatch must not silently overwrite the stored version"
+        );
+    }
+
+    #[test]
+    fn check_row_hash_version_first_run_inserts() {
+        let conn = bare_conn();
+
+        check_row_hash_version(&conn).unwrap();
+
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?",
+                duckdb::params![ROW_HASH_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, ROW_HASH_VERSION.to_string());
+    }
+
+    /// `.ok()` would have silently swallowed a genuine query failure (not
+    /// just "no row yet") as if the version had never been recorded. Drop
+    /// `metadata` entirely so the query fails for a real reason, and confirm
+    /// the error propagates instead of being treated as first-run.
+    #[test]
+    fn check_row_hash_version_propagates_genuine_query_errors() {
+        let conn = bare_conn();
+        conn.execute_batch("DROP TABLE metadata").unwrap();
+
+        let err = check_row_hash_version(&conn).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("row hash version"),
+            "error should mention row hash version, got: {err:#}"
+        );
     }
 }
