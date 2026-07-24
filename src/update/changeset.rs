@@ -24,7 +24,6 @@ use crate::tile_math::CHANGE_CELL_ZOOM;
 /// live, once from staging), so that cell's `modified` is 2 for one object.
 /// That is intended — consumers use these cells to decide what to re-render,
 /// not to report object counts.
-#[allow(dead_code)]
 pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i64) -> Result<i64> {
     let live = spec.table;
     let staging = spec.staging_table();

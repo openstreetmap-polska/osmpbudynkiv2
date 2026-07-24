@@ -1,4 +1,5 @@
 pub mod changeset;
+pub mod dataset;
 pub mod diff;
 pub mod osm;
 

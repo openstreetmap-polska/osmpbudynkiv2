@@ -3,7 +3,6 @@ use duckdb::Connection;
 
 use crate::dataset::DatasetSpec;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffCounts {
     pub added: i64,
@@ -18,7 +17,6 @@ pub struct DiffCounts {
 /// single order-independent hash via `hash(list_sort(list(_row_hash)))`.
 /// IDs are NOT unique in these datasets (BDOT10k ships duplicates), so an
 /// ID's whole row-set is replaced as a unit and duplicates cannot drift.
-#[allow(dead_code)]
 pub fn compute(conn: &Connection, spec: &DatasetSpec) -> Result<DiffCounts> {
     let live = spec.table;
     let staging = spec.staging_table();
