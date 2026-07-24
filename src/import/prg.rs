@@ -73,12 +73,17 @@ pub fn import(
 
 /// Refresh `prg_addresses` from a fresh snapshot, reusing the import
 /// streaming path to build the staging table.
+///
+/// `source_etag` is the validator observed by the caller's HEAD check (see
+/// `update::source_unchanged`), if any; it is threaded through unchanged to
+/// `dataset::refresh` so it lands in `dataset_refreshes.source_etag`.
 pub fn update_prg(
     conn: &Connection,
     config: &Config,
     file: Option<&Path>,
     terc_file: Option<&Path>,
     url: &str,
+    source_etag: Option<&str>,
 ) -> Result<()> {
     let (zip_path, terc) = prepare_source(config, file, terc_file, url)?;
     crate::update::dataset::refresh(
@@ -89,7 +94,7 @@ pub fn update_prg(
             stream_gml_into(c, &zip_path, &terc, &raw)?;
             materialize_into(c, target, &raw)
         },
-        None,
+        source_etag,
     )
     .map(|_| ())
 }

@@ -136,6 +136,28 @@ async fn do_download(client: &reqwest::Client, url: &str, dest_path: &Path) -> R
     Ok(())
 }
 
+/// Fetch a cheap change validator for `url` via HEAD: the `ETag` if the
+/// server sends one, else `Last-Modified`, else `None`.
+///
+/// `None` means "cannot tell" and callers MUST treat it as changed — never
+/// as unchanged — or a refresh could be skipped forever.
+pub fn fetch_etag(url: &str) -> Result<Option<String>> {
+    let rt = Runtime::new().context("Failed to create tokio runtime")?;
+    let client = reqwest::Client::new();
+    rt.block_on(do_fetch_etag(&client, url))
+}
+
+async fn do_fetch_etag(client: &reqwest::Client, url: &str) -> Result<Option<String>> {
+    let response = client.head(url).send().await?.error_for_status()?;
+    let headers = response.headers();
+    let value = headers
+        .get(reqwest::header::ETAG)
+        .or_else(|| headers.get(reqwest::header::LAST_MODIFIED))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +212,46 @@ mod tests {
         let data = b"response without content-length header";
         let result = serve_and_download(data, false).await;
         assert_eq!(result, data);
+    }
+
+    async fn serve_head(header_line: &'static str) -> Option<String> {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: std::net::SocketAddr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.readable().await;
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let resp = format!("HTTP/1.1 200 OK\r\n{header_line}Content-Length: 0\r\n\r\n");
+            tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        do_fetch_etag(&client, &format!("http://{addr}/f.bin"))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn etag_header_is_preferred() {
+        let v = serve_head("ETag: \"abc123\"\r\nLast-Modified: Wed, 01 Jan 2025 00:00:00 GMT\r\n")
+            .await;
+        assert_eq!(v.as_deref(), Some("\"abc123\""));
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_last_modified() {
+        let v = serve_head("Last-Modified: Wed, 01 Jan 2025 00:00:00 GMT\r\n").await;
+        assert_eq!(v.as_deref(), Some("Wed, 01 Jan 2025 00:00:00 GMT"));
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_server_offers_no_validator() {
+        let v = serve_head("").await;
+        assert_eq!(v, None);
     }
 }
