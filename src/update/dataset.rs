@@ -12,22 +12,31 @@ use crate::utils::format_duration;
 /// fires on an upstream restructuring. It is a diagnostic, NOT a stop.
 const IMPLAUSIBLE_CHURN_FRACTION: f64 = 0.5;
 
-/// Drops the staging table on every exit path, including early returns and
-/// errors. DuckDB has no temp-table-per-transaction semantics here, so this
-/// is the only thing standing between a failed refresh and a stale staging
-/// table blocking the next one.
-struct StagingGuard<'a> {
+/// Drops every scratch table a refresh creates — the staging table and the
+/// five `diff_*` temp tables — on every exit path, including early returns
+/// and errors. DuckDB has no temp-table-per-transaction semantics here, so
+/// this is the only thing standing between a failed refresh and a stale
+/// staging table blocking the next one, and between a *successful* refresh
+/// and its per-ID hash tables (~16M rows for PRG) sitting on the pooled
+/// connection until the next refresh happens to drop them.
+struct ScratchGuard<'a> {
     conn: &'a Connection,
-    table: String,
+    staging: String,
 }
 
-impl Drop for StagingGuard<'_> {
+impl Drop for ScratchGuard<'_> {
     fn drop(&mut self) {
-        if let Err(e) = self
-            .conn
-            .execute_batch(&format!("DROP TABLE IF EXISTS {}", self.table))
-        {
-            warn!(table = %self.table, error = %e, "failed to drop staging table");
+        let sql = format!(
+            "DROP TABLE IF EXISTS {};
+             DROP TABLE IF EXISTS diff_live_hashes;
+             DROP TABLE IF EXISTS diff_new_hashes;
+             DROP TABLE IF EXISTS diff_added;
+             DROP TABLE IF EXISTS diff_removed;
+             DROP TABLE IF EXISTS diff_modified;",
+            self.staging
+        );
+        if let Err(e) = self.conn.execute_batch(&sql) {
+            warn!(staging = %self.staging, error = %e, "failed to drop refresh scratch tables");
         }
     }
 }
@@ -49,9 +58,9 @@ pub fn refresh(
     conn.execute_batch(&format!("DROP TABLE IF EXISTS {staging}"))
         .with_context(|| format!("Failed to clear stale staging table {staging}"))?;
 
-    let _guard = StagingGuard {
+    let _guard = ScratchGuard {
         conn,
-        table: staging.clone(),
+        staging: staging.clone(),
     };
 
     // --- stage ---
@@ -202,9 +211,18 @@ pub fn refresh(
     Ok(counts)
 }
 
-/// A DuckDB upgrade can change `hash()` output, which makes every row compare
-/// as modified. That is correct but slow and produces a misleadingly large
-/// changeset, so warn loudly and explain the cause — but do not block.
+/// Warn when the row-hash expression has changed since the live table was
+/// built: every row then compares as modified, which is correct but slow and
+/// produces a misleadingly large changeset. Diagnostic only — never blocks.
+///
+/// Scope, deliberately narrow: [`ROW_HASH_VERSION`] is a constant we bump by
+/// hand when we edit [`crate::dataset::hashed_select`]. It is not derived
+/// from the DuckDB version, so an upgrade that silently changed `hash()`
+/// output would NOT be caught here. Nor is the stamp written by the import
+/// path, so the first update after a bump finds no stored value, records the
+/// new one and stays quiet; only the second and later updates can warn.
+/// Neither gap costs correctness — a full-rewrite refresh still produces the
+/// right table — so closing them is a nice-to-have, not a fix.
 fn check_row_hash_version(conn: &Connection) -> Result<()> {
     // `.optional()` turns `QueryReturnedNoRows` (first run, nothing stored
     // yet) into `Ok(None)` while still propagating any genuine query error
@@ -450,11 +468,34 @@ mod tests {
         assert!(!staging_exists(&conn), "staging left behind after failure");
     }
 
+    /// The per-ID hash tables are the largest thing a refresh materializes
+    /// (one row per ID, ~16M for PRG). They must not outlive the refresh on
+    /// the pooled connection, waiting for the *next* refresh to drop them.
+    #[test]
+    fn diff_temp_tables_do_not_outlive_the_refresh() {
+        let conn = conn_with_live(LIVE_ROWS);
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+
+        for t in [
+            "diff_live_hashes",
+            "diff_new_hashes",
+            "diff_added",
+            "diff_removed",
+            "diff_modified",
+        ] {
+            assert!(!table_exists(&conn, t), "{t} left behind after success");
+        }
+    }
+
     fn staging_exists(conn: &Connection) -> bool {
+        table_exists(conn, &TEST_SPEC.staging_table())
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
         let n: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?",
-                duckdb::params![TEST_SPEC.staging_table()],
+                "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = ?",
+                duckdb::params![name],
                 |r| r.get(0),
             )
             .unwrap();
