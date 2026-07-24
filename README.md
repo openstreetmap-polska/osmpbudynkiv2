@@ -141,6 +141,29 @@ nothing" stays distinguishable from "never ran".
 These refreshes also run on a schedule in the background under `run` — see the
 `[jobs]` config section.
 
+#### Row-hash version
+
+The diff works by comparing a whole-row hash, so an import and a later update
+must compute that hash identically. The expression lives in exactly one place,
+`hashed_select` in `src/dataset.rs`, and the version it was built with is
+stamped into the `metadata` table under the key `row_hash_version`.
+
+**If you change `hashed_select` in a way that alters its output, bump the
+`ROW_HASH_VERSION` constant next to it.** Nothing else needs changing — every
+import and every update reads that one constant.
+
+What happens after a bump: the stamp in an existing database still names the
+old version, so the next update logs a `row hash version mismatch` warning and
+every row compares as modified. That refresh is effectively a full rewrite —
+correct, just slower than usual, and it reports a changeset the size of the
+whole dataset. On success it re-stamps the new version, so the warning appears
+once per bump, not on every run afterwards. A refresh that fails leaves the old
+stamp alone, so the warning survives until a rewrite actually lands.
+
+The check only detects changes you make and declare. It is not derived from the
+DuckDB version, so a DuckDB upgrade that silently changed `hash()` output would
+produce the same full rewrite without the explanatory warning.
+
 ### compare — compare government data against OSM
 
 ```bash

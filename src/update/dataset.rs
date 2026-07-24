@@ -88,7 +88,7 @@ pub fn refresh(
         );
     }
 
-    check_row_hash_version(conn)?;
+    let hash_version = check_row_hash_version(conn)?;
 
     // --- diff ---
     let t = std::time::Instant::now();
@@ -156,6 +156,16 @@ pub fn refresh(
         ))
         .with_context(|| format!("Failed to apply delta to {live}"))?;
 
+        // A stale stamp means every ID compared as modified, so the DELETE +
+        // INSERT above just replaced the whole table with staging rows — whose
+        // hashes come from the current expression. Re-stamping here is what
+        // makes the mismatch warning fire once per bump instead of forever.
+        // An unstamped database gets its first stamp the same way. Inside the
+        // transaction, so a refresh that rolls back leaves the stamp alone.
+        if hash_version != RowHashVersion::Current {
+            crate::dataset::stamp_row_hash_version(conn)?;
+        }
+
         conn.execute(
             "INSERT INTO dataset_refreshes
              (snapshot_id, source, started_at, finished_at, source_etag,
@@ -211,23 +221,33 @@ pub fn refresh(
     Ok(counts)
 }
 
-/// Warn when the row-hash expression has changed since the live table was
-/// built: every row then compares as modified, which is correct but slow and
-/// produces a misleadingly large changeset. Diagnostic only — never blocks.
+/// What `metadata.row_hash_version` says about the live table's `_row_hash`
+/// values, relative to the expression this build would produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowHashVersion {
+    /// Stamped, and the stamp matches. Nothing to do.
+    Current,
+    /// Stamped with a different version: `hashed_select` changed since this
+    /// table was built, so every row will compare as modified.
+    Stale(String),
+    /// No stamp at all — a database imported before stamping existed.
+    Unstamped,
+}
+
+/// Read the stamp and warn if it is stale. Pure read: re-stamping happens in
+/// the apply transaction (see [`refresh`]), so a refresh that never lands
+/// cannot leave a stamp claiming a rewrite that did not happen.
 ///
-/// Scope, deliberately narrow: [`ROW_HASH_VERSION`] is a constant we bump by
+/// Deliberately narrow scope: [`ROW_HASH_VERSION`] is a constant we bump by
 /// hand when we edit [`crate::dataset::hashed_select`]. It is not derived
 /// from the DuckDB version, so an upgrade that silently changed `hash()`
-/// output would NOT be caught here. Nor is the stamp written by the import
-/// path, so the first update after a bump finds no stored value, records the
-/// new one and stays quiet; only the second and later updates can warn.
-/// Neither gap costs correctness — a full-rewrite refresh still produces the
-/// right table — so closing them is a nice-to-have, not a fix.
-fn check_row_hash_version(conn: &Connection) -> Result<()> {
-    // `.optional()` turns `QueryReturnedNoRows` (first run, nothing stored
-    // yet) into `Ok(None)` while still propagating any genuine query error
-    // (e.g. the `metadata` table itself is missing) — `.ok()` would have
-    // silently swallowed both cases alike.
+/// output would NOT be caught here. That costs no correctness — the refresh
+/// would simply be a full rewrite — only the explanatory warning.
+fn check_row_hash_version(conn: &Connection) -> Result<RowHashVersion> {
+    // `.optional()` turns `QueryReturnedNoRows` (nothing stored yet) into
+    // `Ok(None)` while still propagating any genuine query error (e.g. the
+    // `metadata` table itself is missing) — `.ok()` would have silently
+    // swallowed both cases alike.
     use duckdb::OptionalExt;
     let stored: Option<String> = conn
         .query_row(
@@ -238,24 +258,21 @@ fn check_row_hash_version(conn: &Connection) -> Result<()> {
         .optional()
         .context("Failed to read row hash version from metadata")?;
 
-    match stored {
-        Some(v) if v == ROW_HASH_VERSION.to_string() => {}
-        Some(v) => warn!(
-            stored = %v,
-            expected = ROW_HASH_VERSION,
-            "row hash version mismatch — every row will compare as modified. \
-             This refresh is effectively a full rewrite. Re-run the full import \
-             to resync."
-        ),
-        None => {
-            conn.execute(
-                "INSERT INTO metadata VALUES (?, ?)",
-                duckdb::params![ROW_HASH_VERSION_KEY, ROW_HASH_VERSION.to_string()],
-            )
-            .context("Failed to record row hash version")?;
+    Ok(match stored {
+        Some(v) if v == ROW_HASH_VERSION.to_string() => RowHashVersion::Current,
+        Some(v) => {
+            warn!(
+                stored = %v,
+                expected = ROW_HASH_VERSION,
+                "row hash version mismatch — the row-hash expression changed since this \
+                 table was built, so every row compares as modified and this refresh is \
+                 effectively a full rewrite. It re-stamps the version on success, so this \
+                 warning should not appear again."
+            );
+            RowHashVersion::Stale(v)
         }
-    }
-    Ok(())
+        None => RowHashVersion::Unstamped,
+    })
 }
 
 #[cfg(test)]
@@ -678,7 +695,10 @@ mod tests {
         )
         .unwrap();
 
-        check_row_hash_version(&conn).unwrap();
+        assert_eq!(
+            check_row_hash_version(&conn).unwrap(),
+            RowHashVersion::Current
+        );
 
         let value: String = conn
             .query_row(
@@ -694,9 +714,8 @@ mod tests {
         assert_eq!(rows, 1, "must not insert a duplicate row");
     }
 
-    /// A version mismatch must warn, not error, and must not overwrite the
-    /// stored value — the whole point is to keep running with a full-rewrite
-    /// diagnostic, not to "fix" the discrepancy on its own.
+    /// A version mismatch must warn, not error, and must not re-stamp on its
+    /// own — the stamp is only earned by an apply that actually lands.
     #[test]
     fn check_row_hash_version_mismatch_warns_but_does_not_block() {
         let conn = bare_conn();
@@ -706,7 +725,10 @@ mod tests {
         )
         .unwrap();
 
-        check_row_hash_version(&conn).unwrap();
+        assert_eq!(
+            check_row_hash_version(&conn).unwrap(),
+            RowHashVersion::Stale("999".to_string())
+        );
 
         let value: String = conn
             .query_row(
@@ -717,24 +739,94 @@ mod tests {
             .unwrap();
         assert_eq!(
             value, "999",
-            "mismatch must not silently overwrite the stored version"
+            "the check itself must not overwrite the stored version"
         );
     }
 
     #[test]
-    fn check_row_hash_version_first_run_inserts() {
+    fn check_row_hash_version_reports_unstamped_without_writing() {
         let conn = bare_conn();
 
-        check_row_hash_version(&conn).unwrap();
+        assert_eq!(
+            check_row_hash_version(&conn).unwrap(),
+            RowHashVersion::Unstamped
+        );
 
-        let value: String = conn
+        let rows: i64 = conn
             .query_row(
-                "SELECT value FROM metadata WHERE key = ?",
+                "SELECT COUNT(*) FROM metadata WHERE key = ?",
                 duckdb::params![ROW_HASH_VERSION_KEY],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(value, ROW_HASH_VERSION.to_string());
+        assert_eq!(
+            rows, 0,
+            "the check must not stamp; only a landed apply does"
+        );
+    }
+
+    /// The self-heal: a stale stamp means the refresh rewrote every row with
+    /// the current expression, so it must re-stamp. Otherwise the warning
+    /// fires forever and the advice it prints ("re-run the import") cannot
+    /// clear it either.
+    #[test]
+    fn stale_version_is_restamped_after_a_successful_refresh() {
+        let conn = conn_with_live(LIVE_ROWS);
+        conn.execute(
+            "INSERT INTO metadata VALUES (?, ?)",
+            duckdb::params![ROW_HASH_VERSION_KEY, "999"],
+        )
+        .unwrap();
+
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+
+        assert_eq!(
+            check_row_hash_version(&conn).unwrap(),
+            RowHashVersion::Current,
+            "a second refresh must not warn again"
+        );
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key = ?",
+                duckdb::params![ROW_HASH_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "re-stamping must replace, not duplicate");
+    }
+
+    #[test]
+    fn unstamped_database_is_stamped_after_a_successful_refresh() {
+        let conn = conn_with_live(LIVE_ROWS);
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+
+        assert_eq!(
+            check_row_hash_version(&conn).unwrap(),
+            RowHashVersion::Current
+        );
+    }
+
+    /// The stamp claims "the live table was rebuilt with this expression". A
+    /// refresh that aborts rebuilds nothing, so it must leave the old stamp
+    /// in place — otherwise the next run would silently skip the warning for
+    /// a table whose hashes are still stale.
+    #[test]
+    fn aborted_refresh_does_not_restamp() {
+        let conn = conn_with_live(LIVE_ROWS);
+        conn.execute(
+            "INSERT INTO metadata VALUES (?, ?)",
+            duckdb::params![ROW_HASH_VERSION_KEY, "999"],
+        )
+        .unwrap();
+
+        let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
+        refresh(&conn, &TEST_SPEC, loader(empty), None).unwrap_err();
+
+        assert_eq!(
+            check_row_hash_version(&conn).unwrap(),
+            RowHashVersion::Stale("999".to_string()),
+            "an aborted refresh must not claim the rewrite happened"
+        );
     }
 
     /// `.ok()` would have silently swallowed a genuine query failure (not

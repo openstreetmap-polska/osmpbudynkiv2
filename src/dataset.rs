@@ -14,11 +14,33 @@
 //! gaining or losing a column cannot silently desynchronize the import and
 //! update expressions.
 
-/// Bumped whenever the row-hash expression changes in a way that alters its
-/// output. A mismatch against `metadata.row_hash_version` means every row
-/// will compare as modified; the refresh warns and proceeds.
+/// Bumped whenever [`hashed_select`] changes in a way that alters its output.
+///
+/// The value in force when a live table was built is stamped into
+/// `metadata.row_hash_version` by [`stamp_row_hash_version`]. A mismatch
+/// against this constant means the stored `_row_hash` values were produced by
+/// a different expression, so every row will compare as modified; the refresh
+/// warns, rewrites the table wholesale, and re-stamps — so the warning fires
+/// once per bump rather than forever.
 pub const ROW_HASH_VERSION: i64 = 1;
 pub const ROW_HASH_VERSION_KEY: &str = "row_hash_version";
+
+/// Record that the live dataset tables were built with the current
+/// [`ROW_HASH_VERSION`].
+///
+/// Called by every path that (re)builds a live table's `_row_hash` column
+/// wholesale: a full `import`, and the full-rewrite refresh that follows a
+/// version bump. Anything that rewrites only a delta must NOT call this — the
+/// untouched rows would still carry the old expression's hashes.
+pub fn stamp_row_hash_version(conn: &duckdb::Connection) -> anyhow::Result<()> {
+    use anyhow::Context;
+    // Both interpolated values are compile-time constants of this crate.
+    conn.execute_batch(&format!(
+        "DELETE FROM metadata WHERE key = '{ROW_HASH_VERSION_KEY}';
+         INSERT INTO metadata VALUES ('{ROW_HASH_VERSION_KEY}', '{ROW_HASH_VERSION}');"
+    ))
+    .context("Failed to record row hash version")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeomKind {

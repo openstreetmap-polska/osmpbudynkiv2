@@ -95,4 +95,16 @@ fn test_import_bdot10k_writes_row_hash() {
         .unwrap();
     assert_eq!(total, 74);
     assert_eq!(null_hashes, 0, "every row must carry a hash");
+
+    // The import must also stamp the version those hashes were built with.
+    // Without it, a later `update` cannot tell "these hashes are comparable"
+    // from "the expression changed underneath them".
+    let stamp: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'row_hash_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("import must stamp row_hash_version");
+    assert_eq!(stamp, "1");
 }
