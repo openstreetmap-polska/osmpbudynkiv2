@@ -109,10 +109,25 @@ pub enum ImportSource {
 pub enum UpdateSource {
     /// Update OpenStreetMap data from replication feed
     Osm,
-    /// Update BDOT10k building data
-    Bdot10k,
-    /// Update EGIB building data
-    Egib,
-    /// Update PRG address data
-    Prg,
+    /// Update BDOT10k building data from a fresh snapshot
+    Bdot10k {
+        /// Path to local file (skips download)
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Update EGIB building data from a fresh snapshot
+    Egib {
+        /// Path to local file (skips download)
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Update PRG address data from a fresh snapshot
+    Prg {
+        /// Path to local file (skips download)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Path to a TERC (TERYT) dictionary file (.zip or .xml).
+        #[arg(long)]
+        terc_file: Option<PathBuf>,
+    },
 }

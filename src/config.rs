@@ -110,11 +110,34 @@ impl Default for UpdatesConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct JobsConfig {
     pub osm_update: JobConfig,
     pub export_log_prune: ExportLogPruneConfig,
+    pub bdot10k_update: JobConfig,
+    pub egib_update: JobConfig,
+    pub prg_update: JobConfig,
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        // Government snapshots are republished irregularly, so a daily poll
+        // is plenty; the ETag HEAD check makes a no-op poll nearly free.
+        let daily = |timeout_seconds| JobConfig {
+            enabled: true,
+            interval_seconds: 86400,
+            timeout_seconds,
+        };
+        Self {
+            osm_update: JobConfig::default(),
+            export_log_prune: ExportLogPruneConfig::default(),
+            bdot10k_update: daily(3600),
+            egib_update: daily(3600),
+            // PRG streams ~16 GML files out of a ~1.7GB zip, so it needs longer.
+            prg_update: daily(7200),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -503,6 +526,43 @@ max_minutes = 720
         let config = load_config(Some(tmp.path())).unwrap();
         assert_eq!(config.updates.default_minutes, 30);
         assert_eq!(config.updates.max_minutes, 720);
+    }
+
+    #[test]
+    fn test_dataset_update_job_defaults() {
+        let config = load_config(None).unwrap();
+        assert!(config.jobs.bdot10k_update.enabled);
+        assert_eq!(config.jobs.bdot10k_update.interval_seconds, 86400);
+        assert_eq!(config.jobs.bdot10k_update.timeout_seconds, 3600);
+        assert!(config.jobs.egib_update.enabled);
+        assert_eq!(config.jobs.egib_update.interval_seconds, 86400);
+        assert_eq!(config.jobs.egib_update.timeout_seconds, 3600);
+        assert!(config.jobs.prg_update.enabled);
+        assert_eq!(config.jobs.prg_update.interval_seconds, 86400);
+        assert_eq!(config.jobs.prg_update.timeout_seconds, 7200);
+    }
+
+    #[test]
+    fn test_dataset_update_job_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[jobs.bdot10k_update]
+enabled = false
+interval_seconds = 3600
+timeout_seconds = 300
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert!(!config.jobs.bdot10k_update.enabled);
+        assert_eq!(config.jobs.bdot10k_update.interval_seconds, 3600);
+        assert_eq!(config.jobs.bdot10k_update.timeout_seconds, 300);
+        // Unrelated jobs keep their defaults.
+        assert!(config.jobs.egib_update.enabled);
+        assert_eq!(config.jobs.egib_update.interval_seconds, 86400);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;
 use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
+use prg_convert::terc::Terc;
 use prg_convert::{get_address_parser_2021_zip, get_teryt_mapping};
 use tracing::info;
 use zip::ZipArchive;
@@ -34,6 +36,81 @@ pub fn import(
     terc_file: Option<&Path>,
     url: &str,
 ) -> Result<()> {
+    let total = std::time::Instant::now();
+
+    let (zip_path, terc) = prepare_source(config, file, terc_file, url)?;
+
+    let raw_table = "prg_addresses_raw";
+    stream_gml_into(conn, &zip_path, &terc, raw_table)?;
+
+    // Materialize the final table with a geometry column built from
+    // EPSG:4326 lon/lat (the parser already reprojected from EPSG:2180).
+    let t = std::time::Instant::now();
+    materialize_into(conn, crate::dataset::PRG.table, raw_table)?;
+    info!(
+        elapsed = %format_duration(t.elapsed()),
+        "Step done: build prg_addresses with geom column"
+    );
+
+    let t = std::time::Instant::now();
+    conn.execute_batch("CREATE INDEX prg_addresses_geom_idx ON prg_addresses USING RTREE (geom);")
+        .context("Failed to create spatial index on prg_addresses")?;
+    info!(
+        elapsed = %format_duration(t.elapsed()),
+        "Step done: create spatial index"
+    );
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM prg_addresses", [], |row| row.get(0))?;
+
+    info!(
+        count,
+        elapsed = %format_duration(total.elapsed()),
+        "PRG import complete"
+    );
+
+    Ok(())
+}
+
+/// Refresh `prg_addresses` from a fresh snapshot, reusing the import
+/// streaming path to build the staging table.
+///
+/// `source_etag` is the validator observed by the caller's HEAD check (see
+/// `update::source_unchanged`), if any; it is threaded through unchanged to
+/// `dataset::refresh` so it lands in `dataset_refreshes.source_etag`.
+pub fn update_prg(
+    conn: &Connection,
+    config: &Config,
+    file: Option<&Path>,
+    terc_file: Option<&Path>,
+    url: &str,
+    source_etag: Option<&str>,
+) -> Result<()> {
+    let (zip_path, terc) = prepare_source(config, file, terc_file, url)?;
+    crate::update::dataset::refresh(
+        conn,
+        &crate::dataset::PRG,
+        |c, target| {
+            let raw = format!("{target}_raw");
+            stream_gml_into(c, &zip_path, &terc, &raw)?;
+            materialize_into(c, target, &raw)
+        },
+        source_etag,
+    )
+    .map(|_| ())
+}
+
+/// Resolve the PRG zip (local file or download) and build the TERC mapping
+/// needed to parse it. Resolution priority for TERC: `--terc-file` CLI flag >
+/// `teryt.file_path` in config > TERYT API download.
+///
+/// Does not touch the database — this is pure "get the inputs ready" work
+/// shared by both `import` and `update_prg`.
+fn prepare_source(
+    config: &Config,
+    file: Option<&Path>,
+    terc_file: Option<&Path>,
+    url: &str,
+) -> Result<(PathBuf, Arc<HashMap<String, Terc>>)> {
     let zip_path = match file {
         Some(p) => PathBuf::from(p),
         None => {
@@ -59,10 +136,8 @@ pub fn import(
         } else {
             "api"
         },
-        "Importing PRG addresses (2021 schema)"
+        "Preparing PRG addresses source (2021 schema)"
     );
-
-    let total = std::time::Instant::now();
 
     // Build TERC mapping (small, ~3000 entries — fits comfortably in memory).
     let t = std::time::Instant::now();
@@ -110,11 +185,27 @@ pub fn import(
         "Step done: load TERC mapping"
     );
 
+    Ok((zip_path, terc))
+}
+
+/// Enumerate every `.gml` entry in the PRG zip and stream its parsed arrow
+/// batches into `raw_table`, creating it from the first batch's schema and
+/// appending the rest. Drops any leftover `raw_table` from a previous run
+/// first.
+fn stream_gml_into(
+    conn: &Connection,
+    zip_path: &Path,
+    terc: &Arc<HashMap<String, Terc>>,
+    raw_table: &str,
+) -> Result<()> {
+    let zip_str = zip_path
+        .to_str()
+        .context("PRG zip path is not valid UTF-8")?;
+
     // List the zip once and pick the indices of all 2021 GML entries.
-    let mut archive = ZipArchive::new(
-        File::open(&zip_path).with_context(|| format!("Failed to open {zip_str}"))?,
-    )
-    .with_context(|| format!("Failed to read PRG zip archive {zip_str}"))?;
+    let mut archive =
+        ZipArchive::new(File::open(zip_path).with_context(|| format!("Failed to open {zip_str}"))?)
+            .with_context(|| format!("Failed to read PRG zip archive {zip_str}"))?;
 
     let gml_indices = collect_gml_indices(&mut archive)
         .with_context(|| format!("Failed to enumerate entries in {zip_str}"))?;
@@ -128,8 +219,8 @@ pub fn import(
 
     // Drop any leftover staging table from a previous run; we (re)create it
     // lazily from the first arrow batch's schema.
-    conn.execute_batch("DROP TABLE IF EXISTS prg_addresses_raw")
-        .context("Failed to drop existing prg_addresses_raw")?;
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS {raw_table}"))
+        .with_context(|| format!("Failed to drop existing {raw_table}"))?;
 
     let t = std::time::Instant::now();
     let mut table_created = false;
@@ -144,7 +235,7 @@ pub fn import(
         let parser = get_address_parser_2021_zip(
             &mut archive,
             &2048, // STANDARD_VECTOR_SIZE; arrow vtab panics on larger batches
-            &terc,
+            terc,
             idx,
         )
         .with_context(|| format!("Failed to build PRG 2021 parser for zip entry {idx}"))?;
@@ -157,17 +248,17 @@ pub fn import(
             let params = arrow_recordbatch_to_query_params(batch);
             if !table_created {
                 conn.execute(
-                    "CREATE TABLE prg_addresses_raw AS SELECT * FROM arrow(?, ?)",
+                    &format!("CREATE TABLE {raw_table} AS SELECT * FROM arrow(?, ?)"),
                     params,
                 )
-                .context("Failed to create prg_addresses_raw from first arrow batch")?;
+                .with_context(|| format!("Failed to create {raw_table} from first arrow batch"))?;
                 table_created = true;
             } else {
                 conn.execute(
-                    "INSERT INTO prg_addresses_raw SELECT * FROM arrow(?, ?)",
+                    &format!("INSERT INTO {raw_table} SELECT * FROM arrow(?, ?)"),
                     params,
                 )
-                .context("Failed to insert PRG batch into prg_addresses_raw")?;
+                .with_context(|| format!("Failed to insert PRG batch into {raw_table}"))?;
             }
         }
     }
@@ -180,44 +271,27 @@ pub fn import(
         "Step done: stream PRG batches into staging table"
     );
 
-    // Materialize the final table with a geometry column built from
-    // EPSG:4326 lon/lat (the parser already reprojected from EPSG:2180).
-    let t = std::time::Instant::now();
-    conn.execute_batch(
-        "
-        DROP TABLE IF EXISTS prg_addresses;
-        CREATE TABLE prg_addresses AS
-        SELECT *,
-               ST_Point(dlugosc_geograficzna, szerokosc_geograficzna) AS geom
-        FROM prg_addresses_raw
-        WHERE dlugosc_geograficzna IS NOT NULL
-          AND szerokosc_geograficzna IS NOT NULL;
-        DROP TABLE prg_addresses_raw;
-        ",
-    )
-    .context("Failed to materialize prg_addresses table")?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: build prg_addresses with geom column"
-    );
-
-    let t = std::time::Instant::now();
-    conn.execute_batch("CREATE INDEX prg_addresses_geom_idx ON prg_addresses USING RTREE (geom);")
-        .context("Failed to create spatial index on prg_addresses")?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: create spatial index"
-    );
-
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM prg_addresses", [], |row| row.get(0))?;
-
-    info!(
-        count,
-        elapsed = %format_duration(total.elapsed()),
-        "PRG import complete"
-    );
-
     Ok(())
+}
+
+/// Build `target_table` from the streamed `raw_table`, adding a geometry
+/// column built from EPSG:4326 lon/lat (the parser already reprojected from
+/// EPSG:2180) and the `_row_hash` column. Drops `raw_table` afterwards.
+/// Does NOT create an index.
+pub fn materialize_into(conn: &Connection, target_table: &str, raw_table: &str) -> Result<()> {
+    let inner = format!(
+        "SELECT *, ST_Point(dlugosc_geograficzna, szerokosc_geograficzna) AS geom \
+         FROM {raw_table} \
+         WHERE dlugosc_geograficzna IS NOT NULL \
+           AND szerokosc_geograficzna IS NOT NULL"
+    );
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {target_table};
+         CREATE TABLE {target_table} AS {};
+         DROP TABLE {raw_table};",
+        crate::dataset::hashed_select(&inner)
+    ))
+    .with_context(|| format!("Failed to materialize {target_table}"))
 }
 
 /// Walk the archive once and collect indices of entries whose name ends in

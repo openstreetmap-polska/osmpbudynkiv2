@@ -16,10 +16,12 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] `import prg` — address registry ZIP parsed via [prg_convert](https://github.com/ttomasz/prg_convert/), with TERC dictionary support
 - [x] `import bdot10k` / `import egib` — building registries from GeoParquet (auto-download or local file)
 - [x] `update osm` — incremental updates from the minutely OSM replication feed
+- [x] `update prg` / `update bdot10k` / `update egib` — re-download a government dataset and apply only the delta, skipping the refresh entirely when the source ETag is unchanged
 - [x] `compare buildings` (BDOT10k, EGIB) — spatial matching of government buildings against OSM buildings
 - [x] `compare addresses` (PRG) — matching government addresses against OSM, producing import candidate tables
 - [x] `run` HTTP server basics: `/health`, `/status` (background job status), startup checks, graceful shutdown, read-only connection pool + single writer
-- [x] Background job scheduler with a periodic OSM update job (no overlapping runs, timeout handling)
+- [x] Background job scheduler (no overlapping runs, timeout handling) with periodic OSM and government-dataset refresh jobs
+- [x] Per-tile change tracking — every refresh records which z14 cells changed (`dataset_change_areas`) alongside a refresh log (`dataset_refreshes`)
 - [x] Vector tile endpoint `/tiles/{z}/{x}/{y}` (MVT; zoom 14 only, serving raw address and building layers)
 - [x] GeoJSON data package endpoint `GET/POST /package` — live comparison against current OSM data, OSM-ready tags for direct JOSM import (bbox in GET, polygon in POST)
 - [x] `GET /updates` — recent `/package` export activity as a GeoJSON `FeatureCollection`, browser-cacheable for 60 seconds (`?minutes=`, default 60, capped at 1440)
@@ -27,8 +29,6 @@ Current implementation status against the planned scope (see [`docs/project_idea
 ## Not yet implemented
 
 - [ ] `import full` — running all imports in one command (individual imports work)
-- [ ] `update prg` / `update bdot10k` / `update egib` — re-downloading government datasets
-- [ ] Background refresh jobs for government datasets (only the OSM update job exists)
 - [ ] Serving comparison results via the API (tiles currently show raw datasets, not comparison output)
 - [ ] Vector tiles for lower zoom levels with aggregation/clustering (DBSCAN or H3) and tile caching
 - [ ] Web map frontend for browsing data status and downloading packages
@@ -77,6 +77,7 @@ The config file controls:
 - **`download_urls`** — URLs for downloading data sources
 - **`[package]`** — `/package` endpoint limits (`max_area_sq_deg`, default 0.04)
 - **`[updates]`** — `/updates` time window limits (`default_minutes`, `max_minutes`)
+- **`[jobs.*]`** — background jobs, each with `enabled`, `interval_seconds` and a per-run timeout: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, and export-log pruning. Only one dataset refresh runs at a time, regardless of how the schedules line up.
 
 All fields are optional — only specify what you want to override. Note that `duckdb_init_commands` is fully replaced if specified (not merged with defaults).
 
@@ -115,11 +116,53 @@ cargo run -- import prg --file prg.zip
 # Update OSM data from minutely replication feed
 cargo run -- update osm
 
-# Update government datasets (not yet implemented)
+# Update government datasets (re-downloads unless --file is given)
 cargo run -- update bdot10k
 cargo run -- update egib
 cargo run -- update prg
+
+# Update from a local snapshot instead of downloading
+cargo run -- update bdot10k --file bdot10k.parquet
+cargo run -- update egib --file egib.parquet
+cargo run -- update prg --file prg.zip --terc-file terc.csv
 ```
+
+A government-dataset update stages the new snapshot alongside the live table,
+diffs it by whole-row hash, and applies only the delta — so an unchanged row is
+never rewritten and the spatial index stays intact. The delta, the refresh
+record and the per-tile change areas all commit in one transaction, so readers
+never observe a partially-applied update.
+
+When the source is downloaded rather than passed with `--file`, a `HEAD` request
+compares the remote `ETag` against the last one recorded; an unchanged source
+skips the refresh entirely and records a zero-count row, so "ran and found
+nothing" stays distinguishable from "never ran".
+
+These refreshes also run on a schedule in the background under `run` — see the
+`[jobs]` config section.
+
+#### Row-hash version
+
+The diff works by comparing a whole-row hash, so an import and a later update
+must compute that hash identically. The expression lives in exactly one place,
+`hashed_select` in `src/dataset.rs`, and the version it was built with is
+stamped into the `metadata` table under the key `row_hash_version`.
+
+**If you change `hashed_select` in a way that alters its output, bump the
+`ROW_HASH_VERSION` constant next to it.** Nothing else needs changing — every
+import and every update reads that one constant.
+
+What happens after a bump: the stamp in an existing database still names the
+old version, so the next update logs a `row hash version mismatch` warning and
+every row compares as modified. That refresh is effectively a full rewrite —
+correct, just slower than usual, and it reports a changeset the size of the
+whole dataset. On success it re-stamps the new version, so the warning appears
+once per bump, not on every run afterwards. A refresh that fails leaves the old
+stamp alone, so the warning survives until a rewrite actually lands.
+
+The check only detects changes you make and declare. It is not derived from the
+DuckDB version, so a DuckDB upgrade that silently changed `hash()` output would
+produce the same full rewrite without the explanatory warning.
 
 ### compare — compare government data against OSM
 

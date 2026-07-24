@@ -108,6 +108,27 @@ pub async fn run(
             Arc::new(jobs::export_log_prune::ExportLogPruneJob) as Arc<dyn jobs::Job>,
             export_prune_cfg,
         ),
+        (
+            Arc::new(jobs::dataset_update::DatasetUpdateJob::new(
+                &crate::dataset::BDOT10K,
+                "bdot10k_update",
+            )) as Arc<dyn jobs::Job>,
+            jobs::JobConfigResolved::from(&config.jobs.bdot10k_update),
+        ),
+        (
+            Arc::new(jobs::dataset_update::DatasetUpdateJob::new(
+                &crate::dataset::EGIB,
+                "egib_update",
+            )) as Arc<dyn jobs::Job>,
+            jobs::JobConfigResolved::from(&config.jobs.egib_update),
+        ),
+        (
+            Arc::new(jobs::dataset_update::DatasetUpdateJob::new(
+                &crate::dataset::PRG,
+                "prg_update",
+            )) as Arc<dyn jobs::Job>,
+            jobs::JobConfigResolved::from(&config.jobs.prg_update),
+        ),
     ];
     let scheduler = jobs::Scheduler::start(job_list, pool.clone(), kv, config.clone());
     let registry = scheduler.registry.clone();

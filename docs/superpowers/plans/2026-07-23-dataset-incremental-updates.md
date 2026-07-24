@@ -15,6 +15,7 @@
 - **`hash()` returns `UBIGINT`.** All hash columns and variables are `UBIGINT` in SQL, `u64` in Rust.
 - **The row-hash expression must come from one shared function** used by both the import and the update path. If they disagree, every row compares as modified on every refresh, forever. This is the single most important invariant in the feature.
 - **The apply phase must be exactly one transaction** covering the data delta, the `dataset_refreshes` row and the `dataset_change_areas` rows.
+- **Within that transaction, the `dataset_change_areas` rows must be written before the delta.** The changeset reads the old geometry of removed and modified objects out of the live table, and the `DELETE` destroys it. Getting this backwards yields a silently wrong changeset, not an error.
 - **Never `DROP` or `ALTER` a live source table** (`prg_addresses`, `bdot10k_buildings`, `egib_buildings`) outside the `import` path. DuckDB refuses to rename an indexed table, and a view degrades `RTREE_INDEX_SCAN` to `SEQ_SCAN` — both were verified and both are why this design exists.
 - **Run `cargo fmt` and `cargo clippy` before every commit.** The repo is clean on both today; keep it that way.
 - No new external dependencies. No migration machinery — the dev database is dropped and recreated when the schema changes.
@@ -1063,7 +1064,7 @@ Turn the diff tables into aggregated per-tile change counts. Both old and new ge
 
 **Interfaces:**
 - Consumes: `crate::dataset::DatasetSpec`, `crate::tile_math::CHANGE_CELL_ZOOM`, and the `diff_added` / `diff_removed` / `diff_modified` temp tables from Task 7.
-- Produces: `crate::update::changeset::insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i64) -> Result<i64>` — inserts into `dataset_change_areas` and returns the number of cell rows written. Must be called inside the caller's transaction.
+- Produces: `crate::update::changeset::insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i64) -> Result<i64>` — inserts into `dataset_change_areas` and returns the number of cell rows written. Must be called inside the caller's transaction, and **before** the delta is applied: it reads the old geometry of removed and modified objects out of the live table, which the `DELETE` destroys.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1496,6 +1497,48 @@ mod tests {
         n > 0
     }
 
+    /// Change areas must be written BEFORE the delta is applied, while the
+    /// live table still holds the old snapshot. Written after, the DELETE has
+    /// already destroyed the old rows: removed objects vanish from the
+    /// changeset entirely, and a moved object marks its destination cell
+    /// twice instead of marking both the cell it left and the one it entered.
+    /// This is a silent wrong answer, not an error, so pin it with a test.
+    #[test]
+    fn change_areas_see_the_pre_apply_geometry() {
+        use crate::tile_math::{CHANGE_CELL_ZOOM, lonlat_to_tile};
+
+        const BEFORE: &str = "SELECT * FROM (VALUES
+            ('mov','v1',21.0,52.0), ('del','v1',21.0,52.0)
+          ) t(id,a,lon,lat)";
+        // 'mov' moves to a different z14 cell; 'del' disappears.
+        const AFTER: &str = "SELECT * FROM (VALUES
+            ('mov','v1',19.0,50.0)
+          ) t(id,a,lon,lat)";
+
+        let conn = conn_with_live(BEFORE);
+        refresh(&conn, &TEST_SPEC, loader(AFTER), None).unwrap();
+
+        let cell = |lon: f64, lat: f64| -> (i32, i32, i32) {
+            let (x, y) = lonlat_to_tile(lon, lat, CHANGE_CELL_ZOOM);
+            conn.query_row(
+                "SELECT COALESCE(SUM(added), 0)::INTEGER,
+                        COALESCE(SUM(modified), 0)::INTEGER,
+                        COALESCE(SUM(removed), 0)::INTEGER
+                 FROM dataset_change_areas WHERE cell_x = ? AND cell_y = ?",
+                duckdb::params![x, y],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        let (_, origin_modified, origin_removed) = cell(21.0, 52.0);
+        assert_eq!(origin_removed, 1, "removed object must mark its cell");
+        assert_eq!(origin_modified, 1, "moved object must mark the cell it left");
+
+        let (_, dest_modified, _) = cell(19.0, 50.0);
+        assert_eq!(dest_modified, 1, "moved object must mark the cell it entered");
+    }
+
     /// An unchanged snapshot still records a refresh row, with zero counts
     /// and no change areas, so "ran and did nothing" is distinguishable from
     /// "never ran".
@@ -1698,18 +1741,30 @@ pub fn refresh(
     let t = std::time::Instant::now();
     let id = spec.id_column;
     let live = spec.table;
-    let snapshot_id: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM dataset_refreshes",
-            [],
-            |row| row.get(0),
-        )
-        .context("Failed to allocate snapshot_id")?;
-
     conn.execute_batch("BEGIN TRANSACTION")
         .context("Failed to begin apply transaction")?;
 
-    let applied = (|| -> Result<()> {
+    let applied = (|| -> Result<i64> {
+        // Allocated inside the transaction so the read and the write that
+        // consumes it cannot be split by a concurrent refresh. The PRIMARY KEY
+        // on snapshot_id is the backstop if two ever do overlap.
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM dataset_refreshes",
+                [],
+                |row| row.get(0),
+            )
+            .context("Failed to allocate snapshot_id")?;
+
+        // Change areas FIRST. insert_change_areas reads the OLD geometry of
+        // removed and modified objects out of the live table — the cell each
+        // object is leaving — and the DELETE below is about to destroy it.
+        // Reordering these two produces a silently wrong changeset, not an
+        // error: removed objects contribute nothing, and a moved object marks
+        // its destination cell twice instead of both cells. Nothing in the
+        // schema enforces this, so do not move it.
+        insert_change_areas(conn, spec, snapshot_id)?;
+
         conn.execute_batch(&format!(
             "DELETE FROM {live} WHERE {id} IN (
                  SELECT id FROM diff_removed UNION ALL SELECT id FROM diff_modified);
@@ -1718,32 +1773,43 @@ pub fn refresh(
         ))
         .with_context(|| format!("Failed to apply delta to {live}"))?;
 
-        let etag_sql = match source_etag {
-            Some(e) => format!("'{}'", e.replace('\'', "''")),
-            None => "NULL".to_string(),
-        };
-        conn.execute_batch(&format!(
-            "INSERT INTO dataset_refreshes
-             VALUES ({snapshot_id}, '{}', now(), now(), {etag_sql}, {}, {}, {});",
-            spec.name, counts.added, counts.modified, counts.removed
-        ))
+        // source_etag comes from a remote HTTP server. Bind it; never
+        // interpolate it into the statement text.
+        conn.execute(
+            "INSERT INTO dataset_refreshes VALUES (?, ?, now(), now(), ?, ?, ?, ?)",
+            duckdb::params![
+                snapshot_id,
+                spec.name,
+                source_etag,
+                counts.added,
+                counts.modified,
+                counts.removed
+            ],
+        )
         .context("Failed to record refresh")?;
 
-        insert_change_areas(conn, spec, snapshot_id)?;
-        Ok(())
+        Ok(snapshot_id)
     })();
 
-    match applied {
-        Ok(()) => conn
-            .execute_batch("COMMIT")
-            .context("Failed to commit apply transaction")?,
+    let snapshot_id = match applied {
+        Ok(id) => {
+            // A failed COMMIT leaves the transaction open, poisoning the
+            // pooled connection for the next caller — roll back here too.
+            if let Err(e) = conn.execute_batch("COMMIT") {
+                if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                    warn!(error = %rb, "failed to roll back after failed commit");
+                }
+                return Err(e).context("Failed to commit apply transaction");
+            }
+            id
+        }
         Err(e) => {
             if let Err(rb) = conn.execute_batch("ROLLBACK") {
                 warn!(error = %rb, "failed to roll back apply transaction");
             }
             return Err(e);
         }
-    }
+    };
 
     info!(
         source = spec.name,
@@ -1767,13 +1833,17 @@ pub fn refresh(
 /// as modified. That is correct but slow and produces a misleadingly large
 /// changeset, so warn loudly and explain the cause — but do not block.
 fn check_row_hash_version(conn: &Connection) -> Result<()> {
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = ?",
-            duckdb::params![ROW_HASH_VERSION_KEY],
-            |row| row.get(0),
-        )
-        .ok();
+    // Distinguish "no row yet" (first run) from a genuine query failure —
+    // `.ok()` would conflate them and silently re-insert on a broken database.
+    let stored: Option<String> = match conn.query_row(
+        "SELECT value FROM metadata WHERE key = ?",
+        duckdb::params![ROW_HASH_VERSION_KEY],
+        |row| row.get(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(duckdb::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e).context("Failed to read row hash version"),
+    };
 
     match stored {
         Some(v) if v == ROW_HASH_VERSION.to_string() => {}
@@ -2441,16 +2511,42 @@ Apply the same shape to the EGIB and PRG arms (PRG passes `Some(PRG_DOWNLOAD_FIL
 /// Record a refresh that ran but had nothing to do, so "ran and found no
 /// changes" stays distinguishable from "never ran" in /status.
 fn record_noop_refresh(conn: &Connection, source: &str, etag: Option<&str>) -> Result<()> {
-    let snapshot_id: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM dataset_refreshes",
-        [],
-        |row| row.get(0),
-    )?;
-    conn.execute(
-        "INSERT INTO dataset_refreshes VALUES (?, ?, now(), now(), ?, 0, 0, 0)",
-        duckdb::params![snapshot_id, source, etag],
-    )
-    .context("Failed to record no-op refresh")?;
+    // Same rule as the apply path: allocate snapshot_id in the same
+    // transaction that consumes it, so the MAX+1 read cannot be split from
+    // the INSERT by a concurrent refresh.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .context("Failed to begin no-op refresh transaction")?;
+
+    let recorded = (|| -> Result<()> {
+        let snapshot_id: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM dataset_refreshes",
+            [],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO dataset_refreshes VALUES (?, ?, now(), now(), ?, 0, 0, 0)",
+            duckdb::params![snapshot_id, source, etag],
+        )
+        .context("Failed to record no-op refresh")?;
+        Ok(())
+    })();
+
+    match recorded {
+        Ok(()) => {
+            if let Err(e) = conn.execute_batch("COMMIT") {
+                if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                    tracing::warn!(error = %rb, "failed to roll back after failed commit");
+                }
+                return Err(e).context("Failed to commit no-op refresh");
+            }
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::warn!(error = %rb, "failed to roll back no-op refresh");
+            }
+            return Err(e);
+        }
+    }
     Ok(())
 }
 ```

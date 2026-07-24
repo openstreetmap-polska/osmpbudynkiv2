@@ -75,6 +75,34 @@ fn create_schema(conn: &Connection) -> Result<()> {
             address_count INTEGER,
             building_count INTEGER
         );
+
+        -- One row per dataset refresh attempt, including no-ops. Owns snapshot_id,
+        -- which is assigned inside the apply transaction as MAX(snapshot_id) + 1.
+        CREATE TABLE IF NOT EXISTS dataset_refreshes (
+            snapshot_id BIGINT PRIMARY KEY,
+            source VARCHAR,
+            started_at TIMESTAMP WITH TIME ZONE,
+            finished_at TIMESTAMP WITH TIME ZONE,
+            source_etag VARCHAR,
+            added INTEGER,
+            modified INTEGER,
+            removed INTEGER
+        );
+
+        -- Aggregated change counts per XYZ tile (z = tile_math::CHANGE_CELL_ZOOM).
+        -- Both the old and the new geometry of a changed object contribute, so an
+        -- object that moves marks the cell it left and the cell it entered.
+        CREATE TABLE IF NOT EXISTS dataset_change_areas (
+            snapshot_id BIGINT,
+            source VARCHAR,
+            cell_z INTEGER,
+            cell_x INTEGER,
+            cell_y INTEGER,
+            added INTEGER,
+            modified INTEGER,
+            removed INTEGER,
+            detected_at TIMESTAMP WITH TIME ZONE
+        );
         ",
     )
     .context("Failed to create schema")?;
@@ -141,6 +169,58 @@ mod tests {
         assert_eq!(datasets_json, r#"["prg","bdot10k"]"#);
         assert_eq!(address_count, 3);
         assert_eq!(building_count, 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_init_db_creates_changeset_tables() -> Result<()> {
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
+
+        for table in ["dataset_refreshes", "dataset_change_areas"] {
+            let count: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(count, 0, "Table {table} should be empty initially");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_changeset_tables_round_trip() -> Result<()> {
+        let init_commands = vec![
+            "INSTALL spatial".to_string(),
+            "LOAD spatial".to_string(),
+            "INSTALL icu".to_string(),
+            "LOAD icu".to_string(),
+        ];
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
+
+        conn.execute_batch(
+            "INSERT INTO dataset_refreshes
+                 VALUES (1, 'bdot10k', now(), now(), 'etag-abc', 10, 20, 5);
+             INSERT INTO dataset_change_areas
+                 VALUES (1, 'bdot10k', 14, 9147, 5411, 10, 20, 5, now());",
+        )?;
+
+        let (source, added, modified, removed): (String, i32, i32, i32) = conn.query_row(
+            "SELECT source, added, modified, removed FROM dataset_refreshes",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            (source.as_str(), added, modified, removed),
+            ("bdot10k", 10, 20, 5)
+        );
+
+        let (z, x, y): (i32, i32, i32) = conn.query_row(
+            "SELECT cell_z, cell_x, cell_y FROM dataset_change_areas",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!((z, x, y), (14, 9147, 5411));
 
         Ok(())
     }

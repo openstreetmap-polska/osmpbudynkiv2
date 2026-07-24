@@ -1,12 +1,14 @@
 mod cli;
 mod compare;
 mod config;
+mod dataset;
 mod db;
 mod download;
 mod import;
 mod osm;
 mod server;
 mod shutdown;
+mod tile_math;
 mod update;
 mod utils;
 

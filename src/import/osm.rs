@@ -480,8 +480,8 @@ fn stream_relations_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) 
 
         let members: Vec<(i64, u8, u8)> = refs
             .into_iter()
-            .zip(ref_types.into_iter())
-            .zip(ref_roles.into_iter())
+            .zip(ref_types)
+            .zip(ref_roles)
             .map(|((ref_id, ref_type), ref_role)| {
                 (
                     ref_id,

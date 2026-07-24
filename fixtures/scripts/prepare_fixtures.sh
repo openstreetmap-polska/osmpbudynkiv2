@@ -41,4 +41,8 @@ uv run "$SCRIPT_DIR/verify_geoparquet_fixture.py" \
     "$REPO_ROOT/fixtures/egib.parquet"
 
 echo ""
+echo "=== Preparing update (v2) fixtures ==="
+bash "$SCRIPT_DIR/prepare_update_fixtures.sh"
+
+echo ""
 echo "=== All fixtures prepared and verified ==="

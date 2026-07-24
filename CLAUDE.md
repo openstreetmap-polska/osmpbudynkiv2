@@ -40,6 +40,10 @@ Note: Both `duckdb` and `rocksdb` dependencies use bundled C++ compilation, so n
 - API returns GeoJSON, not OSM XML — JOSM can read GeoJSON (ADR-003)
 - Single process, multithreaded — DuckDB doesn't support multiple writer processes (docs/project_ideas.md)
 
+**Government-dataset updates** stage a fresh snapshot in `<table>__staging`, diff it against the live table by whole-row hash, and apply only the delta. The delta, the `dataset_refreshes` row and the per-tile `dataset_change_areas` rows all commit in one transaction; change areas are written *before* the delta, because they read the pre-update geometry of removed/modified rows out of the live table.
+
+**Gotcha — row-hash version.** The diff only works if import and update hash a row identically, so the hash expression exists in exactly one place: `hashed_select` in `src/dataset.rs`. **If you change it in a way that alters its output, bump the `ROW_HASH_VERSION` constant beside it.** The version in force is stamped into `metadata.row_hash_version` by `dataset::stamp_row_hash_version`, called from the import dispatch and from the apply transaction in `update::dataset::refresh`. After a bump the next update warns, compares every row as modified (a full rewrite — correct but slow), then re-stamps, so the warning fires once rather than forever; a failed refresh leaves the old stamp. Only paths that rebuild a table's hashes wholesale may stamp — never a partial delta.
+
 ## Data Sources
 
 - **OSM:** Poland PBF extract from OSM France, minutely replication feed

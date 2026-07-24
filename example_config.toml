@@ -112,6 +112,31 @@ interval_seconds = 86400
 # How long package_exports rows are kept before being deleted.
 retention_days = 365
 
+# Government dataset refreshes. Each downloads the current snapshot, diffs it
+# against the live table, and applies only the difference in a single
+# transaction, so HTTP readers are never disrupted.
+#
+# A HEAD request compares the source's ETag/Last-Modified against the last
+# successful refresh first, so a daily poll costs one round-trip when the
+# publisher has not republished. The three refreshes also share a process-wide
+# lock so at most one runs at a time, since staging all three simultaneously
+# could exceed memory_limit.
+[jobs.bdot10k_update]
+enabled = true
+interval_seconds = 86400
+timeout_seconds = 3600
+
+[jobs.egib_update]
+enabled = true
+interval_seconds = 86400
+timeout_seconds = 3600
+
+# PRG streams ~16 GML files out of a ~1.7GB zip, so it gets a longer timeout.
+[jobs.prg_update]
+enabled = true
+interval_seconds = 86400
+timeout_seconds = 7200
+
 # GeoJSON data package endpoint (GET/POST /package, served by the `run` subcommand).
 [package]
 # Maximum allowed area of a request's bounding box, in square degrees.
