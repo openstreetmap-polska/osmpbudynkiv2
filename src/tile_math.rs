@@ -3,7 +3,6 @@ use std::f64::consts::PI;
 /// Zoom level at which dataset change areas are aggregated. Matches the
 /// highest zoom `/tiles` serves, so a change cell maps 1:1 onto a served
 /// tile for cache invalidation.
-#[allow(dead_code)]
 pub const CHANGE_CELL_ZOOM: u32 = 14;
 
 /// Bounding box of an XYZ tile as (min_lon, min_lat, max_lon, max_lat).
@@ -17,6 +16,10 @@ pub fn tile_to_bbox(z: u32, x: u32, y: u32) -> (f64, f64, f64, f64) {
 }
 
 /// XYZ tile containing a lon/lat point. Inverse of [`tile_to_bbox`].
+///
+/// Test-only in the binary: the production change-area path computes tiles in
+/// SQL (see `update::changeset`), and this is the Rust side that keeps those
+/// two projections honest via round-trip assertions.
 #[allow(dead_code)]
 pub fn lonlat_to_tile(lon: f64, lat: f64, z: u32) -> (u32, u32) {
     let n = 2f64.powi(z as i32);
