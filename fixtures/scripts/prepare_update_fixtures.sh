@@ -27,8 +27,14 @@ COPY (
 ) TO 'bdot10k_v2.parquet' (FORMAT PARQUET);
 "
 
+# EGIB, unlike BDOT10k, is read back as real GeoParquet: egib.parquet carries
+# valid GeoParquet metadata and src/import/egib.rs relies on the geometry
+# column auto-detecting as GEOMETRY so it can call ST_Transform on it. Writing
+# v2 with conversion disabled would emit a plain BLOB column with no `geo`
+# metadata, and the EGIB loader would fail with "No function matches
+# ST_Transform(BLOB, ...)". So load spatial and leave conversion on here.
 duckdb -c "
-SET enable_geoparquet_conversion = false;
+LOAD spatial;
 COPY (
   WITH ranked AS (SELECT *, row_number() OVER (ORDER BY id_budynku) rn,
                          count(*) OVER () n FROM 'egib.parquet')
