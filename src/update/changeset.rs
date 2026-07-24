@@ -1,0 +1,180 @@
+use anyhow::{Context, Result};
+use duckdb::Connection;
+
+use crate::dataset::DatasetSpec;
+use crate::tile_math::CHANGE_CELL_ZOOM;
+
+/// Aggregate the diff tables into per-tile change counts and insert them
+/// into `dataset_change_areas`. Returns the number of cell rows written.
+///
+/// Must be called inside the caller's transaction so the changeset commits
+/// atomically with the data delta it describes.
+///
+/// Contributions:
+/// - added: new geometry (from staging)
+/// - removed: old geometry (from live)
+/// - modified: BOTH old and new geometry, so an object that moves marks the
+///   cell it left as well as the cell it entered.
+///
+/// Rows with NULL geometry contribute no cell (they have no location), but
+/// are still counted in `dataset_refreshes`.
+#[allow(dead_code)]
+pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i64) -> Result<i64> {
+    let live = spec.table;
+    let staging = spec.staging_table();
+    let id = spec.id_column;
+    let z = CHANGE_CELL_ZOOM;
+    let n = format!("pow(2, {z})");
+
+    // Web-Mercator XYZ tile of a point, matching tile_math::lonlat_to_tile.
+    let cell_x = |p: &str| format!("floor((ST_X({p}) + 180) / 360 * {n})::INTEGER");
+    let cell_y = |p: &str| {
+        format!(
+            "floor((1 - ln(tan(radians(ST_Y({p}))) + 1 / cos(radians(ST_Y({p})))) / pi()) \
+             / 2 * {n})::INTEGER"
+        )
+    };
+
+    let point_live = spec.representative_point_sql("l.geom");
+    let point_stg = spec.representative_point_sql("s.geom");
+
+    let sql = format!(
+        "INSERT INTO dataset_change_areas
+         SELECT {snapshot_id}, '{source}', {z}, cell_x, cell_y,
+                COUNT(*) FILTER (WHERE kind = 'added')::INTEGER,
+                COUNT(*) FILTER (WHERE kind = 'modified')::INTEGER,
+                COUNT(*) FILTER (WHERE kind = 'removed')::INTEGER,
+                now()
+         FROM (
+             SELECT 'added' AS kind, {sx} AS cell_x, {sy} AS cell_y
+             FROM {staging} s JOIN diff_added d ON s.{id} = d.id
+             WHERE s.geom IS NOT NULL
+             UNION ALL
+             SELECT 'removed', {lx}, {ly}
+             FROM {live} l JOIN diff_removed d ON l.{id} = d.id
+             WHERE l.geom IS NOT NULL
+             UNION ALL
+             SELECT 'modified', {sx}, {sy}
+             FROM {staging} s JOIN diff_modified d ON s.{id} = d.id
+             WHERE s.geom IS NOT NULL
+             UNION ALL
+             SELECT 'modified', {lx}, {ly}
+             FROM {live} l JOIN diff_modified d ON l.{id} = d.id
+             WHERE l.geom IS NOT NULL
+         )
+         GROUP BY cell_x, cell_y",
+        source = spec.name,
+        sx = cell_x(&point_stg),
+        sy = cell_y(&point_stg),
+        lx = cell_x(&point_live),
+        ly = cell_y(&point_live),
+    );
+
+    conn.execute_batch(&sql)
+        .with_context(|| format!("Failed to write change areas for {}", spec.name))?;
+
+    conn.query_row(
+        "SELECT COUNT(*) FROM dataset_change_areas WHERE snapshot_id = ?",
+        duckdb::params![snapshot_id],
+        |row| row.get(0),
+    )
+    .context("Failed to count inserted change areas")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataset::{DatasetSpec, GeomKind};
+    use crate::db::init_db;
+    use crate::tile_math::lonlat_to_tile;
+    use std::path::Path;
+
+    const TEST_SPEC: DatasetSpec = DatasetSpec {
+        name: "test",
+        table: "live",
+        id_column: "id",
+        geom_kind: GeomKind::Point,
+    };
+
+    /// Build live/staging tables plus the three diff tables by hand, so this
+    /// test does not depend on the diff engine's internals.
+    fn setup() -> Connection {
+        let init = vec![
+            "INSTALL spatial".to_string(),
+            "LOAD spatial".to_string(),
+            "INSTALL icu".to_string(),
+            "LOAD icu".to_string(),
+        ];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE live AS
+                 SELECT * FROM (VALUES
+                     ('del', ST_Point(21.0, 52.0)),
+                     ('mov', ST_Point(21.0, 52.0))
+                 ) t(id, geom);
+             CREATE TABLE live__staging AS
+                 SELECT * FROM (VALUES
+                     ('add', ST_Point(21.0, 52.0)),
+                     ('mov', ST_Point(19.0, 50.0))
+                 ) t(id, geom);
+             CREATE TEMP TABLE diff_added    AS SELECT 'add' AS id;
+             CREATE TEMP TABLE diff_removed  AS SELECT 'del' AS id;
+             CREATE TEMP TABLE diff_modified AS SELECT 'mov' AS id;",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn aggregates_counts_per_cell() {
+        let conn = setup();
+        let rows = insert_change_areas(&conn, &TEST_SPEC, 7).unwrap();
+
+        let (home_x, home_y) = lonlat_to_tile(21.0, 52.0, CHANGE_CELL_ZOOM);
+        let (added, modified, removed): (i32, i32, i32) = conn
+            .query_row(
+                "SELECT added, modified, removed FROM dataset_change_areas
+                 WHERE cell_x = ? AND cell_y = ?",
+                duckdb::params![home_x, home_y],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        // 'add' added here, 'del' removed here, and 'mov' left from here.
+        assert_eq!((added, modified, removed), (1, 1, 1));
+        assert_eq!(rows, 2, "two distinct cells were touched");
+    }
+
+    /// An object that moves marks BOTH the cell it left and the one it entered.
+    #[test]
+    fn moved_object_marks_both_cells() {
+        let conn = setup();
+        insert_change_areas(&conn, &TEST_SPEC, 7).unwrap();
+
+        let (dest_x, dest_y) = lonlat_to_tile(19.0, 50.0, CHANGE_CELL_ZOOM);
+        let modified: i32 = conn
+            .query_row(
+                "SELECT modified FROM dataset_change_areas WHERE cell_x = ? AND cell_y = ?",
+                duckdb::params![dest_x, dest_y],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(modified, 1, "destination cell must be marked too");
+    }
+
+    #[test]
+    fn stamps_snapshot_id_source_and_zoom() {
+        let conn = setup();
+        insert_change_areas(&conn, &TEST_SPEC, 7).unwrap();
+
+        let (snapshot_id, source, z): (i64, String, i32) = conn
+            .query_row(
+                "SELECT DISTINCT snapshot_id, source, cell_z FROM dataset_change_areas",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(snapshot_id, 7);
+        assert_eq!(source, "test");
+        assert_eq!(z, CHANGE_CELL_ZOOM as i32);
+    }
+}
