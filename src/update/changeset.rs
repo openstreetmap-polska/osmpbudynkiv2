@@ -18,6 +18,12 @@ use crate::tile_math::CHANGE_CELL_ZOOM;
 ///
 /// Rows with NULL geometry contribute no cell (they have no location), but
 /// are still counted in `dataset_refreshes`.
+///
+/// The counts measure churn events touching a cell, not distinct objects: a
+/// modified object that did NOT move contributes its cell twice (once from
+/// live, once from staging), so that cell's `modified` is 2 for one object.
+/// That is intended — consumers use these cells to decide what to re-render,
+/// not to report object counts.
 #[allow(dead_code)]
 pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i64) -> Result<i64> {
     let live = spec.table;
@@ -159,6 +165,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(modified, 1, "destination cell must be marked too");
+    }
+
+    /// The three count columns are written positionally, so a fixture whose
+    /// added/modified/removed totals are all equal cannot catch a transposed
+    /// SELECT list. Pin them with three distinct values.
+    #[test]
+    fn counts_land_in_their_own_columns() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE live AS
+                 SELECT * FROM (VALUES
+                     ('r1', ST_Point(21.0, 52.0)),
+                     ('r2', ST_Point(21.0, 52.0)),
+                     ('r3', ST_Point(21.0, 52.0))
+                 ) t(id, geom);
+             CREATE TABLE live__staging AS
+                 SELECT * FROM (VALUES ('a1', ST_Point(21.0, 52.0))) t(id, geom);
+             CREATE TEMP TABLE diff_added   AS SELECT 'a1' AS id;
+             CREATE TEMP TABLE diff_removed AS
+                 SELECT unnest(['r1', 'r2', 'r3']) AS id;
+             CREATE TEMP TABLE diff_modified AS SELECT 'x' AS id WHERE false;",
+        )
+        .unwrap();
+
+        insert_change_areas(&conn, &TEST_SPEC, 7).unwrap();
+
+        let (home_x, home_y) = lonlat_to_tile(21.0, 52.0, CHANGE_CELL_ZOOM);
+        let counts: (i32, i32, i32) = conn
+            .query_row(
+                "SELECT added, modified, removed FROM dataset_change_areas
+                 WHERE cell_x = ? AND cell_y = ?",
+                duckdb::params![home_x, home_y],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 0, 3));
     }
 
     #[test]
