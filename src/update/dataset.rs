@@ -10,14 +10,12 @@ use crate::utils::format_duration;
 /// Fraction of the live table that may change before the refresh warns.
 /// Measured normal churn for BDOT10k is ~2% over five weeks, so this only
 /// fires on an upstream restructuring. It is a diagnostic, NOT a stop.
-#[allow(dead_code)]
 const IMPLAUSIBLE_CHURN_FRACTION: f64 = 0.5;
 
 /// Drops the staging table on every exit path, including early returns and
 /// errors. DuckDB has no temp-table-per-transaction semantics here, so this
 /// is the only thing standing between a failed refresh and a stale staging
 /// table blocking the next one.
-#[allow(dead_code)]
 struct StagingGuard<'a> {
     conn: &'a Connection,
     table: String,
@@ -39,7 +37,6 @@ impl Drop for StagingGuard<'_> {
 ///
 /// `load` must create the staging table named by `spec.staging_table()`,
 /// including a `_row_hash` column (use `crate::dataset::hashed_select`).
-#[allow(dead_code)]
 pub fn refresh(
     conn: &Connection,
     spec: &DatasetSpec,
@@ -208,7 +205,6 @@ pub fn refresh(
 /// A DuckDB upgrade can change `hash()` output, which makes every row compare
 /// as modified. That is correct but slow and produces a misleadingly large
 /// changeset, so warn loudly and explain the cause — but do not block.
-#[allow(dead_code)]
 fn check_row_hash_version(conn: &Connection) -> Result<()> {
     // `.optional()` turns `QueryReturnedNoRows` (first run, nothing stored
     // yet) into `Ok(None)` while still propagating any genuine query error

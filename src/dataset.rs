@@ -17,12 +17,9 @@
 /// Bumped whenever the row-hash expression changes in a way that alters its
 /// output. A mismatch against `metadata.row_hash_version` means every row
 /// will compare as modified; the refresh warns and proceeds.
-#[allow(dead_code)]
 pub const ROW_HASH_VERSION: i64 = 1;
-#[allow(dead_code)]
 pub const ROW_HASH_VERSION_KEY: &str = "row_hash_version";
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeomKind {
     /// Geometry is already a point; use it directly.
@@ -31,7 +28,6 @@ pub enum GeomKind {
     Polygon,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct DatasetSpec {
     /// Short source name, used in CLI output, job names and changeset rows.
@@ -47,7 +43,6 @@ pub struct DatasetSpec {
 impl DatasetSpec {
     /// SQL for the point that represents this object when assigning it to a
     /// change cell.
-    #[allow(dead_code)]
     pub fn representative_point_sql(&self, geom_expr: &str) -> String {
         match self.geom_kind {
             GeomKind::Point => geom_expr.to_string(),
@@ -56,13 +51,11 @@ impl DatasetSpec {
     }
 
     /// Name of the transient staging table used during a refresh.
-    #[allow(dead_code)]
     pub fn staging_table(&self) -> String {
         format!("{}__staging", self.table)
     }
 }
 
-#[allow(dead_code)]
 pub const BDOT10K: DatasetSpec = DatasetSpec {
     name: "bdot10k",
     table: "bdot10k_buildings",
@@ -70,7 +63,6 @@ pub const BDOT10K: DatasetSpec = DatasetSpec {
     geom_kind: GeomKind::Polygon,
 };
 
-#[allow(dead_code)]
 pub const EGIB: DatasetSpec = DatasetSpec {
     name: "egib",
     table: "egib_buildings",
@@ -78,7 +70,6 @@ pub const EGIB: DatasetSpec = DatasetSpec {
     geom_kind: GeomKind::Polygon,
 };
 
-#[allow(dead_code)]
 pub const PRG: DatasetSpec = DatasetSpec {
     name: "prg",
     table: "prg_addresses",
@@ -91,7 +82,6 @@ pub const PRG: DatasetSpec = DatasetSpec {
 /// This is the ONLY place the hash expression is written. Both the import
 /// and the update path call it; if they ever diverge, every row compares as
 /// modified on every refresh forever.
-#[allow(dead_code)]
 pub fn hashed_select(inner_select: &str) -> String {
     format!("SELECT *, hash(s) AS _row_hash FROM ({inner_select}) s")
 }
