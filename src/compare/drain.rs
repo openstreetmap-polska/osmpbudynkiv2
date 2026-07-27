@@ -4,7 +4,6 @@ use duckdb::Connection;
 use crate::compare::incremental::recompute_cell_in_txn;
 
 pub struct DrainStats {
-    #[allow(dead_code)] // only read from #[cfg(test)] until Task 11 wires drain_batch's caller
     pub cells: u64,
 }
 
@@ -12,7 +11,6 @@ pub struct DrainStats {
 /// before the batch start. Each cell: recompute + delete its queue rows under
 /// the same cutoff, in one transaction. A cell re-dirtied after batch_start
 /// keeps a surviving queue row for the next tick.
-#[allow(dead_code)] // not yet consumed: wired up by Task 11 (match_refresh background job)
 pub fn drain_batch(conn: &Connection, batch_size: usize) -> Result<DrainStats> {
     // A single wall-clock cutoff for the whole batch.
     let batch_start: String = conn

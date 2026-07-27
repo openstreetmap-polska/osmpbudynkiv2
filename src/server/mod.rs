@@ -129,6 +129,18 @@ pub async fn run(
             )) as Arc<dyn jobs::Job>,
             jobs::JobConfigResolved::from(&config.jobs.prg_update),
         ),
+        (
+            Arc::new(jobs::match_refresh::MatchRefreshJob::new(
+                config.jobs.match_refresh.batch_size,
+            )) as Arc<dyn jobs::Job>,
+            jobs::JobConfigResolved {
+                enabled: config.jobs.match_refresh.enabled,
+                interval: std::time::Duration::from_secs(
+                    config.jobs.match_refresh.interval_seconds,
+                ),
+                timeout: std::time::Duration::from_secs(config.jobs.match_refresh.timeout_seconds),
+            },
+        ),
     ];
     let scheduler = jobs::Scheduler::start(job_list, pool.clone(), kv, config.clone());
     let registry = scheduler.registry.clone();

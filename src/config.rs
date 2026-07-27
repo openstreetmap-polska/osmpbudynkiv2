@@ -96,6 +96,27 @@ impl Default for ExportLogPruneConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
+pub struct MatchRefreshConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    /// Max number of distinct dirty (source, cell) recomputed per tick.
+    pub batch_size: usize,
+}
+
+impl Default for MatchRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 30,
+            timeout_seconds: 300,
+            batch_size: 512,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
 pub struct UpdatesConfig {
     pub default_minutes: u64,
     pub max_minutes: u64,
@@ -118,6 +139,7 @@ pub struct JobsConfig {
     pub bdot10k_update: JobConfig,
     pub egib_update: JobConfig,
     pub prg_update: JobConfig,
+    pub match_refresh: MatchRefreshConfig,
 }
 
 impl Default for JobsConfig {
@@ -136,6 +158,7 @@ impl Default for JobsConfig {
             egib_update: daily(3600),
             // PRG streams ~16 GML files out of a ~1.7GB zip, so it needs longer.
             prg_update: daily(7200),
+            match_refresh: MatchRefreshConfig::default(),
         }
     }
 }
@@ -408,6 +431,10 @@ file_path = "/data/TERC.zip"
         assert!(config.jobs.osm_update.enabled);
         assert_eq!(config.jobs.osm_update.interval_seconds, 60);
         assert_eq!(config.jobs.osm_update.timeout_seconds, 600);
+        assert!(config.jobs.match_refresh.enabled);
+        assert_eq!(config.jobs.match_refresh.interval_seconds, 30);
+        assert_eq!(config.jobs.match_refresh.timeout_seconds, 300);
+        assert_eq!(config.jobs.match_refresh.batch_size, 512);
     }
 
     #[test]

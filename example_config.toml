@@ -137,6 +137,16 @@ enabled = true
 interval_seconds = 86400
 timeout_seconds = 7200
 
+# Drains the dirty-cell queue (populated by government dataset refreshes and
+# OSM updates) by recomputing the affected z14 cells' *_unmatched serving
+# tables. Keeps /tiles and /package results current between full comparisons.
+[jobs.match_refresh]
+enabled = true
+interval_seconds = 30
+timeout_seconds = 300
+# Max number of distinct dirty (source, cell) recomputed per tick.
+batch_size = 512
+
 # GeoJSON data package endpoint (GET/POST /package, served by the `run` subcommand).
 [package]
 # Maximum allowed area of a request's bounding box, in square degrees.

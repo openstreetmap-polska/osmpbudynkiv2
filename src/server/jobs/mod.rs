@@ -8,6 +8,7 @@
 
 pub mod dataset_update;
 pub mod export_log_prune;
+pub mod match_refresh;
 pub mod osm_update;
 pub mod status_handler;
 
