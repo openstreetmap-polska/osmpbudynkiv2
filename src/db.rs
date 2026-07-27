@@ -103,6 +103,47 @@ fn create_schema(conn: &Connection) -> Result<()> {
             removed INTEGER,
             detected_at TIMESTAMP WITH TIME ZONE
         );
+
+        -- Precomputed unmatched government objects served by /tiles and /package.
+        -- Only unmatched rows are stored, tagged with the z14 cell of their
+        -- representative point and the time that cell was last recomputed.
+        CREATE TABLE IF NOT EXISTS bdot10k_unmatched (
+            LOKALNYID VARCHAR,
+            geom GEOMETRY,
+            cell_x INTEGER,
+            cell_y INTEGER,
+            computed_at TIMESTAMP WITH TIME ZONE
+        );
+        CREATE TABLE IF NOT EXISTS egib_unmatched (
+            id_budynku VARCHAR,
+            geom GEOMETRY,
+            cell_x INTEGER,
+            cell_y INTEGER,
+            computed_at TIMESTAMP WITH TIME ZONE
+        );
+        CREATE TABLE IF NOT EXISTS prg_unmatched (
+            geom GEOMETRY,
+            lokalny_id VARCHAR,
+            numer_porzadkowy VARCHAR,
+            ulica VARCHAR,
+            miejscowosc VARCHAR,
+            kod_pocztowy VARCHAR,
+            teryt_miejscowosc VARCHAR,
+            cell_x INTEGER,
+            cell_y INTEGER,
+            computed_at TIMESTAMP WITH TIME ZONE
+        );
+
+        -- Dirty-cell queue drained by the match_refresh job. Duplicates allowed
+        -- (deduped on drain). source is 'bdot10k'|'egib'|'prg'; an OSM building
+        -- edit enqueues bdot10k+egib, an OSM address edit enqueues prg.
+        CREATE TABLE IF NOT EXISTS match_dirty_cells (
+            source VARCHAR,
+            cell_z INTEGER,
+            cell_x INTEGER,
+            cell_y INTEGER,
+            enqueued_at TIMESTAMP WITH TIME ZONE
+        );
         ",
     )
     .context("Failed to create schema")?;
@@ -222,6 +263,37 @@ mod tests {
         )?;
         assert_eq!((z, x, y), (14, 9147, 5411));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_init_db_creates_serving_and_queue_tables() -> Result<()> {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None)?;
+        for table in [
+            "bdot10k_unmatched",
+            "egib_unmatched",
+            "prg_unmatched",
+            "match_dirty_cells",
+        ] {
+            let n: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+            assert_eq!(n, 0, "table {table} should exist and be empty");
+        }
+        // prg_unmatched must carry the serving + cell columns.
+        conn.execute_batch(
+            "INSERT INTO prg_unmatched
+             (geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy,
+              teryt_miejscowosc, cell_x, cell_y, computed_at)
+             VALUES (ST_Point(21.0,52.0),'id1','5','Main','Town','00-001','0918123',
+                     9147, 5411, now());",
+        )?;
+        let (hn, cx): (String, i32) = conn.query_row(
+            "SELECT numer_porzadkowy, cell_x FROM prg_unmatched",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!((hn.as_str(), cx), ("5", 9147));
         Ok(())
     }
 }
