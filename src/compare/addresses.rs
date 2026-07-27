@@ -295,4 +295,65 @@ mod tests {
             "re-running must not duplicate rows"
         );
     }
+
+    /// The full grid-key path and the per-cell rule must agree on the unmatched
+    /// set. Seed a spread of addresses (some matched, some not, some near cell
+    /// edges) and compare the two id sets.
+    #[test]
+    fn full_and_per_cell_paths_agree() {
+        use crate::compare::rule::{OSM_MATCH_BUFFER_DEG, buffer, unmatched_addresses_in_cell_sql};
+        use crate::tile_math::{CHANGE_CELL_ZOOM, lonlat_to_tile, tile_to_bbox};
+        use std::collections::BTreeSet;
+
+        let conn = setup(); // creates prg_addresses + osm_addresses via init_db
+        conn.execute_batch(
+            "INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, geom) VALUES
+                ('a','12', ST_Point(21.010, 52.210)),   -- matched (osm ~22m)
+                ('b','12', ST_Point(21.010, 52.212)),   -- too far -> unmatched
+                ('c','7',  ST_Point(21.050, 52.250)),   -- no osm -> unmatched
+                ('d','9',  ST_Point(21.0001, 52.2001)); -- near a cell edge
+             INSERT INTO osm_addresses VALUES
+                (1,'node','12',NULL,NULL,NULL, ST_Point(21.010, 52.2102));",
+        )
+        .unwrap();
+
+        // Full path.
+        compare_prg(&conn).unwrap();
+        let full: BTreeSet<String> = {
+            let mut s = conn
+                .prepare("SELECT lokalny_id FROM prg_unmatched")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+
+        // Per-cell path over the distinct cells the addresses fall in.
+        let mut cells = BTreeSet::new();
+        for (lon, lat) in [
+            (21.010, 52.210),
+            (21.010, 52.212),
+            (21.050, 52.250),
+            (21.0001, 52.2001),
+        ] {
+            cells.insert(lonlat_to_tile(lon, lat, CHANGE_CELL_ZOOM));
+        }
+        let mut per_cell = BTreeSet::new();
+        for (cx, cy) in cells {
+            let w = tile_to_bbox(CHANGE_CELL_ZOOM, cx, cy);
+            let sql = unmatched_addresses_in_cell_sql(
+                "prg_addresses",
+                "a.lokalny_id",
+                w,
+                buffer(w, OSM_MATCH_BUFFER_DEG),
+            );
+            let mut s = conn.prepare(&sql).unwrap();
+            for id in s.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+                per_cell.insert(id.unwrap());
+            }
+        }
+
+        assert_eq!(full, per_cell, "full grid-key and per-cell rule disagree");
+    }
 }
