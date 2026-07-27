@@ -29,6 +29,23 @@ pub fn lonlat_to_tile(lon: f64, lat: f64, z: u32) -> (u32, u32) {
     (x as u32, y as u32)
 }
 
+/// SQL for the Web-Mercator XYZ tile X of `point_expr` at [`CHANGE_CELL_ZOOM`].
+/// The Rust inverse is [`lonlat_to_tile`]; `cell_sql_matches_lonlat_to_tile`
+/// pins the two together. This is the ONLY home for the SQL projection.
+pub fn cell_x_sql(point_expr: &str) -> String {
+    let n = format!("pow(2, {})", CHANGE_CELL_ZOOM);
+    format!("floor((ST_X({point_expr}) + 180) / 360 * {n})::INTEGER")
+}
+
+/// SQL for the Web-Mercator XYZ tile Y of `point_expr` at [`CHANGE_CELL_ZOOM`].
+pub fn cell_y_sql(point_expr: &str) -> String {
+    let n = format!("pow(2, {})", CHANGE_CELL_ZOOM);
+    format!(
+        "floor((1 - ln(tan(radians(ST_Y({point_expr}))) + 1 / cos(radians(ST_Y({point_expr})))) \
+         / pi()) / 2 * {n})::INTEGER"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +80,29 @@ mod tests {
         assert!((min_lat - 51.998410).abs() < 1e-5, "min_lat was {min_lat}");
         assert!((max_lon - 21.005859).abs() < 1e-5, "max_lon was {max_lon}");
         assert!((max_lat - 52.011937).abs() < 1e-5, "max_lat was {max_lat}");
+    }
+
+    #[test]
+    fn cell_sql_matches_lonlat_to_tile() {
+        use crate::db::init_db;
+        use std::path::Path;
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        for (lon, lat) in [(21.0, 52.0), (14.5, 49.35), (23.88, 54.54), (19.94, 50.06)] {
+            let (rx, ry) = lonlat_to_tile(lon, lat, CHANGE_CELL_ZOOM);
+            let sql = format!(
+                "SELECT {}, {}",
+                cell_x_sql(&format!("ST_Point({lon}, {lat})")),
+                cell_y_sql(&format!("ST_Point({lon}, {lat})")),
+            );
+            let (sx, sy): (i32, i32) = conn
+                .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
+            assert_eq!(
+                (sx as u32, sy as u32),
+                (rx, ry),
+                "mismatch at ({lon},{lat})"
+            );
+        }
     }
 }

@@ -29,19 +29,14 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
     let staging = spec.staging_table();
     let id = spec.id_column;
     let z = CHANGE_CELL_ZOOM;
-    let n = format!("pow(2, {z})");
-
-    // Web-Mercator XYZ tile of a point, matching tile_math::lonlat_to_tile.
-    let cell_x = |p: &str| format!("floor((ST_X({p}) + 180) / 360 * {n})::INTEGER");
-    let cell_y = |p: &str| {
-        format!(
-            "floor((1 - ln(tan(radians(ST_Y({p}))) + 1 / cos(radians(ST_Y({p})))) / pi()) \
-             / 2 * {n})::INTEGER"
-        )
-    };
 
     let point_live = spec.representative_point_sql("l.geom");
     let point_stg = spec.representative_point_sql("s.geom");
+
+    let sx = crate::tile_math::cell_x_sql(&point_stg);
+    let sy = crate::tile_math::cell_y_sql(&point_stg);
+    let lx = crate::tile_math::cell_x_sql(&point_live);
+    let ly = crate::tile_math::cell_y_sql(&point_live);
 
     let sql = format!(
         "INSERT INTO dataset_change_areas
@@ -69,10 +64,6 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
          )
          GROUP BY cell_x, cell_y",
         source = spec.name,
-        sx = cell_x(&point_stg),
-        sy = cell_y(&point_stg),
-        lx = cell_x(&point_live),
-        ly = cell_y(&point_live),
     );
 
     conn.execute_batch(&sql)
