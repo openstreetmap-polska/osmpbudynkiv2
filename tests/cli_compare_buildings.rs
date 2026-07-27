@@ -96,14 +96,12 @@ fn import_all(cfg_path: &str) {
     import_prg(cfg_path);
 }
 
-/// Query `(total, matched)` counts from a comparison table.
-fn comparison_counts(db_path: &Path, table: &str) -> (i64, i64) {
+/// Query the row count of a `*_unmatched` serving table.
+fn unmatched_count(db_path: &Path, table: &str) -> i64 {
     let conn = Connection::open(db_path).unwrap();
-    conn.query_row(
-        &format!("SELECT COUNT(*), COUNT(*) FILTER (WHERE matched) FROM {table}"),
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
     .unwrap()
 }
 
@@ -131,9 +129,10 @@ fn test_compare_buildings_both() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("BDOT10k comparison complete")
-                .and(predicate::str::contains("total=74"))
-                .and(predicate::str::contains("EGIB comparison complete")),
+            predicate::str::contains("buildings comparison complete")
+                .and(predicate::str::contains(r#"source="bdot10k""#))
+                .and(predicate::str::contains(r#"source="egib""#))
+                .and(predicate::str::contains("total=74")),
         );
 }
 
@@ -148,9 +147,9 @@ fn test_compare_buildings_bdot10k_only() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("BDOT10k comparison complete")
+            predicate::str::contains(r#"source="bdot10k""#)
                 .and(predicate::str::contains("total=74"))
-                .and(predicate::str::contains("EGIB comparison complete").not()),
+                .and(predicate::str::contains(r#"source="egib""#).not()),
         );
 }
 
@@ -165,9 +164,9 @@ fn test_compare_buildings_egib_only() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("EGIB comparison complete")
+            predicate::str::contains(r#"source="egib""#)
                 .and(predicate::str::contains("total=74"))
-                .and(predicate::str::contains("BDOT10k comparison complete").not()),
+                .and(predicate::str::contains(r#"source="bdot10k""#).not()),
         );
 }
 
@@ -194,9 +193,10 @@ fn test_compare_full() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("BDOT10k comparison complete")
+            predicate::str::contains("buildings comparison complete")
+                .and(predicate::str::contains(r#"source="bdot10k""#))
+                .and(predicate::str::contains(r#"source="egib""#))
                 .and(predicate::str::contains("total=74"))
-                .and(predicate::str::contains("EGIB comparison complete"))
                 .and(predicate::str::contains("PRG comparison complete")),
         );
 }
@@ -212,17 +212,20 @@ fn test_compare_buildings_all() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("BDOT10k comparison complete")
-                .and(predicate::str::contains("total=74"))
-                .and(predicate::str::contains("EGIB comparison complete")),
+            predicate::str::contains("buildings comparison complete")
+                .and(predicate::str::contains(r#"source="bdot10k""#))
+                .and(predicate::str::contains(r#"source="egib""#))
+                .and(predicate::str::contains("total=74")),
         );
 }
 
-/// Correctness: verify the comparison actually produces the expected matches
-/// (not just that the command runs and logs "complete"). The fixture has 74
-/// rows in each source table and exactly one real match against OSM building
-/// 947235698 (a way), with the other OSM building — relation 1891415, a
-/// school — never matching because no government centroid falls inside it.
+/// Correctness: verify the comparison actually produces the expected unmatched
+/// set (not just that the command runs and logs "complete"). The fixture has
+/// 74 rows in each source table and exactly one real match against OSM
+/// building 947235698 (a way), with the other OSM building — relation
+/// 1891415, a school — never matching because no government centroid falls
+/// inside it. So each `*_unmatched` serving table ends up with 73 rows, and
+/// the matched id is absent from it.
 #[test]
 fn test_compare_buildings_correctness() {
     let (cfg, _db_dir, _rocksdb_dir, db_path) = persistent_config();
@@ -234,51 +237,52 @@ fn test_compare_buildings_correctness() {
         .assert()
         .success();
 
-    // Row counts
+    // Row counts: 73 of 74 are unmatched (1 real match).
     assert_eq!(
-        comparison_counts(&db_path, "bdot10k_comparison"),
-        (74, 1),
-        "bdot10k_comparison: expected (total=74, matched=1)"
+        unmatched_count(&db_path, "bdot10k_unmatched"),
+        73,
+        "bdot10k_unmatched: expected 73 unmatched rows"
     );
     assert_eq!(
-        comparison_counts(&db_path, "egib_comparison"),
-        (74, 1),
-        "egib_comparison: expected (total=74, matched=1)"
+        unmatched_count(&db_path, "egib_unmatched"),
+        73,
+        "egib_unmatched: expected 73 unmatched rows"
     );
 
     let conn = Connection::open(&db_path).unwrap();
 
-    // Specific matched row — BDOT10k
-    let (lokalnyid, osm_id, osm_type): (String, i64, String) = conn
+    // The matched BDOT10k row must be absent from the serving table.
+    let bdot10k_matched_present: i64 = conn
         .query_row(
-            "SELECT lokalnyid, matched_osm_id, matched_osm_type
-             FROM bdot10k_comparison WHERE matched",
+            "SELECT COUNT(*) FROM bdot10k_unmatched
+             WHERE LOKALNYID = '38F62226-DC07-F520-E053-CA2BA8C0BE14'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(lokalnyid, "38F62226-DC07-F520-E053-CA2BA8C0BE14");
-    assert_eq!(osm_id, 947235698);
-    assert_eq!(osm_type, "way");
+    assert_eq!(
+        bdot10k_matched_present, 0,
+        "the matched BDOT10k building must not appear in bdot10k_unmatched"
+    );
 
-    // Specific matched row — EGIB
-    let (id_budynku, osm_id, osm_type): (String, i64, String) = conn
+    // The matched EGIB row must be absent from the serving table.
+    let egib_matched_present: i64 = conn
         .query_row(
-            "SELECT id_budynku, matched_osm_id, matched_osm_type
-             FROM egib_comparison WHERE matched",
+            "SELECT COUNT(*) FROM egib_unmatched WHERE id_budynku = '146505_8.0110.32_BUD'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(id_budynku, "146505_8.0110.32_BUD");
-    assert_eq!(osm_id, 947235698);
-    assert_eq!(osm_type, "way");
+    assert_eq!(
+        egib_matched_present, 0,
+        "the matched EGIB building must not appear in egib_unmatched"
+    );
 
-    // Unmatched rows must have NULL osm_id / osm_type.
+    // Every row in the serving tables must carry cell tags and a timestamp.
     let bad_bdot10k: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM bdot10k_comparison
-             WHERE NOT matched AND (matched_osm_id IS NOT NULL OR matched_osm_type IS NOT NULL)",
+            "SELECT COUNT(*) FROM bdot10k_unmatched
+             WHERE cell_x IS NULL OR cell_y IS NULL OR computed_at IS NULL",
             [],
             |row| row.get(0),
         )
@@ -286,8 +290,8 @@ fn test_compare_buildings_correctness() {
     assert_eq!(bad_bdot10k, 0);
     let bad_egib: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM egib_comparison
-             WHERE NOT matched AND (matched_osm_id IS NOT NULL OR matched_osm_type IS NOT NULL)",
+            "SELECT COUNT(*) FROM egib_unmatched
+             WHERE cell_x IS NULL OR cell_y IS NULL OR computed_at IS NULL",
             [],
             |row| row.get(0),
         )
@@ -296,7 +300,7 @@ fn test_compare_buildings_correctness() {
 }
 
 /// Running `compare buildings` twice in a row should produce identical
-/// result tables — `compare_chunked` drops and recreates them each time.
+/// serving tables — `compare` clears then re-inserts each time.
 #[test]
 fn test_compare_buildings_is_idempotent() {
     let (cfg, _db_dir, _rocksdb_dir, db_path) = persistent_config();
@@ -307,15 +311,15 @@ fn test_compare_buildings_is_idempotent() {
         .args(["--config", &cfg_path, "compare", "buildings"])
         .assert()
         .success();
-    let first_bdot10k = comparison_counts(&db_path, "bdot10k_comparison");
-    let first_egib = comparison_counts(&db_path, "egib_comparison");
+    let first_bdot10k = unmatched_count(&db_path, "bdot10k_unmatched");
+    let first_egib = unmatched_count(&db_path, "egib_unmatched");
 
     cmd()
         .args(["--config", &cfg_path, "compare", "buildings"])
         .assert()
         .success();
-    let second_bdot10k = comparison_counts(&db_path, "bdot10k_comparison");
-    let second_egib = comparison_counts(&db_path, "egib_comparison");
+    let second_bdot10k = unmatched_count(&db_path, "bdot10k_unmatched");
+    let second_egib = unmatched_count(&db_path, "egib_unmatched");
 
     assert_eq!(first_bdot10k, second_bdot10k);
     assert_eq!(first_egib, second_egib);
@@ -335,15 +339,17 @@ fn test_compare_full_without_imported_data_fails() {
 }
 
 /// Partial-import behavior: if BDOT10k is imported but EGIB is not,
-/// `compare buildings` runs BDOT10k first, writes its result table, then
+/// `compare buildings` runs BDOT10k first, writes its serving table, then
 /// fails when it tries to read the missing `egib_buildings` source table.
 /// This test documents that behavior — the first stage's output persists
 /// and there is no transactional rollback across stages.
 ///
-/// Note: `compare_chunked` creates the result table before the grid loop
-/// reads the source, so `egib_comparison` is left as an *empty* table
-/// after the failure. If you ever move the DROP/CREATE to happen lazily
-/// (or wrap stages in a transaction), update this test.
+/// Note: `bdot10k_unmatched`/`egib_unmatched` are created once by `init_db`
+/// and always exist, unlike the old `*_comparison` tables which were
+/// drop/created per stage. The EGIB stage's `DELETE FROM egib_unmatched`
+/// succeeds (it's a no-op on the already-empty table) before the first
+/// INSERT fails on the missing `egib_buildings` source, so `egib_unmatched`
+/// is left empty after the failure.
 #[test]
 fn test_compare_buildings_partial_imports_fails_after_bdot10k_ran() {
     let (cfg, _db_dir, _rocksdb_dir, db_path) = persistent_config();
@@ -357,11 +363,11 @@ fn test_compare_buildings_partial_imports_fails_after_bdot10k_ran() {
         .failure();
 
     // BDOT10k stage wrote its full output before EGIB stage failed.
-    assert!(table_exists(&db_path, "bdot10k_comparison"));
-    assert_eq!(comparison_counts(&db_path, "bdot10k_comparison"), (74, 1));
+    assert!(table_exists(&db_path, "bdot10k_unmatched"));
+    assert_eq!(unmatched_count(&db_path, "bdot10k_unmatched"), 73);
 
-    // EGIB stage created its result table (empty) before the first INSERT
-    // failed on the missing egib_buildings source.
-    assert!(table_exists(&db_path, "egib_comparison"));
-    assert_eq!(comparison_counts(&db_path, "egib_comparison"), (0, 0));
+    // egib_unmatched exists (created by init_db) but stayed empty: the
+    // stage's DELETE ran, but the source-reading INSERT failed.
+    assert!(table_exists(&db_path, "egib_unmatched"));
+    assert_eq!(unmatched_count(&db_path, "egib_unmatched"), 0);
 }

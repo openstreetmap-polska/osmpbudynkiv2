@@ -22,7 +22,6 @@ pub fn buffer(b: Bounds, deg: f64) -> Bounds {
 /// by any osm_buildings polygon (osm filtered to `area` for the R-tree scan —
 /// no buffer needed: any polygon containing an in-`area` point has a bbox that
 /// intersects `area`).
-#[allow(dead_code)] // not yet consumed: wired up by later tasks in this plan
 pub fn unmatched_buildings_sql(source_table: &str, select_list: &str, area: Bounds) -> String {
     let (x1, y1, x2, y2) = area;
     format!(

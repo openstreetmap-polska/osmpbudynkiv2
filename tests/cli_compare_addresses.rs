@@ -89,16 +89,14 @@ fn test_compare_addresses_default() {
                 .and(predicate::str::contains("total=3")),
         );
 
-    assert!(table_exists(&db_path, "prg_import_candidates"));
+    assert!(table_exists(&db_path, "prg_unmatched"));
 
     // The PRG fixture has 3 lubuskie addresses. The OSM fixture has Warsaw
     // addresses. None of them share housenumber + proximity, so all 3 PRG
     // rows become candidates.
     let conn = Connection::open(&db_path).unwrap();
     let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM prg_import_candidates", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT COUNT(*) FROM prg_unmatched", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 3, "all 3 lubuskie PRG addresses are candidates");
 }
@@ -157,10 +155,8 @@ fn test_compare_addresses_is_idempotent() {
         .success();
     let first: i64 = {
         let conn = Connection::open(&db_path).unwrap();
-        conn.query_row("SELECT COUNT(*) FROM prg_import_candidates", [], |row| {
-            row.get(0)
-        })
-        .unwrap()
+        conn.query_row("SELECT COUNT(*) FROM prg_unmatched", [], |row| row.get(0))
+            .unwrap()
     };
 
     cmd()
@@ -169,10 +165,8 @@ fn test_compare_addresses_is_idempotent() {
         .success();
     let second: i64 = {
         let conn = Connection::open(&db_path).unwrap();
-        conn.query_row("SELECT COUNT(*) FROM prg_import_candidates", [], |row| {
-            row.get(0)
-        })
-        .unwrap()
+        conn.query_row("SELECT COUNT(*) FROM prg_unmatched", [], |row| row.get(0))
+            .unwrap()
     };
 
     assert_eq!(first, second);
