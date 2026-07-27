@@ -431,13 +431,15 @@ mod tests {
 
     use crate::server::package::{get_package, post_package};
 
-    /// Seeds an in-memory connection with the government + OSM tables
-    /// `/package` needs (one unmatched PRG address, no buildings) plus
+    /// Seeds an in-memory connection with the precomputed serving tables
+    /// `/package` reads (one unmatched PRG address, no buildings) plus
     /// `package_exports` and the icu extension `/updates`' interval query
     /// requires, all on one pool -- exercising the real
     /// `/package` -> `package_exports` -> `/updates` path end to end, with
     /// both steps drawing from the same shared connection pool like
-    /// production does.
+    /// production does. Matching is precomputed upstream, so there is no
+    /// OSM table to seed here -- `/package` only reads the `*_unmatched`
+    /// tables directly.
     fn make_full_state() -> AppState {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -446,17 +448,17 @@ mod tests {
         )
         .unwrap();
         conn.execute_batch(
-            "CREATE TABLE prg_addresses (
+            "CREATE TABLE prg_unmatched (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
-                 geom GEOMETRY);
-             CREATE TABLE osm_addresses (
-                 osm_id BIGINT, osm_type VARCHAR, housenumber VARCHAR, street VARCHAR,
-                 city VARCHAR, postcode VARCHAR, geom GEOMETRY);
-             CREATE TABLE bdot10k_buildings (lokalnyid VARCHAR, geom GEOMETRY);
-             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
-             CREATE TABLE osm_buildings (
-                 osm_id BIGINT, osm_type VARCHAR, building VARCHAR, geom GEOMETRY);
+                 geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
+                 computed_at TIMESTAMP WITH TIME ZONE);
+             CREATE TABLE bdot10k_unmatched (
+                 lokalnyid VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
+                 computed_at TIMESTAMP WITH TIME ZONE);
+             CREATE TABLE egib_unmatched (
+                 id_budynku VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
+                 computed_at TIMESTAMP WITH TIME ZONE);
              CREATE TABLE package_exports (
                 exported_at TIMESTAMP WITH TIME ZONE,
                 area GEOMETRY('epsg:4326'),
@@ -464,9 +466,9 @@ mod tests {
                 address_count INTEGER,
                 building_count INTEGER
              );
-             INSERT INTO prg_addresses VALUES
+             INSERT INTO prg_unmatched VALUES
                  ('a1', '12', 'Marszałkowska', 'Warszawa', '00-590', '0918123',
-                  ST_Point(21.001, 52.201));",
+                  ST_Point(21.001, 52.201), 8000, 4900, now());",
         )
         .unwrap();
 
