@@ -147,6 +147,7 @@ pub fn refresh(
         // (see the regression test `change_areas_capture_the_origin_cell_
         // before_the_delta_is_applied`).
         insert_change_areas(conn, spec, snapshot_id)?;
+        crate::update::changeset::insert_dirty_cells(conn, spec)?;
 
         conn.execute_batch(&format!(
             "DELETE FROM {live} WHERE {id} IN (
@@ -395,6 +396,15 @@ mod tests {
             )
             .unwrap();
         assert!(cells > 0, "expected at least one change area row");
+
+        let dirty: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(dirty > 0, "refresh must enqueue dirty cells");
     }
 
     /// The added/modified/removed columns in `dataset_refreshes` are written

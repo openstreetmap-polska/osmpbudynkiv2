@@ -77,6 +77,43 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
     .context("Failed to count inserted change areas")
 }
 
+/// Enqueue one dirty-cell row per distinct z14 cell this refresh touches
+/// (added from staging, removed/modified from both live and staging). Must run
+/// inside the apply transaction so the queue commits atomically with the delta.
+pub fn insert_dirty_cells(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
+    let live = spec.table;
+    let staging = spec.staging_table();
+    let id = spec.id_column;
+    let z = crate::tile_math::CHANGE_CELL_ZOOM;
+    let point_live = spec.representative_point_sql("l.geom");
+    let point_stg = spec.representative_point_sql("s.geom");
+    let sx = crate::tile_math::cell_x_sql(&point_stg);
+    let sy = crate::tile_math::cell_y_sql(&point_stg);
+    let lx = crate::tile_math::cell_x_sql(&point_live);
+    let ly = crate::tile_math::cell_y_sql(&point_live);
+
+    let sql = format!(
+        "INSERT INTO match_dirty_cells
+         SELECT DISTINCT '{source}', {z}, cell_x, cell_y, now()
+         FROM (
+             SELECT {sx} AS cell_x, {sy} AS cell_y
+             FROM {staging} s JOIN diff_added d ON s.{id} = d.id WHERE s.geom IS NOT NULL
+             UNION
+             SELECT {lx}, {ly}
+             FROM {live} l JOIN diff_removed d ON l.{id} = d.id WHERE l.geom IS NOT NULL
+             UNION
+             SELECT {sx}, {sy}
+             FROM {staging} s JOIN diff_modified d ON s.{id} = d.id WHERE s.geom IS NOT NULL
+             UNION
+             SELECT {lx}, {ly}
+             FROM {live} l JOIN diff_modified d ON l.{id} = d.id WHERE l.geom IS NOT NULL
+         )",
+        source = spec.name,
+    );
+    conn.execute_batch(&sql)
+        .with_context(|| format!("Failed to enqueue dirty cells for {}", spec.name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +246,28 @@ mod tests {
         assert_eq!(snapshot_id, 7);
         assert_eq!(source, "test");
         assert_eq!(z, CHANGE_CELL_ZOOM as i32);
+    }
+
+    #[test]
+    fn enqueues_distinct_touched_cells() {
+        let conn = setup();
+        insert_dirty_cells(&conn, &TEST_SPEC).unwrap();
+        // 'del'/'mov' left the home cell; 'add'/'mov' arrive — 2 distinct cells.
+        let (home_x, home_y) = lonlat_to_tile(21.0, 52.0, CHANGE_CELL_ZOOM);
+        let (dest_x, dest_y) = lonlat_to_tile(19.0, 50.0, CHANGE_CELL_ZOOM);
+        let cells: Vec<(String, i32, i32)> = {
+            let mut s = conn
+                .prepare(
+                    "SELECT source, cell_x, cell_y FROM match_dirty_cells ORDER BY cell_x, cell_y",
+                )
+                .unwrap();
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(cells.iter().all(|(s, _, _)| s == "test"));
+        assert!(cells.contains(&("test".to_string(), home_x as i32, home_y as i32)));
+        assert!(cells.contains(&("test".to_string(), dest_x as i32, dest_y as i32)));
     }
 }
