@@ -6,11 +6,17 @@ use crate::compare::rule::{
 };
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
-/// Rebuild one z14 cell's slice of `<source>_unmatched` from current live data,
-/// in a single transaction. Read wide (buffered OSM for addresses), write narrow
-/// (only rows whose representative point is inside the cell).
-#[allow(dead_code)] // not yet consumed: wired up by later tasks in this plan (drain job, reconcile sweep)
-pub fn recompute_cell(conn: &Connection, source: &str, cell_x: i32, cell_y: i32) -> Result<()> {
+/// Rebuild one z14 cell's slice of `<source>_unmatched` from current live data.
+/// Read wide (buffered OSM for addresses), write narrow (only rows whose
+/// representative point is inside the cell). Assumes an open transaction —
+/// callers that need atomicity with other statements should wrap this
+/// themselves (see `drain_batch`, which pairs it with a queue delete).
+pub fn recompute_cell_in_txn(
+    conn: &Connection,
+    source: &str,
+    cell_x: i32,
+    cell_y: i32,
+) -> Result<()> {
     let write = tile_to_bbox(CHANGE_CELL_ZOOM, cell_x as u32, cell_y as u32);
     let (dest, insert_cols, inner) = match source {
         "bdot10k" | "egib" => {
@@ -47,16 +53,22 @@ pub fn recompute_cell(conn: &Connection, source: &str, cell_x: i32, cell_y: i32)
         other => bail!("recompute_cell: unknown source {other}"),
     };
 
+    conn.execute(
+        &format!("DELETE FROM {dest} WHERE cell_x = ? AND cell_y = ?"),
+        duckdb::params![cell_x, cell_y],
+    )?;
+    conn.execute_batch(&format!("INSERT INTO {dest} ({insert_cols}) {inner};"))?;
+    Ok(())
+}
+
+/// Rebuild one z14 cell's slice of `<source>_unmatched` from current live data,
+/// in a single transaction of its own. Thin wrapper around
+/// `recompute_cell_in_txn` — see that function for what actually runs.
+#[allow(dead_code)] // not yet consumed: wired up by later tasks in this plan (reconcile sweep)
+pub fn recompute_cell(conn: &Connection, source: &str, cell_x: i32, cell_y: i32) -> Result<()> {
     conn.execute_batch("BEGIN TRANSACTION")
         .context("recompute_cell: begin")?;
-    let res = (|| -> Result<()> {
-        conn.execute(
-            &format!("DELETE FROM {dest} WHERE cell_x = ? AND cell_y = ?"),
-            duckdb::params![cell_x, cell_y],
-        )?;
-        conn.execute_batch(&format!("INSERT INTO {dest} ({insert_cols}) {inner};"))?;
-        Ok(())
-    })();
+    let res = recompute_cell_in_txn(conn, source, cell_x, cell_y);
     match res {
         Ok(()) => conn
             .execute_batch("COMMIT")
