@@ -1,6 +1,7 @@
 pub mod changeset;
 pub mod dataset;
 pub mod diff;
+pub mod dirty_cells;
 pub mod osm;
 
 use std::path::{Path, PathBuf};
