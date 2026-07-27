@@ -4,16 +4,12 @@
 //! grid-key fast path to it.
 
 /// (min_lon, min_lat, max_lon, max_lat).
-#[allow(dead_code)] // not yet consumed: wired up by later tasks in this plan
 pub type Bounds = (f64, f64, f64, f64);
 
-#[allow(dead_code)] // not yet consumed: wired up by later tasks in this plan
 pub const MATCH_DISTANCE_METERS: f64 = 50.0;
 /// OSM read buffer around a cell for address matching. Matches /package.
-#[allow(dead_code)] // not yet consumed: wired up by later tasks in this plan
 pub const OSM_MATCH_BUFFER_DEG: f64 = 0.001;
 
-#[allow(dead_code)] // not yet consumed: wired up by later tasks in this plan
 pub fn buffer(b: Bounds, deg: f64) -> Bounds {
     (b.0 - deg, b.1 - deg, b.2 + deg, b.3 + deg)
 }
@@ -39,7 +35,6 @@ pub fn unmatched_buildings_sql(source_table: &str, select_list: &str, area: Boun
 /// Unmatched address rows: government point within `write` and no osm_addresses
 /// point (read from `read`) with equal normalized housenumber within 50 m.
 /// NULL housenumber never matches (SQL `= NULL` is never true).
-#[allow(dead_code)] // not yet consumed: wired up by later tasks in this plan
 pub fn unmatched_addresses_in_cell_sql(
     source_table: &str,
     select_list: &str,

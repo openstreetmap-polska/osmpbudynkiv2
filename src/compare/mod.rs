@@ -1,5 +1,6 @@
 pub mod addresses;
 pub mod buildings;
+pub mod incremental;
 pub mod rule;
 
 use anyhow::Result;
