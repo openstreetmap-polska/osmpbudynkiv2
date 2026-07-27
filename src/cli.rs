@@ -51,6 +51,10 @@ pub enum CompareTarget {
     },
     /// Run all available comparisons
     Full,
+    /// Enqueue every cell containing a government object, so the drain
+    /// rebuilds them (safety net for a dropped enqueue; also usable as an
+    /// offline rebuild path or a daily job).
+    Reconcile,
 }
 
 #[derive(Subcommand)]
