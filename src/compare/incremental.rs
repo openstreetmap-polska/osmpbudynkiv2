@@ -64,7 +64,13 @@ pub fn recompute_cell_in_txn(
 /// Rebuild one z14 cell's slice of `<source>_unmatched` from current live data,
 /// in a single transaction of its own. Thin wrapper around
 /// `recompute_cell_in_txn` — see that function for what actually runs.
-#[allow(dead_code)] // not yet consumed: wired up by later tasks in this plan (reconcile sweep)
+///
+/// Standalone transactional single-cell recompute; the drain pairs
+/// `recompute_cell_in_txn` with its own queue-delete in one transaction instead
+/// of calling this, so this wrapper is currently only exercised by tests — kept
+/// as a coherent, tested public API for manual use or future callers that want
+/// a recompute without a queue delete.
+#[allow(dead_code)]
 pub fn recompute_cell(conn: &Connection, source: &str, cell_x: i32, cell_y: i32) -> Result<()> {
     conn.execute_batch("BEGIN TRANSACTION")
         .context("recompute_cell: begin")?;
