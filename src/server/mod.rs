@@ -129,6 +129,18 @@ pub async fn run(
             )) as Arc<dyn jobs::Job>,
             jobs::JobConfigResolved::from(&config.jobs.prg_update),
         ),
+        (
+            Arc::new(jobs::match_refresh::MatchRefreshJob::new(
+                config.jobs.match_refresh.batch_size,
+            )) as Arc<dyn jobs::Job>,
+            jobs::JobConfigResolved {
+                enabled: config.jobs.match_refresh.enabled,
+                interval: std::time::Duration::from_secs(
+                    config.jobs.match_refresh.interval_seconds,
+                ),
+                timeout: std::time::Duration::from_secs(config.jobs.match_refresh.timeout_seconds),
+            },
+        ),
     ];
     let scheduler = jobs::Scheduler::start(job_list, pool.clone(), kv, config.clone());
     let registry = scheduler.registry.clone();
@@ -185,6 +197,14 @@ const REQUIRED_TABLES: &[&str] = &[
     "egib_buildings",
 ];
 
+/// The serving tables `/tiles` and `/package` read directly. Unlike
+/// `REQUIRED_TABLES` these always exist (created by `CREATE TABLE IF NOT
+/// EXISTS` in `db::create_schema` on every startup), so there is nothing to
+/// bail on -- only "empty" is worth flagging, since an in-place upgrade of an
+/// existing database gains these tables empty and would otherwise start
+/// serving zero features with no indication why (see README).
+const UNMATCHED_TABLES: &[&str] = &["bdot10k_unmatched", "egib_unmatched", "prg_unmatched"];
+
 fn check_startup_conditions(pool: &DbPool) -> Result<()> {
     let conn = pool
         .get()
@@ -216,6 +236,23 @@ fn check_startup_conditions(pool: &DbPool) -> Result<()> {
             .with_context(|| format!("Failed to count rows in table '{table}'"))?;
 
         info!("Table {} has {} rows.", table, rows);
+    }
+
+    for table in UNMATCHED_TABLES {
+        let rows: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .with_context(|| format!("Failed to count rows in table '{table}'"))?;
+
+        info!("Table {} has {} rows.", table, rows);
+        if rows == 0 {
+            tracing::warn!(
+                "serving table '{table}' is empty -- /tiles and /package will return no \
+                 features for this source until an offline `compare full` populates it \
+                 (see README)"
+            );
+        }
     }
 
     info!("Startup checks passed: pool connection OK, all required tables present");
@@ -302,5 +339,65 @@ mod tests {
         assert_eq!(jobs[0]["state"], "idle");
         assert_eq!(jobs[0]["run_count"], 7);
         assert_eq!(jobs[0]["last_outcome"]["kind"], "Success");
+    }
+
+    /// An in-place upgrade of an existing database gains the `*_unmatched`
+    /// tables via `CREATE TABLE IF NOT EXISTS`, empty -- `check_startup_conditions`
+    /// must not bail (empty is not a hard requirement), but must warn loudly
+    /// enough that an operator can tell why `/tiles`/`/package` are serving
+    /// nothing, rather than the server starting silently.
+    #[test]
+    fn check_startup_conditions_warns_when_a_serving_table_is_empty() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = crate::db::init_db(std::path::Path::new(":memory:"), &init, None).unwrap();
+        // REQUIRED_TABLES also needs these three -- create empty, matching a
+        // freshly-upgraded database whose government tables just haven't
+        // been (re)compared yet.
+        conn.execute_batch(
+            "CREATE TABLE prg_addresses (lokalny_id VARCHAR, geom GEOMETRY);
+             CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);",
+        )
+        .unwrap();
+        let pool = build_pool(conn, 2).unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::check_startup_conditions(&pool).unwrap();
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("bdot10k_unmatched") && out.contains("empty"),
+            "expected a warning naming the empty serving table, got: {out}"
+        );
     }
 }

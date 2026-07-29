@@ -17,19 +17,18 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] `import bdot10k` / `import egib` — building registries from GeoParquet (auto-download or local file)
 - [x] `update osm` — incremental updates from the minutely OSM replication feed
 - [x] `update prg` / `update bdot10k` / `update egib` — re-download a government dataset and apply only the delta, skipping the refresh entirely when the source ETag is unchanged
-- [x] `compare buildings` (BDOT10k, EGIB) — spatial matching of government buildings against OSM buildings
-- [x] `compare addresses` (PRG) — matching government addresses against OSM, producing import candidate tables
-- [x] `run` HTTP server basics: `/health`, `/status` (background job status), startup checks, graceful shutdown, read-only connection pool + single writer
-- [x] Background job scheduler (no overlapping runs, timeout handling) with periodic OSM and government-dataset refresh jobs
+- [x] `compare buildings` (BDOT10k, EGIB) / `compare addresses` (PRG) — spatial matching of government objects against OSM, writing precomputed `*_unmatched` serving tables (`bdot10k_unmatched`, `egib_unmatched`, `prg_unmatched`) that `/tiles` and `/package` read directly
+- [x] Incremental freshness for `*_unmatched` between full compares — government refreshes and OSM updates enqueue the z14 cells they touched into `match_dirty_cells`; the `match_refresh` background job drains that queue by recomputing just those cells; `compare reconcile` re-enqueues every live cell as a safety net or offline rebuild path; `/status` reports queue staleness
+- [x] `run` HTTP server basics: `/health`, `/status` (background job status + match-queue staleness), startup checks, graceful shutdown, read-only connection pool + single writer
+- [x] Background job scheduler (no overlapping runs, timeout handling) with periodic OSM refresh, government-dataset refresh, and `match_refresh` jobs
 - [x] Per-tile change tracking — every refresh records which z14 cells changed (`dataset_change_areas`) alongside a refresh log (`dataset_refreshes`)
-- [x] Vector tile endpoint `/tiles/{z}/{x}/{y}` (MVT; zoom 14 only, serving raw address and building layers)
-- [x] GeoJSON data package endpoint `GET/POST /package` — live comparison against current OSM data, OSM-ready tags for direct JOSM import (bbox in GET, polygon in POST)
+- [x] Vector tile endpoint `/tiles/{z}/{x}/{y}` (MVT; zoom 14 only) — serves the precomputed `*_unmatched` tables (unmatched government objects, not raw datasets)
+- [x] GeoJSON data package endpoint `GET/POST /package` — reads the precomputed `*_unmatched` tables, OSM-ready tags for direct JOSM import (bbox in GET, polygon in POST)
 - [x] `GET /updates` — recent `/package` export activity as a GeoJSON `FeatureCollection`, browser-cacheable for 60 seconds (`?minutes=`, default 60, capped at 1440)
 
 ## Not yet implemented
 
 - [ ] `import full` — running all imports in one command (individual imports work)
-- [ ] Serving comparison results via the API (tiles currently show raw datasets, not comparison output)
 - [ ] Vector tiles for lower zoom levels with aggregation/clustering (DBSCAN or H3) and tile caching
 - [ ] Web map frontend for browsing data status and downloading packages
 - [ ] Endpoint for reporting records to exclude (bad source data, comparison mismatches)
@@ -77,7 +76,7 @@ The config file controls:
 - **`download_urls`** — URLs for downloading data sources
 - **`[package]`** — `/package` endpoint limits (`max_area_sq_deg`, default 0.04)
 - **`[updates]`** — `/updates` time window limits (`default_minutes`, `max_minutes`)
-- **`[jobs.*]`** — background jobs, each with `enabled`, `interval_seconds` and a per-run timeout: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, and export-log pruning. Only one dataset refresh runs at a time, regardless of how the schedules line up.
+- **`[jobs.*]`** — background jobs, each with `enabled`, `interval_seconds` and a per-run timeout: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, `match_refresh` (drains the dirty-cell queue to keep `*_unmatched` serving tables current; also takes `batch_size`), and export-log pruning. Only one dataset refresh runs at a time, regardless of how the schedules line up.
 
 All fields are optional — only specify what you want to override. Note that `duckdb_init_commands` is fully replaced if specified (not merged with defaults).
 
@@ -178,7 +177,22 @@ cargo run -- compare buildings egib
 # Compare addresses
 cargo run -- compare addresses
 cargo run -- compare addresses prg
+
+# Re-enqueue every cell containing a government object, so the drain rebuilds
+# them (safety net for a dropped enqueue; also usable as an offline rebuild
+# path or a daily job)
+cargo run -- compare reconcile
 ```
+
+`compare` recomputes the `*_unmatched` serving tables (`bdot10k_unmatched`,
+`egib_unmatched`, `prg_unmatched`) from scratch — the tables `/tiles` and
+`/package` read. Between full re-compares, government refreshes and OSM
+updates keep them current incrementally: each producer enqueues the z14 cells
+it touched into `match_dirty_cells`, and the `match_refresh` background job
+(see `run` below) drains that queue by recomputing just those cells.
+`compare reconcile` re-enqueues every live cell instead of comparing directly,
+for when the queue can't be trusted or a full serving rebuild is wanted
+without redoing the whole comparison.
 
 ### run — HTTP service (partially implemented)
 
@@ -188,13 +202,29 @@ cargo run -- run
 
 Currently serves:
 - `/health` — liveness check
-- `/status` — background job status as JSON
-- `/tiles/{z}/{x}/{y}` — Mapbox Vector Tiles (zoom 14 only)
+- `/status` — background job status as JSON, including match-queue staleness (`match_staleness`: pending cell count overall and per source, oldest enqueued timestamp)
+- `/tiles/{z}/{x}/{y}` — Mapbox Vector Tiles (zoom 14 only), reading the precomputed `*_unmatched` serving tables
 - `/package` — GeoJSON `FeatureCollection` of government-registry records missing
-  from OSM in the requested area, tagged for direct JOSM import. The comparison
-  runs live against the current OSM data. The request area (bounding box) is
-  capped by the `[package] max_area_sq_deg` config setting (default 0.04 sq deg).
+  from OSM in the requested area, tagged for direct JOSM import. Reads the same
+  precomputed `*_unmatched` serving tables as `/tiles` (no live comparison per
+  request). The request area (bounding box) is capped by the
+  `[package] max_area_sq_deg` config setting (default 0.04 sq deg).
 - `/updates` — recent `/package` export activity (timestamp, area, datasets, feature counts) as GeoJSON, `Cache-Control: public, max-age=60`. A background job prunes entries older than `[jobs.export_log_prune] retention_days` (default 365).
+
+The `match_refresh` background job keeps `/tiles` and `/package` fresh between
+full `compare` runs, by draining `match_dirty_cells` on a schedule (see
+`[jobs.match_refresh]`).
+
+**Upgrading an existing database in place:** the `*_unmatched` serving tables
+are created with `CREATE TABLE IF NOT EXISTS`, so starting the server against
+an older database that predates them leaves all three empty — `/tiles` and
+`/package` will start up cleanly but serve zero features (a startup warning
+names each empty table). Run an offline `compare full` before restarting the
+server against that database. `compare reconcile` is **not** an equivalent
+fast path here: it only re-enqueues every live cell for the incremental
+drain, so populating a fully empty database through it means draining the
+entire country cell-by-cell, which is orders of magnitude slower than a
+direct full `compare`.
 
 ```bash
 # bbox: minLon,minLat,maxLon,maxLat; datasets: prg, bdot10k, egib, or all (default)

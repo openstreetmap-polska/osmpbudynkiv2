@@ -25,7 +25,7 @@ const ADDRESSES_MVT_SQL: &str = "
                a.lokalny_id,
                a.numer_porzadkowy AS housenumber,
                a.miejscowosc AS city
-        FROM prg_addresses a, bbox
+        FROM prg_unmatched a, bbox
         WHERE a.geom && bbox.geom
     ) t
     WHERE t.geom IS NOT NULL
@@ -38,13 +38,13 @@ const BUILDINGS_MVT_SQL: &str = "
         SELECT ST_AsMVTGeom(raw.geom, bbox.geom, 4096, 256, true) AS geom,
                raw.id, raw.source
         FROM (
-            SELECT bdot10k_buildings.geom, LOKALNYID AS id, 'bdot10k' AS source
-            FROM bdot10k_buildings, bbox
-            WHERE bdot10k_buildings.geom && bbox.geom
+            SELECT bdot10k_unmatched.geom, LOKALNYID AS id, 'bdot10k' AS source
+            FROM bdot10k_unmatched, bbox
+            WHERE bdot10k_unmatched.geom && bbox.geom
             UNION ALL
-            SELECT egib_buildings.geom, id_budynku AS id, 'egib' AS source
-            FROM egib_buildings, bbox
-            WHERE egib_buildings.geom && bbox.geom
+            SELECT egib_unmatched.geom, id_budynku AS id, 'egib' AS source
+            FROM egib_unmatched, bbox
+            WHERE egib_unmatched.geom && bbox.geom
         ) raw, bbox
     ) t
     WHERE t.geom IS NOT NULL
@@ -129,10 +129,15 @@ mod tests {
         conn.execute_batch("INSTALL spatial; LOAD spatial; SET GLOBAL geometry_always_xy = true;")
             .unwrap();
         conn.execute_batch(
-            "CREATE TABLE prg_addresses (
-                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, miejscowosc VARCHAR, geom GEOMETRY);
-             CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);",
+            "CREATE TABLE prg_unmatched (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, miejscowosc VARCHAR, geom GEOMETRY,
+                 cell_x INTEGER, cell_y INTEGER, computed_at TIMESTAMP WITH TIME ZONE);
+             CREATE TABLE bdot10k_unmatched (
+                 LOKALNYID VARCHAR, geom GEOMETRY,
+                 cell_x INTEGER, cell_y INTEGER, computed_at TIMESTAMP WITH TIME ZONE);
+             CREATE TABLE egib_unmatched (
+                 id_budynku VARCHAR, geom GEOMETRY,
+                 cell_x INTEGER, cell_y INTEGER, computed_at TIMESTAMP WITH TIME ZONE);",
         )
         .unwrap();
         if !seed_sql.is_empty() {
@@ -202,12 +207,12 @@ mod tests {
         let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
         let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
         let seed = format!(
-            "INSERT INTO prg_addresses VALUES
-                 ('a1', '12', 'Warszawa', ST_Point({mid_lon}, {mid_lat}));
-             INSERT INTO bdot10k_buildings VALUES
-                 ('b1', ST_Point({mid_lon}, {mid_lat}));
-             INSERT INTO egib_buildings VALUES
-                 ('e1', ST_Point({mid_lon}, {mid_lat}));"
+            "INSERT INTO prg_unmatched VALUES
+                 ('a1', '12', 'Warszawa', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
+             INSERT INTO bdot10k_unmatched VALUES
+                 ('b1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
+             INSERT INTO egib_unmatched VALUES
+                 ('e1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());"
         );
         let state = make_state(&seed);
         let response = tiles_app(state)
@@ -231,8 +236,8 @@ mod tests {
     #[tokio::test]
     async fn tile_with_no_nearby_data_returns_ok_with_no_matching_features() {
         // Data exists, but nowhere near the requested tile.
-        let seed = "INSERT INTO prg_addresses VALUES
-            ('a1', '12', 'Warszawa', ST_Point(0.0, 0.0));";
+        let seed = "INSERT INTO prg_unmatched VALUES
+            ('a1', '12', 'Warszawa', ST_Point(0.0, 0.0), 0, 0, now());";
         let state = make_state(seed);
         let response = tiles_app(state)
             .oneshot(

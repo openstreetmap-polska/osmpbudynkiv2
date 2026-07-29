@@ -15,6 +15,7 @@ use crate::osm::replication::{
     sequence_to_path,
 };
 use crate::osm::{encoding, kvstore};
+use crate::update::dirty_cells::{DirtyCells, Layer};
 
 pub fn update(
     conn: &Connection,
@@ -150,6 +151,7 @@ fn decompress_gz(path: &Path) -> Result<String> {
 fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result<()> {
     let mut affected_way_ids: HashSet<i64> = HashSet::new();
     let mut affected_relation_ids: HashSet<i64> = HashSet::new();
+    let mut dirty = DirtyCells::new();
 
     // --- Apply node changes ---
     for node in &changes.nodes {
@@ -161,6 +163,7 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
                     kvstore::remove_node_to_ways(kv, node.id, wid)?;
                 }
                 kvstore::delete_node(kv, node.id)?;
+                dirty.note_existing(conn, Layer::Addresses, "osm_addresses", node.id, "node")?;
                 conn.execute(
                     "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'node'",
                     [node.id],
@@ -170,6 +173,7 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
                 kvstore::put_node(kv, node.id, node.lon, node.lat)?;
                 let way_ids = kvstore::get_node_to_ways(kv, node.id)?;
                 affected_way_ids.extend(&way_ids);
+                dirty.note_existing(conn, Layer::Addresses, "osm_addresses", node.id, "node")?;
                 conn.execute(
                     "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'node'",
                     [node.id],
@@ -184,6 +188,7 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
                          VALUES (?, 'node', ?, ?, ?, ?, ST_Point(?, ?))",
                         duckdb::params![node.id, hn, street, city, postcode, node.lon, node.lat],
                     )?;
+                    dirty.note_point(Layer::Addresses, node.lon, node.lat);
                 }
             }
         }
@@ -201,6 +206,8 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
                 let rel_ids = kvstore::get_way_to_relations(kv, way.id)?;
                 affected_relation_ids.extend(&rel_ids);
                 kvstore::delete_way(kv, way.id)?;
+                dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way.id, "way")?;
+                dirty.note_existing(conn, Layer::Addresses, "osm_addresses", way.id, "way")?;
                 conn.execute(
                     "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way'",
                     [way.id],
@@ -239,6 +246,8 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
                     }
                 }
                 kvstore::delete_relation(kv, rel.id)?;
+                dirty.note_existing(conn, Layer::Buildings, "osm_buildings", rel.id, "relation")?;
+                dirty.note_existing(conn, Layer::Addresses, "osm_addresses", rel.id, "relation")?;
                 conn.execute(
                     "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'relation'",
                     [rel.id],
@@ -280,7 +289,7 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
 
     // --- Rebuild affected way geometries ---
     for &way_id in &affected_way_ids {
-        rebuild_way_geometry(conn, kv, way_id, &changes.ways)?;
+        rebuild_way_geometry(conn, kv, way_id, &changes.ways, &mut dirty)?;
     }
 
     // Cascade way changes to relations
@@ -291,8 +300,10 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
 
     // --- Rebuild affected relation geometries ---
     for &relation_id in &affected_relation_ids {
-        rebuild_relation_geometry(conn, kv, relation_id, &changes.relations)?;
+        rebuild_relation_geometry(conn, kv, relation_id, &changes.relations, &mut dirty)?;
     }
+
+    dirty.flush(conn)?;
 
     Ok(())
 }
@@ -306,6 +317,7 @@ fn rebuild_way_geometry(
     kv: &RocksDB,
     way_id: i64,
     way_changes: &[WayChange],
+    dirty: &mut DirtyCells,
 ) -> Result<()> {
     if kvstore::get_way(kv, way_id)?.is_none() {
         return Ok(());
@@ -363,6 +375,9 @@ fn rebuild_way_geometry(
         return Ok(());
     }
 
+    dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way_id, "way")?;
+    dirty.note_existing(conn, Layer::Addresses, "osm_addresses", way_id, "way")?;
+
     conn.execute(
         "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way'",
         [way_id],
@@ -383,6 +398,7 @@ fn rebuild_way_geometry(
                AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords({way_id}))) >= 4
                AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords({way_id})))"
         ))?;
+        dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way_id, "way")?;
     }
 
     if housenumber.is_some() {
@@ -393,6 +409,7 @@ fn rebuild_way_geometry(
              WHERE resolve_way_coords(?) IS NOT NULL",
             duckdb::params![way_id, housenumber, street, city, postcode, way_id, way_id],
         )?;
+        dirty.note_existing(conn, Layer::Addresses, "osm_addresses", way_id, "way")?;
     }
 
     Ok(())
@@ -403,6 +420,7 @@ fn rebuild_relation_geometry(
     kv: &RocksDB,
     relation_id: i64,
     relation_changes: &[RelationChange],
+    dirty: &mut DirtyCells,
 ) -> Result<()> {
     let members = match kvstore::get_relation(kv, relation_id)? {
         Some(m) => m,
@@ -460,6 +478,21 @@ fn rebuild_relation_geometry(
     if building_tag.is_none() && housenumber.is_none() {
         return Ok(());
     }
+
+    dirty.note_existing(
+        conn,
+        Layer::Buildings,
+        "osm_buildings",
+        relation_id,
+        "relation",
+    )?;
+    dirty.note_existing(
+        conn,
+        Layer::Addresses,
+        "osm_addresses",
+        relation_id,
+        "relation",
+    )?;
 
     conn.execute(
         "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'relation'",
@@ -523,6 +556,13 @@ fn rebuild_relation_geometry(
              LEFT JOIN inner_polys i ON true
              WHERE o.outer_geom IS NOT NULL"
         ))?;
+        dirty.note_existing(
+            conn,
+            Layer::Buildings,
+            "osm_buildings",
+            relation_id,
+            "relation",
+        )?;
     }
 
     if housenumber.is_some() {
@@ -555,6 +595,13 @@ fn rebuild_relation_geometry(
                     ST_Centroid(ST_Collect(list(line_geom)))
              FROM way_geoms"
         ))?;
+        dirty.note_existing(
+            conn,
+            Layer::Addresses,
+            "osm_addresses",
+            relation_id,
+            "relation",
+        )?;
     }
 
     Ok(())
@@ -731,6 +778,106 @@ mod tests {
         assert_eq!(building_count, 0);
 
         assert!(kvstore::get_way(&kv, 100)?.is_none());
+
+        Ok(())
+    }
+
+    /// An OSM diff that adds a served address node must enqueue the 3x3
+    /// z14 neighbourhood of its cell under source 'prg', and must NOT touch
+    /// the building sources.
+    ///
+    /// A `.osc.gz`-driven CLI test was tried first: `fixtures/osm.osc.gz`
+    /// (a real minutely diff) does not touch any node/way/relation id
+    /// present in the imported `fixtures/osm.pbf` extract, so it never
+    /// exercises the served-object note sites. Crafting a synthetic
+    /// `.osc.gz` would just re-encode this same `OsmChange` value in XML+gz
+    /// for no added assurance, so this unit test exercises `apply_changes`
+    /// directly instead (per the task's documented fallback).
+    #[test]
+    fn test_apply_node_create_enqueues_prg_dirty_cells() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        let changes = OsmChange {
+            nodes: vec![NodeChange {
+                action: ChangeAction::Create,
+                id: 10,
+                lon: 21.0,
+                lat: 51.0,
+                tags: vec![
+                    ("addr:housenumber".into(), "5".into()),
+                    ("addr:street".into(), "Nowa".into()),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        apply_changes(&conn, &kv, &changes)?;
+
+        let (px, py) =
+            crate::tile_math::lonlat_to_tile(21.0, 51.0, crate::tile_math::CHANGE_CELL_ZOOM);
+        let prg: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'prg'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(prg, 9, "3x3 neighbourhood should be enqueued for prg");
+        let center: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM match_dirty_cells
+             WHERE source = 'prg' AND cell_x = ? AND cell_y = ?",
+            duckdb::params![px as i32, py as i32],
+            |row| row.get(0),
+        )?;
+        assert_eq!(center, 1, "center cell of the new address must be enqueued");
+
+        let building_sources: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM match_dirty_cells WHERE source IN ('bdot10k', 'egib')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            building_sources, 0,
+            "an address-only edit must not enqueue building sources"
+        );
+
+        Ok(())
+    }
+
+    /// Deleting a served building way must enqueue the 3x3 neighbourhood of
+    /// the cell it left under BOTH building sources (bdot10k + egib), and
+    /// must NOT touch prg (the way carries no address in this fixture).
+    #[test]
+    fn test_apply_way_delete_enqueues_building_dirty_cells() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        let changes = OsmChange {
+            ways: vec![WayChange {
+                action: ChangeAction::Delete,
+                id: 100,
+                node_refs: vec![],
+                tags: vec![],
+            }],
+            ..Default::default()
+        };
+
+        apply_changes(&conn, &kv, &changes)?;
+
+        for source in ["bdot10k", "egib"] {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = ?",
+                duckdb::params![source],
+                |row| row.get(0),
+            )?;
+            assert_eq!(n, 9, "3x3 neighbourhood should be enqueued for {source}");
+        }
+        let prg: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'prg'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            prg, 0,
+            "a building-only edit must not enqueue the address source"
+        );
 
         Ok(())
     }

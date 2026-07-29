@@ -2,152 +2,160 @@ use anyhow::{Context, Result};
 use duckdb::Connection;
 use tracing::info;
 
+use crate::compare::rule::unmatched_buildings_sql;
+use crate::tile_math::{cell_x_sql, cell_y_sql};
 use crate::utils::format_duration;
 
-/// Grid cell size in degrees for chunked spatial comparison.
-/// 0.5 degrees is roughly 35x55 km, yielding ~250 cells over Poland.
+/// Grid cell size in degrees for chunked spatial comparison (memory bound).
 const GRID_STEP: f64 = 0.5;
 
 pub fn compare_bdot10k(conn: &Connection) -> Result<()> {
-    info!("Comparing BDOT10k buildings against OSM");
-    let t = std::time::Instant::now();
-
-    compare_chunked(
+    compare_buildings(
         conn,
+        "bdot10k",
         "bdot10k_buildings",
         "LOKALNYID",
-        "lokalnyid",
-        "bdot10k_comparison",
+        "bdot10k_unmatched",
     )
-    .context("Failed to compare BDOT10k buildings against OSM")?;
-
-    let (total, matched): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COUNT(*) FILTER (WHERE matched) FROM bdot10k_comparison",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-
-    info!(
-        total,
-        matched,
-        unmatched = total - matched,
-        elapsed = %format_duration(t.elapsed()),
-        "BDOT10k comparison complete"
-    );
-
-    Ok(())
 }
 
 pub fn compare_egib(conn: &Connection) -> Result<()> {
-    info!("Comparing EGIB buildings against OSM");
-    let t = std::time::Instant::now();
-
-    compare_chunked(
+    compare_buildings(
         conn,
+        "egib",
         "egib_buildings",
         "id_budynku",
-        "id_budynku",
-        "egib_comparison",
+        "egib_unmatched",
     )
-    .context("Failed to compare EGIB buildings against OSM")?;
-
-    let (total, matched): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COUNT(*) FILTER (WHERE matched) FROM egib_comparison",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-
-    info!(
-        total,
-        matched,
-        unmatched = total - matched,
-        elapsed = %format_duration(t.elapsed()),
-        "EGIB comparison complete"
-    );
-
-    Ok(())
 }
 
-/// Compare buildings using a spatial grid to keep memory usage bounded.
-///
-/// DuckDB's R-tree indexes only accelerate queries where one argument to the
-/// spatial predicate is a constant known at planning time. A lateral join between
-/// two table columns cannot use the index, causing a full scan of osm_buildings
-/// per source row and OOM on large datasets.
-///
-/// This function divides the data extent into grid cells and processes each cell
-/// independently. Within each cell, `ST_Intersects(geom, constant_bbox)` enables
-/// R-tree index scans on both tables, reducing each chunk to a small subset.
-fn compare_chunked(
+fn compare_buildings(
     conn: &Connection,
+    label: &str,
     source_table: &str,
-    source_id_col: &str,
-    result_id_col: &str,
-    result_table: &str,
+    id_col: &str,
+    dest: &str,
 ) -> Result<()> {
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {result_table};
-         CREATE TABLE {result_table} (
-             {result_id_col} VARCHAR,
-             matched_osm_id BIGINT,
-             matched_osm_type VARCHAR,
-             matched BOOLEAN
-         );"
-    ))?;
+    info!(source = label, "Comparing buildings against OSM");
+    let t = std::time::Instant::now();
 
-    // Fixed grid covering Poland's extent (EPSG:4326).
-    // All government datasets (PRG, BDOT10k, EGIB) fall within these bounds.
-    let (min_x, min_y, max_x, max_y) = (14.0, 49.0, 25.0, 55.0);
+    conn.execute_batch(&format!("DELETE FROM {dest};"))
+        .with_context(|| format!("Failed to clear {dest}"))?;
 
-    let cols_count = ((max_x - min_x) / GRID_STEP).ceil() as u32;
-    let rows_count = ((max_y - min_y) / GRID_STEP).ceil() as u32;
-    let total_cells = cols_count * rows_count;
-    info!(
-        grid_step = GRID_STEP,
-        cells = total_cells,
-        "Processing comparison in grid cells"
-    );
+    let (min_x, min_y, max_x, max_y) = source_grid_extent(conn, source_table, GRID_STEP)
+        .with_context(|| format!("Failed to compute source extent for {source_table}"))?;
+    let cx = cell_x_sql("ST_Centroid(b.geom)");
+    let cy = cell_y_sql("ST_Centroid(b.geom)");
+    let select = format!("b.{id_col}, b.geom, {cx}, {cy}, now()");
 
-    let mut cell = 0u32;
     let mut y = min_y;
     while y < max_y {
         let mut x = min_x;
         while x < max_x {
-            cell += 1;
-            let x2 = x + GRID_STEP;
-            let y2 = y + GRID_STEP;
-
-            // Filter source buildings into this cell via CTE, then lateral-join
-            // against OSM buildings filtered by constant bbox (enables R-tree
-            // index scan on osm_buildings).
+            let (x_hi, y_hi) = (x + GRID_STEP, y + GRID_STEP);
+            let area = (x, y, x_hi, y_hi);
+            let inner = unmatched_buildings_sql(source_table, &select, area);
+            // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
+            // closed on all four cell edges, so a centroid exactly on a grid
+            // line would satisfy two neighbouring cells' predicates. Restrict
+            // the actual write to this cell's half-open interval so a
+            // boundary row is written by exactly the cell that owns it (the
+            // z14 analogue of this guard lives in
+            // incremental::recompute_cell_in_txn).
             conn.execute_batch(&format!(
-                "INSERT INTO {result_table}
-                 WITH cell_source AS (
-                     SELECT * FROM {source_table}
-                     WHERE ST_Intersects(ST_Centroid(geom), ST_MakeEnvelope({x}, {y}, {x2}, {y2}))
-                 )
-                 SELECT
-                     b.{source_id_col},
-                     m.osm_id,
-                     m.osm_type,
-                     m.osm_id IS NOT NULL
-                 FROM cell_source b
-                 LEFT JOIN LATERAL (
-                     SELECT osm.osm_id, osm.osm_type
-                     FROM osm_buildings osm
-                     WHERE ST_Contains(osm.geom, ST_Centroid(b.geom))
-                       AND ST_Intersects(osm.geom, ST_MakeEnvelope({x}, {y}, {x2}, {y2}))
-                     LIMIT 1
-                 ) m ON TRUE;"
+                "INSERT INTO {dest} ({id_col}, geom, cell_x, cell_y, computed_at)
+                 {inner}
+                   AND ST_X(ST_Centroid(b.geom)) >= {x} AND ST_X(ST_Centroid(b.geom)) < {x_hi}
+                   AND ST_Y(ST_Centroid(b.geom)) >= {y} AND ST_Y(ST_Centroid(b.geom)) < {y_hi};"
             ))
-            .with_context(|| format!("Failed at grid cell {cell}/{total_cells}"))?;
-
+            .with_context(|| format!("Failed comparing {label} in cell ({x},{y})"))?;
             x += GRID_STEP;
         }
         y += GRID_STEP;
     }
 
+    // total is now accurate: the grid above covers the source table's full
+    // extent (source_grid_extent), and the write-narrow guard means each row
+    // is written by exactly one cell, so matched = total - unmatched holds.
+    let (total, unmatched): (i64, i64) = conn.query_row(
+        &format!("SELECT (SELECT COUNT(*) FROM {source_table}), (SELECT COUNT(*) FROM {dest})"),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    info!(
+        source = label, total, unmatched, matched = total - unmatched,
+        elapsed = %format_duration(t.elapsed()),
+        "buildings comparison complete"
+    );
     Ok(())
+}
+
+/// Grid-aligned bounding box covering every row in `source_table`, snapped
+/// outward to `grid_step` multiples so the chunked scan above never misses a
+/// row whose centroid falls outside the historical Poland bbox (a coordinate
+/// error, a stray far-away row). The upper bound is snapped via
+/// `floor(x/step)*step + step` rather than `ceil`, so a value that already
+/// sits exactly on a grid line still gets a full extra cell of headroom
+/// (`ceil` would leave it exactly on the loop's exclusive upper bound,
+/// covered by nothing). Falls back to the historical (14.0, 49.0, 25.0, 55.0)
+/// box when the table has no rows — the grid still iterates, every cell just
+/// matches nothing.
+///
+/// Because the extent comes from the data rather than a fixed box, a single
+/// malformed coordinate inflates the cell count that the caller then iterates
+/// one query at a time. Even a *valid* WGS84 outlier is enough: one row at
+/// (-180, -90) turns Poland's 264 cells into 259 200. So the cell count is
+/// capped — exceeding the cap means the source table holds a coordinate no
+/// grid should be built around, which is a data fault worth failing loudly on
+/// rather than silently skipping (the old hardcoded box) or grinding for hours
+/// (an uncapped derived box).
+fn source_grid_extent(
+    conn: &Connection,
+    source_table: &str,
+    grid_step: f64,
+) -> Result<(f64, f64, f64, f64)> {
+    const FALLBACK: (f64, f64, f64, f64) = (14.0, 49.0, 25.0, 55.0);
+    /// ~8× the historical Poland grid (22 × 12 = 264 cells) — generous enough
+    /// for a stray row a few degrees outside the country, far short of the
+    /// blow-up a wild coordinate causes.
+    const MAX_GRID_CELLS: f64 = 2048.0;
+
+    let row: (Option<f64>, Option<f64>, Option<f64>, Option<f64>) = conn.query_row(
+        &format!(
+            "SELECT ST_XMin(ST_Extent_Agg(geom)), ST_YMin(ST_Extent_Agg(geom)),
+                    ST_XMax(ST_Extent_Agg(geom)), ST_YMax(ST_Extent_Agg(geom))
+             FROM {source_table}"
+        ),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let (x1, y1, x2, y2) = match row {
+        (Some(x1), Some(y1), Some(x2), Some(y2)) => (
+            (x1 / grid_step).floor() * grid_step,
+            (y1 / grid_step).floor() * grid_step,
+            (x2 / grid_step).floor() * grid_step + grid_step,
+            (y2 / grid_step).floor() * grid_step + grid_step,
+        ),
+        // Any NULL means no rows with geometry; NaN would poison the loop
+        // bounds, so treat it the same way.
+        _ => return Ok(FALLBACK),
+    };
+    if !(x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite()) {
+        anyhow::bail!(
+            "{source_table} extent is not finite ({x1},{y1},{x2},{y2}) — \
+             the table holds a malformed geometry"
+        );
+    }
+    let cells = ((x2 - x1) / grid_step) * ((y2 - y1) / grid_step);
+    if cells > MAX_GRID_CELLS {
+        anyhow::bail!(
+            "{source_table} spans ({x1},{y1},{x2},{y2}) — {cells:.0} grid cells at \
+             {grid_step}°, over the {MAX_GRID_CELLS:.0}-cell cap. A coordinate far \
+             outside Poland is almost certainly bad source data; find and fix that row \
+             (its centroid is at one of the extent corners) before comparing."
+        );
+    }
+    Ok((x1, y1, x2, y2))
 }
 
 #[cfg(test)]
@@ -157,135 +165,164 @@ mod tests {
     use super::*;
     use crate::db::init_db;
 
-    /// Spin up an in-memory DuckDB with spatial loaded and a custom
-    /// `test_source` table. `osm_buildings` is created by `init_db` and
-    /// is seeded with a single polygon unless the caller overrides.
+    /// Spin up an in-memory DuckDB with spatial loaded and the serving
+    /// tables created by `init_db`. `osm_buildings` is seeded with a single
+    /// polygon; tests create their own government-source table.
     fn setup() -> Connection {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         conn.execute_batch(
-            "CREATE TABLE test_source (src_id VARCHAR, geom GEOMETRY);
-             INSERT INTO osm_buildings VALUES
+            "INSERT INTO osm_buildings VALUES
                  (1, 'way', NULL, ST_MakeEnvelope(20.0, 52.0, 20.001, 52.001));",
         )
         .unwrap();
         conn
     }
 
-    fn counts(conn: &Connection, table: &str) -> (i64, i64) {
-        conn.query_row(
-            &format!("SELECT COUNT(*), COUNT(*) FILTER (WHERE matched) FROM {table}"),
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap()
-    }
-
-    /// A source centroid that lies inside an OSM polygon must be matched,
-    /// and the result row must carry the matching osm_id/osm_type.
     #[test]
-    fn compare_chunked_matches_contained_centroid() {
+    fn writes_only_unmatched_rows_with_cell_tags() {
         let conn = setup();
-        // Source envelope wholly inside the seeded osm_buildings polygon.
         conn.execute_batch(
-            "INSERT INTO test_source VALUES
-                 ('inside', ST_MakeEnvelope(20.0002, 52.0002, 20.0008, 52.0008));",
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             INSERT INTO bdot10k_buildings VALUES
+                 ('inside', ST_MakeEnvelope(20.0002,52.0002,20.0008,52.0008)),
+                 ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));",
         )
         .unwrap();
-
-        compare_chunked(&conn, "test_source", "src_id", "src_id", "test_result").unwrap();
-
-        assert_eq!(counts(&conn, "test_result"), (1, 1));
-
-        let (src_id, osm_id, osm_type): (String, i64, String) = conn
-            .query_row(
-                "SELECT src_id, matched_osm_id, matched_osm_type
-                 FROM test_result WHERE matched",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+        compare_bdot10k(&conn).unwrap();
+        let ids: Vec<String> = {
+            let mut s = conn
+                .prepare("SELECT LOKALNYID FROM bdot10k_unmatched ORDER BY LOKALNYID")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["lonely".to_string()],
+            "only the uncontained building is stored"
+        );
+        let (cx, cy): (i32, i32) = conn
+            .query_row("SELECT cell_x, cell_y FROM bdot10k_unmatched", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
-        assert_eq!(src_id, "inside");
-        assert_eq!(osm_id, 1);
-        assert_eq!(osm_type, "way");
+        let (ex, ey) =
+            crate::tile_math::lonlat_to_tile(21.0005, 52.2005, crate::tile_math::CHANGE_CELL_ZOOM);
+        assert_eq!((cx as u32, cy as u32), (ex, ey));
     }
 
-    /// A source centroid with no containing OSM building produces an
-    /// unmatched row with NULL osm_id/osm_type — the source row is NOT
-    /// dropped from the result table.
     #[test]
-    fn compare_chunked_emits_null_row_for_unmatched_source() {
+    fn compare_is_idempotent() {
         let conn = setup();
-        // Source somewhere else in Poland, well away from the seeded polygon.
         conn.execute_batch(
-            "INSERT INTO test_source VALUES
-                 ('lonely', ST_MakeEnvelope(21.0, 52.2, 21.001, 52.201));",
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             INSERT INTO bdot10k_buildings VALUES ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));",
         )
         .unwrap();
-
-        compare_chunked(&conn, "test_source", "src_id", "src_id", "test_result").unwrap();
-
-        assert_eq!(counts(&conn, "test_result"), (1, 0));
-
-        let (osm_id, osm_type): (Option<i64>, Option<String>) = conn
-            .query_row(
-                "SELECT matched_osm_id, matched_osm_type FROM test_result",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        compare_bdot10k(&conn).unwrap();
+        compare_bdot10k(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bdot10k_unmatched", [], |r| r.get(0))
             .unwrap();
-        assert!(osm_id.is_none());
-        assert!(osm_type.is_none());
+        assert_eq!(n, 1, "re-running compare must not duplicate rows");
     }
 
-    /// `compare_chunked` iterates a fixed grid over Poland's bounding box
-    /// (14..25 E, 49..55 N). Source buildings whose centroids fall outside
-    /// that extent are silently dropped from the result table. This test
-    /// documents that behavior; if the grid coverage changes (or becomes
-    /// data-driven) this test must change too.
+    /// Deriving the grid from the data means one wild coordinate would
+    /// otherwise inflate a 264-cell grid into hundreds of thousands of
+    /// one-query-each iterations. A row at the WGS84 extreme is a valid
+    /// geometry, so nothing upstream rejects it -- the cap must, and the error
+    /// must point at the extent so the operator can find the bad row.
     #[test]
-    fn compare_chunked_silently_drops_source_outside_poland_extent() {
+    fn refuses_to_build_a_grid_around_a_wild_coordinate() {
         let conn = setup();
-        // Longitude 30°E — outside the 14..25 grid.
         conn.execute_batch(
-            "INSERT INTO test_source VALUES
-                 ('far_east', ST_MakeEnvelope(30.0, 52.0, 30.001, 52.001));",
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             INSERT INTO bdot10k_buildings VALUES
+                 ('sane', ST_MakeEnvelope(20.0,52.0,20.001,52.001)),
+                 ('wild', ST_MakeEnvelope(-180.0,-90.0,-179.999,-89.999));",
         )
         .unwrap();
-
-        compare_chunked(&conn, "test_source", "src_id", "src_id", "test_result").unwrap();
-
-        assert_eq!(counts(&conn, "test_result"), (0, 0));
+        // `{:#}` walks the whole anyhow chain -- the caller wraps this in
+        // with_context, so plain Display would only show the outer message.
+        let err = format!("{:#}", compare_bdot10k(&conn).unwrap_err());
+        assert!(
+            err.contains("grid cells") && err.contains("cap"),
+            "the error must name the cell count and the cap, got: {err}"
+        );
     }
 
-    /// Known edge case: a source centroid that lands *exactly* on a cell
-    /// boundary is processed by both adjacent cells, because ST_Intersects
-    /// returns true on touch. The source row ends up duplicated in the
-    /// result table. This is vanishingly rare in practice (centroids are
-    /// float-valued) but this test locks the behavior in so future changes
-    /// are deliberate. If you ever switch to a half-open cell convention
-    /// (e.g. `ST_Within` with lower-closed / upper-open ranges), this test
-    /// will need updating.
+    /// A row whose centroid falls outside the old hardcoded (14,49,25,55)
+    /// Poland bbox (a coordinate error, a stray 0/0-adjacent row) must still
+    /// be compared -- the grid now derives its extent from the source table
+    /// instead of a fixed box, so `compare full` and the incremental path
+    /// (which has no extent restriction at all) agree on every row. A stray row
+    /// a few degrees out stays well under the cell cap that
+    /// `refuses_to_build_a_grid_around_a_wild_coordinate` pins.
+    #[test]
+    fn covers_a_row_outside_the_historical_poland_bbox() {
+        let conn = setup();
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             INSERT INTO bdot10k_buildings VALUES
+                 ('stray', ST_MakeEnvelope(30.0,60.0,30.001,60.001));",
+        )
+        .unwrap();
+        compare_bdot10k(&conn).unwrap();
+        let ids: Vec<String> = {
+            let mut s = conn
+                .prepare("SELECT LOKALNYID FROM bdot10k_unmatched")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["stray".to_string()],
+            "a row outside the hardcoded bbox must still be compared"
+        );
+    }
+
+    /// Regression test for the write-narrow guard (re-added equivalent of the
+    /// test deleted in the Task 4 refactor -- see
+    /// `git show 0331d15^:src/compare/buildings.rs`, which asserted 2 rows
+    /// before the chunked scan's write predicate was narrowed). A centroid
+    /// exactly on a 0.5° grid line satisfies both neighbouring cells'
+    /// ST_Intersects envelope test (closed on all four edges), so without a
+    /// narrow write it would be inserted twice.
     #[test]
     fn compare_chunked_duplicates_source_on_cell_boundary() {
         let conn = setup();
-        // x = 14.5 is the boundary between the first and second grid
-        // columns (GRID_STEP = 0.5 starting at 14.0). y = 52.25 is safely
-        // inside one row.
         conn.execute_batch(
-            "INSERT INTO test_source VALUES
-                 ('boundary', ST_Point(14.5, 52.25));",
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             INSERT INTO bdot10k_buildings VALUES
+                 -- centroid (14.5, 52.25): x = 14.5 is the boundary between
+                 -- the [14.0,14.5) and [14.5,15.0) grid columns; y = 52.25 is
+                 -- safely mid-row.
+                 ('boundary', ST_MakeEnvelope(14.4998,52.2498,14.5002,52.2502)),
+                 -- Widens the source extent so both neighbouring columns are
+                 -- actually scanned by the chunked loop -- a lone boundary
+                 -- point would otherwise sit at a tightly-snapped extent edge
+                 -- and only ever be scanned by one cell, which would not
+                 -- exercise the guard at all.
+                 ('anchor', ST_MakeEnvelope(14.05,52.25,14.06,52.26));",
         )
         .unwrap();
-
-        compare_chunked(&conn, "test_source", "src_id", "src_id", "test_result").unwrap();
-
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM test_result", [], |row| row.get(0))
+        compare_bdot10k(&conn).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bdot10k_unmatched WHERE LOKALNYID = 'boundary'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(
-            total, 2,
-            "source centroid on a cell boundary is processed by both adjacent cells"
+            n, 1,
+            "a centroid exactly on a grid boundary must be written by exactly one cell"
         );
     }
 }

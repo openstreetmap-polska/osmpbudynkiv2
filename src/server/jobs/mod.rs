@@ -8,6 +8,7 @@
 
 pub mod dataset_update;
 pub mod export_log_prune;
+pub mod match_refresh;
 pub mod osm_update;
 pub mod status_handler;
 
@@ -39,12 +40,10 @@ pub struct JobContext {
     pub pool: DbPool,
     pub kv: Arc<RocksDB>,
     pub config: Arc<AppConfig>,
-    #[allow(dead_code)]
     pub cancel: Arc<AtomicBool>,
 }
 
 impl JobContext {
-    #[allow(dead_code)]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
     }

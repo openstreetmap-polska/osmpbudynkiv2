@@ -26,6 +26,9 @@ example_data/
 # git worktrees
 .worktrees/
 
+# superpowers subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
+
 # default location of database when running this project
 osmpbudynkiv2.duckdb*
 osmpbudynkiv2.rocksdb*
