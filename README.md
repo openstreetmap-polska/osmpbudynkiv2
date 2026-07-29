@@ -215,6 +215,17 @@ The `match_refresh` background job keeps `/tiles` and `/package` fresh between
 full `compare` runs, by draining `match_dirty_cells` on a schedule (see
 `[jobs.match_refresh]`).
 
+**Upgrading an existing database in place:** the `*_unmatched` serving tables
+are created with `CREATE TABLE IF NOT EXISTS`, so starting the server against
+an older database that predates them leaves all three empty — `/tiles` and
+`/package` will start up cleanly but serve zero features (a startup warning
+names each empty table). Run an offline `compare full` before restarting the
+server against that database. `compare reconcile` is **not** an equivalent
+fast path here: it only re-enqueues every live cell for the incremental
+drain, so populating a fully empty database through it means draining the
+entire country cell-by-cell, which is orders of magnitude slower than a
+direct full `compare`.
+
 ```bash
 # bbox: minLon,minLat,maxLon,maxLat; datasets: prg, bdot10k, egib, or all (default)
 curl 'http://127.0.0.1:3000/package?bbox=20.99,52.19,21.02,52.22&datasets=prg,bdot10k'
