@@ -329,6 +329,12 @@ pub fn feature(
 /// this is a plain spatial read of that serving table clipped to the polygon.
 pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<AddressRow>> {
     let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
+    // Envelope bounds are validated finite f64s (parsed and range-checked by
+    // parse_bbox/parse_polygon_body, never raw request text) formatted
+    // straight into the SQL text -- a constant predicate enables an R-tree
+    // index scan, the same pattern used in compare::buildings/compare::rule.
+    // The polygon itself stays a bound parameter (`?`), since it is
+    // arbitrary-length user-supplied geometry, not a handful of numbers.
     let sql = format!(
         "SELECT ST_AsGeoJSON(a.geom), a.numer_porzadkowy, a.ulica, a.miejscowosc,
                 a.kod_pocztowy, a.teryt_miejscowosc
@@ -369,6 +375,7 @@ pub fn unmatched_buildings(
     area: &RequestArea,
 ) -> Result<Vec<String>> {
     let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
+    // Same bbox-interpolation rationale as unmatched_addresses above.
     let sql = format!(
         "SELECT ST_AsGeoJSON(b.geom)
          FROM {dest_table} b

@@ -266,6 +266,12 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect()
         };
+        assert_eq!(
+            cells.len(),
+            2,
+            "exactly the two distinct touched cells -- a UNION -> UNION ALL \
+             regression in insert_dirty_cells would double this"
+        );
         assert!(cells.iter().all(|(s, _, _)| s == "test"));
         assert!(cells.contains(&("test".to_string(), home_x as i32, home_y as i32)));
         assert!(cells.contains(&("test".to_string(), dest_x as i32, dest_y as i32)));

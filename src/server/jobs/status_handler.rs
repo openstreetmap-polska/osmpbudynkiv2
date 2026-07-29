@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::extract::State;
@@ -10,7 +12,12 @@ use crate::server::jobs::JobStatus;
 #[derive(Serialize, Default)]
 pub struct MatchStaleness {
     pub pending_total: i64,
-    pub pending_by_source: Vec<(String, i64)>,
+    /// A map, not a `Vec<(String, i64)>` -- the latter serializes as a JSON
+    /// array of 2-element arrays (e.g. `[["bdot10k",1],["prg",1]]`) rather
+    /// than an object, which is an awkward shape for any consumer of this
+    /// brand-new public field. `BTreeMap` also gives stable (sorted) key
+    /// order for free.
+    pub pending_by_source: BTreeMap<String, i64>,
     pub oldest_enqueued_at: Option<String>,
 }
 
@@ -24,7 +31,7 @@ pub fn compute_match_staleness(conn: &Connection) -> Result<MatchStaleness> {
             |r| r.get(0),
         )
         .context("count pending cells")?;
-    let mut pending_by_source = Vec::new();
+    let mut pending_by_source = BTreeMap::new();
     {
         let mut stmt = conn.prepare(
             "SELECT source, COUNT(*) FROM (SELECT DISTINCT source, cell_x, cell_y FROM match_dirty_cells)
@@ -32,7 +39,8 @@ pub fn compute_match_staleness(conn: &Connection) -> Result<MatchStaleness> {
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
-            pending_by_source.push(row?);
+            let (source, count) = row?;
+            pending_by_source.insert(source, count);
         }
     }
     let oldest_enqueued_at: Option<String> = conn
@@ -106,10 +114,9 @@ mod tests {
         .unwrap();
         let s = compute_match_staleness(&conn).unwrap();
         assert_eq!(s.pending_total, 2, "distinct (source,cell) pairs");
-        assert!(
-            s.pending_by_source
-                .iter()
-                .any(|(k, v)| k == "bdot10k" && *v == 1)
+        assert_eq!(
+            s.pending_by_source,
+            BTreeMap::from([("bdot10k".to_string(), 1), ("prg".to_string(), 1)])
         );
         assert!(s.oldest_enqueued_at.is_some());
     }
