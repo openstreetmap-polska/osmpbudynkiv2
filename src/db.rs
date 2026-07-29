@@ -137,6 +137,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
         -- Dirty-cell queue drained by the match_refresh job. Duplicates allowed
         -- (deduped on drain). source is 'bdot10k'|'egib'|'prg'; an OSM building
         -- edit enqueues bdot10k+egib, an OSM address edit enqueues prg.
+        -- cell_z is informational only: every producer writes CHANGE_CELL_ZOOM
+        -- and the drain neither selects nor filters on it (recompute_cell_in_txn
+        -- hardcodes CHANGE_CELL_ZOOM). If CHANGE_CELL_ZOOM ever changes, queue
+        -- rows written at the old zoom are silently reinterpreted at the new
+        -- one — drain the queue before changing it, then `compare reconcile`.
         CREATE TABLE IF NOT EXISTS match_dirty_cells (
             source VARCHAR,
             cell_z INTEGER,

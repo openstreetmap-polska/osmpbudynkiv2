@@ -1,13 +1,25 @@
 //! The single home for "which government object is unmatched against OSM".
-//! Both `compare` (full recompute) and `match_refresh` (incremental per-cell)
-//! resolve to this rule; the equivalence test in `compare` pins the address
-//! grid-key fast path to it.
+//!
+//! Full building `compare` and the per-cell incremental recompute both call
+//! `unmatched_buildings_sql` here, so they share the predicate text itself.
+//! Full address `compare` uses its own grid-key SQL for performance and shares
+//! only `MATCH_DISTANCE_METERS`; two tests pin the paths together —
+//! `addresses::full_and_per_cell_paths_agree` (grid-key vs. per-cell rule) and
+//! `compare::full_vs_incremental_equivalence` (full `compare` vs.
+//! reconcile+drain, end to end).
 
 /// (min_lon, min_lat, max_lon, max_lat).
 pub type Bounds = (f64, f64, f64, f64);
 
 pub const MATCH_DISTANCE_METERS: f64 = 50.0;
 /// OSM read buffer around a cell for address matching. Matches /package.
+///
+/// **Coupled to `MATCH_DISTANCE_METERS`.** 0.001° is ~64 m of longitude at
+/// Poland's northern edge (54.8 °N) and ~111 m of latitude, so it covers the
+/// 50 m match distance with only 1.28× headroom east-west. Raising the distance
+/// past ~64 m would silently break read-wide/write-narrow — an OSM address just
+/// outside the buffered read would stop matching — with no test failure. Raise
+/// this buffer alongside it.
 pub const OSM_MATCH_BUFFER_DEG: f64 = 0.001;
 
 pub fn buffer(b: Bounds, deg: f64) -> Bounds {
