@@ -269,8 +269,12 @@ mod tests {
         assert_eq!(
             cells.len(),
             2,
-            "exactly the two distinct touched cells -- a UNION -> UNION ALL \
-             regression in insert_dirty_cells would double this"
+            // Pins the enqueued *set*, not the dedup mechanism: the outer
+            // SELECT DISTINCT collapses duplicates on its own (now() is
+            // statement-stable, so it does not defeat DISTINCT), which means
+            // this would still pass if the inner UNION became UNION ALL.
+            // Duplicate queue rows are harmless anyway -- the drain dedups.
+            "exactly the two distinct touched cells"
         );
         assert!(cells.iter().all(|(s, _, _)| s == "test"));
         assert!(cells.contains(&("test".to_string(), home_x as i32, home_y as i32)));

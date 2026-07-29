@@ -98,14 +98,28 @@ fn compare_buildings(
 /// sits exactly on a grid line still gets a full extra cell of headroom
 /// (`ceil` would leave it exactly on the loop's exclusive upper bound,
 /// covered by nothing). Falls back to the historical (14.0, 49.0, 25.0, 55.0)
-/// box when the table has no rows, so an empty table still produces a
-/// (degenerate, zero-iteration) grid rather than an error.
+/// box when the table has no rows — the grid still iterates, every cell just
+/// matches nothing.
+///
+/// Because the extent comes from the data rather than a fixed box, a single
+/// malformed coordinate inflates the cell count that the caller then iterates
+/// one query at a time. Even a *valid* WGS84 outlier is enough: one row at
+/// (-180, -90) turns Poland's 264 cells into 259 200. So the cell count is
+/// capped — exceeding the cap means the source table holds a coordinate no
+/// grid should be built around, which is a data fault worth failing loudly on
+/// rather than silently skipping (the old hardcoded box) or grinding for hours
+/// (an uncapped derived box).
 fn source_grid_extent(
     conn: &Connection,
     source_table: &str,
     grid_step: f64,
 ) -> Result<(f64, f64, f64, f64)> {
     const FALLBACK: (f64, f64, f64, f64) = (14.0, 49.0, 25.0, 55.0);
+    /// ~8× the historical Poland grid (22 × 12 = 264 cells) — generous enough
+    /// for a stray row a few degrees outside the country, far short of the
+    /// blow-up a wild coordinate causes.
+    const MAX_GRID_CELLS: f64 = 2048.0;
+
     let row: (Option<f64>, Option<f64>, Option<f64>, Option<f64>) = conn.query_row(
         &format!(
             "SELECT ST_XMin(ST_Extent_Agg(geom)), ST_YMin(ST_Extent_Agg(geom)),
@@ -115,15 +129,33 @@ fn source_grid_extent(
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
-    Ok(match row {
+    let (x1, y1, x2, y2) = match row {
         (Some(x1), Some(y1), Some(x2), Some(y2)) => (
             (x1 / grid_step).floor() * grid_step,
             (y1 / grid_step).floor() * grid_step,
             (x2 / grid_step).floor() * grid_step + grid_step,
             (y2 / grid_step).floor() * grid_step + grid_step,
         ),
-        _ => FALLBACK,
-    })
+        // Any NULL means no rows with geometry; NaN would poison the loop
+        // bounds, so treat it the same way.
+        _ => return Ok(FALLBACK),
+    };
+    if !(x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite()) {
+        anyhow::bail!(
+            "{source_table} extent is not finite ({x1},{y1},{x2},{y2}) — \
+             the table holds a malformed geometry"
+        );
+    }
+    let cells = ((x2 - x1) / grid_step) * ((y2 - y1) / grid_step);
+    if cells > MAX_GRID_CELLS {
+        anyhow::bail!(
+            "{source_table} spans ({x1},{y1},{x2},{y2}) — {cells:.0} grid cells at \
+             {grid_step}°, over the {MAX_GRID_CELLS:.0}-cell cap. A coordinate far \
+             outside Poland is almost certainly bad source data; find and fix that row \
+             (its centroid is at one of the extent corners) before comparing."
+        );
+    }
+    Ok((x1, y1, x2, y2))
 }
 
 #[cfg(test)]
@@ -198,11 +230,37 @@ mod tests {
         assert_eq!(n, 1, "re-running compare must not duplicate rows");
     }
 
+    /// Deriving the grid from the data means one wild coordinate would
+    /// otherwise inflate a 264-cell grid into hundreds of thousands of
+    /// one-query-each iterations. A row at the WGS84 extreme is a valid
+    /// geometry, so nothing upstream rejects it -- the cap must, and the error
+    /// must point at the extent so the operator can find the bad row.
+    #[test]
+    fn refuses_to_build_a_grid_around_a_wild_coordinate() {
+        let conn = setup();
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             INSERT INTO bdot10k_buildings VALUES
+                 ('sane', ST_MakeEnvelope(20.0,52.0,20.001,52.001)),
+                 ('wild', ST_MakeEnvelope(-180.0,-90.0,-179.999,-89.999));",
+        )
+        .unwrap();
+        // `{:#}` walks the whole anyhow chain -- the caller wraps this in
+        // with_context, so plain Display would only show the outer message.
+        let err = format!("{:#}", compare_bdot10k(&conn).unwrap_err());
+        assert!(
+            err.contains("grid cells") && err.contains("cap"),
+            "the error must name the cell count and the cap, got: {err}"
+        );
+    }
+
     /// A row whose centroid falls outside the old hardcoded (14,49,25,55)
     /// Poland bbox (a coordinate error, a stray 0/0-adjacent row) must still
     /// be compared -- the grid now derives its extent from the source table
     /// instead of a fixed box, so `compare full` and the incremental path
-    /// (which has no extent restriction at all) agree on every row.
+    /// (which has no extent restriction at all) agree on every row. A stray row
+    /// a few degrees out stays well under the cell cap that
+    /// `refuses_to_build_a_grid_around_a_wild_coordinate` pins.
     #[test]
     fn covers_a_row_outside_the_historical_poland_bbox() {
         let conn = setup();
