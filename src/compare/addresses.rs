@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use duckdb::Connection;
 use tracing::info;
 
+use crate::compare::rule::MATCH_DISTANCE_METERS;
 use crate::utils::format_duration;
 
 /// Grid cell size in degrees for the spatial grid-key matching strategy.
@@ -9,10 +10,6 @@ use crate::utils::format_duration;
 /// the 50 m match distance. Any two addresses within 50 m therefore fall in the
 /// same or adjacent grid cells, so a ±1 cell neighbourhood is always sufficient.
 const GRID_KEY_DEG: f64 = 0.005;
-
-/// Two address points are considered matching when their (trimmed, uppercased)
-/// housenumbers are equal AND they are within this distance in meters.
-const MATCH_DISTANCE_METERS: f64 = 50.0;
 
 pub fn compare_prg(conn: &Connection) -> Result<()> {
     info!("Comparing PRG addresses against OSM");

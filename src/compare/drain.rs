@@ -258,13 +258,13 @@ mod tests {
         let cancel = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
 
         let s = drain_batch(&c, 10, &cancel).unwrap();
-        assert_eq!(s.cells, 1, "drain stops after the first cell once cancelled");
+        assert_eq!(
+            s.cells, 1,
+            "drain stops after the first cell once cancelled"
+        );
         let left: i64 = c
             .query_row("SELECT COUNT(*) FROM match_dirty_cells", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(
-            left, 2,
-            "the remaining cells stay queued for the next tick"
-        );
+        assert_eq!(left, 2, "the remaining cells stay queued for the next tick");
     }
 }

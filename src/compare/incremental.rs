@@ -28,10 +28,21 @@ pub fn recompute_cell_in_txn(
             let cx = cell_x_sql("ST_Centroid(b.geom)");
             let cy = cell_y_sql("ST_Centroid(b.geom)");
             let select = format!("b.{id}, b.geom, {cx}, {cy}, now()");
+            // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
+            // closed on all four cell edges, so a centroid exactly on a
+            // shared boundary would satisfy both neighbours' predicates.
+            // Restrict the write to rows whose canonical cell tag (the same
+            // cell_x_sql/cell_y_sql expression stored in the row) matches
+            // this cell, so a boundary row is written by exactly the cell
+            // that owns it.
+            let inner = format!(
+                "{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
+                unmatched_buildings_sql(src, &select, write)
+            );
             (
                 dest,
                 format!("{id}, geom, cell_x, cell_y, computed_at"),
-                unmatched_buildings_sql(src, &select, write),
+                inner,
             )
         }
         "prg" => {
@@ -42,12 +53,17 @@ pub fn recompute_cell_in_txn(
                 "a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc, \
                  a.kod_pocztowy, a.teryt_miejscowosc, {cx}, {cy}, now()"
             );
+            // Same write-narrow guard as the buildings branch above.
+            let inner = format!(
+                "{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
+                unmatched_addresses_in_cell_sql("prg_addresses", &select, write, read)
+            );
             (
                 "prg_unmatched",
                 "geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy, \
                  teryt_miejscowosc, cell_x, cell_y, computed_at"
                     .to_string(),
-                unmatched_addresses_in_cell_sql("prg_addresses", &select, write, read),
+                inner,
             )
         }
         other => bail!("recompute_cell: unknown source {other}"),
@@ -147,6 +163,66 @@ mod tests {
             ids,
             vec!["q".to_string()],
             "p's cell rebuilt to matched; q's cell untouched"
+        );
+    }
+
+    /// A representative point lying exactly on a shared z14 cell edge
+    /// satisfies both neighbours' ST_Intersects envelope test (closed on all
+    /// four edges), but must carry only one canonical cell_x/cell_y tag (the
+    /// row's SELECT always computes the true cell from its geometry, not from
+    /// which cell's recompute is running). Recomputing the row's *canonical*
+    /// cell first, then its neighbour, must not leave a second copy behind:
+    /// the neighbour's DELETE is keyed to the neighbour's own cell number, so
+    /// it cannot remove a row tagged with the canonical cell, and its INSERT
+    /// (without the guard) would compute that same canonical tag again --
+    /// this is precisely the ordering that reproduces the duplicate.
+    #[test]
+    fn write_narrow_by_cell_tag_prevents_boundary_duplicates() {
+        let c = conn();
+        let (cx, cy) = (9147u32, 5411u32);
+        let (_, min_lat, boundary_lon, max_lat) = tile_to_bbox(CHANGE_CELL_ZOOM, cx, cy);
+        let mid_lat = (min_lat + max_lat) / 2.0;
+        // boundary_lon is simultaneously this cell's max_lon and (cx+1)'s
+        // min_lon (same tile_to_bbox formula, same float bits) -- exactly the
+        // closed-edge ambiguity the cell-tag guard exists to resolve.
+        c.execute_batch(&format!(
+            "INSERT INTO bdot10k_buildings VALUES ('boundary', ST_Point({boundary_lon}, {mid_lat}));"
+        ))
+        .unwrap();
+
+        // Determine which of the two candidate neighbours (cx, cx+1) is the
+        // row's true canonical cell -- the same expression the INSERT itself
+        // uses -- so the two recompute calls below run canonical-cell-first,
+        // the ordering that actually exercises the guard.
+        let true_cx: i32 = c
+            .query_row(
+                &format!(
+                    "SELECT {} FROM bdot10k_buildings WHERE LOKALNYID = 'boundary'",
+                    cell_x_sql("geom")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let other_cx = if true_cx == cx as i32 { cx + 1 } else { cx } as i32;
+        assert!(
+            true_cx == cx as i32 || true_cx == (cx + 1) as i32,
+            "sanity: the boundary point must canonically belong to one of the two candidate cells"
+        );
+
+        recompute_cell(&c, "bdot10k", true_cx, cy as i32).unwrap();
+        recompute_cell(&c, "bdot10k", other_cx, cy as i32).unwrap();
+
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM bdot10k_unmatched WHERE LOKALNYID = 'boundary'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "a representative point on a shared cell edge must be written by exactly one neighbour"
         );
     }
 }
