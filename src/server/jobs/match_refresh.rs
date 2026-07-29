@@ -26,9 +26,16 @@ impl Job for MatchRefreshJob {
             .pool
             .get()
             .context("failed to acquire pool connection")?;
-        let stats = crate::compare::drain::drain_batch(&conn, self.batch_size)?;
+        let stats =
+            crate::compare::drain::drain_batch(&conn, self.batch_size, &|| ctx.is_cancelled())?;
         if stats.cells > 0 {
             tracing::info!(cells = stats.cells, "match_refresh drained dirty cells");
+        }
+        if stats.failed > 0 {
+            tracing::warn!(
+                failed = stats.failed,
+                "match_refresh: some cells failed to recompute and remain queued for retry"
+            );
         }
         Ok(())
     }
