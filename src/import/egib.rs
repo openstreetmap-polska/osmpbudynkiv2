@@ -59,7 +59,7 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
     );
 
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM egib_buildings", [], |row| row.get(0))?;
-    if was_downloaded {
+    if was_downloaded && config.cleanup_downloaded_files {
         info!(path = %parquet_path.display(), "Cleaning up downloaded file");
         let _ = std::fs::remove_file(&parquet_path);
     }

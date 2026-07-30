@@ -22,6 +22,20 @@ http_listen_addr = "127.0.0.1:3000"
 # and files are cleaned up automatically after processing.
 # download_dir = "./data"
 
+# When true, files that import/update downloaded themselves are deleted once
+# consumed. Set to false to keep them in download_dir, e.g. to avoid
+# re-downloading a large snapshot across repeated local runs. Never applies
+# to a user-supplied --file input, which is never deleted either way.
+#
+# Caution: download_file/download_file_as skip downloading when a file
+# already exists at the destination, and PRG/BDOT10k/EGIB always download to
+# the same filename. If this is false and a leftover file isn't removed by
+# hand, a later import/update will silently reuse that stale file instead of
+# fetching the current snapshot. Does not affect OSM's incremental
+# replication downloads (state.txt, per-sequence .osc.gz), which are always
+# cleaned up regardless of this setting.
+cleanup_downloaded_files = true
+
 # SQL statements executed on DuckDB initialization (after opening the database).
 # These run before schema creation.
 # WARNING: replacing this list removes the defaults — include everything you need.

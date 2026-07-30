@@ -46,7 +46,7 @@ pub fn import(
 
     let raw_table = "prg_addresses_raw";
     stream_gml_into(conn, &zip_path, &terc, raw_table)?;
-    cleanup_if_downloaded(&zip_path, was_downloaded);
+    cleanup_if_downloaded(&zip_path, was_downloaded && config.cleanup_downloaded_files);
 
     // Materialize the final table with a geometry column built from
     // EPSG:4326 lon/lat (the parser already reprojected from EPSG:2180).
@@ -101,7 +101,7 @@ pub fn update_prg(
         },
         source_etag,
     );
-    cleanup_if_downloaded(&zip_path, was_downloaded);
+    cleanup_if_downloaded(&zip_path, was_downloaded && config.cleanup_downloaded_files);
     result.map(|_| ())
 }
 
@@ -198,10 +198,11 @@ fn prepare_source(
     Ok((zip_path, was_downloaded, terc))
 }
 
-/// Remove the zip once it's been fully consumed, but only if we downloaded
-/// it ourselves — a user-supplied `--file` is never deleted.
-fn cleanup_if_downloaded(zip_path: &Path, was_downloaded: bool) {
-    if was_downloaded {
+/// Remove the zip once it's been fully consumed. `should_delete` must already
+/// fold in both "we downloaded it ourselves" (a user-supplied `--file` is
+/// never deleted) and `config.cleanup_downloaded_files`.
+fn cleanup_if_downloaded(zip_path: &Path, should_delete: bool) {
+    if should_delete {
         info!(path = %zip_path.display(), "Cleaning up downloaded file");
         let _ = std::fs::remove_file(zip_path);
     }

@@ -179,7 +179,7 @@ pub fn import(
 
     log_import_stats(conn)?;
 
-    if was_downloaded {
+    if was_downloaded && config.cleanup_downloaded_files {
         info!(path = %pbf_path.display(), "Cleaning up downloaded file");
         let _ = std::fs::remove_file(&pbf_path);
     }

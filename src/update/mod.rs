@@ -39,15 +39,16 @@ pub fn run(
                     return Ok(());
                 }
             }
-            let path = resolve(file.as_deref(), config, &urls.bdot10k, None)?;
+            let (path, was_downloaded) = resolve(file.as_deref(), config, &urls.bdot10k, None)?;
             let p = path_str(&path)?;
-            dataset::refresh(
+            let result = dataset::refresh(
                 conn,
                 &spec::BDOT10K,
                 |c, target| crate::import::bdot10k::load_into(c, target, &p),
                 etag.as_deref(),
-            )
-            .map(|_| ())
+            );
+            cleanup_if_downloaded(&path, was_downloaded && config.cleanup_downloaded_files);
+            result.map(|_| ())
         }
         UpdateSource::Egib { file } => {
             let mut etag = None;
@@ -63,15 +64,16 @@ pub fn run(
                     return Ok(());
                 }
             }
-            let path = resolve(file.as_deref(), config, &urls.egib, None)?;
+            let (path, was_downloaded) = resolve(file.as_deref(), config, &urls.egib, None)?;
             let p = path_str(&path)?;
-            dataset::refresh(
+            let result = dataset::refresh(
                 conn,
                 &spec::EGIB,
                 |c, target| crate::import::egib::load_into(c, target, &p),
                 etag.as_deref(),
-            )
-            .map(|_| ())
+            );
+            cleanup_if_downloaded(&path, was_downloaded && config.cleanup_downloaded_files);
+            result.map(|_| ())
         }
         UpdateSource::Prg { file, terc_file } => {
             let mut etag = None;
@@ -172,19 +174,24 @@ fn record_noop_refresh(conn: &Connection, source: &str, etag: Option<&str>) -> R
 }
 
 /// Resolve a local path or download the snapshot, then verify it is a
-/// non-empty regular file BEFORE any staging work begins.
+/// non-empty regular file BEFORE any staging work begins. Returns whether
+/// the file was downloaded (vs. a user-supplied `--file`), so callers know
+/// whether it's theirs to delete once consumed.
 fn resolve(
     file: Option<&Path>,
     config: &Config,
     url: &str,
     download_as: Option<&str>,
-) -> Result<PathBuf> {
-    let path = match file {
-        Some(p) => p.to_path_buf(),
-        None => match download_as {
-            Some(name) => download_file_as(url, &config.download_dir(), name)?,
-            None => download_file(url, &config.download_dir())?,
-        },
+) -> Result<(PathBuf, bool)> {
+    let (path, was_downloaded) = match file {
+        Some(p) => (p.to_path_buf(), false),
+        None => {
+            let path = match download_as {
+                Some(name) => download_file_as(url, &config.download_dir(), name)?,
+                None => download_file(url, &config.download_dir())?,
+            };
+            (path, true)
+        }
     };
     let meta = std::fs::metadata(&path)
         .with_context(|| format!("Source file {} is not readable", path.display()))?;
@@ -197,7 +204,17 @@ fn resolve(
             path.display()
         );
     }
-    Ok(path)
+    Ok((path, was_downloaded))
+}
+
+/// Remove a downloaded snapshot once it's been fully consumed. `should_delete`
+/// must already fold in both "we downloaded it ourselves" (a user-supplied
+/// `--file` is never deleted) and `config.cleanup_downloaded_files`.
+fn cleanup_if_downloaded(path: &Path, should_delete: bool) {
+    if should_delete {
+        tracing::info!(path = %path.display(), "Cleaning up downloaded file");
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn path_str(p: &Path) -> Result<String> {
@@ -239,6 +256,75 @@ mod tests {
             }
         });
         format!("http://{addr}/f.bin")
+    }
+
+    /// One-shot blocking HTTP server that answers a single GET with `body`.
+    fn serve_body_once(body: &'static [u8], name: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        format!("http://{addr}/{name}")
+    }
+
+    fn config_with_download_dir(dir: &Path) -> Config {
+        Config {
+            download_dir: Some(dir.to_string_lossy().into_owned()),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn resolve_downloads_and_reports_was_downloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_download_dir(dir.path());
+        let url = serve_body_once(b"snapshot data", "resolve_download.bin");
+
+        let (path, was_downloaded) = resolve(None, &config, &url, None).unwrap();
+
+        assert!(was_downloaded);
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"snapshot data");
+    }
+
+    #[test]
+    fn resolve_uses_local_file_without_downloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_download_dir(dir.path());
+        let mut local = tempfile::NamedTempFile::new().unwrap();
+        local.write_all(b"local snapshot").unwrap();
+
+        let (path, was_downloaded) = resolve(Some(local.path()), &config, "unused", None).unwrap();
+
+        assert!(!was_downloaded);
+        assert_eq!(path, local.path());
+    }
+
+    #[test]
+    fn cleanup_if_downloaded_removes_file_when_should_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("downloaded.bin");
+        std::fs::write(&path, b"data").unwrap();
+
+        cleanup_if_downloaded(&path, true);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cleanup_if_downloaded_keeps_file_when_should_not_delete() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+
+        cleanup_if_downloaded(tmp.path(), false);
+
+        assert!(tmp.path().exists());
     }
 
     fn insert_refresh_with_etag(conn: &Connection, source: &str, etag: Option<&str>) {

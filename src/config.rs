@@ -40,6 +40,30 @@ pub struct Config {
     pub log_level: String,
     pub http_listen_addr: String,
     pub download_dir: Option<String>,
+    /// When true (default), files that `import`/`update` downloaded
+    /// themselves are deleted once consumed. Set to false to keep them in
+    /// `download_dir` — e.g. to avoid re-downloading a large snapshot across
+    /// repeated local runs.
+    ///
+    /// Never applies to a user-supplied `--file` input, which is never
+    /// deleted regardless of this setting.
+    ///
+    /// Gotcha: `download_file`/`download_file_as` skip downloading when a
+    /// file already exists at the destination (see `src/download.rs`), and
+    /// datasets that always download to the same filename (PRG's zip,
+    /// BDOT10k/EGIB's parquet) will silently reuse a stale leftover file
+    /// instead of fetching the current snapshot if it was never cleaned up.
+    /// Turning this off is safe for one-off/local use but risky for the
+    /// unattended `update`/background-job paths — a stale snapshot would be
+    /// re-applied as if it were fresh.
+    ///
+    /// Does NOT cover the OSM incremental replication downloads
+    /// (`state.txt`, per-sequence `.osc.gz`) in `update::osm` — those are
+    /// always cleaned up unconditionally, because `state.txt` downloads to a
+    /// fixed filename and a leftover copy would make every subsequent
+    /// `update osm` read a stale sequence number and silently stop applying
+    /// new changes.
+    pub cleanup_downloaded_files: bool,
     pub teryt: TerytConfig,
     pub duckdb_init_commands: Vec<String>,
     /// Number of connections in the shared DuckDB pool used by the `run`
@@ -236,6 +260,7 @@ impl Default for Config {
             log_level: "info".to_string(),
             http_listen_addr: "127.0.0.1:3000".to_string(),
             download_dir: None,
+            cleanup_downloaded_files: true,
             teryt: TerytConfig::default(),
             // All SET commands use GLOBAL scope. The `run` server pools multiple
             // connections that are try_clone()s of one base connection (see
@@ -403,6 +428,21 @@ osm_replication = "https://example.com/replication"
             config.download_dir(),
             std::path::PathBuf::from("/my/downloads")
         );
+    }
+
+    #[test]
+    fn test_cleanup_downloaded_files_default() {
+        let config = load_config(None).unwrap();
+        assert!(config.cleanup_downloaded_files);
+    }
+
+    #[test]
+    fn test_cleanup_downloaded_files_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "cleanup_downloaded_files = false").unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert!(!config.cleanup_downloaded_files);
     }
 
     #[test]
