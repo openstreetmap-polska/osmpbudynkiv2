@@ -22,13 +22,14 @@ measurements items 1 and 3 were waiting on.
 |------|-------|
 | 1. Serving-table indexes | **Done.** Conclusion changed by measurement: an index alone is a no-op, so the fix is index **+** query rewrite. Implemented and verified end-to-end. |
 | 2. `osm.rs` de-tag gap | **Fixed** (working tree, uncommitted) + 2 regression tests. |
-| 3. No periodic reconcile | **Sized** (measured, below). Not yet implemented. |
-| 4. Drain-vs-refresh concurrency | **Tested — assumption confirmed.** Test added (working tree, uncommitted). |
-| 5. Smaller gaps | Untouched. |
-| **6. 23 tiles return HTTP 500** | **NEW — found during item 1.** Pre-existing, unrelated to this feature. See below. |
+| 3. No periodic reconcile | **Done**, shipped **disabled by default** — measurement showed enabling it would starve fresh edits. See below. |
+| 4. Drain-vs-refresh concurrency | **Tested — assumption confirmed.** Test added. |
+| 5. Smaller gaps | **Done** — all five closed. |
+| **6. 23 tiles return HTTP 500** | **NEW — found during item 1.** Pre-existing. `docs/invalid_geometry_tile_500s.md`. Not fixed. |
+| **7. Per-cell recompute full-scans** | **NEW — found during item 3.** The hot loop costs ~0.9 s/cell. `docs/per_cell_recompute_full_scan.md`. Not fixed. |
 
-Suite after the above: **262 passed, 0 failed**; clippy `--all-targets` and
-`fmt --check` clean. All changes are in the working tree, uncommitted.
+Suite after the above: **265 passed, 0 failed**; clippy `--all-targets` and
+`fmt --check` clean.
 
 ### Baseline facts from the fresh DB
 
@@ -268,11 +269,30 @@ return, and skip only the re-inserts. Test: a Modify that strips all tags must
 > as badly stale even though nothing is wrong, which will confuse `/status`
 > unless it is expected.
 >
-> Two knobs make this comfortable if it turns out to matter: the measured
-> per-cell recompute cost is only ~2 ms (Finding C above), so the drain is
-> nowhere near saturated at 512/30 s — roughly 1 s of work per 30 s tick. Raising
-> `batch_size` is cheap. Worth deciding the default deliberately rather than
-> inheriting 512/30 s from the incremental-only workload.
+> **CORRECTION — the 5.5 h figure above is wrong, and so was the reasoning
+> behind it.** It assumed the ~2 ms/cell figure from Finding C, but that
+> measured only the serving-table `DELETE`+`INSERT`, not the *match query* that
+> precedes it. Measured for real by draining a seeded queue through the running
+> server, a cell recompute costs **~0.9 s**, because the per-cell match
+> predicate full-scans the government table
+> (`docs/per_cell_recompute_full_scan.md`). A full sweep is therefore **~85 h**,
+> not 5.5 h.
+>
+> **IMPLEMENTED 2026-07-30, disabled by default.** `match_reconcile` is
+> registered next to `match_refresh` in `src/server/mod.rs` with a
+> `[jobs.match_reconcile]` block, and can be switched on from config. It ships
+> off for two measured reasons:
+>
+> 1. At ~85 h per sweep, any interval under ~4 days would pile sweeps up.
+> 2. Worse, and not anticipated by the original write-up: the drain is
+>    deliberately **oldest-enqueued-first** (commit `d0ac267`, so no source
+>    starves). A bulk sweep therefore sits *in front of* every later OSM edit —
+>    a building edited a minute after the sweep began would not reach the
+>    serving tables until all ~339k cells drained. The safety net would cost
+>    hours of freshness on exactly the thing it protects.
+>
+> Both reasons dissolve once the per-cell recompute is index-driven, so this is
+> gated on item 7, not on a config tweak.
 
 The design (line 282) argues that the only real failure mode — a dropped
 enqueue — is self-repairing *because* a daily `match_reconcile` tick re-enqueues
@@ -347,6 +367,32 @@ Written up in full, with scope, the list of failing tiles, and three remedies
 ---
 
 ## 5. Smaller gaps
+
+> **ALL FIVE CLOSED 2026-07-30.**
+>
+> - **OSM producer e2e** —
+>   `osm::tests::osc_xml_flows_through_parse_apply_drain_into_the_serving_table`
+>   runs raw `.osc` XML through `parse_osc` → `apply_changes` → `drain_batch`
+>   and asserts on the serving table: a government building covered by an OSM
+>   way must reappear as unmatched once that way is deleted. Non-vacuous by
+>   construction (0 served before, 1 after).
+> - **Thin reconcile test** —
+>   `enqueue_all_collapses_cells_skips_null_geom_and_covers_egib` now covers the
+>   DISTINCT collapse (co-located objects → one cell), the `geom IS NOT NULL`
+>   skip, the egib centroid branch, and that every row carries
+>   `CHANGE_CELL_ZOOM`.
+> - **`cell_x_sql` / `cell_y_sql`** — shared `pow(2, Z)` hoisted into
+>   `cell_zoom_factor_sql`, and the "only home" note moved to a module-level
+>   comment covering the pair rather than sitting on `cell_x_sql` alone.
+> - **`/status` `last_drained_at`** — confirmed as covered by the
+>   `match_refresh` entry's `last_finished_at`, and said so in a comment next to
+>   `MatchStaleness`, so the spec gap is closed by documentation rather than a
+>   duplicate field.
+> - **`oldest_enqueued_at` bias** — documented on the field itself and added as
+>   a CLAUDE.md gotcha, including the warning not to "fix" it by reaching for
+>   `now()` inside the drain, where the cutoff is load-bearing.
+
+### Original list
 
 - **No e2e for the OSM producer path.** Unit tests cover `apply_changes` logic;
   nothing exercises `parse_osc → apply_sequence → commit → drain` end to end.
