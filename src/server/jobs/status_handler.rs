@@ -6,6 +6,7 @@ use axum::extract::State;
 use duckdb::Connection;
 use serde::Serialize;
 
+use crate::job_log::{self, JobRunLogEntry};
 use crate::server::AppState;
 use crate::server::jobs::JobStatus;
 
@@ -94,20 +95,48 @@ fn match_staleness_or_default(state: &AppState) -> MatchStaleness {
     }
 }
 
+/// Acquires a pool connection and reads `job_run_log`, falling back to an
+/// empty map (rather than propagating an error) for the same reason
+/// `match_staleness_or_default` does: this is a secondary diagnostic, not a
+/// reason for `/status` to fail.
+fn job_run_log_or_default(state: &AppState) -> BTreeMap<String, JobRunLogEntry> {
+    let outcome = (|| -> Result<BTreeMap<String, JobRunLogEntry>> {
+        let conn = state
+            .pool
+            .get()
+            .context("Failed to acquire pool connection")?;
+        job_log::read_all(&conn)
+    })();
+    match outcome {
+        Ok(log) => log,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read job_run_log for /status; falling back to empty");
+            BTreeMap::new()
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub jobs: Vec<JobStatus>,
     pub match_staleness: MatchStaleness,
+    pub job_run_log: BTreeMap<String, JobRunLogEntry>,
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let jobs = state.registry.snapshot();
-    let match_staleness = tokio::task::spawn_blocking(move || match_staleness_or_default(&state))
-        .await
-        .unwrap_or_default();
+    let (match_staleness, job_run_log) = tokio::task::spawn_blocking(move || {
+        (
+            match_staleness_or_default(&state),
+            job_run_log_or_default(&state),
+        )
+    })
+    .await
+    .unwrap_or_default();
     Json(StatusResponse {
         jobs,
         match_staleness,
+        job_run_log,
     })
 }
 
@@ -115,7 +144,9 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
 mod tests {
     use super::*;
     use crate::db::init_db;
+    use crate::server::jobs::JobRegistry;
     use std::path::Path;
+    use std::sync::Arc;
 
     #[test]
     fn staleness_counts_distinct_cells_per_source() {
@@ -134,5 +165,31 @@ mod tests {
             BTreeMap::from([("bdot10k".to_string(), 1), ("prg".to_string(), 1)])
         );
         assert!(s.oldest_enqueued_at.is_some());
+    }
+
+    #[test]
+    fn job_run_log_or_default_reads_recorded_entries() {
+        use crate::db::init_db;
+        use crate::server::jobs::JobRegistry;
+        use std::sync::Arc;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        crate::job_log::record(&conn, "import:bdot10k", "Success", Some("no invalid geometry"))
+            .unwrap();
+
+        let pool = crate::server::build_pool(conn, 2).unwrap();
+        let state = AppState {
+            pool,
+            registry: Arc::new(JobRegistry::new_for_tests(vec![])),
+            config: Arc::new(crate::config::Config::default()),
+        };
+
+        let log = job_run_log_or_default(&state);
+        let entry = log
+            .get("import:bdot10k")
+            .expect("entry must be present");
+        assert_eq!(entry.outcome, "Success");
+        assert_eq!(entry.message.as_deref(), Some("no invalid geometry"));
     }
 }
