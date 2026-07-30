@@ -29,17 +29,32 @@ pub fn lonlat_to_tile(lon: f64, lat: f64, z: u32) -> (u32, u32) {
     (x as u32, y as u32)
 }
 
+// --- The SQL projection ---------------------------------------------------
+//
+// `cell_x_sql` and `cell_y_sql` below are the ONLY home for the Web-Mercator
+// XYZ projection expressed in SQL. Every producer of `match_dirty_cells` and
+// every writer of a `cell_x`/`cell_y` column goes through them, so the cell a
+// row is tagged with and the cell a query looks for cannot drift apart. Their
+// Rust inverse is [`lonlat_to_tile`], and `cell_sql_matches_lonlat_to_tile`
+// pins the two together over a spread of coordinates.
+//
+// (This note used to sit on `cell_x_sql` alone, which made it look like a
+// property of the X projection rather than of the pair.)
+
+/// The `2^CHANGE_CELL_ZOOM` factor shared by both cell projections.
+fn cell_zoom_factor_sql() -> String {
+    format!("pow(2, {CHANGE_CELL_ZOOM})")
+}
+
 /// SQL for the Web-Mercator XYZ tile X of `point_expr` at [`CHANGE_CELL_ZOOM`].
-/// The Rust inverse is [`lonlat_to_tile`]; `cell_sql_matches_lonlat_to_tile`
-/// pins the two together. This is the ONLY home for the SQL projection.
 pub fn cell_x_sql(point_expr: &str) -> String {
-    let n = format!("pow(2, {})", CHANGE_CELL_ZOOM);
+    let n = cell_zoom_factor_sql();
     format!("floor((ST_X({point_expr}) + 180) / 360 * {n})::INTEGER")
 }
 
 /// SQL for the Web-Mercator XYZ tile Y of `point_expr` at [`CHANGE_CELL_ZOOM`].
 pub fn cell_y_sql(point_expr: &str) -> String {
-    let n = format!("pow(2, {})", CHANGE_CELL_ZOOM);
+    let n = cell_zoom_factor_sql();
     format!(
         "floor((1 - ln(tan(radians(ST_Y({point_expr}))) + 1 / cos(radians(ST_Y({point_expr})))) \
          / pi()) / 2 * {n})::INTEGER"

@@ -882,6 +882,82 @@ mod tests {
         Ok(())
     }
 
+    /// The OSM producer leg, end to end: raw `.osc` XML through `parse_osc`,
+    /// `apply_changes` (which enqueues dirty cells), and `drain_batch` into the
+    /// `*_unmatched` serving table an editor actually sees.
+    ///
+    /// Every other test here stops at `apply_changes` and asserts on
+    /// `match_dirty_cells`, and the branch's smoke test substituted `reconcile`
+    /// for the `update osm` leg because the checked-in fixture touches no id
+    /// present in the fixture PBF. So nothing covered the whole chain: an OSM
+    /// edit arriving as XML and changing what is served. The scenario is the
+    /// one that matters most -- an editor deletes an OSM building, so the
+    /// government building it was matching must come *back* as unmatched.
+    #[test]
+    fn osc_xml_flows_through_parse_apply_drain_into_the_serving_table() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+             CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 geom GEOMETRY);
+             -- Sits inside way 100's footprint, so OSM currently covers it.
+             INSERT INTO bdot10k_buildings VALUES
+                 ('gov1', ST_MakeEnvelope(20.0002, 50.0002, 20.0008, 50.0008));",
+        )?;
+
+        // Baseline: the government building is matched, so it is NOT served.
+        crate::compare::buildings::compare_bdot10k(&conn)?;
+        let served: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM bdot10k_unmatched WHERE LOKALNYID = 'gov1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            served, 0,
+            "precondition: gov1 is covered by OSM way 100, so it must not be served"
+        );
+
+        // An editor deletes the OSM building, arriving as replication XML.
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <delete>
+    <way id="100" version="2"/>
+  </delete>
+</osmChange>"#;
+        let changes = parse_osc(osc)?;
+        assert_eq!(changes.ways.len(), 1, "parse_osc must see the deleted way");
+
+        apply_changes(&conn, &kv, &changes)?;
+
+        // apply_changes only enqueues; the drain is what rebuilds the cell.
+        let queued: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'bdot10k'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(queued > 0, "the delete must enqueue the vacated cell");
+
+        let stats = crate::compare::drain::drain_batch(&conn, 100, &|| false)?;
+        assert_eq!(stats.failed, 0, "no cell may fail to recompute");
+        assert!(stats.cells > 0, "the drain must have recomputed something");
+
+        // The government building is now uncovered, so it must be served.
+        let served_after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM bdot10k_unmatched WHERE LOKALNYID = 'gov1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            served_after, 1,
+            "after the OSM building was deleted, gov1 must reappear as unmatched"
+        );
+
+        Ok(())
+    }
+
     /// A Modify that strips every building/address tag off a served way is a
     /// de-tag: the OSM building is gone even though the way still exists. The
     /// base row must go with it, and the cell must be enqueued so the

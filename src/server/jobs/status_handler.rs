@@ -18,8 +18,23 @@ pub struct MatchStaleness {
     /// brand-new public field. `BTreeMap` also gives stable (sorted) key
     /// order for free.
     pub pending_by_source: BTreeMap<String, i64>,
+    /// Oldest queued cell, i.e. how far behind the drain is.
+    ///
+    /// **Biased pessimistically just after a long government refresh.** DuckDB's
+    /// `now()` is transaction-*start*-scoped, and the refresh enqueues its dirty
+    /// cells inside the apply transaction, so a 5-minute BDOT10k refresh stamps
+    /// every cell it touched with its BEGIN time. This field then reads ~5 min
+    /// staler than reality until those cells drain. Cosmetic only: the drain's
+    /// own cutoff logic is snapshot-based (`drain_batch` reads one `batch_start`
+    /// and uses it for both the select and the paired delete), so correctness is
+    /// unaffected.
     pub oldest_enqueued_at: Option<String>,
 }
+
+// The design (line 298) also lists a `last_drained_at`. It is deliberately not
+// a field here: `/status` already reports `jobs[]`, and the `match_refresh`
+// entry's `last_finished_at` is exactly that timestamp. A second copy would be
+// a second thing to keep in sync for no new information.
 
 /// Pending `match_dirty_cells` rows, deduped on `(source, cell_x, cell_y)` —
 /// a cell enqueued multiple times (e.g. by overlapping OSM edits) counts once.

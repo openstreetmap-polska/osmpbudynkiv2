@@ -72,6 +72,81 @@ mod tests {
         assert_eq!(by, vec![("bdot10k".into(), 1), ("prg".into(), 1)]);
     }
 
+    /// The original test seeded one row per source and none for egib, so three
+    /// behaviours of `enqueue_all` went uncovered: the DISTINCT collapse (many
+    /// objects sharing a cell must enqueue that cell once), the
+    /// `geom IS NOT NULL` skip, and the egib branch's ST_Centroid path.
+    #[test]
+    fn enqueue_all_collapses_cells_skips_null_geom_and_covers_egib() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let c = init_db(Path::new(":memory:"), &init, None).unwrap();
+        c.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+             CREATE TABLE prg_addresses (lokalny_id VARCHAR, geom GEOMETRY);
+
+             -- Three bdot10k buildings inside ONE z14 cell (cells are ~0.022
+             -- deg wide here, so these cannot straddle a boundary), plus one
+             -- far away: 2 distinct cells, not 4 rows.
+             INSERT INTO bdot10k_buildings VALUES
+                 ('a', ST_MakeEnvelope(21.0000,52.0000,21.0005,52.0005)),
+                 ('b', ST_MakeEnvelope(21.0006,52.0006,21.0010,52.0010)),
+                 ('c', ST_MakeEnvelope(21.0011,52.0011,21.0015,52.0015)),
+                 ('far', ST_MakeEnvelope(19.0000,50.0000,19.0005,50.0005)),
+                 -- NULL geometry must be skipped, not counted or crashed on.
+                 ('nogeom', NULL);
+
+             -- egib goes through the same ST_Centroid path as bdot10k; two
+             -- buildings in one cell plus a NULL.
+             INSERT INTO egib_buildings VALUES
+                 ('e1', ST_MakeEnvelope(22.0000,53.0000,22.0005,53.0005)),
+                 ('e2', ST_MakeEnvelope(22.0006,53.0006,22.0010,53.0010)),
+                 ('e_nogeom', NULL);
+
+             -- prg uses the raw point, not a centroid.
+             INSERT INTO prg_addresses VALUES
+                 ('p1', ST_Point(23.0000,54.0000)),
+                 ('p2', ST_Point(23.0005,54.0005)),
+                 ('p_nogeom', NULL);",
+        )
+        .unwrap();
+
+        let n = enqueue_all(&c).unwrap();
+        assert_eq!(
+            n, 4,
+            "2 bdot10k cells + 1 egib cell + 1 prg cell, NULL geometries skipped"
+        );
+
+        let by: Vec<(String, i64)> = {
+            let mut s = c
+                .prepare(
+                    "SELECT source, COUNT(*) FROM match_dirty_cells
+                     GROUP BY source ORDER BY source",
+                )
+                .unwrap();
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            by,
+            vec![("bdot10k".into(), 2), ("egib".into(), 1), ("prg".into(), 1)],
+            "co-located objects must collapse to one cell per source"
+        );
+
+        // Every enqueued row must carry the change-cell zoom, since the drain
+        // reinterprets cell_x/cell_y at CHANGE_CELL_ZOOM unconditionally.
+        let wrong_zoom: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE cell_z <> ?",
+                duckdb::params![CHANGE_CELL_ZOOM as i32],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_zoom, 0);
+    }
+
     /// The returned total must be the number of rows *this sweep* inserted,
     /// not the queue's overall depth for that source -- a pre-existing dirty
     /// cell (e.g. left over from an OSM update moments earlier) must not
