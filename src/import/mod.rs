@@ -3,7 +3,7 @@ pub mod egib;
 pub mod osm;
 pub mod prg;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use duckdb::Connection;
 
 use crate::cli::ImportSource;
@@ -37,8 +37,24 @@ pub fn run(
             )?;
             stamp_row_hash_version(conn)
         }
-        ImportSource::Full => {
-            bail!("Full import is not yet implemented");
+        ImportSource::Full {
+            osm_file,
+            bdot10k_file,
+            egib_file,
+            prg_file,
+            terc_file,
+        } => {
+            osm::import(conn, kv, config, osm_file.as_deref(), &urls.osm_pbf)?;
+            bdot10k::import(conn, config, bdot10k_file.as_deref(), &urls.bdot10k)?;
+            egib::import(conn, config, egib_file.as_deref(), &urls.egib)?;
+            prg::import(
+                conn,
+                config,
+                prg_file.as_deref(),
+                terc_file.as_deref(),
+                &urls.prg,
+            )?;
+            stamp_row_hash_version(conn)
         }
     }
 }
