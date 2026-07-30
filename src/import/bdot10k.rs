@@ -18,6 +18,12 @@ use crate::utils::format_duration;
 /// we disable the automatic conversion, read the file as plain parquet, and
 /// manually convert the WKB geometry column. Geometry is transformed from
 /// EPSG:2180 to EPSG:4326 for uniform spatial comparisons.
+///
+/// `enable_geoparquet_conversion` has GLOBAL scope in DuckDB — it's visible
+/// to every connection sharing this database instance, not just this one, so
+/// it must be restored before returning. Left disabled, it silently breaks
+/// any later automatic GeoParquet decoding on the same instance — e.g.
+/// EGIB's `load_into`, which relies on the default being on.
 pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> Result<()> {
     let inner = format!(
         "SELECT * EXCLUDE(GEOM), \
@@ -27,7 +33,8 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
     conn.execute_batch(&format!(
         "SET enable_geoparquet_conversion = false;
          DROP TABLE IF EXISTS {target_table};
-         CREATE TABLE {target_table} AS {};",
+         CREATE TABLE {target_table} AS {};
+         SET enable_geoparquet_conversion = true;",
         crate::dataset::hashed_select(&inner)
     ))
     .with_context(|| format!("Failed to load BDOT10k data into {target_table}"))
