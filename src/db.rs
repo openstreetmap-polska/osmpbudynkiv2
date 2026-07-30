@@ -149,6 +149,23 @@ fn create_schema(conn: &Connection) -> Result<()> {
             cell_y INTEGER,
             enqueued_at TIMESTAMP WITH TIME ZONE
         );
+
+        -- Read-path indexes for /tiles and /package, which scan the serving
+        -- tables on a bbox predicate. Both callers must phrase that predicate
+        -- as ST_Intersects(geom, <constant>) for these to be used at all: an
+        -- RTREE index scan only fires against a constant argument, so the
+        -- `geom && bbox.geom` form (bbox joined in as a one-row CTE) plans as
+        -- a full sequential scan even with the index present. Measured on the
+        -- Poland dataset, the paired index+predicate is 3-60x on /tiles, and
+        -- the cost is genuinely one-sided: per-cell recompute churn measured
+        -- 1.89ms unindexed vs 1.91ms indexed, with no read degradation after
+        -- 15k cell rewrites. See docs/followups_precomputed_unmatched_serving.md.
+        CREATE INDEX IF NOT EXISTS bdot10k_unmatched_geom_idx
+            ON bdot10k_unmatched USING RTREE (geom);
+        CREATE INDEX IF NOT EXISTS egib_unmatched_geom_idx
+            ON egib_unmatched USING RTREE (geom);
+        CREATE INDEX IF NOT EXISTS prg_unmatched_geom_idx
+            ON prg_unmatched USING RTREE (geom);
         ",
     )
     .context("Failed to create schema")?;
@@ -178,6 +195,28 @@ mod tests {
                     row.get(0)
                 })?;
             assert_eq!(count, 0, "Table {table} should be empty initially");
+        }
+
+        Ok(())
+    }
+
+    /// The serving tables carry RTREE indexes, and /tiles + /package phrase
+    /// their bbox filter so those indexes are actually usable. The index half
+    /// is pinned here; `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`
+    /// pins the query half. Either one alone is a silent no-op.
+    #[test]
+    fn test_init_db_creates_serving_table_rtree_indexes() -> Result<()> {
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
+
+        for table in ["bdot10k_unmatched", "egib_unmatched", "prg_unmatched"] {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM duckdb_indexes()
+                 WHERE table_name = ? AND sql ILIKE '%USING RTREE%'",
+                duckdb::params![table],
+                |row| row.get(0),
+            )?;
+            assert_eq!(n, 1, "{table} must have an RTREE index on geom");
         }
 
         Ok(())
