@@ -105,8 +105,24 @@ pub enum ImportSource {
         #[arg(long)]
         terc_file: Option<PathBuf>,
     },
-    /// Run all imports in sequence
-    Full,
+    /// Run all imports in sequence (OSM, BDOT10k, EGIB, PRG)
+    Full {
+        /// Path to local OSM PBF file (skips download)
+        #[arg(long)]
+        osm_file: Option<PathBuf>,
+        /// Path to local BDOT10k file (skips download)
+        #[arg(long)]
+        bdot10k_file: Option<PathBuf>,
+        /// Path to local EGIB file (skips download)
+        #[arg(long)]
+        egib_file: Option<PathBuf>,
+        /// Path to local PRG file (skips download)
+        #[arg(long)]
+        prg_file: Option<PathBuf>,
+        /// Path to a TERC (TERYT) dictionary file (.zip or .xml), for the PRG import
+        #[arg(long)]
+        terc_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
