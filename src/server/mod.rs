@@ -141,6 +141,22 @@ pub async fn run(
                 timeout: std::time::Duration::from_secs(config.jobs.match_refresh.timeout_seconds),
             },
         ),
+        // The safety net for a dropped enqueue. Off by default -- see
+        // MatchReconcileConfig for the measured reasons. It only appends to
+        // match_dirty_cells and lets the per-cell drain rebuild, so unlike
+        // `compare reconcile` on the CLI it is safe against a live server.
+        (
+            Arc::new(jobs::match_reconcile::MatchReconcileJob) as Arc<dyn jobs::Job>,
+            jobs::JobConfigResolved {
+                enabled: config.jobs.match_reconcile.enabled,
+                interval: std::time::Duration::from_secs(
+                    config.jobs.match_reconcile.interval_seconds,
+                ),
+                timeout: std::time::Duration::from_secs(
+                    config.jobs.match_reconcile.timeout_seconds,
+                ),
+            },
+        ),
     ];
     let scheduler = jobs::Scheduler::start(job_list, pool.clone(), kv, config.clone());
     let registry = scheduler.registry.clone();

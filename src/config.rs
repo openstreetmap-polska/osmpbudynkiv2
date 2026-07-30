@@ -115,6 +115,42 @@ impl Default for MatchRefreshConfig {
     }
 }
 
+/// Periodic `enqueue_all` sweep — the design's safety net against a dropped
+/// enqueue (design ~line 282).
+///
+/// **Disabled by default, deliberately.** Two measured reasons, both of which
+/// go away once the per-cell recompute stops full-scanning the government table
+/// (see `docs/per_cell_recompute_full_scan.md`):
+///
+/// 1. A sweep enqueues ~339,000 cells. At the drain's measured ~0.9 s/cell that
+///    is ~85 h of work, so any interval under ~4 days would pile sweeps on top
+///    of each other.
+/// 2. Worse, the drain is deliberately oldest-enqueued-first (so no source
+///    starves). A bulk sweep therefore sits *in front of* every subsequent OSM
+///    edit: a building edited a minute after the sweep started would not reach
+///    the serving tables until the whole sweep drained. The safety net would
+///    cost hours of freshness on the thing it is protecting.
+///
+/// Turn it on once a cell recompute is cheap enough that a sweep completes in
+/// well under the interval.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct MatchReconcileConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+}
+
+impl Default for MatchReconcileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: 86400,
+            timeout_seconds: 1800,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct UpdatesConfig {
@@ -140,6 +176,7 @@ pub struct JobsConfig {
     pub egib_update: JobConfig,
     pub prg_update: JobConfig,
     pub match_refresh: MatchRefreshConfig,
+    pub match_reconcile: MatchReconcileConfig,
 }
 
 impl Default for JobsConfig {
@@ -159,6 +196,7 @@ impl Default for JobsConfig {
             // PRG streams ~16 GML files out of a ~1.7GB zip, so it needs longer.
             prg_update: daily(7200),
             match_refresh: MatchRefreshConfig::default(),
+            match_reconcile: MatchReconcileConfig::default(),
         }
     }
 }
@@ -435,6 +473,29 @@ file_path = "/data/TERC.zip"
         assert_eq!(config.jobs.match_refresh.interval_seconds, 30);
         assert_eq!(config.jobs.match_refresh.timeout_seconds, 300);
         assert_eq!(config.jobs.match_refresh.batch_size, 512);
+        // Off by default on purpose: a sweep enqueues ~339k cells, which the
+        // drain cannot absorb at its current per-cell cost, and would starve
+        // fresh OSM edits behind it. See MatchReconcileConfig.
+        assert!(!config.jobs.match_reconcile.enabled);
+        assert_eq!(config.jobs.match_reconcile.interval_seconds, 86400);
+    }
+
+    /// The reconcile job must still be configurable on, or the safety net is
+    /// unreachable without a code change.
+    #[test]
+    fn match_reconcile_can_be_enabled_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(
+            &path,
+            "[jobs.match_reconcile]\nenabled = true\ninterval_seconds = 604800\n",
+        )
+        .unwrap();
+        let config = load_config(Some(path.as_path())).unwrap();
+        assert!(config.jobs.match_reconcile.enabled);
+        assert_eq!(config.jobs.match_reconcile.interval_seconds, 604800);
+        // Unset field still falls back to the default.
+        assert_eq!(config.jobs.match_reconcile.timeout_seconds, 1800);
     }
 
     #[test]

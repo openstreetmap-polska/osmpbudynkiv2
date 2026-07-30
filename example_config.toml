@@ -145,7 +145,29 @@ enabled = true
 interval_seconds = 30
 timeout_seconds = 300
 # Max number of distinct dirty (source, cell) recomputed per tick.
+#
+# NOTE: on a Poland-scale database a cell recompute currently costs ~0.9s,
+# because the per-cell match predicate full-scans the government table (see
+# docs/per_cell_recompute_full_scan.md). 512 cells therefore cannot finish
+# inside timeout_seconds, and each tick drains ~330 cells and records TimedOut.
+# That is self-limiting, not lossy -- undrained cells stay queued -- but expect
+# match_refresh to show as TimedOut in /status until that predicate is fixed.
 batch_size = 512
+
+# Periodically re-enqueues every live government cell so the drain rebuilds it:
+# the safety net for a dropped enqueue. Unlike `compare reconcile` on the CLI,
+# this is safe to run against a live server, because it only appends to the
+# dirty-cell queue and lets the per-cell drain do the work.
+#
+# Disabled by default. A sweep enqueues ~339,000 cells, which at the current
+# ~0.9s/cell is ~85h of draining; and because the drain is oldest-first, those
+# cells would sit in front of every subsequent OSM edit and delay real updates
+# by hours. Enable once a cell recompute is cheap enough that a sweep finishes
+# well inside interval_seconds.
+[jobs.match_reconcile]
+enabled = false
+interval_seconds = 86400
+timeout_seconds = 1800
 
 # GeoJSON data package endpoint (GET/POST /package, served by the `run` subcommand).
 [package]
