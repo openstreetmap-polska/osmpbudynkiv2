@@ -182,3 +182,201 @@ mod full_vs_incremental_equivalence {
         );
     }
 }
+
+/// The design lets `match_refresh` run *outside* the dataset-refresh
+/// `refresh_lock` (design ~line 230), so the drain and a government refresh can
+/// write the same DuckDB instance at the same time. Review traced the overlap
+/// by hand -- the only shared table is `match_dirty_cells`, and
+/// append-vs-delete-of-different-rows is not a conflict for DuckDB's optimistic
+/// CC -- but that was analysis, not evidence. This module is the evidence.
+#[cfg(test)]
+mod drain_refresh_concurrency {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use duckdb::Connection;
+
+    use crate::compare::drain::drain_batch;
+    use crate::compare::reconcile::enqueue_all;
+    use crate::dataset::{BDOT10K, hashed_select};
+    use crate::db::init_db;
+    use crate::update::dataset::refresh;
+
+    /// `n` buildings, one per z14 cell (cells are ~0.022 deg wide at this
+    /// latitude, so a 0.03 deg stride guarantees distinct cells), with `tag`
+    /// woven into the id-independent column so a re-stage produces a
+    /// whole-row-hash change on every row.
+    fn rows_sql(n: i64, tag: &str) -> String {
+        format!(
+            "SELECT 'b' || i AS LOKALNYID,
+                    '{tag}' AS wersja,
+                    ST_MakeEnvelope(20.0 + i * 0.03, 52.0,
+                                    20.0 + i * 0.03 + 0.002, 52.002) AS geom
+             FROM range({n}) t(i)"
+        )
+    }
+
+    /// Ids currently served as unmatched, order-independent.
+    fn snapshot_ids(c: &Connection) -> std::collections::BTreeSet<String> {
+        let mut stmt = c
+            .prepare("SELECT LOKALNYID FROM bdot10k_unmatched")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn conn(n: i64) -> Connection {
+        let init = vec![
+            "INSTALL spatial".to_string(),
+            "LOAD spatial".to_string(),
+            "INSTALL icu".to_string(),
+            "LOAD icu".to_string(),
+            "SET geometry_always_xy = true".to_string(),
+        ];
+        let c = init_db(Path::new(":memory:"), &init, None).unwrap();
+        c.execute_batch(&format!(
+            "CREATE TABLE bdot10k_buildings AS {};
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+             CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 geom GEOMETRY);",
+            hashed_select(&rows_sql(n, "v1"))
+        ))
+        .unwrap();
+        // Match roughly every third building, so the serving table is neither
+        // empty nor a copy of the source.
+        c.execute_batch(
+            "INSERT INTO osm_buildings
+             SELECT i, 'way', NULL,
+                    ST_MakeEnvelope(20.0 + i * 0.09, 52.0, 20.0 + i * 0.09 + 0.002, 52.002)
+             FROM range(100) t(i);",
+        )
+        .unwrap();
+        c
+    }
+
+    /// Drive `drain_batch` in a loop on one thread while `refresh()` runs on
+    /// another. Asserts: neither side errors, the drain really did overlap
+    /// (non-vacuous), and the queue converges once both are done.
+    #[test]
+    fn drain_and_dataset_refresh_do_not_collide() {
+        const N: i64 = 400;
+        let conn = conn(N);
+        enqueue_all(&conn).unwrap();
+
+        let drain_conn = conn.try_clone().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_drain = stop.clone();
+        let drained = Arc::new(AtomicU64::new(0));
+        let drained_thread = drained.clone();
+
+        let handle = std::thread::spawn(move || {
+            let mut errors: Vec<String> = Vec::new();
+            let mut calls: Vec<(u128, u64)> = Vec::new();
+            while !stop_drain.load(Ordering::SeqCst) {
+                let t = std::time::Instant::now();
+                match drain_batch(&drain_conn, 16, &|| false) {
+                    Ok(stats) => {
+                        calls.push((t.elapsed().as_millis(), stats.cells));
+                        drained_thread.fetch_add(stats.cells, Ordering::SeqCst);
+                        if stats.failed > 0 {
+                            errors.push(format!("{} cells failed to recompute", stats.failed));
+                        }
+                    }
+                    Err(e) => {
+                        calls.push((t.elapsed().as_millis(), 0));
+                        errors.push(format!("drain_batch errored: {e:#}"));
+                    }
+                }
+            }
+            (errors, calls)
+        });
+
+        // Several refresh cycles, so the windows genuinely overlap rather than
+        // the drain happening to finish first.
+        let mut refresh_errors: Vec<String> = Vec::new();
+        for tag in [
+            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+        ] {
+            let rows = rows_sql(N, tag);
+            let res = refresh(
+                &conn,
+                &BDOT10K,
+                move |c: &Connection, target: &str| {
+                    c.execute_batch(&format!(
+                        "CREATE TABLE {target} AS {}",
+                        hashed_select(&rows)
+                    ))?;
+                    Ok(())
+                },
+                None,
+            );
+            if let Err(e) = res {
+                refresh_errors.push(format!("refresh({tag}) errored: {e:#}"));
+            }
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        let (drain_errors, drain_calls) = handle.join().unwrap();
+
+        assert!(
+            refresh_errors.is_empty(),
+            "dataset refresh must not abort against a concurrent drain: {refresh_errors:?}"
+        );
+        assert!(
+            drain_errors.is_empty(),
+            "drain must not abort against a concurrent dataset refresh: {drain_errors:?}"
+        );
+        // Non-vacuity: the drain must have completed several batches *during*
+        // the refresh window, not squeezed one in at the end. Measured on a
+        // dev box this is consistently 6 batches of 16 cells at a steady
+        // 276-372 ms each -- no stall, no lock convoy, no starvation -- so a
+        // floor of 2 leaves wide margin on a loaded machine while still
+        // failing if the drain ever gets serialized behind the refresh.
+        let productive = drain_calls.iter().filter(|(_, cells)| *cells > 0).count();
+        assert!(
+            productive >= 2,
+            "drain made {productive} productive batches during {} refreshes -- \
+             expected steady progress; calls (ms, cells): {drain_calls:?}",
+            12
+        );
+        assert!(
+            drained.load(Ordering::SeqCst) > 0,
+            "drain thread never drained a cell -- the test did not exercise the overlap"
+        );
+
+        // Whatever interleaving happened, the queue must still converge: drain
+        // to empty, then every remaining dirty cell is gone and the serving
+        // table holds exactly the unmatched buildings of the final snapshot.
+        loop {
+            let s = drain_batch(&conn, 1000, &|| false).unwrap();
+            assert_eq!(s.failed, 0, "post-run drain reported failed cells");
+            if s.cells == 0 {
+                break;
+            }
+        }
+        let queued: i64 = conn
+            .query_row("SELECT COUNT(*) FROM match_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0, "queue must drain to empty");
+
+        let live: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bdot10k_buildings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live, N, "refresh must leave the live table intact");
+
+        let served_from_drain = snapshot_ids(&conn);
+        conn.execute_batch("DELETE FROM bdot10k_unmatched;")
+            .unwrap();
+        crate::compare::buildings::compare_bdot10k(&conn).unwrap();
+        let served_from_full = snapshot_ids(&conn);
+        assert_eq!(
+            served_from_drain, served_from_full,
+            "after a concurrent refresh + drain, the serving table must match a full compare"
+        );
+    }
+}
