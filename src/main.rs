@@ -5,6 +5,7 @@ mod dataset;
 mod db;
 mod download;
 mod import;
+mod job_log;
 mod osm;
 mod server;
 mod shutdown;

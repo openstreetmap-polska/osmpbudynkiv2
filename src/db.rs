@@ -46,6 +46,17 @@ fn create_schema(conn: &Connection) -> Result<()> {
             value VARCHAR
         );
 
+        -- Last-run outcome per job/command, keyed by job_name (e.g.
+        -- 'import:bdot10k', 'update:egib'). Delete-then-insert on every run
+        -- (see job_log::record), so only the most recent run survives --
+        -- this is a status snapshot, not a history. Read by /status.
+        CREATE TABLE IF NOT EXISTS job_run_log (
+            job_name VARCHAR,
+            ran_at TIMESTAMP WITH TIME ZONE,
+            outcome VARCHAR,
+            message VARCHAR
+        );
+
         -- Processed OSM data with geometry
         CREATE TABLE IF NOT EXISTS osm_addresses (
             osm_id BIGINT,
@@ -212,6 +223,7 @@ mod tests {
             "osm_addresses",
             "osm_buildings",
             "package_exports",
+            "job_run_log",
         ];
         for table in tables {
             let count: i64 =
