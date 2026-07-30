@@ -150,27 +150,51 @@ fn create_schema(conn: &Connection) -> Result<()> {
             enqueued_at TIMESTAMP WITH TIME ZONE
         );
 
-        -- Read-path indexes for /tiles and /package, which scan the serving
-        -- tables on a bbox predicate. Both callers must phrase that predicate
-        -- as ST_Intersects(geom, <constant>) for these to be used at all: an
-        -- RTREE index scan only fires against a constant argument, so the
-        -- `geom && bbox.geom` form (bbox joined in as a one-row CTE) plans as
-        -- a full sequential scan even with the index present. Measured on the
-        -- Poland dataset, the paired index+predicate is 3-60x on /tiles, and
-        -- the cost is genuinely one-sided: per-cell recompute churn measured
-        -- 1.89ms unindexed vs 1.91ms indexed, with no read degradation after
-        -- 15k cell rewrites. See docs/followups_precomputed_unmatched_serving.md.
-        CREATE INDEX IF NOT EXISTS bdot10k_unmatched_geom_idx
-            ON bdot10k_unmatched USING RTREE (geom);
-        CREATE INDEX IF NOT EXISTS egib_unmatched_geom_idx
-            ON egib_unmatched USING RTREE (geom);
-        CREATE INDEX IF NOT EXISTS prg_unmatched_geom_idx
-            ON prg_unmatched USING RTREE (geom);
         ",
     )
     .context("Failed to create schema")?;
 
+    create_serving_indexes(conn);
+
     Ok(())
+}
+
+/// Read-path indexes for `/tiles` and `/package`, which scan the serving tables
+/// on a bbox predicate. Both callers must phrase that predicate as
+/// `ST_Intersects(geom, <constant>)` for these to be used at all: an RTREE index
+/// scan only fires against a constant argument, so the `geom && bbox.geom` form
+/// (bbox joined in as a one-row CTE) plans as a full sequential scan even with
+/// the index present. Measured on the Poland dataset the paired index+predicate
+/// is 3-60x on `/tiles`, and the cost is one-sided: per-cell recompute churn
+/// measured 1.89ms unindexed vs 1.91ms indexed, with no read degradation after
+/// 15k cell rewrites. See `docs/followups_precomputed_unmatched_serving.md`.
+///
+/// **Warns instead of failing, deliberately.** `CREATE INDEX` forces a DuckDB
+/// checkpoint, and a database that cannot checkpoint therefore turns index
+/// creation into a fatal error. That happened for real on the Poland database
+/// (`docs/duckdb_checkpoint_failure.md`): with these statements inside the
+/// schema batch, `create_schema` failed and the server would not boot at all —
+/// converting "queries are slower than they could be" into "the service is
+/// down". Serving unindexed is strictly better than not serving, so a failure
+/// here is logged and startup continues.
+fn create_serving_indexes(conn: &Connection) {
+    for (name, table) in [
+        ("bdot10k_unmatched_geom_idx", "bdot10k_unmatched"),
+        ("egib_unmatched_geom_idx", "egib_unmatched"),
+        ("prg_unmatched_geom_idx", "prg_unmatched"),
+    ] {
+        let sql = format!("CREATE INDEX IF NOT EXISTS {name} ON {table} USING RTREE (geom);");
+        if let Err(e) = conn.execute_batch(&sql) {
+            tracing::warn!(
+                index = name,
+                table = table,
+                error = %e,
+                "could not create serving-table index; /tiles and /package will \
+                 fall back to sequential scans. This is usually a database that \
+                 cannot checkpoint -- see docs/duckdb_checkpoint_failure.md"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
