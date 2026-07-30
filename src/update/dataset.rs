@@ -49,7 +49,7 @@ impl Drop for ScratchGuard<'_> {
 pub fn refresh(
     conn: &Connection,
     spec: &DatasetSpec,
-    load: impl FnOnce(&Connection, &str) -> Result<()>,
+    load: impl FnOnce(&Connection, &str) -> Result<crate::dataset::LoadStats>,
     source_etag: Option<&str>,
 ) -> Result<DiffCounts> {
     let total = std::time::Instant::now();
@@ -63,163 +63,205 @@ pub fn refresh(
         staging: staging.clone(),
     };
 
-    // --- stage ---
-    let t = std::time::Instant::now();
-    load(conn, &staging).with_context(|| format!("Failed to stage {} snapshot", spec.name))?;
-    let staged: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {staging}"), [], |row| {
-            row.get(0)
-        })
-        .with_context(|| format!("Failed to count rows in {staging}"))?;
-    info!(
-        source = spec.name,
-        rows = staged,
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: stage snapshot"
-    );
-
-    // The load-bearing guard: an empty snapshot would delete the dataset.
-    if staged == 0 {
-        bail!(
-            "Staged snapshot for {} has 0 rows — refusing to apply, \
-             which would delete the entire live dataset. The download is \
-             most likely empty or truncated.",
-            spec.name
-        );
-    }
-
-    let hash_version = check_row_hash_version(conn)?;
-
-    // --- diff ---
-    let t = std::time::Instant::now();
-    let counts = diff::compute(conn, spec)?;
-    info!(
-        source = spec.name,
-        added = counts.added,
-        modified = counts.modified,
-        removed = counts.removed,
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: diff snapshot"
-    );
-
-    let live_rows: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {}", spec.table), [], |row| {
-            row.get(0)
-        })
-        .with_context(|| format!("Failed to count rows in {}", spec.table))?;
-    let churn = counts.added + counts.modified + counts.removed;
-    if live_rows > 0 && (churn as f64) > (live_rows as f64) * IMPLAUSIBLE_CHURN_FRACTION {
-        warn!(
+    let job_name = format!("update:{}", spec.name);
+    let outcome = (|| -> Result<(DiffCounts, crate::dataset::LoadStats)> {
+        // --- stage ---
+        let t = std::time::Instant::now();
+        let load_stats = load(conn, &staging)
+            .with_context(|| format!("Failed to stage {} snapshot", spec.name))?;
+        let staged: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {staging}"), [], |row| {
+                row.get(0)
+            })
+            .with_context(|| format!("Failed to count rows in {staging}"))?;
+        info!(
             source = spec.name,
-            churn,
-            live_rows,
-            "implausibly large change set (>{:.0}% of rows) — proceeding, but this \
-             usually means the source was restructured rather than genuinely changed",
-            IMPLAUSIBLE_CHURN_FRACTION * 100.0
+            rows = staged,
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: stage snapshot"
         );
-    }
 
-    // --- apply ---
-    let t = std::time::Instant::now();
-    let id = spec.id_column;
-    let live = spec.table;
-
-    conn.execute_batch("BEGIN TRANSACTION")
-        .context("Failed to begin apply transaction")?;
-
-    // snapshot_id is allocated inside the transaction: a concurrent refresh
-    // that started BEGIN first will hold this SELECT until it commits or
-    // rolls back, so two overlapping refreshes cannot allocate the same id.
-    let applied = (|| -> Result<i64> {
-        let snapshot_id: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM dataset_refreshes",
-                [],
-                |row| row.get(0),
-            )
-            .context("Failed to allocate snapshot_id")?;
-
-        // Change areas are computed BEFORE the delta is applied: they read
-        // the OLD geometry of removed/modified objects out of `live`. If
-        // this ran after the DELETE+INSERT below, a removed object's row
-        // would already be gone and a modified object's row would already
-        // hold its NEW geometry — losing the "cell it left" signal entirely
-        // (see the regression test `change_areas_capture_the_origin_cell_
-        // before_the_delta_is_applied`).
-        insert_change_areas(conn, spec, snapshot_id)?;
-        crate::update::changeset::insert_dirty_cells(conn, spec)?;
-
-        conn.execute_batch(&format!(
-            "DELETE FROM {live} WHERE {id} IN (
-                 SELECT id FROM diff_removed UNION ALL SELECT id FROM diff_modified);
-             INSERT INTO {live} SELECT * FROM {staging} WHERE {id} IN (
-                 SELECT id FROM diff_added UNION ALL SELECT id FROM diff_modified);"
-        ))
-        .with_context(|| format!("Failed to apply delta to {live}"))?;
-
-        // A stale stamp means every ID compared as modified, so the DELETE +
-        // INSERT above just replaced the whole table with staging rows — whose
-        // hashes come from the current expression. Re-stamping here is what
-        // makes the mismatch warning fire once per bump instead of forever.
-        // An unstamped database gets its first stamp the same way. Inside the
-        // transaction, so a refresh that rolls back leaves the stamp alone.
-        if hash_version != RowHashVersion::Current {
-            crate::dataset::stamp_row_hash_version(conn)?;
+        // The load-bearing guard: an empty snapshot would delete the dataset.
+        if staged == 0 {
+            bail!(
+                "Staged snapshot for {} has 0 rows — refusing to apply, \
+                 which would delete the entire live dataset. The download is \
+                 most likely empty or truncated.",
+                spec.name
+            );
         }
 
-        conn.execute(
-            "INSERT INTO dataset_refreshes
-             (snapshot_id, source, started_at, finished_at, source_etag,
-              added, modified, removed)
-             VALUES (?, ?, now(), now(), ?, ?, ?, ?)",
-            duckdb::params![
-                snapshot_id,
-                spec.name,
-                source_etag,
-                counts.added,
-                counts.modified,
-                counts.removed,
-            ],
-        )
-        .context("Failed to record refresh")?;
+        let hash_version = check_row_hash_version(conn)?;
 
-        Ok(snapshot_id)
-    })();
+        // --- diff ---
+        let t = std::time::Instant::now();
+        let counts = diff::compute(conn, spec)?;
+        info!(
+            source = spec.name,
+            added = counts.added,
+            modified = counts.modified,
+            removed = counts.removed,
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: diff snapshot"
+        );
 
-    let snapshot_id = match applied {
-        Ok(snapshot_id) => match conn.execute_batch("COMMIT") {
-            Ok(()) => snapshot_id,
+        let live_rows: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {}", spec.table), [], |row| {
+                row.get(0)
+            })
+            .with_context(|| format!("Failed to count rows in {}", spec.table))?;
+        let churn = counts.added + counts.modified + counts.removed;
+        if live_rows > 0 && (churn as f64) > (live_rows as f64) * IMPLAUSIBLE_CHURN_FRACTION {
+            warn!(
+                source = spec.name,
+                churn,
+                live_rows,
+                "implausibly large change set (>{:.0}% of rows) — proceeding, but this \
+                 usually means the source was restructured rather than genuinely changed",
+                IMPLAUSIBLE_CHURN_FRACTION * 100.0
+            );
+        }
+
+        // --- apply ---
+        let t = std::time::Instant::now();
+        let id = spec.id_column;
+        let live = spec.table;
+
+        conn.execute_batch("BEGIN TRANSACTION")
+            .context("Failed to begin apply transaction")?;
+
+        // snapshot_id is allocated inside the transaction: a concurrent refresh
+        // that started BEGIN first will hold this SELECT until it commits or
+        // rolls back, so two overlapping refreshes cannot allocate the same id.
+        let applied = (|| -> Result<i64> {
+            let snapshot_id: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM dataset_refreshes",
+                    [],
+                    |row| row.get(0),
+                )
+                .context("Failed to allocate snapshot_id")?;
+
+            // Change areas are computed BEFORE the delta is applied: they read
+            // the OLD geometry of removed/modified objects out of `live`. If
+            // this ran after the DELETE+INSERT below, a removed object's row
+            // would already be gone and a modified object's row would already
+            // hold its NEW geometry — losing the "cell it left" signal entirely
+            // (see the regression test `change_areas_capture_the_origin_cell_
+            // before_the_delta_is_applied`).
+            insert_change_areas(conn, spec, snapshot_id)?;
+            crate::update::changeset::insert_dirty_cells(conn, spec)?;
+
+            conn.execute_batch(&format!(
+                "DELETE FROM {live} WHERE {id} IN (
+                     SELECT id FROM diff_removed UNION ALL SELECT id FROM diff_modified);
+                 INSERT INTO {live} SELECT * FROM {staging} WHERE {id} IN (
+                     SELECT id FROM diff_added UNION ALL SELECT id FROM diff_modified);"
+            ))
+            .with_context(|| format!("Failed to apply delta to {live}"))?;
+
+            // A stale stamp means every ID compared as modified, so the DELETE +
+            // INSERT above just replaced the whole table with staging rows — whose
+            // hashes come from the current expression. Re-stamping here is what
+            // makes the mismatch warning fire once per bump instead of forever.
+            // An unstamped database gets its first stamp the same way. Inside the
+            // transaction, so a refresh that rolls back leaves the stamp alone.
+            if hash_version != RowHashVersion::Current {
+                crate::dataset::stamp_row_hash_version(conn)?;
+            }
+
+            conn.execute(
+                "INSERT INTO dataset_refreshes
+                 (snapshot_id, source, started_at, finished_at, source_etag,
+                  added, modified, removed)
+                 VALUES (?, ?, now(), now(), ?, ?, ?, ?)",
+                duckdb::params![
+                    snapshot_id,
+                    spec.name,
+                    source_etag,
+                    counts.added,
+                    counts.modified,
+                    counts.removed,
+                ],
+            )
+            .context("Failed to record refresh")?;
+
+            Ok(snapshot_id)
+        })();
+
+        let snapshot_id = match applied {
+            Ok(snapshot_id) => match conn.execute_batch("COMMIT") {
+                Ok(()) => snapshot_id,
+                Err(e) => {
+                    if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                        warn!(error = %rb, "failed to roll back apply transaction after commit failure");
+                    }
+                    return Err(e).context("Failed to commit apply transaction");
+                }
+            },
             Err(e) => {
                 if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                    warn!(error = %rb, "failed to roll back apply transaction after commit failure");
+                    warn!(error = %rb, "failed to roll back apply transaction");
                 }
-                return Err(e).context("Failed to commit apply transaction");
+                return Err(e);
             }
-        },
-        Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                warn!(error = %rb, "failed to roll back apply transaction");
-            }
-            return Err(e);
+        };
+
+        info!(
+            source = spec.name,
+            snapshot_id,
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: apply delta"
+        );
+        info!(
+            source = spec.name,
+            added = counts.added,
+            modified = counts.modified,
+            removed = counts.removed,
+            elapsed = %format_duration(total.elapsed()),
+            "Dataset refresh complete"
+        );
+
+        Ok((counts, load_stats))
+    })();
+
+    match &outcome {
+        Ok((counts, stats)) => {
+            let _ = crate::job_log::record(
+                conn,
+                &job_name,
+                "Success",
+                Some(&summarize_refresh(counts, stats)),
+            );
         }
-    };
+        Err(e) => {
+            let _ = crate::job_log::record(conn, &job_name, "Error", Some(&format!("{e:#}")));
+        }
+    }
 
-    info!(
-        source = spec.name,
-        snapshot_id,
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: apply delta"
-    );
-    info!(
-        source = spec.name,
-        added = counts.added,
-        modified = counts.modified,
-        removed = counts.removed,
-        elapsed = %format_duration(total.elapsed()),
-        "Dataset refresh complete"
-    );
+    outcome.map(|(counts, _)| counts)
+}
 
-    Ok(counts)
+/// Human-readable message for the `job_run_log` row.
+fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> String {
+    let mut msg = format!(
+        "added {} modified {} removed {}",
+        counts.added, counts.modified, counts.removed
+    );
+    if stats.skipped_invalid_geometry > 0 {
+        let shown = stats.skipped_example_ids.join(", ");
+        let more = stats.skipped_invalid_geometry as usize - stats.skipped_example_ids.len();
+        let more_suffix = if more > 0 {
+            format!(", +{more} more")
+        } else {
+            String::new()
+        };
+        msg.push_str(&format!(
+            "; skipped {} invalid-geometry rows (ids: {shown}{more_suffix})",
+            stats.skipped_invalid_geometry
+        ));
+    }
+    msg
 }
 
 /// What `metadata.row_hash_version` says about the live table's `_row_hash`
@@ -308,14 +350,16 @@ mod tests {
     }
 
     /// Loader closure that fills staging from an inline VALUES list.
-    fn loader(rows: &'static str) -> impl FnOnce(&Connection, &str) -> Result<()> {
+    fn loader(
+        rows: &'static str,
+    ) -> impl FnOnce(&Connection, &str) -> Result<crate::dataset::LoadStats> {
         move |conn: &Connection, target: &str| {
             let inner = format!("SELECT id, a, ST_Point(lon, lat) AS geom FROM ({rows})");
             conn.execute_batch(&format!(
                 "CREATE TABLE {target} AS {};",
                 crate::dataset::hashed_select(&inner)
             ))?;
-            Ok(())
+            Ok(crate::dataset::LoadStats::default())
         }
     }
 
@@ -325,6 +369,62 @@ mod tests {
     const NEW_ROWS: &str = "SELECT * FROM (VALUES
         ('keep','v1',21.0,52.0), ('mod','CHANGED',21.0,52.0), ('add','v1',21.0,52.0)
       ) t(id,a,lon,lat)";
+
+    #[test]
+    fn refresh_records_success_in_job_run_log_including_skip_stats() {
+        let conn = conn_with_live(LIVE_ROWS);
+        let loader_with_stats = |rows: &'static str, stats: crate::dataset::LoadStats| {
+            move |conn: &Connection, target: &str| -> Result<crate::dataset::LoadStats> {
+                let inner = format!("SELECT id, a, ST_Point(lon, lat) AS geom FROM ({rows})");
+                conn.execute_batch(&format!(
+                    "CREATE TABLE {target} AS {};",
+                    crate::dataset::hashed_select(&inner)
+                ))?;
+                Ok(stats)
+            }
+        };
+
+        refresh(
+            &conn,
+            &TEST_SPEC,
+            loader_with_stats(
+                NEW_ROWS,
+                crate::dataset::LoadStats {
+                    skipped_invalid_geometry: 2,
+                    skipped_example_ids: vec!["bad1".to_string(), "bad2".to_string()],
+                },
+            ),
+            None,
+        )
+        .unwrap();
+
+        let log = crate::job_log::read_all(&conn).unwrap();
+        let entry = log
+            .get("update:test")
+            .expect("job_run_log entry must exist");
+        assert_eq!(entry.outcome, "Success");
+        let msg = entry.message.as_deref().unwrap();
+        assert!(
+            msg.contains("skipped 2 invalid-geometry rows"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("bad1") && msg.contains("bad2"), "got: {msg}");
+    }
+
+    #[test]
+    fn refresh_records_error_in_job_run_log_on_failure() {
+        let conn = conn_with_live(LIVE_ROWS);
+        let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
+
+        let _ = refresh(&conn, &TEST_SPEC, loader(empty), None);
+
+        let log = crate::job_log::read_all(&conn).unwrap();
+        let entry = log
+            .get("update:test")
+            .expect("job_run_log entry must exist even on failure");
+        assert_eq!(entry.outcome, "Error");
+        assert!(entry.message.as_deref().unwrap().contains("0 rows"));
+    }
 
     #[test]
     fn applies_delta_to_live_table() {

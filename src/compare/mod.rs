@@ -311,7 +311,7 @@ mod drain_refresh_concurrency {
                         "CREATE TABLE {target} AS {}",
                         hashed_select(&rows)
                     ))?;
-                    Ok(())
+                    Ok(crate::dataset::LoadStats::default())
                 },
                 None,
             );

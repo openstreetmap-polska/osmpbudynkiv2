@@ -97,7 +97,10 @@ pub fn update_prg(
         |c, target| {
             let raw = format!("{target}_raw");
             stream_gml_into(c, &zip_path, &terc, &raw)?;
-            materialize_into(c, target, &raw)
+            // PRG does not filter invalid geometry (that's bdot10k/egib-only,
+            // see `crate::dataset::filter_invalid_geometry`), so there is
+            // nothing to report beyond the default (all-zero) stats.
+            materialize_into(c, target, &raw).map(|()| crate::dataset::LoadStats::default())
         },
         source_etag,
     );
