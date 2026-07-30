@@ -108,6 +108,63 @@ pub fn hashed_select(inner_select: &str) -> String {
     format!("SELECT *, hash(s) AS _row_hash FROM ({inner_select}) s")
 }
 
+/// Cap on how many skipped-row ids `filter_invalid_geometry` collects as
+/// examples -- enough to point an operator at the actual bad records
+/// upstream, without holding an unbounded list for a source with many
+/// invalid rows. The returned count is always the true total regardless of
+/// this cap.
+pub const MAX_EXAMPLE_IDS: usize = 20;
+
+/// Rows a dataset loader dropped rather than staging, because their geometry
+/// failed `ST_IsValid`. `ST_AsMVTGeom` cannot tolerate invalid geometry (see
+/// docs/invalid_geometry_tile_500s.md) -- we drop rather than repair.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadStats {
+    pub skipped_invalid_geometry: i64,
+    /// First `MAX_EXAMPLE_IDS` ids of skipped rows, in whatever order the
+    /// SELECT below finds them -- not exhaustive, just enough to point an
+    /// operator at the actual bad records upstream.
+    pub skipped_example_ids: Vec<String>,
+}
+
+/// Delete invalid-geometry rows from a just-loaded table, capturing example
+/// ids before they're gone. Shared by `import::bdot10k::load_into` and
+/// `import::egib::load_into` -- the one place both `import` and `update`'s
+/// staging load funnel through, so a row filtered out here never reaches
+/// `compare::buildings` or `compare::incremental` at all.
+pub fn filter_invalid_geometry(
+    conn: &duckdb::Connection,
+    table: &str,
+    id_col: &str,
+) -> anyhow::Result<LoadStats> {
+    use anyhow::Context;
+
+    let mut skipped_example_ids = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {id_col} FROM {table} WHERE NOT ST_IsValid(geom) LIMIT {MAX_EXAMPLE_IDS}"
+            ))
+            .with_context(|| format!("Failed to prepare invalid-geometry scan on {table}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .with_context(|| format!("Failed to scan invalid-geometry rows in {table}"))?;
+        for row in rows {
+            skipped_example_ids.push(row.context("Failed to read invalid-geometry id")?);
+        }
+    }
+
+    let skipped_invalid_geometry = conn
+        .execute(&format!("DELETE FROM {table} WHERE NOT ST_IsValid(geom)"), [])
+        .with_context(|| format!("Failed to delete invalid-geometry rows from {table}"))?
+        as i64;
+
+    Ok(LoadStats {
+        skipped_invalid_geometry,
+        skipped_example_ids,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +238,80 @@ mod tests {
             })
             .unwrap();
         assert_eq!(nulls, 0, "NULL geometry must still produce a hash");
+    }
+
+    #[test]
+    fn filter_invalid_geometry_drops_only_invalid_rows_and_returns_stats() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id VARCHAR, geom GEOMETRY);
+             INSERT INTO t VALUES
+                 ('valid', ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
+                 ('bowtie', ST_GeomFromText('POLYGON((0 0, 2 2, 2 0, 0 2, 0 0))'));",
+        )
+        .unwrap();
+
+        let stats = filter_invalid_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(stats.skipped_invalid_geometry, 1);
+        assert_eq!(stats.skipped_example_ids, vec!["bowtie".to_string()]);
+
+        let remaining: Vec<String> = {
+            let mut s = conn.prepare("SELECT id FROM t ORDER BY id").unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(remaining, vec!["valid".to_string()]);
+    }
+
+    #[test]
+    fn filter_invalid_geometry_caps_example_ids_but_counts_all() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch("CREATE TABLE t (id VARCHAR, geom GEOMETRY);")
+            .unwrap();
+        for i in 0..25 {
+            conn.execute(
+                "INSERT INTO t VALUES (?, ST_GeomFromText('POLYGON((0 0, 2 2, 2 0, 0 2, 0 0))'))",
+                duckdb::params![format!("bad{i}")],
+            )
+            .unwrap();
+        }
+
+        let stats = filter_invalid_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(stats.skipped_invalid_geometry, 25);
+        assert_eq!(stats.skipped_example_ids.len(), MAX_EXAMPLE_IDS);
+    }
+
+    #[test]
+    fn filter_invalid_geometry_is_a_noop_when_everything_is_valid() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id VARCHAR, geom GEOMETRY);
+             INSERT INTO t VALUES ('a', ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))'));",
+        )
+        .unwrap();
+
+        let stats = filter_invalid_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(stats, LoadStats::default());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
