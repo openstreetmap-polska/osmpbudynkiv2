@@ -12,6 +12,7 @@ Current implementation status against the planned scope (see [`docs/project_idea
 
 - [x] CLI with TOML configuration (`--config`), built-in defaults, `RUST_LOG` override
 - [x] Storage layer: embedded DuckDB (geospatial/analytical queries) + RocksDB (raw OSM node coordinates and way/relation structure)
+- [x] `import full` — running all imports (OSM, BDOT10k, EGIB, PRG) in one command
 - [x] `import osm` — Poland PBF extract (auto-download or local file)
 - [x] `import prg` — address registry ZIP parsed via [prg_convert](https://github.com/ttomasz/prg_convert/), with TERC dictionary support
 - [x] `import bdot10k` / `import egib` — building registries from GeoParquet (auto-download or local file)
@@ -28,7 +29,6 @@ Current implementation status against the planned scope (see [`docs/project_idea
 
 ## Not yet implemented
 
-- [ ] `import full` — running all imports in one command (individual imports work)
 - [ ] Vector tiles for lower zoom levels with aggregation/clustering (DBSCAN or H3) and tile caching
 - [ ] Web map frontend for browsing data status and downloading packages
 - [ ] Endpoint for reporting records to exclude (bad source data, comparison mismatches)
@@ -85,8 +85,17 @@ All fields are optional — only specify what you want to override. Note that `d
 ### import — bulk-load data
 
 ```bash
-# Import everything (OSM, BDOT10k, EGIB, PRG) in sequence (not yet implemented)
+# Import everything (OSM, BDOT10k, EGIB, PRG) in sequence
 cargo run -- import full
+
+# Import everything from local files instead of downloading (any subset of flags works;
+# omitted sources still download)
+cargo run -- import full \
+  --osm-file poland-latest.osm.pbf \
+  --bdot10k-file bdot10k.parquet \
+  --egib-file egib.parquet \
+  --prg-file prg.zip \
+  --terc-file terc.zip
 
 # Import OpenStreetMap data (downloads Poland PBF extract automatically)
 cargo run -- import osm
