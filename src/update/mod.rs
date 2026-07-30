@@ -70,7 +70,8 @@ pub fn run(
             let result = dataset::refresh(
                 conn,
                 &spec::EGIB,
-                |c, target| crate::import::egib::load_into(c, target, &p),
+                // Temporary: removed once refresh()'s `load` param becomes Result<LoadStats> (Task 5)
+                |c, target| crate::import::egib::load_into(c, target, &p).map(|_| ()),
                 etag.as_deref(),
             );
             cleanup_if_downloaded(&path, was_downloaded && config.cleanup_downloaded_files);
