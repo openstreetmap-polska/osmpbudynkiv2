@@ -18,6 +18,10 @@ use crate::utils::format_duration;
 
 const PRG_DOWNLOAD_FILENAME: &str = "PRG-punkty_adresowe.zip";
 
+/// Resolved PRG input: the zip path, whether it was downloaded (vs.
+/// user-supplied), and the TERC mapping needed to parse it.
+type PreparedSource = (PathBuf, bool, Arc<HashMap<String, Terc>>);
+
 /// Import PRG addresses (2021 GML schema) from a local zip file into the
 /// `prg_addresses` DuckDB table.
 ///
@@ -38,10 +42,11 @@ pub fn import(
 ) -> Result<()> {
     let total = std::time::Instant::now();
 
-    let (zip_path, terc) = prepare_source(config, file, terc_file, url)?;
+    let (zip_path, was_downloaded, terc) = prepare_source(config, file, terc_file, url)?;
 
     let raw_table = "prg_addresses_raw";
     stream_gml_into(conn, &zip_path, &terc, raw_table)?;
+    cleanup_if_downloaded(&zip_path, was_downloaded);
 
     // Materialize the final table with a geometry column built from
     // EPSG:4326 lon/lat (the parser already reprojected from EPSG:2180).
@@ -85,8 +90,8 @@ pub fn update_prg(
     url: &str,
     source_etag: Option<&str>,
 ) -> Result<()> {
-    let (zip_path, terc) = prepare_source(config, file, terc_file, url)?;
-    crate::update::dataset::refresh(
+    let (zip_path, was_downloaded, terc) = prepare_source(config, file, terc_file, url)?;
+    let result = crate::update::dataset::refresh(
         conn,
         &crate::dataset::PRG,
         |c, target| {
@@ -95,8 +100,9 @@ pub fn update_prg(
             materialize_into(c, target, &raw)
         },
         source_etag,
-    )
-    .map(|_| ())
+    );
+    cleanup_if_downloaded(&zip_path, was_downloaded);
+    result.map(|_| ())
 }
 
 /// Resolve the PRG zip (local file or download) and build the TERC mapping
@@ -105,18 +111,22 @@ pub fn update_prg(
 ///
 /// Does not touch the database — this is pure "get the inputs ready" work
 /// shared by both `import` and `update_prg`.
+///
+/// Returns whether the zip was downloaded (vs. a user-supplied `--file`), so
+/// callers know whether it's theirs to delete once consumed.
 fn prepare_source(
     config: &Config,
     file: Option<&Path>,
     terc_file: Option<&Path>,
     url: &str,
-) -> Result<(PathBuf, Arc<HashMap<String, Terc>>)> {
-    let zip_path = match file {
-        Some(p) => PathBuf::from(p),
+) -> Result<PreparedSource> {
+    let (zip_path, was_downloaded) = match file {
+        Some(p) => (PathBuf::from(p), false),
         None => {
             info!(url, "Downloading PRG data");
-            download_file_as(url, &config.download_dir(), PRG_DOWNLOAD_FILENAME)
-                .context("Failed to download PRG data")?
+            let path = download_file_as(url, &config.download_dir(), PRG_DOWNLOAD_FILENAME)
+                .context("Failed to download PRG data")?;
+            (path, true)
         }
     };
 
@@ -185,7 +195,16 @@ fn prepare_source(
         "Step done: load TERC mapping"
     );
 
-    Ok((zip_path, terc))
+    Ok((zip_path, was_downloaded, terc))
+}
+
+/// Remove the zip once it's been fully consumed, but only if we downloaded
+/// it ourselves — a user-supplied `--file` is never deleted.
+fn cleanup_if_downloaded(zip_path: &Path, was_downloaded: bool) {
+    if was_downloaded {
+        info!(path = %zip_path.display(), "Cleaning up downloaded file");
+        let _ = std::fs::remove_file(zip_path);
+    }
 }
 
 /// Enumerate every `.gml` entry in the PRG zip and stream its parsed arrow
