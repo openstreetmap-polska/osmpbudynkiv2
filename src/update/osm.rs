@@ -371,10 +371,12 @@ fn rebuild_way_geometry(
         }
     };
 
-    if building_tag.is_none() && housenumber.is_none() {
-        return Ok(());
-    }
-
+    // No early return when both tags are absent: that is the de-tag case (a
+    // Modify stripped building/addr:housenumber off a way we serve), and it
+    // still has to delete the base row and note the cell it left -- otherwise
+    // the government object this way was matching stays suppressed until the
+    // next full compare. The re-inserts below are already guarded by their own
+    // is_some() checks, so falling through simply deletes and stops.
     dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way_id, "way")?;
     dirty.note_existing(conn, Layer::Addresses, "osm_addresses", way_id, "way")?;
 
@@ -475,10 +477,8 @@ fn rebuild_relation_geometry(
         }
     };
 
-    if building_tag.is_none() && housenumber.is_none() {
-        return Ok(());
-    }
-
+    // No early return when both tags are absent -- the de-tag case still has to
+    // delete and note the vacated cell. See rebuild_way_geometry.
     dirty.note_existing(
         conn,
         Layer::Buildings,
@@ -614,7 +614,7 @@ mod tests {
     use super::*;
     use crate::db::init_db;
     use crate::osm::kvstore;
-    use crate::osm::replication::NodeChange;
+    use crate::osm::replication::{NodeChange, RelationMember};
 
     fn setup_test_db_and_kv() -> Result<(Connection, Arc<RocksDB>, tempfile::TempDir)> {
         let tmpdir = tempfile::tempdir()?;
@@ -878,6 +878,118 @@ mod tests {
             prg, 0,
             "a building-only edit must not enqueue the address source"
         );
+
+        Ok(())
+    }
+
+    /// A Modify that strips every building/address tag off a served way is a
+    /// de-tag: the OSM building is gone even though the way still exists. The
+    /// base row must go with it, and the cell must be enqueued so the
+    /// government building it was matching reappears as unmatched.
+    #[test]
+    fn test_apply_way_modify_stripping_tags_removes_row_and_enqueues() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        let changes = OsmChange {
+            ways: vec![WayChange {
+                action: ChangeAction::Modify,
+                id: 100,
+                node_refs: vec![1, 2, 3, 4, 1],
+                // building=yes removed by the editor; nothing served left.
+                tags: vec![("note".into(), "not a building any more".into())],
+            }],
+            ..Default::default()
+        };
+
+        apply_changes(&conn, &kv, &changes)?;
+
+        let building_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 100 AND osm_type = 'way'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            building_count, 0,
+            "de-tagged way must not leave a stale osm_buildings row"
+        );
+
+        for source in ["bdot10k", "egib"] {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = ?",
+                duckdb::params![source],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                n, 9,
+                "de-tagged way must enqueue the cell it left for {source}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Same de-tag, but on a relation: `rebuild_relation_geometry` has the
+    /// identical early return, so it needs its own coverage.
+    #[test]
+    fn test_apply_relation_modify_stripping_tags_removes_row_and_enqueues() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        // Seed a served multipolygon relation 200 built from way 100.
+        kvstore::put_relation(
+            &kv,
+            200,
+            &[(
+                100,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(&kv, 100, 200)?;
+        conn.execute_batch(
+            "INSERT INTO osm_buildings VALUES (200, 'relation', 'yes', ST_MakePolygon(ST_MakeLine(
+                list_value(ST_Point(20.0, 50.0), ST_Point(20.001, 50.0),
+                           ST_Point(20.001, 50.001), ST_Point(20.0, 50.001),
+                           ST_Point(20.0, 50.0))
+            )));",
+        )?;
+
+        let changes = OsmChange {
+            relations: vec![RelationChange {
+                action: ChangeAction::Modify,
+                id: 200,
+                members: vec![RelationMember {
+                    member_type: "way".into(),
+                    member_ref: 100,
+                    role: "outer".into(),
+                }],
+                tags: vec![("type".into(), "multipolygon".into())],
+            }],
+            ..Default::default()
+        };
+
+        apply_changes(&conn, &kv, &changes)?;
+
+        let building_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 200 AND osm_type = 'relation'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            building_count, 0,
+            "de-tagged relation must not leave a stale osm_buildings row"
+        );
+
+        for source in ["bdot10k", "egib"] {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = ?",
+                duckdb::params![source],
+                |row| row.get(0),
+            )?;
+            assert!(
+                n >= 9,
+                "de-tagged relation must enqueue the cell it left for {source}, got {n}"
+            );
+        }
 
         Ok(())
     }
