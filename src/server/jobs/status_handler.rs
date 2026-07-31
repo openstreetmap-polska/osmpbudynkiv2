@@ -144,9 +144,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
 mod tests {
     use super::*;
     use crate::db::init_db;
-    use crate::server::jobs::JobRegistry;
     use std::path::Path;
-    use std::sync::Arc;
 
     #[test]
     fn staleness_counts_distinct_cells_per_source() {
