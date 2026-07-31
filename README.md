@@ -211,7 +211,7 @@ cargo run -- run
 
 Currently serves:
 - `/health` — liveness check
-- `/status` — background job status as JSON, including match-queue staleness (`match_staleness`: pending cell count overall and per source, oldest enqueued timestamp)
+- `/status` — background job status as JSON, including match-queue staleness (`match_staleness`: pending cell count overall and per source, oldest enqueued timestamp) and per-job last-run outcome (`job_run_log`, keyed by job name)
 - `/tiles/{z}/{x}/{y}` — Mapbox Vector Tiles (zoom 14 only), reading the precomputed `*_unmatched` serving tables
 - `/package` — GeoJSON `FeatureCollection` of government-registry records missing
   from OSM in the requested area, tagged for direct JOSM import. Reads the same
