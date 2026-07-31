@@ -96,7 +96,8 @@ fn summarize(stats: &LoadStats) -> String {
         return "no invalid geometry".to_string();
     }
     let shown = stats.skipped_example_ids.join(", ");
-    let more = stats.skipped_invalid_geometry as usize - stats.skipped_example_ids.len();
+    let more =
+        (stats.skipped_invalid_geometry as usize).saturating_sub(stats.skipped_example_ids.len());
     if more > 0 {
         format!(
             "skipped {} invalid-geometry rows (ids: {shown}, +{more} more)",
@@ -147,8 +148,7 @@ mod tests {
         .unwrap();
 
         let stats =
-            crate::dataset::filter_invalid_geometry(&conn, "egib_buildings", "id_budynku")
-                .unwrap();
+            crate::dataset::filter_invalid_geometry(&conn, "egib_buildings", "id_budynku").unwrap();
 
         assert_eq!(stats.skipped_invalid_geometry, 1);
         assert_eq!(stats.skipped_example_ids, vec!["bad".to_string()]);
@@ -160,7 +160,13 @@ mod tests {
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         let config = Config::default();
 
-        import(&conn, &config, Some(Path::new("fixtures/egib.parquet")), "unused").unwrap();
+        import(
+            &conn,
+            &config,
+            Some(Path::new("fixtures/egib.parquet")),
+            "unused",
+        )
+        .unwrap();
 
         let log = crate::job_log::read_all(&conn).unwrap();
         let entry = log.get("import:egib").expect("entry must be present");
@@ -174,11 +180,18 @@ mod tests {
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         let config = Config::default();
 
-        let result = import(&conn, &config, Some(Path::new("nonexistent.parquet")), "unused");
+        let result = import(
+            &conn,
+            &config,
+            Some(Path::new("nonexistent.parquet")),
+            "unused",
+        );
         assert!(result.is_err());
 
         let log = crate::job_log::read_all(&conn).unwrap();
-        let entry = log.get("import:egib").expect("entry must exist even on failure");
+        let entry = log
+            .get("import:egib")
+            .expect("entry must exist even on failure");
         assert_eq!(entry.outcome, "Error");
         assert!(entry.message.is_some());
     }

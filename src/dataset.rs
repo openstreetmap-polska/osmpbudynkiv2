@@ -155,7 +155,10 @@ pub fn filter_invalid_geometry(
     }
 
     let skipped_invalid_geometry = conn
-        .execute(&format!("DELETE FROM {table} WHERE NOT ST_IsValid(geom)"), [])
+        .execute(
+            &format!("DELETE FROM {table} WHERE NOT ST_IsValid(geom)"),
+            [],
+        )
         .with_context(|| format!("Failed to delete invalid-geometry rows from {table}"))?
         as i64;
 

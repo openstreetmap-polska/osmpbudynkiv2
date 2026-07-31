@@ -96,10 +96,12 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
 
     match &outcome {
         Ok(stats) => {
-            let _ = crate::job_log::record(conn, "import:bdot10k", "Success", Some(&summarize(stats)));
+            let _ =
+                crate::job_log::record(conn, "import:bdot10k", "Success", Some(&summarize(stats)));
         }
         Err(e) => {
-            let _ = crate::job_log::record(conn, "import:bdot10k", "Error", Some(&format!("{e:#}")));
+            let _ =
+                crate::job_log::record(conn, "import:bdot10k", "Error", Some(&format!("{e:#}")));
         }
     }
     outcome.map(|_| ())
@@ -111,7 +113,8 @@ fn summarize(stats: &LoadStats) -> String {
         return "no invalid geometry".to_string();
     }
     let shown = stats.skipped_example_ids.join(", ");
-    let more = stats.skipped_invalid_geometry as usize - stats.skipped_example_ids.len();
+    let more =
+        (stats.skipped_invalid_geometry as usize).saturating_sub(stats.skipped_example_ids.len());
     if more > 0 {
         format!(
             "skipped {} invalid-geometry rows (ids: {shown}, +{more} more)",
@@ -190,7 +193,13 @@ mod tests {
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         let config = Config::default();
 
-        import(&conn, &config, Some(Path::new("fixtures/bdot10k.parquet")), "unused").unwrap();
+        import(
+            &conn,
+            &config,
+            Some(Path::new("fixtures/bdot10k.parquet")),
+            "unused",
+        )
+        .unwrap();
 
         let log = crate::job_log::read_all(&conn).unwrap();
         let entry = log.get("import:bdot10k").expect("entry must be present");
@@ -204,11 +213,18 @@ mod tests {
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         let config = Config::default();
 
-        let result = import(&conn, &config, Some(Path::new("nonexistent.parquet")), "unused");
+        let result = import(
+            &conn,
+            &config,
+            Some(Path::new("nonexistent.parquet")),
+            "unused",
+        );
         assert!(result.is_err());
 
         let log = crate::job_log::read_all(&conn).unwrap();
-        let entry = log.get("import:bdot10k").expect("entry must exist even on failure");
+        let entry = log
+            .get("import:bdot10k")
+            .expect("entry must exist even on failure");
         assert_eq!(entry.outcome, "Error");
         assert!(entry.message.is_some());
     }

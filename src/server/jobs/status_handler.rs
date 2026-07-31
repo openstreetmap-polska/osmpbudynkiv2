@@ -173,8 +173,13 @@ mod tests {
 
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
-        crate::job_log::record(&conn, "import:bdot10k", "Success", Some("no invalid geometry"))
-            .unwrap();
+        crate::job_log::record(
+            &conn,
+            "import:bdot10k",
+            "Success",
+            Some("no invalid geometry"),
+        )
+        .unwrap();
 
         let pool = crate::server::build_pool(conn, 2).unwrap();
         let state = AppState {
@@ -184,9 +189,7 @@ mod tests {
         };
 
         let log = job_run_log_or_default(&state);
-        let entry = log
-            .get("import:bdot10k")
-            .expect("entry must be present");
+        let entry = log.get("import:bdot10k").expect("entry must be present");
         assert_eq!(entry.outcome, "Success");
         assert_eq!(entry.message.as_deref(), Some("no invalid geometry"));
     }

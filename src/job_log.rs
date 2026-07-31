@@ -104,8 +104,20 @@ mod tests {
     #[test]
     fn record_keeps_only_the_latest_run_per_job_name() {
         let conn = conn();
-        record(&conn, "update:bdot10k", "Error", Some("first attempt failed")).unwrap();
-        record(&conn, "update:bdot10k", "Success", Some("second attempt: no issues")).unwrap();
+        record(
+            &conn,
+            "update:bdot10k",
+            "Error",
+            Some("first attempt failed"),
+        )
+        .unwrap();
+        record(
+            &conn,
+            "update:bdot10k",
+            "Success",
+            Some("second attempt: no issues"),
+        )
+        .unwrap();
 
         let log = read_all(&conn).unwrap();
         assert_eq!(log.len(), 1, "only one row per job_name must survive");

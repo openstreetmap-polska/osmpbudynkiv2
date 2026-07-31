@@ -250,7 +250,8 @@ fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> 
     );
     if stats.skipped_invalid_geometry > 0 {
         let shown = stats.skipped_example_ids.join(", ");
-        let more = stats.skipped_invalid_geometry as usize - stats.skipped_example_ids.len();
+        let more = (stats.skipped_invalid_geometry as usize)
+            .saturating_sub(stats.skipped_example_ids.len());
         let more_suffix = if more > 0 {
             format!(", +{more} more")
         } else {
