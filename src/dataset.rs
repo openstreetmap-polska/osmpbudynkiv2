@@ -64,11 +64,32 @@ pub struct DatasetSpec {
 
 impl DatasetSpec {
     /// SQL for the point that represents this object when assigning it to a
-    /// change cell.
-    pub fn representative_point_sql(&self, geom_expr: &str) -> String {
+    /// change cell. `alias` is the table alias in the surrounding query
+    /// (e.g. `"l"` for the live table, `"s"` for staging). For `Point`
+    /// sources the geometry itself is the point; for `Polygon` sources this
+    /// reads the persisted `centroid` column (see `with_centroid_select`)
+    /// rather than recomputing `ST_Centroid` — the whole reason that column
+    /// exists is so this stops being a per-row function call.
+    pub fn representative_point_sql(&self, alias: &str) -> String {
         match self.geom_kind {
-            GeomKind::Point => geom_expr.to_string(),
-            GeomKind::Polygon => format!("ST_Centroid({geom_expr})"),
+            GeomKind::Point => format!("{alias}.geom"),
+            GeomKind::Polygon => format!("{alias}.centroid"),
+        }
+    }
+
+    /// Wrap `select_sql` (the output of [`hashed_select`]) so a `Polygon`
+    /// source also gains a persisted `centroid GEOMETRY` column, computed
+    /// from `geom`. Added OUTSIDE `hashed_select`'s projection deliberately:
+    /// `hash(s)` inside `hashed_select` already ran over the inner columns
+    /// only, so wrapping here cannot change any row's `_row_hash` and needs
+    /// no `ROW_HASH_VERSION` bump. A no-op passthrough for `Point` sources
+    /// (PRG), which have no separate centroid to store.
+    pub fn with_centroid_select(&self, select_sql: &str) -> String {
+        match self.geom_kind {
+            GeomKind::Point => select_sql.to_string(),
+            GeomKind::Polygon => {
+                format!("SELECT *, ST_Centroid(geom) AS centroid FROM ({select_sql}) t")
+            }
         }
     }
 
@@ -181,17 +202,87 @@ mod tests {
     }
 
     #[test]
-    fn representative_point_uses_centroid_for_polygons() {
-        assert_eq!(
-            BDOT10K.representative_point_sql("geom"),
-            "ST_Centroid(geom)"
-        );
-        assert_eq!(EGIB.representative_point_sql("geom"), "ST_Centroid(geom)");
+    fn representative_point_reads_the_stored_centroid_for_polygons() {
+        assert_eq!(BDOT10K.representative_point_sql("l"), "l.centroid");
+        assert_eq!(EGIB.representative_point_sql("s"), "s.centroid");
     }
 
     #[test]
     fn representative_point_passes_through_for_points() {
-        assert_eq!(PRG.representative_point_sql("geom"), "geom");
+        assert_eq!(PRG.representative_point_sql("l"), "l.geom");
+    }
+
+    #[test]
+    fn with_centroid_select_wraps_polygon_sources_outside_the_hash() {
+        let hashed = hashed_select("SELECT 1 AS a, ST_Point(1, 2) AS geom");
+        let wrapped = BDOT10K.with_centroid_select(&hashed);
+        assert_eq!(
+            wrapped,
+            format!("SELECT *, ST_Centroid(geom) AS centroid FROM ({hashed}) t")
+        );
+    }
+
+    #[test]
+    fn with_centroid_select_is_a_noop_for_points() {
+        let hashed = hashed_select("SELECT 1 AS a, ST_Point(1, 2) AS geom");
+        assert_eq!(PRG.with_centroid_select(&hashed), hashed);
+    }
+
+    /// The load-bearing invariant from the module doc: adding `centroid` via
+    /// `with_centroid_select` must not change `_row_hash`, since it wraps
+    /// `hashed_select`'s output rather than feeding into it. If this ever
+    /// regresses, every refresh would compare every row as modified forever
+    /// (see `ROW_HASH_VERSION`) without anyone bumping the constant.
+    #[test]
+    fn with_centroid_select_does_not_change_the_row_hash() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE src (id VARCHAR, geom GEOMETRY);
+             INSERT INTO src VALUES
+                 ('1', ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
+                 ('2', NULL);",
+        )
+        .unwrap();
+
+        let inner = "SELECT id, geom FROM src";
+        let hashed = hashed_select(inner);
+        let with_centroid = BDOT10K.with_centroid_select(&hashed);
+
+        conn.execute_batch(&format!(
+            "CREATE TABLE plain AS {hashed};
+             CREATE TABLE with_centroid AS {with_centroid};"
+        ))
+        .unwrap();
+
+        let disagreements: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plain p JOIN with_centroid c USING (id)
+                 WHERE p._row_hash IS DISTINCT FROM c._row_hash",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            disagreements, 0,
+            "adding centroid outside hashed_select's wrap must not change _row_hash"
+        );
+
+        let has_centroid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM information_schema.columns
+                 WHERE table_name = 'with_centroid' AND column_name = 'centroid'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_centroid,
+            "the wrapped table must actually carry the centroid column"
+        );
     }
 
     #[test]
