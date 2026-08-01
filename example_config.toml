@@ -160,12 +160,19 @@ interval_seconds = 30
 timeout_seconds = 300
 # Max number of distinct dirty (source, cell) recomputed per tick.
 #
-# NOTE: on a Poland-scale database a cell recompute currently costs ~0.9s,
-# because the per-cell match predicate full-scans the government table (see
-# docs/per_cell_recompute_full_scan.md). 512 cells therefore cannot finish
-# inside timeout_seconds, and each tick drains ~330 cells and records TimedOut.
-# That is self-limiting, not lossy -- undrained cells stay queued -- but expect
-# match_refresh to show as TimedOut in /status until that predicate is fixed.
+# On a Poland-scale database a cell recompute used to cost ~0.9s, because the
+# per-cell match predicate full-scanned the government table (see
+# docs/per_cell_recompute_full_scan.md) -- 512 cells could not finish inside
+# timeout_seconds, and each tick drained ~330 cells and recorded TimedOut.
+# Fixed 2026-08-01 by persisting and RTREE-indexing a `centroid` column on
+# bdot10k_buildings/egib_buildings instead of recomputing ST_Centroid(geom) in
+# the predicate; measured on real data at docs/centroid_index_measured.md, a
+# cell recompute now costs roughly 0.01-0.2s depending on local building
+# density, so a 512-cell batch should comfortably finish inside
+# timeout_seconds. The fix only helps databases whose bdot10k/egib tables were
+# (re)imported after 2026-08-01 -- there is no migration, so a database still
+# on an older import will still see the old ~0.9s/cell cost and TimedOut here
+# until `import bdot10k` / `import egib` is re-run.
 batch_size = 512
 
 # Periodically re-enqueues every live government cell so the drain rebuilds it:
@@ -173,11 +180,20 @@ batch_size = 512
 # this is safe to run against a live server, because it only appends to the
 # dirty-cell queue and lets the per-cell drain do the work.
 #
-# Disabled by default. A sweep enqueues ~339,000 cells, which at the current
-# ~0.9s/cell is ~85h of draining; and because the drain is oldest-first, those
-# cells would sit in front of every subsequent OSM edit and delay real updates
-# by hours. Enable once a cell recompute is cheap enough that a sweep finishes
-# well inside interval_seconds.
+# Disabled by default. A sweep enqueues ~339,000 cells, and because the drain
+# is oldest-first, those cells sit in front of every subsequent OSM edit and
+# delay real updates until the sweep finishes -- so this must only be enabled
+# once a sweep finishes well inside interval_seconds.
+#
+# This used to be a hard blocker: at the old ~0.9s/cell (see the batch_size
+# note on match_refresh above), a full sweep was ~85h. The underlying fix
+# (persisted/indexed `centroid` column, 2026-08-01) brought per-cell cost down
+# to roughly 0.01-0.2s on real data (docs/centroid_index_measured.md), which
+# extrapolates to well under a day for a full sweep -- but that's an
+# extrapolation from per-cell timings, not a freshly measured full sweep.
+# Still left disabled here pending an actual timed sweep on a database
+# imported after the fix; flip to `true` once that number is in and
+# comfortably inside interval_seconds.
 [jobs.match_reconcile]
 enabled = false
 interval_seconds = 86400
