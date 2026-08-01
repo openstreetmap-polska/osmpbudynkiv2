@@ -21,10 +21,11 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
          ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom \
          FROM '{parquet_path}'"
     );
+    let select =
+        crate::dataset::EGIB.with_centroid_select(&crate::dataset::hashed_select(&inner));
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS {target_table};
-         CREATE TABLE {target_table} AS {};",
-        crate::dataset::hashed_select(&inner)
+         CREATE TABLE {target_table} AS {select};"
     ))
     .with_context(|| format!("Failed to load EGIB data into {target_table}"))?;
 
@@ -55,9 +56,10 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
 
         let t = std::time::Instant::now();
         conn.execute_batch(
-            "CREATE INDEX egib_buildings_geom_idx ON egib_buildings USING RTREE (geom);",
+            "CREATE INDEX egib_buildings_geom_idx ON egib_buildings USING RTREE (geom);
+             CREATE INDEX egib_buildings_centroid_idx ON egib_buildings USING RTREE (centroid);",
         )
-        .context("Failed to create spatial index on egib_buildings")?;
+        .context("Failed to create spatial indexes on egib_buildings")?;
         info!(
             elapsed = %format_duration(t.elapsed()),
             "Step done: create spatial index"
@@ -133,6 +135,19 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM egib_buildings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 74, "must match the known fixture row count");
+
+        let mismatched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM egib_buildings
+                 WHERE centroid IS DISTINCT FROM ST_Centroid(geom)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mismatched, 0,
+            "centroid must equal ST_Centroid(geom) for every row"
+        );
     }
 
     #[test]
