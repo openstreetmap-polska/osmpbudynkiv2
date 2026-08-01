@@ -30,8 +30,8 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
     let id = spec.id_column;
     let z = CHANGE_CELL_ZOOM;
 
-    let point_live = spec.representative_point_sql("l.geom");
-    let point_stg = spec.representative_point_sql("s.geom");
+    let point_live = spec.representative_point_sql("l");
+    let point_stg = spec.representative_point_sql("s");
 
     let sx = crate::tile_math::cell_x_sql(&point_stg);
     let sy = crate::tile_math::cell_y_sql(&point_stg);
@@ -85,8 +85,8 @@ pub fn insert_dirty_cells(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
     let staging = spec.staging_table();
     let id = spec.id_column;
     let z = crate::tile_math::CHANGE_CELL_ZOOM;
-    let point_live = spec.representative_point_sql("l.geom");
-    let point_stg = spec.representative_point_sql("s.geom");
+    let point_live = spec.representative_point_sql("l");
+    let point_stg = spec.representative_point_sql("s");
     let sx = crate::tile_math::cell_x_sql(&point_stg);
     let sy = crate::tile_math::cell_y_sql(&point_stg);
     let lx = crate::tile_math::cell_x_sql(&point_live);
