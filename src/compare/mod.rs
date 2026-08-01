@@ -74,8 +74,8 @@ mod full_vs_incremental_equivalence {
         // enqueue_all touches all three government tables unconditionally,
         // so all three must exist even if a given test only seeds one.
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
@@ -117,14 +117,15 @@ mod full_vs_incremental_equivalence {
         c.execute_batch(
             "INSERT INTO osm_buildings VALUES
                  (1, 'way', NULL, ST_MakeEnvelope(20.0, 52.0, 20.001, 52.001));
-             INSERT INTO bdot10k_buildings VALUES
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('inside', ST_MakeEnvelope(20.0002,52.0002,20.0008,52.0008)),
                  ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201)),
                  -- Outside the old hardcoded (14,49,25,55) compare_buildings
                  -- bbox: the extent-divergence scenario the extent fix
                  -- exists to close, and the scenario this test must be able
                  -- to catch a regression of.
-                 ('stray', ST_MakeEnvelope(30.0,60.0,30.001,60.001));",
+                 ('stray', ST_MakeEnvelope(30.0,60.0,30.001,60.001));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
 
@@ -239,12 +240,12 @@ mod drain_refresh_concurrency {
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(&format!(
             "CREATE TABLE bdot10k_buildings AS {};
-             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
                  geom GEOMETRY);",
-            hashed_select(&rows_sql(n, "v1"))
+            BDOT10K.with_centroid_select(&hashed_select(&rows_sql(n, "v1")))
         ))
         .unwrap();
         // Match roughly every third building, so the serving table is neither
@@ -309,7 +310,7 @@ mod drain_refresh_concurrency {
                 move |c: &Connection, target: &str| {
                     c.execute_batch(&format!(
                         "CREATE TABLE {target} AS {}",
-                        hashed_select(&rows)
+                        BDOT10K.with_centroid_select(&hashed_select(&rows))
                     ))?;
                     Ok(crate::dataset::LoadStats::default())
                 },

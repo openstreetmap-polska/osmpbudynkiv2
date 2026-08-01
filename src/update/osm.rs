@@ -897,15 +897,16 @@ mod tests {
     fn osc_xml_flows_through_parse_apply_drain_into_the_serving_table() -> Result<()> {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
                  geom GEOMETRY);
              -- Sits inside way 100's footprint, so OSM currently covers it.
-             INSERT INTO bdot10k_buildings VALUES
-                 ('gov1', ST_MakeEnvelope(20.0002, 50.0002, 20.0008, 50.0008));",
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
+                 ('gov1', ST_MakeEnvelope(20.0002, 50.0002, 20.0008, 50.0008));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )?;
 
         // Baseline: the government building is matched, so it is NOT served.
