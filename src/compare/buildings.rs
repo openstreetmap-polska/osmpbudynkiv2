@@ -44,8 +44,8 @@ fn compare_buildings(
 
     let (min_x, min_y, max_x, max_y) = source_grid_extent(conn, source_table, GRID_STEP)
         .with_context(|| format!("Failed to compute source extent for {source_table}"))?;
-    let cx = cell_x_sql("ST_Centroid(b.geom)");
-    let cy = cell_y_sql("ST_Centroid(b.geom)");
+    let cx = cell_x_sql("b.centroid");
+    let cy = cell_y_sql("b.centroid");
     let select = format!("b.{id_col}, b.geom, {cx}, {cy}, now()");
 
     let mut y = min_y;
@@ -65,8 +65,8 @@ fn compare_buildings(
             conn.execute_batch(&format!(
                 "INSERT INTO {dest} ({id_col}, geom, cell_x, cell_y, computed_at)
                  {inner}
-                   AND ST_X(ST_Centroid(b.geom)) >= {x} AND ST_X(ST_Centroid(b.geom)) < {x_hi}
-                   AND ST_Y(ST_Centroid(b.geom)) >= {y} AND ST_Y(ST_Centroid(b.geom)) < {y_hi};"
+                   AND ST_X(b.centroid) >= {x} AND ST_X(b.centroid) < {x_hi}
+                   AND ST_Y(b.centroid) >= {y} AND ST_Y(b.centroid) < {y_hi};"
             ))
             .with_context(|| format!("Failed comparing {label} in cell ({x},{y})"))?;
             x += GRID_STEP;
@@ -183,10 +183,11 @@ mod tests {
     fn writes_only_unmatched_rows_with_cell_tags() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             INSERT INTO bdot10k_buildings VALUES
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('inside', ST_MakeEnvelope(20.0002,52.0002,20.0008,52.0008)),
-                 ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));",
+                 ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
         compare_bdot10k(&conn).unwrap();
@@ -218,8 +219,9 @@ mod tests {
     fn compare_is_idempotent() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             INSERT INTO bdot10k_buildings VALUES ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));",
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
         compare_bdot10k(&conn).unwrap();
@@ -239,10 +241,11 @@ mod tests {
     fn refuses_to_build_a_grid_around_a_wild_coordinate() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             INSERT INTO bdot10k_buildings VALUES
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('sane', ST_MakeEnvelope(20.0,52.0,20.001,52.001)),
-                 ('wild', ST_MakeEnvelope(-180.0,-90.0,-179.999,-89.999));",
+                 ('wild', ST_MakeEnvelope(-180.0,-90.0,-179.999,-89.999));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
         // `{:#}` walks the whole anyhow chain -- the caller wraps this in
@@ -265,9 +268,10 @@ mod tests {
     fn covers_a_row_outside_the_historical_poland_bbox() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             INSERT INTO bdot10k_buildings VALUES
-                 ('stray', ST_MakeEnvelope(30.0,60.0,30.001,60.001));",
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
+                 ('stray', ST_MakeEnvelope(30.0,60.0,30.001,60.001));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
         compare_bdot10k(&conn).unwrap();
@@ -298,8 +302,8 @@ mod tests {
     fn compare_chunked_duplicates_source_on_cell_boundary() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             INSERT INTO bdot10k_buildings VALUES
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  -- centroid (14.5, 52.25): x = 14.5 is the boundary between
                  -- the [14.0,14.5) and [14.5,15.0) grid columns; y = 52.25 is
                  -- safely mid-row.
@@ -309,7 +313,8 @@ mod tests {
                  -- point would otherwise sit at a tightly-snapped extent edge
                  -- and only ever be scanned by one cell, which would not
                  -- exercise the guard at all.
-                 ('anchor', ST_MakeEnvelope(14.05,52.25,14.06,52.26));",
+                 ('anchor', ST_MakeEnvelope(14.05,52.25,14.06,52.26));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
         compare_bdot10k(&conn).unwrap();
