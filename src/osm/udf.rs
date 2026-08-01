@@ -25,7 +25,7 @@ pub struct ResolveNodeCoords;
 impl VScalar for ResolveNodeCoords {
     type State = KvState;
 
-    unsafe fn invoke(
+    fn invoke(
         state: &Self::State,
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
@@ -49,7 +49,7 @@ impl VScalar for ResolveNodeCoords {
             }
 
             let child = list_vec.child(offset + length);
-            let refs = child.as_slice::<i64>();
+            let refs = unsafe { child.as_slice::<i64>() };
             let slice = &refs[offset..offset + length];
 
             let raw_coords = match kvstore::multi_get_nodes_concat(&state.kv, slice)? {
@@ -87,14 +87,14 @@ pub struct ResolveWayCoords;
 impl VScalar for ResolveWayCoords {
     type State = KvState;
 
-    unsafe fn invoke(
+    fn invoke(
         state: &Self::State,
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let num_rows = input.len();
         let way_ids_vec = input.flat_vector(0);
-        let way_ids = way_ids_vec.as_slice::<i64>();
+        let way_ids = unsafe { way_ids_vec.as_slice::<i64>() };
         let mut out = output.flat_vector();
 
         for (i, &way_id) in way_ids.iter().enumerate().take(num_rows) {

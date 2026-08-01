@@ -8,7 +8,7 @@ anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
-duckdb = { version = "1.10502.0", features = ["bundled", "vtab", "vtab-arrow", "vscalar", "r2d2"] }
+duckdb = { version = "1.10505.0", features = ["bundled", "vtab", "vtab-arrow", "vscalar", "r2d2"] }
 r2d2 = "0.8"
 flate2 = "1"
 prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.7.0", default-features = false, features = ["download"] }
@@ -28,7 +28,7 @@ rocksdb = { version = "0.24", default-features = false, features = ["zstd"] }
 
 [dev-dependencies]
 assert_cmd = "2"
-duckdb = { version = "1.10502.0", features = ["bundled"] }
+duckdb = { version = "1.10505.0", features = ["bundled"] }
 predicates = "3"
 tempfile = "3"
 tower = "0.5"
