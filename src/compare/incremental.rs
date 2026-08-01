@@ -25,8 +25,8 @@ pub fn recompute_cell_in_txn(
             } else {
                 ("egib_buildings", "id_budynku", "egib_unmatched")
             };
-            let cx = cell_x_sql("ST_Centroid(b.geom)");
-            let cy = cell_y_sql("ST_Centroid(b.geom)");
+            let cx = cell_x_sql("b.centroid");
+            let cy = cell_y_sql("b.centroid");
             let select = format!("b.{id}, b.geom, {cx}, {cy}, now()");
             // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
             // closed on all four cell edges, so a centroid exactly on a
@@ -118,8 +118,10 @@ mod tests {
             "SET geometry_always_xy = true".to_string(),
         ];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
-        c.execute_batch("CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);")
-            .unwrap();
+        c.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);",
+        )
+        .unwrap();
         c
     }
 
@@ -128,9 +130,10 @@ mod tests {
         let c = conn();
         // Two buildings in different z14 cells, neither matched.
         c.execute_batch(
-            "INSERT INTO bdot10k_buildings VALUES
+            "INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('p', ST_MakeEnvelope(21.0,52.0,21.001,52.001)),
-                 ('q', ST_MakeEnvelope(19.0,50.0,19.001,50.001));",
+                 ('q', ST_MakeEnvelope(19.0,50.0,19.001,50.001));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
         let (px, py) = lonlat_to_tile(21.0005, 52.0005, CHANGE_CELL_ZOOM);
@@ -186,7 +189,8 @@ mod tests {
         // min_lon (same tile_to_bbox formula, same float bits) -- exactly the
         // closed-edge ambiguity the cell-tag guard exists to resolve.
         c.execute_batch(&format!(
-            "INSERT INTO bdot10k_buildings VALUES ('boundary', ST_Point({boundary_lon}, {mid_lat}));"
+            "INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES ('boundary', ST_Point({boundary_lon}, {mid_lat}));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);"
         ))
         .unwrap();
 
