@@ -8,8 +8,8 @@ use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql};
 pub fn enqueue_all(conn: &Connection) -> Result<i64> {
     let z = CHANGE_CELL_ZOOM;
     let specs = [
-        ("bdot10k", "bdot10k_buildings", "ST_Centroid(geom)"),
-        ("egib", "egib_buildings", "ST_Centroid(geom)"),
+        ("bdot10k", "bdot10k_buildings", "centroid"),
+        ("egib", "egib_buildings", "centroid"),
         ("prg", "prg_addresses", "geom"),
     ];
     let mut total = 0i64;
@@ -52,11 +52,12 @@ mod tests {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (lokalny_id VARCHAR, geom GEOMETRY);
-             INSERT INTO bdot10k_buildings VALUES ('a', ST_MakeEnvelope(21.0,52.0,21.001,52.001));
-             INSERT INTO prg_addresses VALUES ('p', ST_Point(19.0,50.0));",
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES ('a', ST_MakeEnvelope(21.0,52.0,21.001,52.001));
+             INSERT INTO prg_addresses VALUES ('p', ST_Point(19.0,50.0));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
         let n = enqueue_all(&c).unwrap();
@@ -81,14 +82,14 @@ mod tests {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (lokalny_id VARCHAR, geom GEOMETRY);
 
              -- Three bdot10k buildings inside ONE z14 cell (cells are ~0.022
              -- deg wide here, so these cannot straddle a boundary), plus one
              -- far away: 2 distinct cells, not 4 rows.
-             INSERT INTO bdot10k_buildings VALUES
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('a', ST_MakeEnvelope(21.0000,52.0000,21.0005,52.0005)),
                  ('b', ST_MakeEnvelope(21.0006,52.0006,21.0010,52.0010)),
                  ('c', ST_MakeEnvelope(21.0011,52.0011,21.0015,52.0015)),
@@ -96,9 +97,9 @@ mod tests {
                  -- NULL geometry must be skipped, not counted or crashed on.
                  ('nogeom', NULL);
 
-             -- egib goes through the same ST_Centroid path as bdot10k; two
-             -- buildings in one cell plus a NULL.
-             INSERT INTO egib_buildings VALUES
+             -- egib goes through the same stored-centroid path as bdot10k;
+             -- two buildings in one cell plus a NULL.
+             INSERT INTO egib_buildings (id_budynku, geom) VALUES
                  ('e1', ST_MakeEnvelope(22.0000,53.0000,22.0005,53.0005)),
                  ('e2', ST_MakeEnvelope(22.0006,53.0006,22.0010,53.0010)),
                  ('e_nogeom', NULL);
@@ -107,7 +108,10 @@ mod tests {
              INSERT INTO prg_addresses VALUES
                  ('p1', ST_Point(23.0000,54.0000)),
                  ('p2', ST_Point(23.0005,54.0005)),
-                 ('p_nogeom', NULL);",
+                 ('p_nogeom', NULL);
+
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             UPDATE egib_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
 
@@ -156,10 +160,11 @@ mod tests {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
-             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (lokalny_id VARCHAR, geom GEOMETRY);
-             INSERT INTO bdot10k_buildings VALUES ('a', ST_MakeEnvelope(21.0,52.0,21.001,52.001));
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES ('a', ST_MakeEnvelope(21.0,52.0,21.001,52.001));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
              -- A pre-existing, unrelated dirty-cell row for the same source,
              -- as if an OSM update had enqueued it moments earlier.
              INSERT INTO match_dirty_cells VALUES ('bdot10k', 14, 1, 1, now());",
