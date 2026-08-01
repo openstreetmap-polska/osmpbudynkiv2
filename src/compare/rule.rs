@@ -30,16 +30,24 @@ pub fn buffer(b: Bounds, deg: f64) -> Bounds {
 /// by any osm_buildings polygon (osm filtered to `area` for the R-tree scan —
 /// no buffer needed: any polygon containing an in-`area` point has a bbox that
 /// intersects `area`).
+///
+/// `source_table` must carry a `centroid GEOMETRY` column (bdot10k_buildings
+/// and egib_buildings both do — see `DatasetSpec::with_centroid_select`).
+/// Reading the stored column instead of computing `ST_Centroid(b.geom)` here
+/// is the fix for the full-table-scan bottleneck in
+/// docs/per_cell_recompute_full_scan.md: an RTREE index cannot be used
+/// through a function wrapped around the indexed column, but it can be used
+/// against a plain column reference.
 pub fn unmatched_buildings_sql(source_table: &str, select_list: &str, area: Bounds) -> String {
     let (x1, y1, x2, y2) = area;
     format!(
         "SELECT {select_list}
          FROM {source_table} b
-         WHERE ST_Intersects(ST_Centroid(b.geom), ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+         WHERE ST_Intersects(b.centroid, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
            AND NOT EXISTS (
                SELECT 1 FROM osm_buildings osm
                WHERE ST_Intersects(osm.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-                 AND ST_Contains(osm.geom, ST_Centroid(b.geom))
+                 AND ST_Contains(osm.geom, b.centroid)
            )"
     )
 }
@@ -85,7 +93,7 @@ mod tests {
         ];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bsrc (LOKALNYID VARCHAR, geom GEOMETRY);
+            "CREATE TABLE bsrc (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE asrc (lokalny_id VARCHAR, numer_porzadkowy VARCHAR, geom GEOMETRY);",
         )
         .unwrap();
@@ -98,8 +106,10 @@ mod tests {
         c.execute_batch(
             "INSERT INTO osm_buildings VALUES
                  (1,'way',NULL, ST_MakeEnvelope(20.0,52.0,20.002,52.002));
-             INSERT INTO bsrc VALUES ('in', ST_MakeEnvelope(20.0005,52.0005,20.0007,52.0007));
-             INSERT INTO bsrc VALUES ('out', ST_MakeEnvelope(21.0,52.0,21.001,52.001));",
+             INSERT INTO bsrc (LOKALNYID, geom) VALUES
+                 ('in', ST_MakeEnvelope(20.0005,52.0005,20.0007,52.0007)),
+                 ('out', ST_MakeEnvelope(21.0,52.0,21.001,52.001));
+             UPDATE bsrc SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
         let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0));
@@ -114,6 +124,38 @@ mod tests {
             ids,
             vec!["out".to_string()],
             "only the uncontained building is unmatched"
+        );
+    }
+
+    /// The actual regression guard for the per-cell-recompute fix
+    /// (docs/per_cell_recompute_full_scan.md): if `unmatched_buildings_sql`
+    /// ever goes back to wrapping the indexed column in `ST_Centroid()`, this
+    /// fails, because an RTREE index cannot be used through a function
+    /// applied to the indexed column.
+    #[test]
+    fn unmatched_buildings_predicate_uses_the_centroid_rtree_index() {
+        let c = conn();
+        c.execute_batch(
+            "CREATE INDEX bsrc_centroid_idx ON bsrc USING RTREE (centroid);
+             INSERT INTO bsrc (LOKALNYID, geom)
+                 SELECT 'b' || i,
+                        ST_MakeEnvelope(20.0 + i * 0.0001, 52.0,
+                                        20.0 + i * 0.0001 + 0.00005, 52.00005)
+                 FROM range(20000) t(i);
+             UPDATE bsrc SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+
+        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (20.5, 52.0, 20.6, 52.1));
+        let mut stmt = c.prepare(&format!("EXPLAIN {sql}")).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut plan = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
+        }
+        assert!(
+            plan.contains("RTREE_INDEX_SCAN"),
+            "the predicate must be able to use the centroid RTREE index, got plan: {plan}"
         );
     }
 
