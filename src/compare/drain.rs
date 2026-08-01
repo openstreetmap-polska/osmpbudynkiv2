@@ -108,8 +108,10 @@ mod tests {
             "LOAD icu".to_string(),
         ];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
-        c.execute_batch("CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);")
-            .unwrap();
+        c.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);",
+        )
+        .unwrap();
         c
     }
 
