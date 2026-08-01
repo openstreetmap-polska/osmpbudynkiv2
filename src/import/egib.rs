@@ -21,8 +21,7 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
          ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom \
          FROM '{parquet_path}'"
     );
-    let select =
-        crate::dataset::EGIB.with_centroid_select(&crate::dataset::hashed_select(&inner));
+    let select = crate::dataset::EGIB.with_centroid_select(&crate::dataset::hashed_select(&inner));
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS {target_table};
          CREATE TABLE {target_table} AS {select};"
