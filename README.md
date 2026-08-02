@@ -250,6 +250,25 @@ curl 'http://127.0.0.1:3000/updates?minutes=1440'
 
 A periodic OSM update job runs in the background. A web map is planned — see the feature roadmap above.
 
+### Street name mappings
+
+PRG publishes abbreviated street names (`gen. Kruka`); OSM Poland uses expanded
+ones (`Generała Kruka`). `mappings/street_names_mappings.csv` maps between them
+and is applied to `addr:street` when `/package` builds its response, so
+downloaded data is importable without hand-editing.
+
+Load it with:
+
+    cargo run -- import street-mappings --file mappings/street_names_mappings.csv
+
+A row with an empty `teryt_simc_code` applies nationwide; one with a code
+applies only to that settlement and overrides the nationwide row. Lookup is
+case-insensitive. The file is optional — without it, names are served exactly
+as PRG publishes them.
+
+To propose a change, edit the CSV and open a PR; `cargo test --test
+street_mappings_file` checks its structure.
+
 ## Development
 
 ```bash
