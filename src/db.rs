@@ -145,6 +145,18 @@ fn create_schema(conn: &Connection) -> Result<()> {
             computed_at TIMESTAMP WITH TIME ZONE
         );
 
+        -- Curated PRG -> OSM street-name expansions, applied by
+        -- server/package.rs when building addr:street. A row with a NULL
+        -- teryt_simc_code is a global rule; a non-NULL one scopes the rule to
+        -- that settlement and takes priority. Populated from
+        -- mappings/street_names_mappings.csv; an empty table is a valid state
+        -- and simply means names are served exactly as PRG publishes them.
+        CREATE TABLE IF NOT EXISTS street_name_mappings (
+            teryt_simc_code VARCHAR,
+            prg_street_name VARCHAR,
+            osm_street_name VARCHAR
+        );
+
         -- Dirty-cell queue drained by the match_refresh job. Duplicates allowed
         -- (deduped on drain). source is 'bdot10k'|'egib'|'prg'; an OSM building
         -- edit enqueues bdot10k+egib, an OSM address edit enqueues prg.

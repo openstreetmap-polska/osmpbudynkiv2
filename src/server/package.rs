@@ -327,6 +327,12 @@ pub fn feature(
 /// PRG addresses in the request area that are unmatched against OSM.
 /// Matching is precomputed upstream (see src/compare/) into `prg_unmatched`;
 /// this is a plain spatial read of that serving table clipped to the polygon.
+/// `addr:street` is resolved through `street_name_mappings` here — the only
+/// place PRG street names reach the outside world. The COALESCE chain *is* the
+/// priority rule: settlement row, then global row, then the raw PRG name, so
+/// an empty mapping table degrades to serving names verbatim rather than
+/// erroring. Matching never reads street names (see compare::addresses), so
+/// this cannot change which addresses are unmatched.
 pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<AddressRow>> {
     let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
     // Envelope bounds are validated finite f64s (parsed and range-checked by
@@ -336,9 +342,16 @@ pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<
     // The polygon itself stays a bound parameter (`?`), since it is
     // arbitrary-length user-supplied geometry, not a handful of numbers.
     let sql = format!(
-        "SELECT ST_AsGeoJSON(a.geom), a.numer_porzadkowy, a.ulica, a.miejscowosc,
-                a.kod_pocztowy, a.teryt_miejscowosc
+        "SELECT ST_AsGeoJSON(a.geom), a.numer_porzadkowy,
+                COALESCE(loc.osm_street_name, gl.osm_street_name, a.ulica),
+                a.miejscowosc, a.kod_pocztowy, a.teryt_miejscowosc
          FROM prg_unmatched a
+         LEFT JOIN street_name_mappings loc
+                ON lower(trim(loc.prg_street_name)) = lower(trim(a.ulica))
+               AND loc.teryt_simc_code = a.teryt_miejscowosc
+         LEFT JOIN street_name_mappings gl
+                ON lower(trim(gl.prg_street_name)) = lower(trim(a.ulica))
+               AND gl.teryt_simc_code IS NULL
          WHERE ST_Intersects(a.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
            AND ST_Intersects(a.geom, ST_GeomFromGeoJSON(?))"
     );
@@ -660,6 +673,87 @@ mod tests {
         assert!(geoms[0].contains("\"Polygon\""));
     }
 
+    /// Seed one unmatched address whose street is the abbreviated PRG form.
+    fn seed_abbreviated_address(conn: &duckdb::Connection) {
+        conn.execute_batch(
+            "INSERT INTO prg_unmatched
+                 (lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy,
+                  teryt_miejscowosc, geom, cell_x, cell_y, computed_at)
+             VALUES ('a1', '12', 'gen. Kruka', 'Kock', '21-150', '0956069',
+                     ST_Point(21.001, 52.201), 8000, 4900, now());",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn street_is_returned_raw_when_no_mapping_is_loaded() {
+        let conn = setup_db();
+        seed_abbreviated_address(&conn);
+        let rows = unmatched_addresses(&conn, &test_area()).unwrap();
+        assert_eq!(rows[0].street.as_deref(), Some("gen. Kruka"));
+    }
+
+    #[test]
+    fn global_mapping_row_rewrites_the_street() {
+        let conn = setup_db();
+        seed_abbreviated_address(&conn);
+        conn.execute_batch(
+            "INSERT INTO street_name_mappings VALUES (NULL, 'gen. Kruka', 'Generała Kruka');",
+        )
+        .unwrap();
+        let rows = unmatched_addresses(&conn, &test_area()).unwrap();
+        assert_eq!(rows[0].street.as_deref(), Some("Generała Kruka"));
+    }
+
+    #[test]
+    fn settlement_mapping_row_beats_the_global_row() {
+        let conn = setup_db();
+        seed_abbreviated_address(&conn);
+        conn.execute_batch(
+            "INSERT INTO street_name_mappings VALUES
+                 (NULL, 'gen. Kruka', 'Generała Kruka'),
+                 ('0956069', 'gen. Kruka', 'Generała Michała Heydenreicha \"Kruka\"');",
+        )
+        .unwrap();
+        let rows = unmatched_addresses(&conn, &test_area()).unwrap();
+        assert_eq!(
+            rows[0].street.as_deref(),
+            Some("Generała Michała Heydenreicha \"Kruka\"")
+        );
+    }
+
+    /// PRG has re-capitalised its leading tokens once already; an exact match
+    /// would silently stop rewriting instead of failing loudly.
+    #[test]
+    fn lookup_ignores_case_and_surrounding_whitespace() {
+        let conn = setup_db();
+        conn.execute_batch(
+            "INSERT INTO prg_unmatched
+                 (lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy,
+                  teryt_miejscowosc, geom, cell_x, cell_y, computed_at)
+             VALUES ('a1', '12', '  Gen. Kruka ', 'Kock', '21-150', '0956069',
+                     ST_Point(21.001, 52.201), 8000, 4900, now());
+             INSERT INTO street_name_mappings VALUES (NULL, 'gen. Kruka', 'Generała Kruka');",
+        )
+        .unwrap();
+        let rows = unmatched_addresses(&conn, &test_area()).unwrap();
+        assert_eq!(rows[0].street.as_deref(), Some("Generała Kruka"));
+    }
+
+    /// A settlement row must not leak into a different settlement.
+    #[test]
+    fn settlement_row_does_not_apply_to_another_settlement() {
+        let conn = setup_db();
+        seed_abbreviated_address(&conn);
+        conn.execute_batch(
+            "INSERT INTO street_name_mappings VALUES
+                 ('9999999', 'gen. Kruka', 'Generała Someone Else');",
+        )
+        .unwrap();
+        let rows = unmatched_addresses(&conn, &test_area()).unwrap();
+        assert_eq!(rows[0].street.as_deref(), Some("gen. Kruka"));
+    }
+
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -684,6 +778,11 @@ mod tests {
         CREATE TABLE egib_unmatched (
             id_budynku VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
             computed_at TIMESTAMP WITH TIME ZONE);
+
+        CREATE TABLE street_name_mappings (
+            teryt_simc_code VARCHAR,
+            prg_street_name VARCHAR,
+            osm_street_name VARCHAR);
 
         INSERT INTO prg_unmatched VALUES
             ('a1', '12', 'Marszałkowska', 'Warszawa', '00-590', '0918123',
@@ -1064,6 +1163,33 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&logged_geojson).unwrap();
         assert_eq!(parsed["type"], "Polygon");
         assert_eq!(parsed["coordinates"][0].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn package_response_serves_the_expanded_street_name() {
+        let state = make_seeded_state();
+        {
+            let conn = state.pool.get().unwrap();
+            conn.execute_batch(
+                "UPDATE prg_unmatched SET ulica = 'gen. Kruka' WHERE lokalny_id = 'a1';
+                 INSERT INTO street_name_mappings VALUES (NULL, 'gen. Kruka', 'Generała Kruka');",
+            )
+            .unwrap();
+        }
+        let app = package_app(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21&datasets=prg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let feature = &json["features"][0];
+        assert_eq!(feature["properties"]["addr:street"], "Generała Kruka");
     }
 
     #[test]

@@ -56,6 +56,20 @@ Note: Both `duckdb` and `rocksdb` dependencies use bundled C++ compilation, so n
 
 **Gotcha — serving tables store rows, not id references.** `*_unmatched` tables copy the columns needed to render a feature (geometry, tags, `cell_x`/`cell_y`, `computed_at`) instead of pointing back at the source table by id or rowid. BDOT10k's `LOKALNYID` isn't unique, and DuckDB rowids aren't stable across the DELETE+INSERT that every recompute (and every refresh) does — so id/rowid references would go stale silently. Recompute is always DELETE-then-INSERT for the affected cell, never an in-place UPDATE.
 
+**Gotcha — street-name mapping is serving-time only.** `street_name_mappings`
+(loaded from `mappings/street_names_mappings.csv`) is applied in exactly one
+place: the `COALESCE(loc, gl, a.ulica)` chain in
+`server::package::unmatched_addresses`. It rewrites `addr:street` on the way
+out and nothing else — `compare::addresses` joins on housenumber and a grid
+key and never reads street names, so a mapping change can never alter which
+addresses are unmatched, and needs no `compare`, reconcile or drain. `/tiles`
+is unaffected (its address layer emits no street). Lookup is
+`lower(trim(...))` on both sides and priority is settlement row → global row
+(NULL `teryt_simc_code`) → raw name, so an empty table serves PRG names
+verbatim instead of failing. Note `make_seeded_state` in `server/package.rs`
+builds its tables from a local `SEED` constant rather than `create_schema` —
+a new serving table has to be added in both places.
+
 **Gotcha — invalid government geometry is dropped, not repaired.** A small number of BDOT10k/EGIB rows have topologically invalid geometry (`ST_IsValid = false`), which crashes `ST_AsMVTGeom` and takes down the whole tile (see `docs/invalid_geometry_tile_500s.md`). `dataset::filter_invalid_geometry` deletes those rows immediately after `import::bdot10k::load_into` / `import::egib::load_into` create their table — the one place both `import` and `update`'s staging load funnel through — so `compare::buildings` and `compare::incremental` never see them and need no changes of their own. `import()` and `update::dataset::refresh()` each self-report their outcome (including any skipped-row summary) to the `job_run_log` table via the `job_log` module, under job names `import:<source>` / `update:<source>`; `/status` reads it back as `job_run_log`. Invalid-geometry filtering is bdot10k/egib-only — PRG's loader was never given a `filter_invalid_geometry` call. `job_run_log` reporting has wider reach, though: PRG's `update_prg` shares the same `refresh()` that self-reports, so `update:prg` also appears in `job_run_log` (with no skip-count clause, since PRG performs no filtering). `import:prg` does not report, since PRG's import path never goes through `refresh()`. A government refresh whose ETag is unchanged returns early via `record_noop_refresh` (`src/update/mod.rs:38`/`:63`/`:88`), before `dataset::refresh` — and its self-report — ever runs, so that job's `job_run_log` entry is left untouched from its last real run. Because no-op refreshes are the common case, `job_run_log["update:<source>"].ran_at` can be days older than the corresponding `jobs[].last_finished_at` for the same job without indicating anything is wrong.
 
 **Gotcha — dirty-queue source strings must match everywhere.** `match_dirty_cells.source` is a plain string (`"bdot10k"` / `"egib"` / `"prg"`), not an enum, and every producer must spell it identically: the government refresh's `spec.name` (defined in `src/dataset.rs`; enqueued at the call site in `update::changeset::insert_dirty_cells`, `src/update/changeset.rs`), the OSM update's flush (`src/update/dirty_cells.rs`), `compare reconcile` (`src/compare/reconcile.rs`), and the drain's dispatch in `recompute_cell_in_txn` (`src/compare/incremental.rs`). A mismatched string silently orphans that source's dirty cells — enqueued but never drained.

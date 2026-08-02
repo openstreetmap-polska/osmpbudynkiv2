@@ -459,6 +459,10 @@ mod tests {
              CREATE TABLE egib_unmatched (
                  id_budynku VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
                  computed_at TIMESTAMP WITH TIME ZONE);
+             CREATE TABLE street_name_mappings (
+                 teryt_simc_code VARCHAR,
+                 prg_street_name VARCHAR,
+                 osm_street_name VARCHAR);
              CREATE TABLE package_exports (
                 exported_at TIMESTAMP WITH TIME ZONE,
                 area GEOMETRY('epsg:4326'),
