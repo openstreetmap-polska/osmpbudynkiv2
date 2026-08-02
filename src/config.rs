@@ -248,6 +248,7 @@ pub struct DownloadUrls {
     pub egib: String,
     pub prg: String,
     pub osm_replication: String,
+    pub street_mappings: String,
 }
 
 impl Default for Config {
@@ -307,6 +308,9 @@ impl Default for DownloadUrls {
                 .to_string(),
             osm_replication:
                 "https://download.openstreetmap.fr/replication/europe/poland/minute".to_string(),
+            street_mappings:
+                "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/street_names_mappings.csv"
+                    .to_string(),
         }
     }
 }
@@ -691,6 +695,28 @@ timeout_seconds = 300
         // Unrelated jobs keep their defaults.
         assert!(config.jobs.egib_update.enabled);
         assert_eq!(config.jobs.egib_update.interval_seconds, 86400);
+    }
+
+    #[test]
+    fn street_mappings_url_defaults_to_this_repo() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.download_urls.street_mappings,
+            "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/street_names_mappings.csv"
+        );
+    }
+
+    #[test]
+    fn street_mappings_url_can_be_overridden() {
+        let toml = r#"
+[download_urls]
+street_mappings = "https://example.test/m.csv"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.download_urls.street_mappings,
+            "https://example.test/m.csv"
+        );
     }
 
     #[test]

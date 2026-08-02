@@ -37,9 +37,20 @@ pub fn run(
             )?;
             stamp_row_hash_version(conn)
         }
-        ImportSource::StreetMappings { file } => {
-            let path =
-                file.ok_or_else(|| anyhow::anyhow!("import street-mappings requires --file"))?;
+        ImportSource::StreetMappings { file, url } => {
+            let downloaded;
+            let path = match file {
+                Some(p) => p,
+                None => {
+                    let src = url.as_deref().unwrap_or(&urls.street_mappings);
+                    downloaded = crate::download::download_file_as(
+                        src,
+                        &config.download_dir(),
+                        "street_names_mappings.csv",
+                    )?;
+                    downloaded
+                }
+            };
             let outcome = crate::mappings::load_from_path(conn, &path);
             match &outcome {
                 Ok(stats) => {

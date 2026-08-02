@@ -110,6 +110,9 @@ pub enum ImportSource {
         /// Path to a local mapping CSV (skips download)
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Override the configured download URL
+        #[arg(long)]
+        url: Option<String>,
     },
     /// Run all imports in sequence (OSM, BDOT10k, EGIB, PRG)
     Full {
