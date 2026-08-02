@@ -34,7 +34,10 @@ fn rows() -> Vec<Vec<String>> {
         header, "teryt_simc_code,prg_street_name,osm_street_name",
         "unexpected header"
     );
-    lines.filter(|l| !l.is_empty()).map(split_csv_line).collect()
+    lines
+        .filter(|l| !l.is_empty())
+        .map(split_csv_line)
+        .collect()
 }
 
 #[test]
@@ -50,7 +53,13 @@ fn every_row_has_three_fields_and_a_non_empty_mapping() {
 fn no_field_has_leading_or_trailing_whitespace() {
     for (i, r) in rows().iter().enumerate() {
         for (col, v) in r.iter().enumerate() {
-            assert_eq!(v.trim(), v, "row {} col {} is not trimmed: {v:?}", i + 2, col);
+            assert_eq!(
+                v.trim(),
+                v,
+                "row {} col {} is not trimmed: {v:?}",
+                i + 2,
+                col
+            );
         }
     }
 }
