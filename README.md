@@ -26,6 +26,7 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] Vector tile endpoint `/tiles/{z}/{x}/{y}` (MVT; zoom 14 only) — serves the precomputed `*_unmatched` tables (unmatched government objects, not raw datasets)
 - [x] GeoJSON data package endpoint `GET/POST /package` — reads the precomputed `*_unmatched` tables, OSM-ready tags for direct JOSM import (bbox in GET, polygon in POST)
 - [x] `GET /updates` — recent `/package` export activity as a GeoJSON `FeatureCollection`, browser-cacheable for 60 seconds (`?minutes=`, default 60, capped at 1440)
+- [x] Street name corrections for addresses to match the osm conventions
 
 ## Not yet implemented
 
@@ -33,8 +34,8 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [ ] Web map frontend for browsing data status and downloading packages
 - [ ] Endpoint for reporting records to exclude (bad source data, comparison mismatches)
 - [ ] Random location endpoint (jump to an area with data to review)
-- [ ] Street name corrections for addresses to match the osm conventions
 - [ ] Mappings of building types in egib/bdot10k to osm tags
+- [ ] Ignore buildings that are map as no longer existing or ruins
 
 ## Building
 
