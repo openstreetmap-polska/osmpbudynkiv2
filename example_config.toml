@@ -194,6 +194,21 @@ enabled = false
 interval_seconds = 86400
 timeout_seconds = 1800
 
+# Re-downloads the curated street-name mapping file and reloads it. A HEAD
+# request compares the ETag against the last load, so a daily poll costs one
+# round-trip when the file has not changed.
+#
+# Disabled by default: the mapping ships in the binary's repository and most
+# deployments will load it once via `import street-mappings`. Enable this only
+# if you want a running instance to pick up mapping PRs without a redeploy.
+#
+# Unlike the dataset refreshes this enqueues no dirty cells and triggers no
+# recompute -- the mapping is applied when /package builds its response.
+[jobs.street_mappings_update]
+enabled = false
+interval_seconds = 86400
+timeout_seconds = 300
+
 # GeoJSON data package endpoint (GET/POST /package, served by the `run` subcommand).
 [package]
 # Maximum allowed area of a request's bounding box, in square degrees.

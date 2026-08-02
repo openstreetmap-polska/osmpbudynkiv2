@@ -201,6 +201,7 @@ pub struct JobsConfig {
     pub prg_update: JobConfig,
     pub match_refresh: MatchRefreshConfig,
     pub match_reconcile: MatchReconcileConfig,
+    pub street_mappings_update: JobConfig,
 }
 
 impl Default for JobsConfig {
@@ -221,6 +222,11 @@ impl Default for JobsConfig {
             prg_update: daily(7200),
             match_refresh: MatchRefreshConfig::default(),
             match_reconcile: MatchReconcileConfig::default(),
+            street_mappings_update: JobConfig {
+                enabled: false,
+                interval_seconds: 86400,
+                timeout_seconds: 300,
+            },
         }
     }
 }
@@ -672,6 +678,13 @@ max_minutes = 720
         assert!(config.jobs.prg_update.enabled);
         assert_eq!(config.jobs.prg_update.interval_seconds, 86400);
         assert_eq!(config.jobs.prg_update.timeout_seconds, 7200);
+    }
+
+    #[test]
+    fn street_mappings_job_is_disabled_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.jobs.street_mappings_update.enabled);
+        assert_eq!(cfg.jobs.street_mappings_update.interval_seconds, 86400);
     }
 
     #[test]

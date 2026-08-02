@@ -12,6 +12,7 @@ pub mod match_reconcile;
 pub mod match_refresh;
 pub mod osm_update;
 pub mod status_handler;
+pub mod street_mappings_update;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
