@@ -6,6 +6,7 @@ mod db;
 mod download;
 mod import;
 mod job_log;
+mod mappings;
 mod osm;
 mod server;
 mod shutdown;
