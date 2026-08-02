@@ -5,6 +5,7 @@ pub mod prg;
 
 use anyhow::Result;
 use duckdb::Connection;
+use tracing::{info, warn};
 
 use crate::cli::ImportSource;
 use crate::config::{Config, DownloadUrls};
@@ -39,18 +40,35 @@ pub fn run(
         }
         ImportSource::StreetMappings { file, url } => {
             let outcome = (|| -> Result<crate::mappings::LoadStats> {
-                let path = match file {
-                    Some(p) => p,
+                let (path, was_downloaded) = match file {
+                    Some(p) => (p, false),
                     None => {
                         let src = url.as_deref().unwrap_or(&urls.street_mappings);
-                        crate::download::download_file_as(
+                        let downloaded = crate::download::download_file_as(
                             src,
                             &config.download_dir(),
                             "street_names_mappings.csv",
-                        )?
+                        )?;
+                        (downloaded, true)
                     }
                 };
-                crate::mappings::load_from_path(conn, &path)
+                let stats = crate::mappings::load_from_path(conn, &path)?;
+
+                if was_downloaded {
+                    if config.cleanup_downloaded_files {
+                        info!(path = %path.display(), "Cleaning up downloaded file");
+                        let _ = std::fs::remove_file(&path);
+                    } else {
+                        warn!(
+                            path = %path.display(),
+                            "cleanup_downloaded_files is false; leaving downloaded file in place \
+                             (it will be reused on the next run since download_file_as skips \
+                             re-downloading an existing destination)"
+                        );
+                    }
+                }
+
+                Ok(stats)
             })();
             match &outcome {
                 Ok(stats) => {
