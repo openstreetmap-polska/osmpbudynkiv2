@@ -37,6 +37,34 @@ pub fn run(
             )?;
             stamp_row_hash_version(conn)
         }
+        ImportSource::StreetMappings { file } => {
+            let path =
+                file.ok_or_else(|| anyhow::anyhow!("import street-mappings requires --file"))?;
+            let outcome = crate::mappings::load_from_path(conn, &path);
+            match &outcome {
+                Ok(stats) => {
+                    let msg = format!(
+                        "loaded {} mapping rows ({} not present in current PRG data)",
+                        stats.rows_loaded, stats.rows_absent_from_prg
+                    );
+                    let _ = crate::job_log::record(
+                        conn,
+                        "import:street-mappings",
+                        "Success",
+                        Some(&msg),
+                    );
+                }
+                Err(e) => {
+                    let _ = crate::job_log::record(
+                        conn,
+                        "import:street-mappings",
+                        "Error",
+                        Some(&format!("{e:#}")),
+                    );
+                }
+            }
+            outcome.map(|_| ())
+        }
         ImportSource::Full {
             osm_file,
             bdot10k_file,

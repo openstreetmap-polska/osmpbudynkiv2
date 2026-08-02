@@ -105,6 +105,12 @@ pub enum ImportSource {
         #[arg(long)]
         terc_file: Option<PathBuf>,
     },
+    /// Import the curated PRG -> OSM street name mappings from CSV
+    StreetMappings {
+        /// Path to a local mapping CSV (skips download)
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
     /// Run all imports in sequence (OSM, BDOT10k, EGIB, PRG)
     Full {
         /// Path to local OSM PBF file (skips download)

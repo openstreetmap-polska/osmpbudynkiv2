@@ -22,7 +22,6 @@ const STAGING_TABLE: &str = "street_name_mappings__staging";
 
 /// Outcome of one successful load.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct LoadStats {
     pub rows_loaded: usize,
     /// Rows whose `prg_street_name` appears nowhere in `prg_addresses.ulica`.
@@ -33,7 +32,6 @@ pub struct LoadStats {
 }
 
 /// Replace the contents of `street_name_mappings` with the rows in `path`.
-#[allow(dead_code)]
 pub fn load_from_path(conn: &Connection, path: &Path) -> Result<LoadStats> {
     let path_str = path
         .to_str()
