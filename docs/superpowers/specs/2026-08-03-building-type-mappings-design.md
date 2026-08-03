@@ -403,10 +403,20 @@ Each step is independently shippable and verifiable.
    through `compare`, add the letter table and EGIB's `nb`/`cnt` CTEs. Larger
    volume and lower confidence than BDOT10k, so it is worth its own reviewable
    change. Needs an `import egib` re-run to populate `rodzaj_kod`.
-6. **`building:levels`.** Independent of everything above and the largest win
-   per line of code, but blocked on the open item: BDOT10k has a single
-   `LICZBAKONDYGNACJI` while OSM's `building:levels` counts above-ground
-   storeys only. Confirm against the XSD before emitting.
+6. **`building:levels`.** Implemented. The blocking question — whether
+   BDOT10k's `LICZBAKONDYGNACJI` counts above-ground storeys only, matching
+   OSM's `building:levels` — is resolved: GUGiK's official BDOT10k/BDOO
+   object catalogue defines it as "liczba nadziemnych kondygnacji budynku"
+   (above-ground only), the same thing EGIB's `kondygnacje_nadziemne` already
+   names explicitly. No unit conversion needed on either source. Read
+   straight off `pkg.liczba_kondygnacji` / `pkg.kondygnacje_nadziemne` in the
+   same serve query as the mapping lookup (not through the CSV's `tags`
+   column: that string is fixed per mapping *class*, while the storey count
+   is a measured per-*building* value that must survive even when no mapping
+   row matches) and layered on by `server::package::with_building_levels`.
+   `0` ("budynek nie posiada kondygnacji") and a missing value both emit
+   nothing, the same as `building_tags`'s `None` case falling back to
+   `building=yes` rather than asserting something the source didn't state.
 
 Both CSV files ship as committed. The earlier plan deferred
 `egib_building_types.csv`'s two 1–2 storey `m` rows, because with a stored

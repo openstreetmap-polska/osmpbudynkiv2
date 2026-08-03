@@ -314,6 +314,37 @@ pub fn building_tags(resolved: Option<&str>) -> BTreeMap<String, String> {
     tags
 }
 
+/// Insert `building:levels` from a source's above-ground storey count.
+///
+/// Both BDOT10k's `LICZBAKONDYGNACJI` and EGIB's `kondygnacje_nadziemne`
+/// count above-ground storeys only -- confirmed against GUGiK's official
+/// BDOT10k/BDOO object catalogue ("liczba nadziemnych kondygnacji budynku"),
+/// which is exactly what OSM's `building:levels` counts, so the value is
+/// emitted as-is with no unit conversion.
+///
+/// Deliberately not part of the CSV-resolved `tags` string `building_tags`
+/// renders: the mapping table's `tags` column is a fixed set of `k=v` pairs
+/// *per class* (every building matching a given key gets the same string),
+/// while the storey count is a measured value that differs per building and
+/// has to survive even when no mapping row matches (an unmatched building
+/// with a known storey count but an unresolved classification still falls
+/// through to `building=yes`, and should still report its storeys).
+/// `0` ("budynek nie posiada kondygnacji" per the source's own definition)
+/// and a missing value are both treated as nothing to report, the same as a
+/// `None` resolved tags string falling back to `building=yes` rather than
+/// asserting something the source didn't actually state.
+fn with_building_levels(
+    mut tags: BTreeMap<String, String>,
+    levels: Option<i32>,
+) -> BTreeMap<String, String> {
+    if let Some(n) = levels
+        && n >= 1
+    {
+        tags.insert("building:levels".to_string(), n.to_string());
+    }
+    tags
+}
+
 #[derive(Serialize)]
 pub struct Feature {
     #[serde(rename = "type")]
@@ -395,6 +426,17 @@ pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<
     Ok(out)
 }
 
+/// One row from `unmatched_bdot10k_buildings` / `unmatched_egib_buildings`.
+/// `levels` is the source's above-ground storey count (BDOT10k
+/// `liczba_kondygnacji` / EGIB `kondygnacje_nadziemne`), read alongside the
+/// mapping resolution so `build_package` doesn't need a second query --
+/// rendered as `building:levels` by `with_building_levels`.
+pub struct UnmatchedBuildingRow {
+    pub geometry_geojson: String,
+    pub tags: Option<String>,
+    pub levels: Option<i32>,
+}
+
 /// The EGIB `rodzaj_kod` letter adjacency is restricted to -- the `m`
 /// (residential) class, per the design doc's Adjacency section.
 const EGIB_ADJACENCY_KEY: &str = "m";
@@ -408,7 +450,7 @@ const EGIB_ADJACENCY_KEY: &str = "m";
 pub fn unmatched_egib_buildings(
     conn: &Connection,
     area: &RequestArea,
-) -> Result<Vec<(String, Option<String>)>> {
+) -> Result<Vec<UnmatchedBuildingRow>> {
     let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
     let (nx1, ny1, nx2, ny2) = (
         x1 - ADJACENCY_READ_BUFFER_DEG,
@@ -436,7 +478,7 @@ pub fn unmatched_egib_buildings(
               AND ST_Intersects(p.geom, nb.geom)
              GROUP BY p.rid
          )
-         SELECT ST_AsGeoJSON(pkg.geom), t.tags
+         SELECT ST_AsGeoJSON(pkg.geom), t.tags, pkg.kondygnacje_nadziemne
          FROM pkg
          LEFT JOIN cnt USING (rid)
          LEFT JOIN LATERAL (
@@ -457,7 +499,11 @@ pub fn unmatched_egib_buildings(
         .context("Failed to prepare package egib building query")?;
     let rows = stmt
         .query_map([area.polygon_geojson.as_str()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok(UnmatchedBuildingRow {
+                geometry_geojson: row.get(0)?,
+                tags: row.get(1)?,
+                levels: row.get(2)?,
+            })
         })
         .context("Failed to run package egib building query")?;
     let mut out = Vec::new();
@@ -498,7 +544,7 @@ const BDOT10K_ADJACENCY_KEY: &str = "budynek jednorodzinny";
 pub fn unmatched_bdot10k_buildings(
     conn: &Connection,
     area: &RequestArea,
-) -> Result<Vec<(String, Option<String>)>> {
+) -> Result<Vec<UnmatchedBuildingRow>> {
     let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
     let (nx1, ny1, nx2, ny2) = (
         x1 - ADJACENCY_READ_BUFFER_DEG,
@@ -526,7 +572,7 @@ pub fn unmatched_bdot10k_buildings(
               AND ST_Intersects(p.geom, nb.geom)
              GROUP BY p.rid
          )
-         SELECT ST_AsGeoJSON(pkg.geom), t.tags
+         SELECT ST_AsGeoJSON(pkg.geom), t.tags, pkg.liczba_kondygnacji
          FROM pkg
          LEFT JOIN cnt USING (rid)
          LEFT JOIN LATERAL (
@@ -549,7 +595,11 @@ pub fn unmatched_bdot10k_buildings(
         .context("Failed to prepare package bdot10k building query")?;
     let rows = stmt
         .query_map([area.polygon_geojson.as_str()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok(UnmatchedBuildingRow {
+                geometry_geojson: row.get(0)?,
+                tags: row.get(1)?,
+                levels: row.get(2)?,
+            })
         })
         .context("Failed to run package bdot10k building query")?;
     let mut out = Vec::new();
@@ -649,14 +699,18 @@ fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> 
                 }
             }
             Dataset::Bdot10k => {
-                for (geometry, tags) in unmatched_bdot10k_buildings(&conn, area)? {
-                    features.push(feature(geometry, building_tags(tags.as_deref()))?);
+                for row in unmatched_bdot10k_buildings(&conn, area)? {
+                    let properties =
+                        with_building_levels(building_tags(row.tags.as_deref()), row.levels);
+                    features.push(feature(row.geometry_geojson, properties)?);
                     building_count += 1;
                 }
             }
             Dataset::Egib => {
-                for (geometry, tags) in unmatched_egib_buildings(&conn, area)? {
-                    features.push(feature(geometry, building_tags(tags.as_deref()))?);
+                for row in unmatched_egib_buildings(&conn, area)? {
+                    let properties =
+                        with_building_levels(building_tags(row.tags.as_deref()), row.levels);
+                    features.push(feature(row.geometry_geojson, properties)?);
                     building_count += 1;
                 }
             }
@@ -822,7 +876,7 @@ mod tests {
 
         let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].0.contains("\"Polygon\""));
+        assert!(rows[0].geometry_geojson.contains("\"Polygon\""));
     }
 
     /// `unmatched_bdot10k_buildings` tests. `bdot10k_buildings` is the live
@@ -907,7 +961,7 @@ mod tests {
 
             let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1.as_deref(), Some("building=detached"));
+            assert_eq!(rows[0].tags.as_deref(), Some("building=detached"));
         }
 
         /// Two `budynek jednorodzinny` buildings sharing a wall: each has 1
@@ -948,11 +1002,10 @@ mod tests {
                 "building=house",
             );
 
-            let mut rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
-            rows.sort();
+            let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 2);
-            for (_, tags) in &rows {
-                assert_eq!(tags.as_deref(), Some("building=house"));
+            for row in &rows {
+                assert_eq!(row.tags.as_deref(), Some("building=house"));
             }
         }
 
@@ -998,7 +1051,7 @@ mod tests {
             let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(
-                rows[0].1.as_deref(),
+                rows[0].tags.as_deref(),
                 Some("building=detached"),
                 "the adjoining garage must not count as a residential neighbour"
             );
@@ -1050,7 +1103,7 @@ mod tests {
             let rows = unmatched_bdot10k_buildings(&conn, &area).unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(
-                rows[0].1.as_deref(),
+                rows[0].tags.as_deref(),
                 Some("building=house"),
                 "the neighbour just outside the bbox must still be read and counted"
             );
@@ -1091,7 +1144,7 @@ mod tests {
 
             let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1.as_deref(), Some("building=office"));
+            assert_eq!(rows[0].tags.as_deref(), Some("building=office"));
         }
 
         /// Neither tier matches -> resolved tags is None, which
@@ -1121,11 +1174,44 @@ mod tests {
 
             let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1, None);
+            assert_eq!(rows[0].tags, None);
             assert_eq!(
-                building_tags(rows[0].1.as_deref()).get("building").unwrap(),
+                building_tags(rows[0].tags.as_deref())
+                    .get("building")
+                    .unwrap(),
                 "yes"
             );
+        }
+
+        /// `liczba_kondygnacji` is read through unchanged (no unit
+        /// conversion -- confirmed above-ground-only against GUGiK's
+        /// BDOT10k/BDOO object catalogue), and independent of whether a
+        /// mapping row matched.
+        #[test]
+        fn levels_is_read_through_regardless_of_mapping_resolution() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at,
+                      funkcja_szczegolowa, liczba_kondygnacji)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'totally unknown', 4);",
+            )
+            .unwrap();
+
+            let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].tags, None, "no mapping row matches this key");
+            assert_eq!(
+                rows[0].levels,
+                Some(4),
+                "the storey count must come through regardless"
+            );
+            let tags = with_building_levels(building_tags(rows[0].tags.as_deref()), rows[0].levels);
+            assert_eq!(tags.get("building").unwrap(), "yes");
+            assert_eq!(tags.get("building:levels").unwrap(), "4");
         }
 
         /// An empty mapping table (the out-of-the-box state) must not error,
@@ -1145,7 +1231,7 @@ mod tests {
 
             let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1, None);
+            assert_eq!(rows[0].tags, None);
         }
 
         /// A `man_made` pair round-trips through the full query into
@@ -1174,7 +1260,7 @@ mod tests {
 
             let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            let tags = building_tags(rows[0].1.as_deref());
+            let tags = building_tags(rows[0].tags.as_deref());
             assert_eq!(tags.get("building").unwrap(), "silo");
             assert_eq!(tags.get("man_made").unwrap(), "silo");
         }
@@ -1397,6 +1483,35 @@ mod tests {
             "geoportal.gov.pl"
         );
         assert_eq!(features[2]["geometry"]["type"], "Polygon");
+    }
+
+    #[tokio::test]
+    async fn get_package_emits_building_levels_end_to_end() {
+        let state = make_seeded_state();
+        {
+            let conn = state.pool.get().unwrap();
+            conn.execute_batch(
+                "UPDATE bdot10k_unmatched SET liczba_kondygnacji = 3 WHERE lokalnyid = 'b1';
+                 UPDATE egib_unmatched SET kondygnacje_nadziemne = 1 WHERE id_budynku = 'e1';",
+            )
+            .unwrap();
+        }
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/package?bbox=21.0,52.2,21.01,52.21&datasets=bdot10k,egib")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let json = body_json(response).await;
+        let features = json["features"].as_array().unwrap();
+        assert_eq!(features.len(), 2); // b1, e1 -- order Bdot10k, Egib
+        assert_eq!(features[0]["properties"]["building:levels"], "3");
+        assert_eq!(features[1]["properties"]["building:levels"], "1");
     }
 
     #[tokio::test]
@@ -1848,7 +1963,7 @@ mod tests {
 
             let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1.as_deref(), Some("building=apartments"));
+            assert_eq!(rows[0].tags.as_deref(), Some("building=apartments"));
         }
 
         /// 1-2 storeys, isolated (no residential neighbour) -> detached.
@@ -1872,7 +1987,7 @@ mod tests {
 
             let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1.as_deref(), Some("building=detached"));
+            assert_eq!(rows[0].tags.as_deref(), Some("building=detached"));
         }
 
         /// 1-2 storeys, touching another `m` building -> house, not detached.
@@ -1897,7 +2012,7 @@ mod tests {
 
             let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1.as_deref(), Some("building=house"));
+            assert_eq!(rows[0].tags.as_deref(), Some("building=house"));
         }
 
         /// 3 storeys, or an unknown storey count, stays generic residential --
@@ -1919,11 +2034,10 @@ mod tests {
             .unwrap();
             seed_mapping(&conn);
 
-            let mut rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
-            rows.sort();
+            let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 2);
-            for (_, tags) in &rows {
-                assert_eq!(tags.as_deref(), Some("building=residential"));
+            for row in &rows {
+                assert_eq!(row.tags.as_deref(), Some("building=residential"));
             }
         }
 
@@ -1945,7 +2059,7 @@ mod tests {
 
             let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1, None);
+            assert_eq!(rows[0].tags, None);
         }
 
         /// An empty mapping table -- the out-of-the-box state -- must not
@@ -1964,7 +2078,7 @@ mod tests {
 
             let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1, None);
+            assert_eq!(rows[0].tags, None);
         }
 
         /// A `rodzaj_kod` of NULL (rodzaj unresolved or absent) must not
@@ -1984,7 +2098,37 @@ mod tests {
 
             let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].1, None);
+            assert_eq!(rows[0].tags, None);
+        }
+
+        /// `kondygnacje_nadziemne` is read through unchanged (already
+        /// named above-ground-only in the source), independent of whether a
+        /// mapping row matched.
+        #[test]
+        fn levels_is_read_through_regardless_of_mapping_resolution() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO egib_unmatched
+                     (id_budynku, geom, cell_x, cell_y, computed_at, rodzaj_kod, kondygnacje_nadziemne)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'x', 2);",
+            )
+            .unwrap();
+            seed_mapping(&conn); // only has 'm' rows -- 'x' matches nothing
+
+            let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].tags, None, "no mapping row matches this letter");
+            assert_eq!(
+                rows[0].levels,
+                Some(2),
+                "the storey count must come through regardless"
+            );
+            let tags = with_building_levels(building_tags(rows[0].tags.as_deref()), rows[0].levels);
+            assert_eq!(tags.get("building").unwrap(), "yes");
+            assert_eq!(tags.get("building:levels").unwrap(), "2");
         }
     }
 
@@ -2200,6 +2344,36 @@ mod tests {
         assert_eq!(tags.get("man_made").unwrap(), "silo");
         assert_eq!(tags.get("source:building").unwrap(), "geoportal.gov.pl");
         assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
+    fn with_building_levels_inserts_a_positive_count() {
+        let tags = with_building_levels(building_tags(None), Some(3));
+        assert_eq!(tags.get("building:levels").unwrap(), "3");
+        assert_eq!(tags.get("building").unwrap(), "yes");
+    }
+
+    #[test]
+    fn with_building_levels_omits_zero() {
+        // "budynek nie posiada kondygnacji" -- nothing to report, the same
+        // way a missing value is nothing to report.
+        let tags = with_building_levels(building_tags(None), Some(0));
+        assert!(!tags.contains_key("building:levels"));
+    }
+
+    #[test]
+    fn with_building_levels_omits_none() {
+        let tags = with_building_levels(building_tags(None), None);
+        assert!(!tags.contains_key("building:levels"));
+    }
+
+    #[test]
+    fn with_building_levels_survives_an_unresolved_classification() {
+        // No mapping row matched (tags is None -> building=yes), but the
+        // storey count is still real data and must still be reported.
+        let tags = with_building_levels(building_tags(None), Some(2));
+        assert_eq!(tags.get("building").unwrap(), "yes");
+        assert_eq!(tags.get("building:levels").unwrap(), "2");
     }
 
     #[test]

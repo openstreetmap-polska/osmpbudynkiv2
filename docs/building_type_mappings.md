@@ -866,15 +866,14 @@ package.
 - **EGIB `p`, `s`, `k`.** Adopted at 41.0%, 62.6% and "generalisation"
   respectively — the weakest values in the EGIB table, together 2.96% of the
   unmatched set. Worth re-measuring on a rural-weighted sample.
-- **`building:levels`.** Both sources carry a storey count, and BDOT10k's
-  `LICZBAKONDYGNACJI` is **99.5% populated** (99.9% for `budynek
-  jednorodzinny`), against 34% for `egib_buildings.kondygnacje_nadziemne`.
-  `building:levels` is well established in OSM and the data is already imported,
-  so this is a large win independent of type mapping and worth doing in the
-  first implementation. One check first: EGIB separates
-  `kondygnacje_nadziemne` from `kondygnacje_podziemne`, but BDOT10k has a single
-  `LICZBAKONDYGNACJI` — OSM's `building:levels` counts above-ground storeys
-  only, so the XSD definition must be confirmed before emitting it.
+- ~~**`building:levels`.**~~ **Implemented.** Confirmed against GUGiK's
+  official BDOT10k/BDOO object catalogue: `liczbaKondygnacji` is defined as
+  "liczba nadziemnych kondygnacji budynku" — above-ground storeys only, the
+  same thing EGIB's `kondygnacje_nadziemne` already names explicitly and the
+  same thing OSM's `building:levels` counts. No unit conversion needed on
+  either source. `0` ("budynek nie posiada kondygnacji") and a missing value
+  are both treated as nothing to report. See
+  `server::package::with_building_levels`.
 - **Values chosen on popularity over precision.** The six `urząd`/town-hall
   entries use `building=government` (1,675 PL uses) rather than the semantically
   exact `building=townhall` (50). Reviewed and accepted; noted here because the
