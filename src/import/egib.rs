@@ -22,6 +22,7 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
          FROM '{parquet_path}'"
     );
     let select = crate::dataset::EGIB.with_centroid_select(&crate::dataset::hashed_select(&inner));
+    let select = crate::mappings::egib::with_rodzaj_kod_select(&select);
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS {target_table};
          CREATE TABLE {target_table} AS {select};"
@@ -146,6 +147,22 @@ mod tests {
         assert_eq!(
             mismatched, 0,
             "centroid must equal ST_Centroid(geom) for every row"
+        );
+
+        // rodzaj_kod is precomputed by mappings::egib::with_rodzaj_kod_select;
+        // on this fixture (48 'm', 13 't', 6 'i', 5 'k', 1 'b', 1 'h', all
+        // already bare letters) every row must resolve to its own letter.
+        let mismatched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM egib_buildings
+                 WHERE rodzaj_kod IS DISTINCT FROM lower(trim(rodzaj))",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mismatched, 0,
+            "every fixture row's rodzaj is already a bare letter, so rodzaj_kod must equal it"
         );
     }
 

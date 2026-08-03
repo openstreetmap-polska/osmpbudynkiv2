@@ -27,6 +27,7 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] GeoJSON data package endpoint `GET/POST /package` — reads the precomputed `*_unmatched` tables, OSM-ready tags for direct JOSM import (bbox in GET, polygon in POST)
 - [x] `GET /updates` — recent `/package` export activity as a GeoJSON `FeatureCollection`, browser-cacheable for 60 seconds (`?minutes=`, default 60, capped at 1440)
 - [x] Street name corrections for addresses to match the osm conventions
+- [x] Mappings of building types in egib/bdot10k to osm tags
 
 ## Not yet implemented
 
@@ -34,7 +35,6 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [ ] Web map frontend for browsing data status and downloading packages
 - [ ] Endpoint for reporting records to exclude (bad source data, comparison mismatches)
 - [ ] Random location endpoint (jump to an area with data to review)
-- [ ] Mappings of building types in egib/bdot10k to osm tags
 - [ ] Ignore buildings that are map as no longer existing or ruins
 
 ## Building

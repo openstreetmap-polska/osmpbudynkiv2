@@ -94,6 +94,69 @@ pub fn run(
             }
             outcome.map(|_| ())
         }
+        ImportSource::BuildingTypes {
+            bdot10k_file,
+            egib_file,
+            bdot10k_url,
+            egib_url,
+        } => {
+            use crate::mappings::building_types::{BDOT10K, BuildingTypeStats, EGIB};
+
+            let outcome = (|| -> Result<(BuildingTypeStats, BuildingTypeStats)> {
+                let bdot10k_stats = load_building_type_file(
+                    conn,
+                    config,
+                    &BDOT10K,
+                    bdot10k_file,
+                    bdot10k_url
+                        .as_deref()
+                        .unwrap_or(&urls.bdot10k_building_types),
+                    "bdot10k_building_types.csv",
+                )?;
+                let egib_stats = load_building_type_file(
+                    conn,
+                    config,
+                    &EGIB,
+                    egib_file,
+                    egib_url.as_deref().unwrap_or(&urls.egib_building_types),
+                    "egib_building_types.csv",
+                )?;
+                Ok((bdot10k_stats, egib_stats))
+            })();
+
+            match &outcome {
+                Ok((b, e)) => {
+                    let msg = format!(
+                        "bdot10k: loaded {} rows ({} keys absent from source, {} source keys \
+                         / {} source rows uncovered); egib: loaded {} rows ({} keys absent \
+                         from source, {} source keys / {} source rows uncovered)",
+                        b.rows_loaded,
+                        b.keys_absent_from_source,
+                        b.source_keys_uncovered,
+                        b.source_rows_uncovered,
+                        e.rows_loaded,
+                        e.keys_absent_from_source,
+                        e.source_keys_uncovered,
+                        e.source_rows_uncovered,
+                    );
+                    let _ = crate::job_log::record(
+                        conn,
+                        "import:building-types",
+                        "Success",
+                        Some(&msg),
+                    );
+                }
+                Err(e) => {
+                    let _ = crate::job_log::record(
+                        conn,
+                        "import:building-types",
+                        "Error",
+                        Some(&format!("{e:#}")),
+                    );
+                }
+            }
+            outcome.map(|_| ())
+        }
         ImportSource::Full {
             osm_file,
             bdot10k_file,
@@ -114,6 +177,44 @@ pub fn run(
             stamp_row_hash_version(conn)
         }
     }
+}
+
+/// Resolve `file` vs. downloading from `url` (mirrors the `StreetMappings`
+/// arm above), load it through `source`, then clean up a downloaded file per
+/// `config.cleanup_downloaded_files` -- a user-supplied `--*-file` is never
+/// deleted regardless of that setting.
+fn load_building_type_file(
+    conn: &Connection,
+    config: &Config,
+    source: &crate::mappings::building_types::BuildingTypeSource,
+    file: Option<std::path::PathBuf>,
+    url: &str,
+    download_filename: &str,
+) -> Result<crate::mappings::building_types::BuildingTypeStats> {
+    let (path, was_downloaded) = match file {
+        Some(p) => (p, false),
+        None => {
+            let downloaded =
+                crate::download::download_file_as(url, &config.download_dir(), download_filename)?;
+            (downloaded, true)
+        }
+    };
+    let stats = crate::mappings::building_types::load_from_path(conn, source, &path)?;
+
+    if was_downloaded {
+        if config.cleanup_downloaded_files {
+            info!(path = %path.display(), "Cleaning up downloaded file");
+            let _ = std::fs::remove_file(&path);
+        } else {
+            warn!(
+                path = %path.display(),
+                "cleanup_downloaded_files is false; leaving downloaded file in place \
+                 (it will be reused on the next run since download_file_as skips \
+                 re-downloading an existing destination)"
+            );
+        }
+    }
+    Ok(stats)
 }
 
 /// Stamp the row-hash version after an import rebuilds a dataset table.

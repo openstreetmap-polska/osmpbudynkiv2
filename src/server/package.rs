@@ -287,11 +287,29 @@ pub fn address_tags(row: &AddressRow) -> BTreeMap<String, String> {
     tags
 }
 
-/// Building type mapping from BDOT10k function codes is a separate roadmap
-/// item; packages currently emit a plain building=yes.
-pub fn building_tags() -> BTreeMap<String, String> {
+/// `resolved` is the `;`-separated `k=v` tags string a mapping lookup
+/// produced (see `unmatched_bdot10k_buildings`), or `None` when the source
+/// has no mapping resolution yet (EGIB, until the design doc's step 5) or the
+/// lookup found no matching row. Splits on `;`, then on the first `=`, and
+/// always inserts `source:building`. `None` or an empty string yields
+/// `building=yes` -- this never warns, since the loader already reports drift
+/// once per load (see `mappings::building_types`), which is strictly more
+/// useful than a warning per packaged feature.
+pub fn building_tags(resolved: Option<&str>) -> BTreeMap<String, String> {
     let mut tags = BTreeMap::new();
-    tags.insert("building".to_string(), "yes".to_string());
+    let pairs = resolved
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| crate::mappings::building_types::parse_tags(s).ok());
+    match pairs {
+        Some(pairs) => {
+            for (k, v) in pairs {
+                tags.insert(k, v);
+            }
+        }
+        None => {
+            tags.insert("building".to_string(), "yes".to_string());
+        }
+    }
     tags.insert("source:building".to_string(), SOURCE_BUILDING.to_string());
     tags
 }
@@ -377,35 +395,166 @@ pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<
     Ok(out)
 }
 
-/// Government buildings in the request area (by centroid) that are unmatched
-/// against OSM. Matching is precomputed upstream into `bdot10k_unmatched`/
-/// `egib_unmatched`; this is a plain spatial read of that serving table.
-/// `dest_table` is "bdot10k_unmatched" or "egib_unmatched" (a code-level
-/// constant, never user input). Returns ST_AsGeoJSON geometry strings.
-pub fn unmatched_buildings(
+/// The EGIB `rodzaj_kod` letter adjacency is restricted to -- the `m`
+/// (residential) class, per the design doc's Adjacency section.
+const EGIB_ADJACENCY_KEY: &str = "m";
+
+/// EGIB buildings in the request area that are unmatched against OSM, paired
+/// with the resolved tags string. Same three-CTE shape as
+/// `unmatched_bdot10k_buildings`, but keyed off the precomputed
+/// `rodzaj_kod` letter (see `mappings::egib`) instead of BDOT10k's raw
+/// function columns, and with no tier-2 fallback -- EGIB has only one
+/// cascade tier.
+pub fn unmatched_egib_buildings(
     conn: &Connection,
-    dest_table: &str,
     area: &RequestArea,
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, Option<String>)>> {
     let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
-    // Same bbox-interpolation rationale as unmatched_addresses above.
+    let (nx1, ny1, nx2, ny2) = (
+        x1 - ADJACENCY_READ_BUFFER_DEG,
+        y1 - ADJACENCY_READ_BUFFER_DEG,
+        x2 + ADJACENCY_READ_BUFFER_DEG,
+        y2 + ADJACENCY_READ_BUFFER_DEG,
+    );
     let sql = format!(
-        "SELECT ST_AsGeoJSON(b.geom)
-         FROM {dest_table} b
-         WHERE ST_Intersects(b.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-           AND ST_Intersects(ST_Centroid(b.geom), ST_GeomFromGeoJSON(?))"
+        "WITH pkg AS (
+             SELECT b.rowid AS rid, b.geom,
+                    ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
+                    b.rodzaj_kod, b.kondygnacje_nadziemne
+             FROM egib_unmatched b
+             WHERE ST_Intersects(b.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+               AND ST_Intersects(ST_Centroid(b.geom), ST_GeomFromGeoJSON(?))
+         ), nb AS (
+             SELECT geom, ST_X(centroid) AS cx, ST_Y(centroid) AS cy
+             FROM egib_buildings
+             WHERE ST_Intersects(geom, ST_MakeEnvelope({nx1}, {ny1}, {nx2}, {ny2}))
+               AND rodzaj_kod = '{EGIB_ADJACENCY_KEY}'
+         ), cnt AS (
+             SELECT p.rid, count(*) AS neighbours
+             FROM pkg p JOIN nb
+               ON (p.cx <> nb.cx OR p.cy <> nb.cy)
+              AND ST_Intersects(p.geom, nb.geom)
+             GROUP BY p.rid
+         )
+         SELECT ST_AsGeoJSON(pkg.geom), t.tags
+         FROM pkg
+         LEFT JOIN cnt USING (rid)
+         LEFT JOIN LATERAL (
+             SELECT m.tags
+             FROM egib_building_types m
+             WHERE m.tier = 1 AND m.key = pkg.rodzaj_kod
+               AND (m.min_levels     IS NULL OR pkg.kondygnacje_nadziemne >= m.min_levels)
+               AND (m.max_levels     IS NULL OR pkg.kondygnacje_nadziemne <= m.max_levels)
+               AND (m.max_neighbours IS NULL OR coalesce(cnt.neighbours, 0) <= m.max_neighbours)
+             ORDER BY (m.min_levels     IS NOT NULL)::INT
+                    + (m.max_levels     IS NOT NULL)::INT
+                    + (m.max_neighbours IS NOT NULL)::INT DESC
+             LIMIT 1
+         ) t ON TRUE"
     );
     let mut stmt = conn
         .prepare(&sql)
-        .with_context(|| format!("Failed to prepare package building query for {dest_table}"))?;
+        .context("Failed to prepare package egib building query")?;
     let rows = stmt
-        .query_map([area.polygon_geojson.as_str()], |row| row.get(0))
-        .with_context(|| format!("Failed to run package building query for {dest_table}"))?;
+        .query_map([area.polygon_geojson.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .context("Failed to run package egib building query")?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(
-            row.with_context(|| format!("Failed to read package building row from {dest_table}"))?,
-        );
+        out.push(row.context("Failed to read package egib building row")?);
+    }
+    Ok(out)
+}
+
+/// Buffer around the request bbox used to read `nb` adjacency candidates, so
+/// a party wall shared with a neighbour just outside the request edge is not
+/// missed. ~35 m -- comfortably wider than an ordinary building's footprint,
+/// so it does not need to reach the neighbour's own centroid, only some part
+/// of its polygon. See "Four things the query must get right" in
+/// docs/superpowers/specs/2026-08-03-building-type-mappings-design.md.
+const ADJACENCY_READ_BUFFER_DEG: f64 = 0.0005;
+
+/// The BDOT10k tier-1 key adjacency is restricted to -- a code-level constant,
+/// not a CSV column, so a CSV row cannot silently reference a neighbour count
+/// the query never computes (enforced at load by
+/// `mappings::building_types::load_from_path`).
+const BDOT10K_ADJACENCY_KEY: &str = "budynek jednorodzinny";
+
+/// BDOT10k buildings in the request area that are unmatched against OSM,
+/// paired with the `;`-separated `k=v` tags string resolved by
+/// `bdot10k_building_types` (or `None` if no row matches, which
+/// `building_tags` renders as `building=yes`).
+///
+/// Three stages, each a CTE: `pkg` is the same read as the old
+/// `unmatched_buildings` plus the raw classification columns; `nb`/`cnt`
+/// count same-class neighbours (buffered read, `budynek jednorodzinny` only,
+/// identity by centroid-coordinate inequality rather than `ST_Equals` --
+/// cheaper and equivalent on this data); the outer `LEFT JOIN LATERAL`
+/// resolves the mapping, most-specific-row-wins, falling through to `NULL`
+/// (rendered as `building=yes`) when the mapping table is empty or nothing
+/// matches. See the design doc's Serving/Adjacency sections for the
+/// reasoning and the measured cost (~+0.1 s on a worst-case request).
+pub fn unmatched_bdot10k_buildings(
+    conn: &Connection,
+    area: &RequestArea,
+) -> Result<Vec<(String, Option<String>)>> {
+    let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
+    let (nx1, ny1, nx2, ny2) = (
+        x1 - ADJACENCY_READ_BUFFER_DEG,
+        y1 - ADJACENCY_READ_BUFFER_DEG,
+        x2 + ADJACENCY_READ_BUFFER_DEG,
+        y2 + ADJACENCY_READ_BUFFER_DEG,
+    );
+    let sql = format!(
+        "WITH pkg AS (
+             SELECT b.rowid AS rid, b.geom,
+                    ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
+                    b.funkcja_szczegolowa, b.funkcja_ogolna, b.liczba_kondygnacji
+             FROM bdot10k_unmatched b
+             WHERE ST_Intersects(b.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+               AND ST_Intersects(ST_Centroid(b.geom), ST_GeomFromGeoJSON(?))
+         ), nb AS (
+             SELECT geom, ST_X(centroid) AS cx, ST_Y(centroid) AS cy
+             FROM bdot10k_buildings
+             WHERE ST_Intersects(geom, ST_MakeEnvelope({nx1}, {ny1}, {nx2}, {ny2}))
+               AND lower(trim(PRZEWAZAJACAFUNKCJABUDYNKU)) = '{BDOT10K_ADJACENCY_KEY}'
+         ), cnt AS (
+             SELECT p.rid, count(*) AS neighbours
+             FROM pkg p JOIN nb
+               ON (p.cx <> nb.cx OR p.cy <> nb.cy)
+              AND ST_Intersects(p.geom, nb.geom)
+             GROUP BY p.rid
+         )
+         SELECT ST_AsGeoJSON(pkg.geom), t.tags
+         FROM pkg
+         LEFT JOIN cnt USING (rid)
+         LEFT JOIN LATERAL (
+             SELECT m.tags
+             FROM bdot10k_building_types m
+             WHERE ((m.tier = 1 AND m.key = lower(trim(pkg.funkcja_szczegolowa)))
+                 OR (m.tier = 2 AND m.key = lower(trim(pkg.funkcja_ogolna))))
+               AND (m.min_levels IS NULL OR pkg.liczba_kondygnacji >= m.min_levels)
+               AND (m.max_levels IS NULL OR pkg.liczba_kondygnacji <= m.max_levels)
+               AND (m.max_neighbours IS NULL OR coalesce(cnt.neighbours, 0) <= m.max_neighbours)
+             ORDER BY m.tier ASC,
+                      (m.min_levels IS NOT NULL)::INT
+                    + (m.max_levels IS NOT NULL)::INT
+                    + (m.max_neighbours IS NOT NULL)::INT DESC
+             LIMIT 1
+         ) t ON TRUE"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare package bdot10k building query")?;
+    let rows = stmt
+        .query_map([area.polygon_geojson.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .context("Failed to run package bdot10k building query")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("Failed to read package bdot10k building row")?);
     }
     Ok(out)
 }
@@ -500,14 +649,14 @@ fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> 
                 }
             }
             Dataset::Bdot10k => {
-                for geometry in unmatched_buildings(&conn, "bdot10k_unmatched", area)? {
-                    features.push(feature(geometry, building_tags())?);
+                for (geometry, tags) in unmatched_bdot10k_buildings(&conn, area)? {
+                    features.push(feature(geometry, building_tags(tags.as_deref()))?);
                     building_count += 1;
                 }
             }
             Dataset::Egib => {
-                for geometry in unmatched_buildings(&conn, "egib_unmatched", area)? {
-                    features.push(feature(geometry, building_tags())?);
+                for (geometry, tags) in unmatched_egib_buildings(&conn, area)? {
+                    features.push(feature(geometry, building_tags(tags.as_deref()))?);
                     building_count += 1;
                 }
             }
@@ -657,20 +806,378 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_buildings_centroid_containment() {
+    fn unmatched_bdot10k_buildings_centroid_containment() {
         let conn = setup_db();
         conn.execute_batch(
-            // Matching is precomputed upstream; bdot10k_unmatched only ever
-            // holds rows already known to be unmatched.
-            "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at)
+            "CREATE TABLE bdot10k_buildings (
+                 LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR);
+             -- Matching is precomputed upstream; bdot10k_unmatched only ever
+             -- holds rows already known to be unmatched.
+             INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at)
              VALUES
                  ('b1', ST_MakeEnvelope(21.0060, 52.2060, 21.0062, 52.2062), 8000, 4900, now());",
         )
         .unwrap();
 
-        let geoms = unmatched_buildings(&conn, "bdot10k_unmatched", &test_area()).unwrap();
-        assert_eq!(geoms.len(), 1);
-        assert!(geoms[0].contains("\"Polygon\""));
+        let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].0.contains("\"Polygon\""));
+    }
+
+    /// `unmatched_bdot10k_buildings` tests. `bdot10k_buildings` is the live
+    /// table adjacency reads (never `bdot10k_unmatched` -- see "Where the
+    /// mapping is applied"); `bdot10k_building_types` is the mapping table
+    /// (empty by default, a valid state that falls through to `building=yes`).
+    mod bdot10k_adjacency_and_mapping {
+        use super::*;
+
+        fn seed_live_table(conn: &Connection, rows: &str) {
+            conn.execute_batch(
+                "CREATE TABLE bdot10k_buildings (
+                     LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                     PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR);",
+            )
+            .unwrap();
+            if !rows.is_empty() {
+                conn.execute_batch(rows).unwrap();
+                conn.execute_batch("UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);")
+                    .unwrap();
+            }
+        }
+
+        fn insert_mapping_row(
+            conn: &Connection,
+            tier: i32,
+            key: &str,
+            min_levels: Option<i32>,
+            max_levels: Option<i32>,
+            max_neighbours: Option<i32>,
+            tags: &str,
+        ) {
+            conn.execute(
+                "INSERT INTO bdot10k_building_types
+                     (tier, key, min_levels, max_levels, max_neighbours, tags)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                duckdb::params![tier, key, min_levels, max_levels, max_neighbours, tags],
+            )
+            .unwrap();
+        }
+
+        /// One isolated `budynek jednorodzinny`, tier-1 mapping present with
+        /// a `max_neighbours=0` row and an unconstrained fallback row --
+        /// pins the tier-1 hit path, the adjacency branch firing at exactly
+        /// 0 (not merely "some small number"), and that an isolated building
+        /// counts 0 real neighbours rather than a NULL that would slip past
+        /// `coalesce`.
+        #[test]
+        fn tier1_hit_isolated_building_resolves_to_the_zero_neighbour_row() {
+            let conn = setup_db();
+            seed_live_table(
+                &conn,
+                "INSERT INTO bdot10k_buildings (LOKALNYID, geom, PRZEWAZAJACAFUNKCJABUDYNKU) VALUES
+                     ('h1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 'budynek jednorodzinny');",
+            );
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at, funkcja_szczegolowa)
+                 VALUES
+                     ('h1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'budynek jednorodzinny');",
+            )
+            .unwrap();
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                Some(0),
+                "building=detached",
+            );
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                None,
+                "building=house",
+            );
+
+            let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1.as_deref(), Some("building=detached"));
+        }
+
+        /// Two `budynek jednorodzinny` buildings sharing a wall: each has 1
+        /// neighbour, so the `max_neighbours=0` row must NOT fire -- pins
+        /// "fires at 0, not at 1".
+        #[test]
+        fn two_touching_houses_each_get_one_neighbour_and_fall_to_the_unconstrained_row() {
+            let conn = setup_db();
+            seed_live_table(
+                &conn,
+                "INSERT INTO bdot10k_buildings (LOKALNYID, geom, PRZEWAZAJACAFUNKCJABUDYNKU) VALUES
+                     ('h1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 'budynek jednorodzinny'),
+                     ('h2', ST_MakeEnvelope(21.0062,52.2060,21.0064,52.2062), 'budynek jednorodzinny');",
+            );
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at, funkcja_szczegolowa)
+                 SELECT LOKALNYID, geom, 8000, 4900, now(), PRZEWAZAJACAFUNKCJABUDYNKU
+                 FROM bdot10k_buildings;",
+            )
+            .unwrap();
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                Some(0),
+                "building=detached",
+            );
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                None,
+                "building=house",
+            );
+
+            let mut rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
+            rows.sort();
+            assert_eq!(rows.len(), 2);
+            for (_, tags) in &rows {
+                assert_eq!(tags.as_deref(), Some("building=house"));
+            }
+        }
+
+        /// A touching building of a different class (not
+        /// `budynek jednorodzinny`) must never be counted -- pins "a
+        /// neighbour of a different class does not count".
+        #[test]
+        fn a_touching_neighbour_of_a_different_class_does_not_count() {
+            let conn = setup_db();
+            seed_live_table(
+                &conn,
+                "INSERT INTO bdot10k_buildings (LOKALNYID, geom, PRZEWAZAJACAFUNKCJABUDYNKU) VALUES
+                     ('h1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 'budynek jednorodzinny'),
+                     ('garaz', ST_MakeEnvelope(21.0058,52.2060,21.0060,52.2062), 'garaż');",
+            );
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at, funkcja_szczegolowa)
+                 VALUES
+                     ('h1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'budynek jednorodzinny');",
+            )
+            .unwrap();
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                Some(0),
+                "building=detached",
+            );
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                None,
+                "building=house",
+            );
+
+            let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].1.as_deref(),
+                Some("building=detached"),
+                "the adjoining garage must not count as a residential neighbour"
+            );
+        }
+
+        /// A neighbour whose polygon sits just past the request bbox edge --
+        /// inside the `ADJACENCY_READ_BUFFER_DEG` buffer, outside the raw
+        /// bbox -- must still be counted. Regression guard for the buffer.
+        #[test]
+        fn a_neighbour_just_outside_the_request_bbox_still_counts() {
+            let conn = setup_db();
+            let area = test_area(); // 21.0,52.2,21.01,52.21
+            seed_live_table(
+                &conn,
+                "INSERT INTO bdot10k_buildings (LOKALNYID, geom, PRZEWAZAJACAFUNKCJABUDYNKU) VALUES
+                     -- inside the bbox (max_lon 21.01), touching the edge building below
+                     ('inside', ST_MakeEnvelope(21.0097,52.2050,21.0100,52.2052), 'budynek jednorodzinny'),
+                     -- outside the raw bbox (min_lon starts past 21.01) but within the
+                     -- 0.0005 deg adjacency read buffer, touching 'inside' at x=21.0100
+                     ('outside', ST_MakeEnvelope(21.0100,52.2050,21.0103,52.2052), 'budynek jednorodzinny');",
+            );
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at, funkcja_szczegolowa)
+                 VALUES
+                     ('inside', ST_MakeEnvelope(21.0097,52.2050,21.0100,52.2052), 8000, 4900, now(),
+                      'budynek jednorodzinny');",
+            )
+            .unwrap();
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                Some(0),
+                "building=detached",
+            );
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                None,
+                "building=house",
+            );
+
+            let rows = unmatched_bdot10k_buildings(&conn, &area).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].1.as_deref(),
+                Some("building=house"),
+                "the neighbour just outside the bbox must still be read and counted"
+            );
+        }
+
+        /// Tier-1 miss, tier-2 hit -- pins the cascade.
+        #[test]
+        fn tier1_miss_falls_through_to_tier2_hit() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at,
+                      funkcja_szczegolowa, funkcja_ogolna)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'jakas nieznana funkcja', 'budynki biurowe');",
+            )
+            .unwrap();
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                Some(0),
+                "building=detached",
+            );
+            insert_mapping_row(
+                &conn,
+                2,
+                "budynki biurowe",
+                None,
+                None,
+                None,
+                "building=office",
+            );
+
+            let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1.as_deref(), Some("building=office"));
+        }
+
+        /// Neither tier matches -> resolved tags is None, which
+        /// `building_tags` renders as plain `building=yes`.
+        #[test]
+        fn neither_tier_matching_yields_none_and_renders_as_building_yes() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at,
+                      funkcja_szczegolowa, funkcja_ogolna)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'totally unknown', 'also unknown');",
+            )
+            .unwrap();
+            insert_mapping_row(
+                &conn,
+                1,
+                "budynek jednorodzinny",
+                None,
+                None,
+                Some(0),
+                "building=detached",
+            );
+
+            let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, None);
+            assert_eq!(
+                building_tags(rows[0].1.as_deref()).get("building").unwrap(),
+                "yes"
+            );
+        }
+
+        /// An empty mapping table (the out-of-the-box state) must not error,
+        /// and every row falls through to `building=yes`.
+        #[test]
+        fn empty_mapping_table_falls_through_for_every_row() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at, funkcja_szczegolowa)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'budynek gospodarczy');",
+            )
+            .unwrap();
+
+            let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, None);
+        }
+
+        /// A `man_made` pair round-trips through the full query into
+        /// `building_tags`' output, not just through the unit-level parser.
+        #[test]
+        fn a_man_made_pair_round_trips_through_the_full_query() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at, funkcja_szczegolowa)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'silos');",
+            )
+            .unwrap();
+            insert_mapping_row(
+                &conn,
+                1,
+                "silos",
+                None,
+                None,
+                None,
+                "building=silo;man_made=silo",
+            );
+
+            let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            let tags = building_tags(rows[0].1.as_deref());
+            assert_eq!(tags.get("building").unwrap(), "silo");
+            assert_eq!(tags.get("man_made").unwrap(), "silo");
+        }
     }
 
     /// Seed one unmatched address whose street is the abbreviated PRG form.
@@ -774,10 +1281,28 @@ mod tests {
             computed_at TIMESTAMP WITH TIME ZONE);
         CREATE TABLE bdot10k_unmatched (
             lokalnyid VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
-            computed_at TIMESTAMP WITH TIME ZONE);
+            computed_at TIMESTAMP WITH TIME ZONE,
+            funkcja_szczegolowa VARCHAR, funkcja_ogolna VARCHAR, liczba_kondygnacji SMALLINT);
         CREATE TABLE egib_unmatched (
             id_budynku VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
-            computed_at TIMESTAMP WITH TIME ZONE);
+            computed_at TIMESTAMP WITH TIME ZONE,
+            rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER);
+        -- unmatched_bdot10k_buildings' nb CTE reads this directly (adjacency
+        -- is a self-comparison against the live table, not the serving
+        -- table -- see the design doc's \"Where the mapping is applied\").
+        CREATE TABLE bdot10k_buildings (
+            LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR);
+        CREATE TABLE bdot10k_building_types (
+            tier INTEGER, key VARCHAR, min_levels INTEGER, max_levels INTEGER,
+            max_neighbours INTEGER, tags VARCHAR);
+        -- unmatched_egib_buildings' nb CTE reads this directly, same rationale
+        -- as bdot10k_buildings above.
+        CREATE TABLE egib_buildings (
+            id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY, rodzaj_kod VARCHAR);
+        CREATE TABLE egib_building_types (
+            tier INTEGER, key VARCHAR, min_levels INTEGER, max_levels INTEGER,
+            max_neighbours INTEGER, tags VARCHAR);
 
         CREATE TABLE street_name_mappings (
             teryt_simc_code VARCHAR,
@@ -787,9 +1312,9 @@ mod tests {
         INSERT INTO prg_unmatched VALUES
             ('a1', '12', 'Marszałkowska', 'Warszawa', '00-590', '0918123',
              ST_Point(21.001, 52.201), 8000, 4900, now());
-        INSERT INTO bdot10k_unmatched VALUES
+        INSERT INTO bdot10k_unmatched (lokalnyid, geom, cell_x, cell_y, computed_at) VALUES
             ('b1', ST_MakeEnvelope(21.0060, 52.2060, 21.0062, 52.2062), 8000, 4900, now());
-        INSERT INTO egib_unmatched VALUES
+        INSERT INTO egib_unmatched (id_budynku, geom, cell_x, cell_y, computed_at) VALUES
             ('e1', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082), 8000, 4900, now());
     ";
 
@@ -1236,12 +1761,14 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_buildings_respects_polygon_via_centroid() {
+    fn unmatched_egib_buildings_respects_polygon_via_centroid() {
         let conn = setup_db();
         conn.execute_batch(
-            // Centroid (21.0081, 52.2081) is inside the triangle's envelope
-            // but outside the triangle → excluded.
-            "INSERT INTO egib_unmatched (id_budynku, geom, cell_x, cell_y, computed_at)
+            "CREATE TABLE egib_buildings (
+                 id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY, rodzaj_kod VARCHAR);
+             -- Centroid (21.0081, 52.2081) is inside the triangle's envelope
+             -- but outside the triangle → excluded.
+             INSERT INTO egib_unmatched (id_budynku, geom, cell_x, cell_y, computed_at)
              VALUES
                  ('e1', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082), 8000, 4900, now());",
         )
@@ -1251,19 +1778,214 @@ mod tests {
             r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#,
         )
         .unwrap();
-        assert_eq!(
-            unmatched_buildings(&conn, "egib_unmatched", &triangle)
-                .unwrap()
-                .len(),
-            0
-        );
+        assert_eq!(unmatched_egib_buildings(&conn, &triangle).unwrap().len(), 0);
         // Sanity check: the plain bbox does include it.
         assert_eq!(
-            unmatched_buildings(&conn, "egib_unmatched", &test_area())
-                .unwrap()
-                .len(),
+            unmatched_egib_buildings(&conn, &test_area()).unwrap().len(),
             1
         );
+    }
+
+    /// `unmatched_egib_buildings` tests -- mirrors
+    /// `bdot10k_adjacency_and_mapping` above, but keyed off the precomputed
+    /// `rodzaj_kod` letter with no tier-2 fallback and with the storey
+    /// (`kondygnacje_nadziemne`) constraints exercised, since that's the axis
+    /// BDOT10k's mapping rows don't currently use.
+    mod egib_adjacency_and_mapping {
+        use super::*;
+
+        fn seed_live_table(conn: &Connection, rows: &str) {
+            conn.execute_batch(
+                "CREATE TABLE egib_buildings (
+                     id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY, rodzaj_kod VARCHAR);",
+            )
+            .unwrap();
+            if !rows.is_empty() {
+                conn.execute_batch(rows).unwrap();
+                conn.execute_batch("UPDATE egib_buildings SET centroid = ST_Centroid(geom);")
+                    .unwrap();
+            }
+        }
+
+        fn insert_mapping_row(
+            conn: &Connection,
+            key: &str,
+            min_levels: Option<i32>,
+            max_levels: Option<i32>,
+            max_neighbours: Option<i32>,
+            tags: &str,
+        ) {
+            conn.execute(
+                "INSERT INTO egib_building_types
+                     (tier, key, min_levels, max_levels, max_neighbours, tags)
+                 VALUES (1, ?, ?, ?, ?, ?)",
+                duckdb::params![key, min_levels, max_levels, max_neighbours, tags],
+            )
+            .unwrap();
+        }
+
+        fn seed_mapping(conn: &Connection) {
+            insert_mapping_row(conn, "m", Some(4), None, None, "building=apartments");
+            insert_mapping_row(conn, "m", Some(1), Some(2), Some(0), "building=detached");
+            insert_mapping_row(conn, "m", Some(1), Some(2), None, "building=house");
+            insert_mapping_row(conn, "m", None, None, None, "building=residential");
+        }
+
+        /// 4+ storeys always resolves to apartments regardless of adjacency.
+        #[test]
+        fn four_plus_storeys_resolves_to_apartments() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO egib_unmatched
+                     (id_budynku, geom, cell_x, cell_y, computed_at, rodzaj_kod, kondygnacje_nadziemne)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'm', 5);",
+            )
+            .unwrap();
+            seed_mapping(&conn);
+
+            let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1.as_deref(), Some("building=apartments"));
+        }
+
+        /// 1-2 storeys, isolated (no residential neighbour) -> detached.
+        #[test]
+        fn isolated_one_to_two_storey_resolves_to_detached() {
+            let conn = setup_db();
+            seed_live_table(
+                &conn,
+                "INSERT INTO egib_buildings (id_budynku, geom, rodzaj_kod) VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 'm');",
+            );
+            conn.execute_batch(
+                "INSERT INTO egib_unmatched
+                     (id_budynku, geom, cell_x, cell_y, computed_at, rodzaj_kod, kondygnacje_nadziemne)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'm', 2);",
+            )
+            .unwrap();
+            seed_mapping(&conn);
+
+            let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1.as_deref(), Some("building=detached"));
+        }
+
+        /// 1-2 storeys, touching another `m` building -> house, not detached.
+        #[test]
+        fn touching_one_to_two_storey_resolves_to_house() {
+            let conn = setup_db();
+            seed_live_table(
+                &conn,
+                "INSERT INTO egib_buildings (id_budynku, geom, rodzaj_kod) VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 'm'),
+                     ('u2', ST_MakeEnvelope(21.0062,52.2060,21.0064,52.2062), 'm');",
+            );
+            conn.execute_batch(
+                "INSERT INTO egib_unmatched
+                     (id_budynku, geom, cell_x, cell_y, computed_at, rodzaj_kod, kondygnacje_nadziemne)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'm', 1);",
+            )
+            .unwrap();
+            seed_mapping(&conn);
+
+            let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1.as_deref(), Some("building=house"));
+        }
+
+        /// 3 storeys, or an unknown storey count, stays generic residential --
+        /// the deliberately ambiguous band from
+        /// docs/building_type_mappings.md.
+        #[test]
+        fn three_storeys_or_unknown_stays_residential() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO egib_unmatched
+                     (id_budynku, geom, cell_x, cell_y, computed_at, rodzaj_kod, kondygnacje_nadziemne)
+                 VALUES
+                     ('three', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'm', 3),
+                     ('unknown', ST_MakeEnvelope(21.0070,52.2070,21.0072,52.2072), 8000, 4900, now(),
+                      'm', NULL);",
+            )
+            .unwrap();
+            seed_mapping(&conn);
+
+            let mut rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
+            rows.sort();
+            assert_eq!(rows.len(), 2);
+            for (_, tags) in &rows {
+                assert_eq!(tags.as_deref(), Some("building=residential"));
+            }
+        }
+
+        /// A `rodzaj_kod` the mapping table has no row for falls through to
+        /// `building=yes` via `None`.
+        #[test]
+        fn unmapped_letter_falls_through_to_none() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO egib_unmatched
+                     (id_budynku, geom, cell_x, cell_y, computed_at, rodzaj_kod, kondygnacje_nadziemne)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(),
+                      'g', NULL);",
+            )
+            .unwrap();
+            seed_mapping(&conn); // only has 'm' rows
+
+            let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, None);
+        }
+
+        /// An empty mapping table -- the out-of-the-box state -- must not
+        /// error, and falls through to `building=yes`.
+        #[test]
+        fn empty_mapping_table_falls_through() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO egib_unmatched
+                     (id_budynku, geom, cell_x, cell_y, computed_at, rodzaj_kod)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(), 'm');",
+            )
+            .unwrap();
+
+            let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, None);
+        }
+
+        /// A `rodzaj_kod` of NULL (rodzaj unresolved or absent) must not
+        /// crash the LATERAL join's equality test and must fall through.
+        #[test]
+        fn null_rodzaj_kod_falls_through_without_erroring() {
+            let conn = setup_db();
+            seed_live_table(&conn, "");
+            conn.execute_batch(
+                "INSERT INTO egib_unmatched
+                     (id_budynku, geom, cell_x, cell_y, computed_at, rodzaj_kod)
+                 VALUES
+                     ('u1', ST_MakeEnvelope(21.0060,52.2060,21.0062,52.2062), 8000, 4900, now(), NULL);",
+            )
+            .unwrap();
+            seed_mapping(&conn);
+
+            let rows = unmatched_egib_buildings(&conn, &test_area()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, None);
+        }
     }
 
     #[test]
@@ -1449,18 +2171,42 @@ mod tests {
     }
 
     #[test]
-    fn building_tags_are_fixed() {
-        let tags = building_tags();
+    fn building_tags_none_yields_plain_building_yes() {
+        let tags = building_tags(None);
         assert_eq!(tags.get("building").unwrap(), "yes");
         assert_eq!(tags.get("source:building").unwrap(), "geoportal.gov.pl");
         assert_eq!(tags.len(), 2);
     }
 
     #[test]
+    fn building_tags_empty_string_yields_plain_building_yes() {
+        let tags = building_tags(Some("  "));
+        assert_eq!(tags.get("building").unwrap(), "yes");
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn building_tags_resolved_string_overrides_the_default() {
+        let tags = building_tags(Some("building=detached"));
+        assert_eq!(tags.get("building").unwrap(), "detached");
+        assert_eq!(tags.get("source:building").unwrap(), "geoportal.gov.pl");
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn building_tags_resolved_multi_pair_round_trips() {
+        let tags = building_tags(Some("building=silo;man_made=silo"));
+        assert_eq!(tags.get("building").unwrap(), "silo");
+        assert_eq!(tags.get("man_made").unwrap(), "silo");
+        assert_eq!(tags.get("source:building").unwrap(), "geoportal.gov.pl");
+        assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
     fn feature_collection_serializes_valid_geojson() {
         let f = feature(
             r#"{"type":"Point","coordinates":[21.0,52.2]}"#.to_string(),
-            building_tags(),
+            building_tags(None),
         )
         .unwrap();
         let fc = FeatureCollection {
@@ -1478,7 +2224,7 @@ mod tests {
 
     #[test]
     fn feature_rejects_invalid_geometry_json() {
-        assert!(feature("not json".to_string(), building_tags()).is_err());
+        assert!(feature("not json".to_string(), building_tags(None)).is_err());
     }
 
     #[test]

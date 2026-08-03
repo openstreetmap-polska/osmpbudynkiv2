@@ -114,6 +114,21 @@ pub enum ImportSource {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Import the curated BDOT10k/EGIB building-type mappings from CSV
+    BuildingTypes {
+        /// Path to a local BDOT10k mapping CSV (skips download)
+        #[arg(long)]
+        bdot10k_file: Option<PathBuf>,
+        /// Path to a local EGIB mapping CSV (skips download)
+        #[arg(long)]
+        egib_file: Option<PathBuf>,
+        /// Override the configured BDOT10k mapping download URL
+        #[arg(long)]
+        bdot10k_url: Option<String>,
+        /// Override the configured EGIB mapping download URL
+        #[arg(long)]
+        egib_url: Option<String>,
+    },
     /// Run all imports in sequence (OSM, BDOT10k, EGIB, PRG)
     Full {
         /// Path to local OSM PBF file (skips download)

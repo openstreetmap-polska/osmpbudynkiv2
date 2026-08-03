@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;
 
+use crate::compare::columns::classification_columns;
 use crate::compare::rule::{
     OSM_MATCH_BUFFER_DEG, buffer, unmatched_addresses_in_cell_sql, unmatched_buildings_sql,
 };
@@ -27,7 +28,8 @@ pub fn recompute_cell_in_txn(
             };
             let cx = cell_x_sql("b.centroid");
             let cy = cell_y_sql("b.centroid");
-            let select = format!("b.{id}, b.geom, {cx}, {cy}, now()");
+            let cc = classification_columns(src);
+            let select = format!("b.{id}, b.geom, {cx}, {cy}, now(), {}", cc.source_exprs);
             // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
             // closed on all four cell edges, so a centroid exactly on a
             // shared boundary would satisfy both neighbours' predicates.
@@ -41,7 +43,7 @@ pub fn recompute_cell_in_txn(
             );
             (
                 dest,
-                format!("{id}, geom, cell_x, cell_y, computed_at"),
+                format!("{id}, geom, cell_x, cell_y, computed_at, {}", cc.dest_names),
                 inner,
             )
         }
@@ -119,7 +121,8 @@ mod tests {
         ];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);",
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT);",
         )
         .unwrap();
         c

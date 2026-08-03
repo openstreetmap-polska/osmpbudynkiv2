@@ -1,5 +1,6 @@
 pub mod addresses;
 pub mod buildings;
+pub mod columns;
 pub mod drain;
 pub mod incremental;
 pub mod reconcile;
@@ -74,8 +75,10 @@ mod full_vs_incremental_equivalence {
         // enqueue_all touches all three government tables unconditionally,
         // so all three must exist even if a given test only seeds one.
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
-             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 kondygnacje_nadziemne INTEGER);
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
@@ -213,7 +216,10 @@ mod drain_refresh_concurrency {
             "SELECT 'b' || i AS LOKALNYID,
                     '{tag}' AS wersja,
                     ST_MakeEnvelope(20.0 + i * 0.03, 52.0,
-                                    20.0 + i * 0.03 + 0.002, 52.002) AS geom
+                                    20.0 + i * 0.03 + 0.002, 52.002) AS geom,
+                    NULL::VARCHAR AS PRZEWAZAJACAFUNKCJABUDYNKU,
+                    NULL::VARCHAR AS FUNKCJAOGOLNABUDYNKU,
+                    NULL::SMALLINT AS LICZBAKONDYGNACJI
              FROM range({n}) t(i)"
         )
     }

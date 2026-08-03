@@ -108,6 +108,13 @@ osm_replication = "https://download.openstreetmap.fr/replication/europe/poland/m
 # street_mappings_update job. The mapping only affects addr:street in /package
 # output; it never changes which addresses are considered unmatched.
 street_mappings = "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/street_names_mappings.csv"
+# Curated BDOT10k/EGIB classification -> OSM building tag mappings (see
+# mappings/bdot10k_building_types.csv and mappings/egib_building_types.csv).
+# Used by `import building-types` when no --bdot10k-file/--egib-file is
+# given, and by the building_types_update job. Applied at serve time only;
+# never changes which buildings are considered unmatched.
+bdot10k_building_types = "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/bdot10k_building_types.csv"
+egib_building_types = "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/egib_building_types.csv"
 
 # Background jobs run by the HTTP server (`run` subcommand).
 # Each job has its own enabled flag, interval, and per-run timeout.
@@ -205,6 +212,20 @@ timeout_seconds = 1800
 # Unlike the dataset refreshes this enqueues no dirty cells and triggers no
 # recompute -- the mapping is applied when /package builds its response.
 [jobs.street_mappings_update]
+enabled = false
+interval_seconds = 86400
+timeout_seconds = 300
+
+# Re-downloads the curated BDOT10k/EGIB building-type mapping files and
+# reloads them. Each file has its own ETag check and its own job_run_log
+# entry (job_run_log["update:bdot10k-building-types"] /
+# ["update:egib-building-types"]), so a failure or no-op on one never blocks
+# the other.
+#
+# Disabled by default, for the same reason as street_mappings_update: the
+# mappings ship in the binary's repository and most deployments will load
+# them once via `import building-types`.
+[jobs.building_types_update]
 enabled = false
 interval_seconds = 86400
 timeout_seconds = 300

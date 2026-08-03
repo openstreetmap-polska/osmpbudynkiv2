@@ -202,6 +202,7 @@ pub struct JobsConfig {
     pub match_refresh: MatchRefreshConfig,
     pub match_reconcile: MatchReconcileConfig,
     pub street_mappings_update: JobConfig,
+    pub building_types_update: JobConfig,
 }
 
 impl Default for JobsConfig {
@@ -223,6 +224,14 @@ impl Default for JobsConfig {
             match_refresh: MatchRefreshConfig::default(),
             match_reconcile: MatchReconcileConfig::default(),
             street_mappings_update: JobConfig {
+                enabled: false,
+                interval_seconds: 86400,
+                timeout_seconds: 300,
+            },
+            // Same rationale as street_mappings_update: applied at serve
+            // time, so a stale mapping is harmless and there is no urgency
+            // to auto-refresh -- an operator opts in explicitly.
+            building_types_update: JobConfig {
                 enabled: false,
                 interval_seconds: 86400,
                 timeout_seconds: 300,
@@ -255,6 +264,8 @@ pub struct DownloadUrls {
     pub prg: String,
     pub osm_replication: String,
     pub street_mappings: String,
+    pub bdot10k_building_types: String,
+    pub egib_building_types: String,
 }
 
 impl Default for Config {
@@ -316,6 +327,12 @@ impl Default for DownloadUrls {
                 "https://download.openstreetmap.fr/replication/europe/poland/minute".to_string(),
             street_mappings:
                 "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/street_names_mappings.csv"
+                    .to_string(),
+            bdot10k_building_types:
+                "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/bdot10k_building_types.csv"
+                    .to_string(),
+            egib_building_types:
+                "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/egib_building_types.csv"
                     .to_string(),
         }
     }
@@ -708,6 +725,44 @@ timeout_seconds = 300
         // Unrelated jobs keep their defaults.
         assert!(config.jobs.egib_update.enabled);
         assert_eq!(config.jobs.egib_update.interval_seconds, 86400);
+    }
+
+    #[test]
+    fn building_types_job_is_disabled_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.jobs.building_types_update.enabled);
+        assert_eq!(cfg.jobs.building_types_update.interval_seconds, 86400);
+    }
+
+    #[test]
+    fn building_types_urls_default_to_this_repo() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.download_urls.bdot10k_building_types,
+            "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/bdot10k_building_types.csv"
+        );
+        assert_eq!(
+            cfg.download_urls.egib_building_types,
+            "https://raw.githubusercontent.com/openstreetmap-polska/osmpbudynkiv2/main/mappings/egib_building_types.csv"
+        );
+    }
+
+    #[test]
+    fn building_types_urls_can_be_overridden() {
+        let toml = r#"
+[download_urls]
+bdot10k_building_types = "https://example.test/b.csv"
+egib_building_types = "https://example.test/e.csv"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.download_urls.bdot10k_building_types,
+            "https://example.test/b.csv"
+        );
+        assert_eq!(
+            cfg.download_urls.egib_building_types,
+            "https://example.test/e.csv"
+        );
     }
 
     #[test]

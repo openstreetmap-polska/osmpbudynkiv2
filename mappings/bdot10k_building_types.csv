@@ -1,0 +1,179 @@
+tier,key,min_levels,max_levels,max_neighbours,tags
+1,budynek jednorodzinny,,,0,building=detached
+1,budynek jednorodzinny,,,,building=house
+1,dom letniskowy,,,,building=bungalow
+1,budynek wielorodzinny,,,,building=apartments
+1,domek kempingowy,,,,building=cabin
+1,dom wypoczynkowy,,,,building=hotel
+1,dom opieki społecznej,,,,building=residential
+1,pensjonat,,,,building=hotel
+1,internat lub bursa szkolna,,,,building=dormitory
+1,leśniczówka,,,,building=house
+1,ośrodek szkoleniowo-wypoczynkowy,,,,building=yes;fixme=BDOT10k: ośrodek szkoleniowo-wypoczynkowy
+1,zajazd,,,,building=hotel
+1,placówka opiekuńczo-wychowawcza,,,,building=residential
+1,dom studencki,,,,building=dormitory
+1,bacówka,,,,building=hut
+1,dom dziecka,,,,building=residential
+1,schronisko turystyczne,,,,building=yes;fixme=BDOT10k: schronisko turystyczne
+1,motel,,,,building=hotel
+1,dom dla bezdomnych,,,,building=residential
+1,hotel robotniczy,,,,building=dormitory
+1,hotel,,,,building=hotel
+1,budynek gospodarczy,,,,building=outbuilding
+1,garaż,,,,building=garage
+1,budynek produkcyjny zwierząt hodowlanych,,,,building=farm_auxiliary
+1,szklarnia lub cieplarnia,,,,building=greenhouse
+1,silos,,,,building=silo;man_made=silo
+1,stajnia,,,,building=stable
+1,młyn,,,,building=yes;fixme=BDOT10k: młyn
+1,elewator,,,,building=silo;man_made=silo
+1,chłodnia,,,,building=warehouse
+1,wiatrak,,,,building=yes;man_made=windmill
+1,ujeżdżalnia,,,,building=riding_hall
+1,obiekt handlowo-usługowy,,,,building=retail
+1,siedziba firmy lub firm,,,,building=office
+1,restauracja,,,,building=yes;fixme=BDOT10k: restauracja
+1,dom towarowy lub handlowy,,,,building=retail
+1,stacja paliw,,,,building=retail
+1,stacja obsługi pojazdów,,,,building=service
+1,dom weselny,,,,building=commercial
+1,bank,,,,building=commercial
+1,hipermarket lub supermarket,,,,building=supermarket
+1,apteka,,,,building=retail
+1,placówka operatora pocztowego,,,,building=commercial
+1,myjnia samochodowa,,,,building=service
+1,klinika weterynaryjna,,,,building=commercial
+1,centrum handlowe,,,,building=retail
+1,"klub, dyskoteka",,,,building=commercial
+1,budynek spedycji,,,,building=warehouse
+1,centrum konferencyjne,,,,building=commercial
+1,kino,,,,building=commercial
+1,hala targowa,,,,building=retail
+1,centrum informacyjne,,,,building=yes;fixme=BDOT10k: centrum informacyjne
+1,kasyno,,,,building=commercial
+1,magazyn,,,,building=warehouse
+1,produkcyjny,,,,building=industrial
+1,warsztat remontowo-naprawczy,,,,building=yes;fixme=BDOT10k: warsztat remontowo-naprawczy
+1,stacja pomp,,,,building=service
+1,stacja transformatorowa,,,,building=service
+1,kotłownia,,,,building=service
+1,zbiornik na ciecz,,,,building=storage_tank;man_made=storage_tank
+1,elektrownia,,,,building=industrial
+1,elektrociepłownia,,,,building=industrial
+1,stacja gazowa,,,,building=service
+1,hangar,,,,building=hangar
+1,zbiornik na gaz,,,,building=storage_tank;man_made=storage_tank
+1,rafineria,,,,building=industrial
+1,spalarnia śmieci,,,,building=industrial
+1,stacja nadawcza radia i telewizji,,,,building=service
+1,centrum telekomunikacyjne,,,,building=yes;fixme=BDOT10k: centrum telekomunikacyjne
+1,budynek kontroli ruchu kolejowego,,,,building=transportation
+1,dworzec kolejowy,,,,building=train_station
+1,parking wielopoziomowy,,,,building=parking
+1,lokomotywownia lub wagonownia,,,,building=transportation
+1,stacja kolejki górskiej lub wyciągu krzesełkowego,,,,building=transportation
+1,dworzec autobusowy,,,,building=transportation
+1,budynek kontroli ruchu powietrznego,,,,building=transportation
+1,dworzec lotniczy,,,,building=transportation
+1,terminal portowy,,,,building=transportation
+1,przejście graniczne,,,,building=yes;fixme=BDOT10k: przejście graniczne
+1,zajezdnia autobusowa,,,,building=transportation
+1,zajezdnia tramwajowa,,,,building=transportation
+1,kapitanat lub bosmanat portu,,,,building=yes;fixme=BDOT10k: kapitanat lub bosmanat portu
+1,stacja nautyczna,,,,building=yes;fixme=BDOT10k: stacja nautyczna
+1,zajezdnia trolejbusowa,,,,building=transportation
+1,latarnia morska,,,,building=lighthouse;man_made=lighthouse
+1,szkoła podstawowa,,,,building=school
+1,szkoła ponadpodstawowa,,,,building=school
+1,przedszkole,,,,building=kindergarten
+1,szkoła wyższa,,,,building=university
+1,biblioteka,,,,building=civic
+1,hala sportowa,,,,building=sports_hall
+1,sala gimnastyczna,,,,building=sports_hall
+1,żłobek,,,,building=kindergarten
+1,placówka badawcza,,,,building=office
+1,inna placówka edukacyjna,,,,building=education
+1,archiwum,,,,building=civic
+1,obserwatorium lub planetarium,,,,building=yes;fixme=BDOT10k: obserwatorium lub planetarium
+1,placówka ochrony zdrowia,,,,building=healthcare
+1,szpital,,,,building=hospital
+1,sanatorium,,,,building=hospital
+1,jednostka ratownictwa medycznego,,,,building=yes;fixme=BDOT10k: jednostka ratownictwa medycznego
+1,hospicjum,,,,building=hospital
+1,stacja sanitarno-epidemiologiczna,,,,building=public
+1,stacja krwiodawstwa,,,,building=healthcare
+1,izba wytrzeźwień,,,,building=yes;fixme=BDOT10k: izba wytrzeźwień
+1,straż pożarna,,,,building=fire_station
+1,dom kultury,,,,building=civic
+1,muzeum,,,,building=museum
+1,inny urząd administracji publicznej,,,,building=government
+1,policja,,,,building=civic
+1,koszary,,,,building=barracks
+1,zabudowania koszarowe,,,,building=barracks
+1,urząd miasta,,,,building=government
+1,sąd,,,,building=government
+1,zakład karny lub poprawczy,,,,building=civic
+1,ośrodek pomocy społecznej,,,,building=civic
+1,urząd gminy,,,,building=government
+1,toaleta publiczna,,,,building=toilets
+1,starostwo powiatowe,,,,building=government
+1,straż graniczna,,,,building=government
+1,zakład karny,,,,building=civic
+1,urząd miasta i gminy,,,,building=government
+1,urząd marszałkowski,,,,building=government
+1,areszt śledczy,,,,building=civic
+1,ministerstwo,,,,building=government
+1,urząd wojewódzki,,,,building=government
+1,prokuratura,,,,building=government
+1,urząd celny,,,,building=government
+1,placówka dyplomatyczna lub konsularna,,,,building=government
+1,rezydencja ambasadora,,,,building=yes;fixme=BDOT10k: rezydencja ambasadora
+1,zakład poprawczy,,,,building=civic
+1,schronisko dla nieletnich,,,,building=civic
+1,rezydencja prezydencka,,,,building=yes;fixme=BDOT10k: rezydencja prezydencka
+1,dom parafialny,,,,building=presbytery
+1,kaplica,,,,building=chapel
+1,klasztor,,,,building=monastery
+1,dzwonnica,,,,building=bell_tower
+1,kościół,,,,building=church
+1,dom zakonny,,,,building=monastery
+1,dom rekolekcyjny,,,,building=religious
+1,budynki cmentarne,,,,building=yes;fixme=BDOT10k: budynki cmentarne
+1,inny budynek kultu religijnego,,,,building=religious
+1,cerkiew,,,,building=church
+1,synagoga,,,,building=synagogue
+1,rezydencja biskupia,,,,building=religious
+1,kuria metropolitalna,,,,building=religious
+1,meczet,,,,building=religious
+1,dom pogrzebowy,,,,building=yes;fixme=BDOT10k: dom pogrzebowy
+1,krematorium,,,,building=yes;fixme=BDOT10k: krematorium
+1,klub sportowy,,,,building=sports_centre
+1,zabytek niepełniący żadnej funkcji użytkowej,,,,building=yes;fixme=BDOT10k: zabytek niepełniący żadnej funkcji użytkowej
+1,schronisko dla zwierząt,,,,building=yes;fixme=BDOT10k: schronisko dla zwierząt
+1,budynek ogrodu zoologicznego lub botanicznego,,,,building=yes;fixme=BDOT10k: budynek ogrodu zoologicznego lub botanicznego
+1,basen kąpielowy,,,,building=sports_centre
+1,korty tenisowe,,,,building=yes;fixme=BDOT10k: korty tenisowe
+1,strzelnica,,,,building=yes;fixme=BDOT10k: strzelnica
+1,teatr,,,,building=civic
+1,hala widowiskowa,,,,building=civic
+1,galeria sztuki,,,,building=civic
+1,sztuczne lodowisko,,,,building=sports_centre
+1,pawilon ogrodowy lub oranżeria,,,,building=yes;fixme=BDOT10k: pawilon ogrodowy lub oranżeria
+1,hala wystawowa,,,,building=civic
+1,filharmonia,,,,building=civic
+1,opera,,,,building=civic
+1,halowy tor gokartowy,,,,building=sports_centre
+1,kręgielnia,,,,building=sports_centre
+1,stacja meteorologiczna,,,,building=yes;fixme=BDOT10k: stacja meteorologiczna
+1,stacja hydrologiczna,,,,building=yes;fixme=BDOT10k: stacja hydrologiczna
+2,"budynki produkcyjne, usługowe i gospodarcze dla rolnictwa",,,,building=outbuilding
+2,budynki transportu i łączności,,,,building=garage
+2,"zbiorniki, silosy i budynki magazynowe",,,,building=warehouse
+2,budynki mieszkalne,,,,building=residential
+2,budynki handlowo-usługowe,,,,building=retail
+2,budynki biurowe,,,,building=office
+2,budynki przemysłowe,,,,building=industrial
+2,budynki szpitali i inne budynki opieki zdrowotnej,,,,building=healthcare
+2,"budynki oświaty, nauki i kultury oraz budynki sportowe",,,,building=civic
+2,pozostałe budynki niemieszkalne,,,,building=yes;fixme=BDOT10k: pozostałe budynki niemieszkalne

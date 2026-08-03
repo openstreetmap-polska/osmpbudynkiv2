@@ -162,6 +162,11 @@ pub async fn run(
                 as Arc<dyn jobs::Job>,
             jobs::JobConfigResolved::from(&config.jobs.street_mappings_update),
         ),
+        (
+            Arc::new(jobs::building_types_update::BuildingTypesUpdateJob::new())
+                as Arc<dyn jobs::Job>,
+            jobs::JobConfigResolved::from(&config.jobs.building_types_update),
+        ),
     ];
     let scheduler = jobs::Scheduler::start(job_list, pool.clone(), kv, config.clone());
     let registry = scheduler.registry.clone();

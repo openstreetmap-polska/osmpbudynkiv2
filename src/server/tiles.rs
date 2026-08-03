@@ -174,10 +174,10 @@ mod tests {
         // Enough rows that an index scan is plausibly cheaper than a seq scan;
         // the optimizer will not reach for an index on a handful of rows.
         conn.execute_batch(
-            "INSERT INTO bdot10k_unmatched
+            "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at)
                  SELECT 'b' || i, ST_MakeEnvelope(20.0 + i*0.0001, 52.0, 20.0 + i*0.0001 + 0.00005, 52.00005), 0, 0, now()
                  FROM range(20000) t(i);
-             INSERT INTO egib_unmatched
+             INSERT INTO egib_unmatched (id_budynku, geom, cell_x, cell_y, computed_at)
                  SELECT 'e' || i, ST_MakeEnvelope(20.0 + i*0.0001, 52.0, 20.0 + i*0.0001 + 0.00005, 52.00005), 0, 0, now()
                  FROM range(20000) t(i);
              INSERT INTO prg_unmatched

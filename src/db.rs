@@ -118,19 +118,33 @@ fn create_schema(conn: &Connection) -> Result<()> {
         -- Precomputed unmatched government objects served by /tiles and /package.
         -- Only unmatched rows are stored, tagged with the z14 cell of their
         -- representative point and the time that cell was last recomputed.
+        --
+        -- funkcja_szczegolowa/funkcja_ogolna/liczba_kondygnacji and
+        -- rodzaj_kod/kondygnacje_nadziemne are the raw classification columns
+        -- carried over at compare time so server::package::building_tags can
+        -- resolve an OSM building tag at serve time -- see
+        -- docs/superpowers/specs/2026-08-03-building-type-mappings-design.md.
+        -- egib_unmatched.rodzaj_kod is populated once `import egib` computes
+        -- `egib_buildings.rodzaj_kod`; until then it stays NULL, same as any
+        -- column added ahead of the compare that first populates it.
         CREATE TABLE IF NOT EXISTS bdot10k_unmatched (
             LOKALNYID VARCHAR,
             geom GEOMETRY,
             cell_x INTEGER,
             cell_y INTEGER,
-            computed_at TIMESTAMP WITH TIME ZONE
+            computed_at TIMESTAMP WITH TIME ZONE,
+            funkcja_szczegolowa VARCHAR,
+            funkcja_ogolna VARCHAR,
+            liczba_kondygnacji SMALLINT
         );
         CREATE TABLE IF NOT EXISTS egib_unmatched (
             id_budynku VARCHAR,
             geom GEOMETRY,
             cell_x INTEGER,
             cell_y INTEGER,
-            computed_at TIMESTAMP WITH TIME ZONE
+            computed_at TIMESTAMP WITH TIME ZONE,
+            rodzaj_kod VARCHAR,
+            kondygnacje_nadziemne INTEGER
         );
         CREATE TABLE IF NOT EXISTS prg_unmatched (
             geom GEOMETRY,
@@ -155,6 +169,31 @@ fn create_schema(conn: &Connection) -> Result<()> {
             teryt_simc_code VARCHAR,
             prg_street_name VARCHAR,
             osm_street_name VARCHAR
+        );
+
+        -- Curated BDOT10k/EGIB classification -> OSM building tag mappings,
+        -- applied at serve time by server/package.rs. An empty table is a
+        -- valid state and degrades to a plain `building=yes`. tier is 1 for
+        -- the source's primary key column, 2 for BDOT10k's fallback KŚT
+        -- category (EGIB has no tier 2). key is stored lower(trim(...)).
+        -- min_levels/max_levels/max_neighbours are inclusive constraints,
+        -- NULL meaning unconstrained; tags is ';'-separated k=v pairs. See
+        -- docs/superpowers/specs/2026-08-03-building-type-mappings-design.md.
+        CREATE TABLE IF NOT EXISTS bdot10k_building_types (
+            tier INTEGER,
+            key VARCHAR,
+            min_levels INTEGER,
+            max_levels INTEGER,
+            max_neighbours INTEGER,
+            tags VARCHAR
+        );
+        CREATE TABLE IF NOT EXISTS egib_building_types (
+            tier INTEGER,
+            key VARCHAR,
+            min_levels INTEGER,
+            max_levels INTEGER,
+            max_neighbours INTEGER,
+            tags VARCHAR
         );
 
         -- Dirty-cell queue drained by the match_refresh job. Duplicates allowed

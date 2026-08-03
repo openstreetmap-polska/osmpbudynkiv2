@@ -1,0 +1,14 @@
+tier,key,min_levels,max_levels,max_neighbours,tags,note
+1,m,4,,,building=apartments,95.6% na 9294 parach
+1,m,1,2,0,building=detached,wolnostojący; sąsiedztwo liczone tylko wśród budynków mieszkalnych
+1,m,1,2,,building=house,przylega do innego budynku mieszkalnego
+1,m,,,,building=residential,3 kondygnacje lub brak danych — przypadek niejednoznaczny
+1,g,,,,building=outbuilding,88.9% (61.8-94.2 wg regionu)
+1,s,,,,building=warehouse,62.6% (35.8-90.0)
+1,h,,,,building=retail,58.0% (51.7-64.6)
+1,b,,,,building=office,56.7% (48.9-63.9)
+1,z,,,,building=healthcare,66.2%
+1,k,,,,"building=civic;fixme=EGiB: budynki oświaty, nauki i kultury oraz budynki sportowe",uogólnienie: school/university/kindergarten bez zwycięzcy
+1,p,,,,building=yes;fixme=EGiB: budynki przemysłowe,"industrial tylko 41.0% — za słabe, by twierdzić"
+1,t,,,,building=yes;fixme=EGiB: budynki transportu i łączności,w praktyce garaż lub budynek gospodarczy; 16.2-97.6% garaże wg województwa
+1,i,,,,building=yes,worek na wszystko (15.5% tabeli); bez fixme — komunikat nic by nie wnosił

@@ -455,10 +455,23 @@ mod tests {
                  computed_at TIMESTAMP WITH TIME ZONE);
              CREATE TABLE bdot10k_unmatched (
                  lokalnyid VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
-                 computed_at TIMESTAMP WITH TIME ZONE);
+                 computed_at TIMESTAMP WITH TIME ZONE,
+                 funkcja_szczegolowa VARCHAR, funkcja_ogolna VARCHAR, liczba_kondygnacji SMALLINT);
              CREATE TABLE egib_unmatched (
                  id_budynku VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
-                 computed_at TIMESTAMP WITH TIME ZONE);
+                 computed_at TIMESTAMP WITH TIME ZONE,
+                 rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER);
+             CREATE TABLE bdot10k_buildings (
+                 LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR);
+             CREATE TABLE bdot10k_building_types (
+                 tier INTEGER, key VARCHAR, min_levels INTEGER, max_levels INTEGER,
+                 max_neighbours INTEGER, tags VARCHAR);
+             CREATE TABLE egib_buildings (
+                 id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY, rodzaj_kod VARCHAR);
+             CREATE TABLE egib_building_types (
+                 tier INTEGER, key VARCHAR, min_levels INTEGER, max_levels INTEGER,
+                 max_neighbours INTEGER, tags VARCHAR);
              CREATE TABLE street_name_mappings (
                  teryt_simc_code VARCHAR,
                  prg_street_name VARCHAR,
