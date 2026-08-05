@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "maplibre-mapbox-migration": {
+      "source": "maplibre/maplibre-agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/maplibre-mapbox-migration/SKILL.md",
+      "computedHash": "e18326c4a5ee445f00c94138d14de974e92177f2ac5209912bb95c7b68c07af8"
+    },
+    "maplibre-tile-sources": {
+      "source": "maplibre/maplibre-agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/maplibre-tile-sources/SKILL.md",
+      "computedHash": "3a54ecb94144f640b88f35a2b3d03e17090d4d07f4dc87a5cc26221885f39d31"
+    }
+  }
+}
