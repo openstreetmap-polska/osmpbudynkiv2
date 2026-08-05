@@ -97,3 +97,16 @@ The binary accepts `--config <path>` pointing to a TOML file (see `example_confi
 - **Integration tests:** `tests/` directory, using `assert_cmd` to test CLI behavior with `tempfile` for isolated DB instances
 - Run a single integration test: `cargo test --test cli_import_osm`
 - **Fixtures:** Regenerate with `fixtures/scripts/prepare_fixtures.sh` (uses local OSM PBF + GeoParquet inputs)
+
+## Web frontend (`web/`) & browser testing
+
+`web/index.html` / `web/app.js` / `web/style.css` is a static MapLibre GL JS frontend served from a config-set disk directory (not embedded in the binary). It reads `/tiles/{z}/{x}/{y}` and `/status` from the running server.
+
+To manually verify a frontend change in a real browser (required for anything touching MapLibre style/paint — type-checking and unit tests don't catch rendering bugs):
+
+1. Run the server: `cargo run -- --config example_config.toml run` — **redirect output to a file** (`> server.log 2>&1`), don't pipe through `tail -N` without `-f`. A non-follow `tail` buffers all output until the process exits, which looks identical to a hung server; poll the log file with `grep` instead.
+2. Drive a browser with `npx playwright cli <command>` (open/goto/click/check/screenshot/eval/run-code, session-based). This needs no install — it reuses the already-`npx`-cached `playwright-core` package. The `mcp__playwright__*` MCP tool is an alternative but has failed in this environment before (missing system Chrome, no sudo to install it) — reach for the CLI first.
+3. **After editing `app.js`, close and reopen the CLI browser session rather than reloading the same page.** The browser caches the script over plain HTTP, so a same-session reload can silently re-run the stale pre-edit version.
+4. Check console output for errors before trusting a visual screenshot — a layer can fail to parse and simply not render, with no visible symptom except a console error.
+
+**Gotcha — MapLibre paint properties don't resolve CSS `var(...)`.** They're MapLibre's own expression language, evaluated against the style JSON at construction time, not CSS. Baking a `var(--x)` string into a paint property (e.g. `"fill-color": "var(--bdot10k)"`) fails style validation immediately — the layer never renders, and patching it after the fact via `setPaintProperty` in a `load` handler is too late, since construction already threw. Instead resolve real values from `getComputedStyle(document.documentElement)` *before* building the style object (see `app.js`'s `sourceColor`/`addressColor`), so `style.css` stays the single source of truth for colors without needing CSS variables inside the style spec itself.
