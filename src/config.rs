@@ -39,6 +39,16 @@ pub struct Config {
     pub rocksdb_write_buffer_mb: u64,
     pub log_level: String,
     pub http_listen_addr: String,
+    /// Directory the `run` HTTP server serves static frontend assets from
+    /// (mounted as a fallback route, so it never shadows `/health`,
+    /// `/status`, `/tiles`, `/package`, `/updates`). Deployed and versioned
+    /// separately from the binary — see the frontend architecture decision:
+    /// the release ships binary + config + this directory as sibling files
+    /// rather than embedding assets in the binary, since a deployment
+    /// already has multiple files (config, systemd unit) to manage.
+    /// A missing directory is not an error at startup; requests that would
+    /// have served a file just 404.
+    pub web_dir: String,
     pub download_dir: Option<String>,
     /// When true (default), files that `import`/`update` downloaded
     /// themselves are deleted once consumed. Set to false to keep them in
@@ -277,6 +287,7 @@ impl Default for Config {
             rocksdb_write_buffer_mb: 64,
             log_level: "info".to_string(),
             http_listen_addr: "127.0.0.1:3000".to_string(),
+            web_dir: "./web".to_string(),
             download_dir: None,
             cleanup_downloaded_files: true,
             teryt: TerytConfig::default(),
@@ -374,6 +385,7 @@ mod tests {
         assert_eq!(config.rocksdb_block_cache_mb, 512);
         assert_eq!(config.rocksdb_write_buffer_mb, 64);
         assert_eq!(config.log_level, "info");
+        assert_eq!(config.web_dir, "./web");
         assert!(config.download_dir.is_none());
         assert_eq!(config.download_dir(), std::env::temp_dir());
         assert_eq!(config.duckdb_init_commands.len(), 9);
@@ -455,6 +467,15 @@ osm_replication = "https://example.com/replication"
             config.download_dir(),
             std::path::PathBuf::from("/my/downloads")
         );
+    }
+
+    #[test]
+    fn test_web_dir_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "web_dir = \"/srv/osmpbudynkiv2/web\"").unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert_eq!(config.web_dir, "/srv/osmpbudynkiv2/web");
     }
 
     #[test]

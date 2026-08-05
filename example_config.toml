@@ -18,6 +18,13 @@ log_level = "info"
 # Address and port the HTTP server listens on (used by the `run` command)
 http_listen_addr = "127.0.0.1:3000"
 
+# Directory the HTTP server serves static frontend assets from (used by the
+# `run` command). Deployed and versioned as a sibling of the binary rather
+# than embedded in it. Mounted as a fallback route, so it never shadows
+# /health, /status, /tiles, /package, /updates. A missing directory is not a
+# startup error -- requests that would have served a file just 404.
+web_dir = "./web"
+
 # Directory for downloaded files. When not set, the system temp directory is used
 # and files are cleaned up automatically after processing.
 # download_dir = "./data"

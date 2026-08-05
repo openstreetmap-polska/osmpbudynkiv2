@@ -10,6 +10,7 @@ use axum::{Router, http::StatusCode};
 use duckdb::Connection;
 use r2d2::Pool;
 use tokio::net::TcpListener;
+use tower_http::services::ServeDir;
 use tracing::info;
 
 use crate::config::Config as AppConfig;
@@ -190,7 +191,13 @@ pub async fn run(
             axum::routing::get(package::get_package).post(package::post_package),
         )
         .route("/updates", axum::routing::get(updates::get_updates))
-        .with_state(state);
+        .with_state(state)
+        // Static frontend assets, served from a directory deployed alongside
+        // the binary (see Config::web_dir) rather than embedded at compile
+        // time. Mounted as a fallback so it never shadows the API routes
+        // above; a missing directory just makes every request 404 instead of
+        // failing startup.
+        .fallback_service(ServeDir::new(&config.web_dir));
 
     let listener = TcpListener::bind(&config.http_listen_addr).await?;
     info!(addr = %config.http_listen_addr, "HTTP server listening");
@@ -296,7 +303,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::jobs::{JobOutcome, JobRegistry, JobState, JobStatus};
-    use super::{AppState, build_pool, jobs};
+    use super::{AppState, ServeDir, build_pool, jobs};
 
     fn make_test_state(initial: Vec<JobStatus>) -> AppState {
         let conn = Connection::open_in_memory().unwrap();
@@ -365,6 +372,126 @@ mod tests {
         assert_eq!(jobs[0]["state"], "idle");
         assert_eq!(jobs[0]["run_count"], 7);
         assert_eq!(jobs[0]["last_outcome"]["kind"], "Success");
+    }
+
+    /// The static frontend is mounted as a `fallback_service`, so it must
+    /// never shadow an API route — a request for `/health` has to keep
+    /// hitting the handler even when a file named `health` happens to sit in
+    /// `web_dir`.
+    #[tokio::test]
+    async fn static_fallback_does_not_shadow_api_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("health"), b"not the api response").unwrap();
+
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .fallback_service(ServeDir::new(dir.path()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert!(
+            body.is_empty(),
+            "must be the API handler, not the static file"
+        );
+    }
+
+    /// A request for a real file under `web_dir` is served by the fallback.
+    #[tokio::test]
+    async fn static_fallback_serves_files_from_web_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), b"<h1>hello</h1>").unwrap();
+
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .fallback_service(ServeDir::new(dir.path()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"<h1>hello</h1>");
+    }
+
+    /// A missing `web_dir` (or a missing file within it) must 404, not crash
+    /// the server — the config doc promises this is not a startup error.
+    #[tokio::test]
+    async fn static_fallback_404s_when_web_dir_is_missing() {
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .fallback_service(ServeDir::new("/nonexistent/web/dir"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The static fallback must not let a request escape `web_dir`. `ServeDir`
+    /// percent-decodes the URI path once and then rejects any component that
+    /// is not `Component::Normal`, so `..` is refused before the filesystem is
+    /// touched — but that is a property of the dependency, not of our code, so
+    /// pin it here rather than trusting a future upgrade to keep it.
+    #[tokio::test]
+    async fn static_fallback_rejects_path_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let web = root.path().join("web");
+        std::fs::create_dir(&web).unwrap();
+        std::fs::write(web.join("index.html"), b"<h1>hello</h1>").unwrap();
+        // The file an attacker would be trying to reach: a sibling of web_dir,
+        // standing in for a config file or the DuckDB database next to it.
+        std::fs::write(root.path().join("secret.txt"), b"SECRET").unwrap();
+
+        // Raw `..`, single-encoded, mixed-case, encoded separator, and
+        // double-encoded. The last one decodes to the literal name `%2e%2e`,
+        // which is a normal component and simply does not exist.
+        for uri in [
+            "/../secret.txt",
+            "/%2e%2e/secret.txt",
+            "/%2E%2E%2Fsecret.txt",
+            "/..%2fsecret.txt",
+            "/%252e%252e/secret.txt",
+            "/subdir/../../secret.txt",
+            "/etc/passwd",
+        ] {
+            let app = Router::new()
+                .route("/health", get(|| async { StatusCode::OK }))
+                .fallback_service(ServeDir::new(&web));
+
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must not resolve outside web_dir"
+            );
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_ne!(&body[..], b"SECRET", "{uri} leaked a file outside web_dir");
+        }
     }
 
     /// An in-place upgrade of an existing database gains the `*_unmatched`
