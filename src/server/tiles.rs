@@ -66,6 +66,48 @@ const BUILDINGS_MVT_SQL: &str = "
     WHERE t.geom IS NOT NULL
 ";
 
+// Same shape as ADDRESSES_MVT_SQL/BUILDINGS_MVT_SQL above, reading the full
+// government tables (`prg_addresses`, `bdot10k_buildings`, `egib_buildings`)
+// instead of the `*_unmatched` serving tables, for the legend's "all" layer.
+// These three tables are in `server::REQUIRED_TABLES` -- `run` refuses to
+// start without them -- so, unlike the serving tables, no empty-table
+// fallback is needed here. They carry the same RTREE(geom) indexes the
+// serving tables do (created at import time; see `import::bdot10k`,
+// `import::egib`, `import::prg`), so the constant-argument `ST_Intersects`
+// form keeps this on the index for the same reason documented above.
+const ALL_ADDRESSES_MVT_SQL: &str = "
+    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom)
+    SELECT ST_AsMVT(t, 'addresses_all', 4096, 'geom') AS mvt
+    FROM (
+        SELECT ST_AsMVTGeom(a.geom, bbox.geom, 4096, 256, true) AS geom,
+               a.lokalny_id,
+               a.numer_porzadkowy AS housenumber,
+               a.miejscowosc AS city
+        FROM prg_addresses a, bbox
+        WHERE ST_Intersects(a.geom, ST_MakeEnvelope(?, ?, ?, ?))
+    ) t
+    WHERE t.geom IS NOT NULL
+";
+
+const ALL_BUILDINGS_MVT_SQL: &str = "
+    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom)
+    SELECT ST_AsMVT(t, 'buildings_all', 4096, 'geom') AS mvt
+    FROM (
+        SELECT ST_AsMVTGeom(raw.geom, bbox.geom, 4096, 256, true) AS geom,
+               raw.id, raw.source
+        FROM (
+            SELECT bdot10k_buildings.geom, LOKALNYID AS id, 'bdot10k' AS source
+            FROM bdot10k_buildings
+            WHERE ST_Intersects(bdot10k_buildings.geom, ST_MakeEnvelope(?, ?, ?, ?))
+            UNION ALL
+            SELECT egib_buildings.geom, id_budynku AS id, 'egib' AS source
+            FROM egib_buildings
+            WHERE ST_Intersects(egib_buildings.geom, ST_MakeEnvelope(?, ?, ?, ?))
+        ) raw, bbox
+    ) t
+    WHERE t.geom IS NOT NULL
+";
+
 pub async fn serve_tile(
     State(state): State<AppState>,
     Path((z, x, y)): Path<(u32, u32, u32)>,
@@ -102,7 +144,24 @@ pub async fn serve_tile(
                 min_lon, min_lat, max_lon, max_lat, // egib_unmatched filter
             ],
         )?;
-        Ok::<Vec<u8>, anyhow::Error>([addresses, buildings].concat())
+        let addresses_all = query_mvt_layer(
+            &conn,
+            ALL_ADDRESSES_MVT_SQL,
+            duckdb::params![
+                min_lon, min_lat, max_lon, max_lat, // bbox CTE
+                min_lon, min_lat, max_lon, max_lat, // prg_addresses filter
+            ],
+        )?;
+        let buildings_all = query_mvt_layer(
+            &conn,
+            ALL_BUILDINGS_MVT_SQL,
+            duckdb::params![
+                min_lon, min_lat, max_lon, max_lat, // bbox CTE
+                min_lon, min_lat, max_lon, max_lat, // bdot10k_buildings filter
+                min_lon, min_lat, max_lon, max_lat, // egib_buildings filter
+            ],
+        )?;
+        Ok::<Vec<u8>, anyhow::Error>([addresses, buildings, addresses_all, buildings_all].concat())
     })
     .await;
 
@@ -182,6 +241,21 @@ mod tests {
                  FROM range(20000) t(i);
              INSERT INTO prg_unmatched
                  SELECT ST_Point(20.0 + i*0.0001, 52.0), 'p' || i, '1', NULL, NULL, NULL, NULL, 0, 0, now()
+                 FROM range(20000) t(i);
+             CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             CREATE INDEX bdot10k_buildings_geom_idx ON bdot10k_buildings USING RTREE (geom);
+             INSERT INTO bdot10k_buildings
+                 SELECT 'b' || i, ST_MakeEnvelope(20.0 + i*0.0001, 52.0, 20.0 + i*0.0001 + 0.00005, 52.00005)
+                 FROM range(20000) t(i);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);
+             CREATE INDEX egib_buildings_geom_idx ON egib_buildings USING RTREE (geom);
+             INSERT INTO egib_buildings
+                 SELECT 'e' || i, ST_MakeEnvelope(20.0 + i*0.0001, 52.0, 20.0 + i*0.0001 + 0.00005, 52.00005)
+                 FROM range(20000) t(i);
+             CREATE TABLE prg_addresses (lokalny_id VARCHAR, numer_porzadkowy VARCHAR, miejscowosc VARCHAR, geom GEOMETRY);
+             CREATE INDEX prg_addresses_geom_idx ON prg_addresses USING RTREE (geom);
+             INSERT INTO prg_addresses
+                 SELECT 'p' || i, '1', NULL, ST_Point(20.0 + i*0.0001, 52.0)
                  FROM range(20000) t(i);",
         )
         .unwrap();
@@ -213,6 +287,18 @@ mod tests {
             bldg_plan.contains("RTREE_INDEX_SCAN"),
             "buildings MVT query must use the RTREE index, got plan:\n{bldg_plan}"
         );
+
+        let all_addr_plan = plan_of(ALL_ADDRESSES_MVT_SQL, &addr_params);
+        assert!(
+            all_addr_plan.contains("RTREE_INDEX_SCAN"),
+            "all-addresses MVT query must use the RTREE index, got plan:\n{all_addr_plan}"
+        );
+
+        let all_bldg_plan = plan_of(ALL_BUILDINGS_MVT_SQL, &bldg_params);
+        assert!(
+            all_bldg_plan.contains("RTREE_INDEX_SCAN"),
+            "all-buildings MVT query must use the RTREE index, got plan:\n{all_bldg_plan}"
+        );
     }
 
     /// In-memory DB with the government/OSM tables `/tiles` queries touch,
@@ -230,7 +316,11 @@ mod tests {
                  cell_x INTEGER, cell_y INTEGER, computed_at TIMESTAMP WITH TIME ZONE);
              CREATE TABLE egib_unmatched (
                  id_budynku VARCHAR, geom GEOMETRY,
-                 cell_x INTEGER, cell_y INTEGER, computed_at TIMESTAMP WITH TIME ZONE);",
+                 cell_x INTEGER, cell_y INTEGER, computed_at TIMESTAMP WITH TIME ZONE);
+             CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, miejscowosc VARCHAR, geom GEOMETRY);
+             CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY);",
         )
         .unwrap();
         if !seed_sql.is_empty() {
@@ -305,7 +395,13 @@ mod tests {
              INSERT INTO bdot10k_unmatched VALUES
                  ('b1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
              INSERT INTO egib_unmatched VALUES
-                 ('e1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());"
+                 ('e1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
+             INSERT INTO prg_addresses VALUES
+                 ('a1', '12', 'Warszawa', ST_Point({mid_lon}, {mid_lat}));
+             INSERT INTO bdot10k_buildings VALUES
+                 ('b1', ST_Point({mid_lon}, {mid_lat}));
+             INSERT INTO egib_buildings VALUES
+                 ('e1', ST_Point({mid_lon}, {mid_lat}));"
         );
         let state = make_state(&seed);
         let response = tiles_app(state)
@@ -322,6 +418,14 @@ mod tests {
         let body = String::from_utf8_lossy(&bytes);
         assert!(body.contains("addresses"), "missing addresses layer");
         assert!(body.contains("buildings"), "missing buildings layer");
+        assert!(
+            body.contains("addresses_all"),
+            "missing addresses_all layer"
+        );
+        assert!(
+            body.contains("buildings_all"),
+            "missing buildings_all layer"
+        );
         assert!(body.contains("bdot10k"), "missing bdot10k source tag");
         assert!(body.contains("egib"), "missing egib source tag");
     }
