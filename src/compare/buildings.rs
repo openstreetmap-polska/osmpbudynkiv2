@@ -3,7 +3,7 @@ use duckdb::Connection;
 use tracing::info;
 
 use crate::compare::columns::classification_columns;
-use crate::compare::rule::unmatched_buildings_sql;
+use crate::compare::rule::{BDOT10K_EKSPLOATOWANY_FILTER, unmatched_buildings_sql};
 use crate::tile_math::{cell_x_sql, cell_y_sql};
 use crate::utils::format_duration;
 
@@ -17,6 +17,7 @@ pub fn compare_bdot10k(conn: &Connection) -> Result<()> {
         "bdot10k_buildings",
         "LOKALNYID",
         "bdot10k_unmatched",
+        Some(BDOT10K_EKSPLOATOWANY_FILTER),
     )
 }
 
@@ -27,6 +28,7 @@ pub fn compare_egib(conn: &Connection) -> Result<()> {
         "egib_buildings",
         "id_budynku",
         "egib_unmatched",
+        None,
     )
 }
 
@@ -36,6 +38,7 @@ fn compare_buildings(
     source_table: &str,
     id_col: &str,
     dest: &str,
+    extra_filter: Option<&str>,
 ) -> Result<()> {
     info!(source = label, "Comparing buildings against OSM");
     let t = std::time::Instant::now();
@@ -56,7 +59,7 @@ fn compare_buildings(
         while x < max_x {
             let (x_hi, y_hi) = (x + GRID_STEP, y + GRID_STEP);
             let area = (x, y, x_hi, y_hi);
-            let inner = unmatched_buildings_sql(source_table, &select, area);
+            let inner = unmatched_buildings_sql(source_table, &select, area, extra_filter);
             // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
             // closed on all four cell edges, so a centroid exactly on a grid
             // line would satisfy two neighbouring cells' predicates. Restrict
@@ -80,8 +83,17 @@ fn compare_buildings(
     // total is now accurate: the grid above covers the source table's full
     // extent (source_grid_extent), and the write-narrow guard means each row
     // is written by exactly one cell, so matched = total - unmatched holds.
+    // `total` applies the same extra_filter as the comparison itself
+    // (e.g. BDOT10K_EKSPLOATOWANY_FILTER), so a filtered-out row is neither
+    // matched nor unmatched -- it's simply excluded from both counts.
+    let total_where = extra_filter
+        .map(|f| format!("WHERE {f}"))
+        .unwrap_or_default();
     let (total, unmatched): (i64, i64) = conn.query_row(
-        &format!("SELECT (SELECT COUNT(*) FROM {source_table}), (SELECT COUNT(*) FROM {dest})"),
+        &format!(
+            "SELECT (SELECT COUNT(*) FROM {source_table} b {total_where}), \
+                    (SELECT COUNT(*) FROM {dest})"
+        ),
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -187,7 +199,8 @@ mod tests {
         let conn = setup();
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
-                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT);
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('inside', ST_MakeEnvelope(20.0002,52.0002,20.0008,52.0008)),
                  ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));
@@ -224,7 +237,8 @@ mod tests {
         let conn = setup();
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
-                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT);
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));
              UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
@@ -247,7 +261,8 @@ mod tests {
         let conn = setup();
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
-                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT);
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('sane', ST_MakeEnvelope(20.0,52.0,20.001,52.001)),
                  ('wild', ST_MakeEnvelope(-180.0,-90.0,-179.999,-89.999));
@@ -275,7 +290,8 @@ mod tests {
         let conn = setup();
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
-                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT);
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('stray', ST_MakeEnvelope(30.0,60.0,30.001,60.001));
              UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
@@ -310,7 +326,8 @@ mod tests {
         let conn = setup();
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
-                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT);
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  -- centroid (14.5, 52.25): x = 14.5 is the boundary between
                  -- the [14.0,14.5) and [14.5,15.0) grid columns; y = 52.25 is
@@ -336,6 +353,41 @@ mod tests {
         assert_eq!(
             n, 1,
             "a centroid exactly on a grid boundary must be written by exactly one cell"
+        );
+    }
+
+    /// `compare bdot10k` only ever considers `KATEGORIAISTNIENIA =
+    /// 'eksploatowany'` rows a government building to compare at all -- an
+    /// unmatched "w budowie" (under construction) building must never be
+    /// served, and must not count towards `total`/`matched` either (see the
+    /// `total_where` comment above).
+    #[test]
+    fn excludes_non_eksploatowany_buildings_from_unmatched_and_totals() {
+        let conn = setup();
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR);
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom, KATEGORIAISTNIENIA) VALUES
+                 ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201), 'eksploatowany'),
+                 ('under_construction', ST_MakeEnvelope(22.0,53.2,22.001,53.201), 'w budowie');
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+        compare_bdot10k(&conn).unwrap();
+        let ids: Vec<String> = {
+            let mut s = conn
+                .prepare("SELECT LOKALNYID FROM bdot10k_unmatched ORDER BY LOKALNYID")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["lonely".to_string()],
+            "the under-construction building must never be served as unmatched"
         );
     }
 }

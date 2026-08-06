@@ -76,7 +76,8 @@ mod full_vs_incremental_equivalence {
         // so all three must exist even if a given test only seeds one.
         c.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
-                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT);
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
              CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  kondygnacje_nadziemne INTEGER);
              CREATE TABLE prg_addresses (
@@ -219,7 +220,8 @@ mod drain_refresh_concurrency {
                                     20.0 + i * 0.03 + 0.002, 52.002) AS geom,
                     NULL::VARCHAR AS PRZEWAZAJACAFUNKCJABUDYNKU,
                     NULL::VARCHAR AS FUNKCJAOGOLNABUDYNKU,
-                    NULL::SMALLINT AS LICZBAKONDYGNACJI
+                    NULL::SMALLINT AS LICZBAKONDYGNACJI,
+                    'eksploatowany' AS KATEGORIAISTNIENIA
              FROM range({n}) t(i)"
         )
     }

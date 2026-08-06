@@ -3,7 +3,8 @@ use duckdb::Connection;
 
 use crate::compare::columns::classification_columns;
 use crate::compare::rule::{
-    OSM_MATCH_BUFFER_DEG, buffer, unmatched_addresses_in_cell_sql, unmatched_buildings_sql,
+    BDOT10K_EKSPLOATOWANY_FILTER, OSM_MATCH_BUFFER_DEG, buffer, unmatched_addresses_in_cell_sql,
+    unmatched_buildings_sql,
 };
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
@@ -21,10 +22,15 @@ pub fn recompute_cell_in_txn(
     let write = tile_to_bbox(CHANGE_CELL_ZOOM, cell_x as u32, cell_y as u32);
     let (dest, insert_cols, inner) = match source {
         "bdot10k" | "egib" => {
-            let (src, id, dest) = if source == "bdot10k" {
-                ("bdot10k_buildings", "LOKALNYID", "bdot10k_unmatched")
+            let (src, id, dest, extra_filter) = if source == "bdot10k" {
+                (
+                    "bdot10k_buildings",
+                    "LOKALNYID",
+                    "bdot10k_unmatched",
+                    Some(BDOT10K_EKSPLOATOWANY_FILTER),
+                )
             } else {
-                ("egib_buildings", "id_budynku", "egib_unmatched")
+                ("egib_buildings", "id_budynku", "egib_unmatched", None)
             };
             let cx = cell_x_sql("b.centroid");
             let cy = cell_y_sql("b.centroid");
@@ -39,7 +45,7 @@ pub fn recompute_cell_in_txn(
             // that owns it.
             let inner = format!(
                 "{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
-                unmatched_buildings_sql(src, &select, write)
+                unmatched_buildings_sql(src, &select, write, extra_filter)
             );
             (
                 dest,
@@ -122,7 +128,8 @@ mod tests {
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
-                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT);",
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');",
         )
         .unwrap();
         c
@@ -230,6 +237,40 @@ mod tests {
         assert_eq!(
             n, 1,
             "a representative point on a shared cell edge must be written by exactly one neighbour"
+        );
+    }
+
+    /// The per-cell recompute must apply the same eksploatowany-only filter
+    /// as the full compare -- otherwise an incremental recompute could serve
+    /// a "w budowie" building that a full `compare` would never have
+    /// written, breaking `full_vs_incremental_equivalence`.
+    #[test]
+    fn recompute_excludes_non_eksploatowany_buildings() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO bdot10k_buildings (LOKALNYID, geom, KATEGORIAISTNIENIA) VALUES
+                 ('lonely', ST_MakeEnvelope(21.0,52.0,21.001,52.001), 'eksploatowany'),
+                 ('under_construction', ST_MakeEnvelope(21.0,52.0,21.001,52.001), 'w budowie');
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+        let (cx, cy) = lonlat_to_tile(21.0005, 52.0005, CHANGE_CELL_ZOOM);
+
+        recompute_cell(&c, "bdot10k", cx as i32, cy as i32).unwrap();
+
+        let ids: Vec<String> = {
+            let mut s = c
+                .prepare("SELECT LOKALNYID FROM bdot10k_unmatched ORDER BY LOKALNYID")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["lonely".to_string()],
+            "the under-construction building must never be served as unmatched"
         );
     }
 }

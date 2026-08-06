@@ -26,6 +26,13 @@ pub fn buffer(b: Bounds, deg: f64) -> Bounds {
     (b.0 - deg, b.1 - deg, b.2 + deg, b.3 + deg)
 }
 
+/// BDOT10k-only pre-filter for `unmatched_buildings_sql`'s `extra_filter`:
+/// only rows still standing count as a government building to compare at
+/// all — excludes `w budowie` (under construction), `nieczynny` (inactive)
+/// and `zniszczony` (destroyed) BDOT10k buildings from ever being matched or
+/// unmatched. EGIB carries no equivalent column, so its callers pass `None`.
+pub const BDOT10K_EKSPLOATOWANY_FILTER: &str = "b.KATEGORIAISTNIENIA = 'eksploatowany'";
+
 /// Unmatched building rows: government centroid within `area` and NOT contained
 /// by any osm_buildings polygon (osm filtered to `area` for the R-tree scan —
 /// no buffer needed: any polygon containing an in-`area` point has a bbox that
@@ -38,13 +45,24 @@ pub fn buffer(b: Bounds, deg: f64) -> Bounds {
 /// docs/per_cell_recompute_full_scan.md: an RTREE index cannot be used
 /// through a function wrapped around the indexed column, but it can be used
 /// against a plain column reference.
-pub fn unmatched_buildings_sql(source_table: &str, select_list: &str, area: Bounds) -> String {
+///
+/// `extra_filter`, when set, is ANDed into the WHERE clause alongside the
+/// `b`-aliased source row (see `BDOT10K_EKSPLOATOWANY_FILTER`).
+pub fn unmatched_buildings_sql(
+    source_table: &str,
+    select_list: &str,
+    area: Bounds,
+    extra_filter: Option<&str>,
+) -> String {
     let (x1, y1, x2, y2) = area;
+    let extra = extra_filter
+        .map(|f| format!("AND {f}\n           "))
+        .unwrap_or_default();
     format!(
         "SELECT {select_list}
          FROM {source_table} b
          WHERE ST_Intersects(b.centroid, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-           AND NOT EXISTS (
+           {extra}AND NOT EXISTS (
                SELECT 1 FROM osm_buildings osm
                WHERE ST_Intersects(osm.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
                  AND ST_Contains(osm.geom, b.centroid)
@@ -112,7 +130,7 @@ mod tests {
              UPDATE bsrc SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
-        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0));
+        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
         let ids: Vec<String> = {
             let mut s = c.prepare(&sql).unwrap();
             s.query_map([], |r| r.get(0))
@@ -146,7 +164,7 @@ mod tests {
         )
         .unwrap();
 
-        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (20.5, 52.0, 20.6, 52.1));
+        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (20.5, 52.0, 20.6, 52.1), None);
         let mut stmt = c.prepare(&format!("EXPLAIN {sql}")).unwrap();
         let mut rows = stmt.query([]).unwrap();
         let mut plan = String::new();
@@ -156,6 +174,37 @@ mod tests {
         assert!(
             plan.contains("RTREE_INDEX_SCAN"),
             "the predicate must be able to use the centroid RTREE index, got plan: {plan}"
+        );
+    }
+
+    #[test]
+    fn extra_filter_excludes_non_eksploatowany_buildings() {
+        let c = conn();
+        c.execute_batch(
+            "ALTER TABLE bsrc ADD COLUMN KATEGORIAISTNIENIA VARCHAR;
+             INSERT INTO bsrc (LOKALNYID, geom, KATEGORIAISTNIENIA) VALUES
+                 ('standing', ST_MakeEnvelope(21.0,52.0,21.001,52.001), 'eksploatowany'),
+                 ('under_construction', ST_MakeEnvelope(22.0,53.0,22.001,53.001), 'w budowie');
+             UPDATE bsrc SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+        let sql = unmatched_buildings_sql(
+            "bsrc",
+            "b.LOKALNYID",
+            (14.0, 49.0, 25.0, 55.0),
+            Some(BDOT10K_EKSPLOATOWANY_FILTER),
+        );
+        let ids: Vec<String> = {
+            let mut s = c.prepare(&sql).unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["standing".to_string()],
+            "the non-eksploatowany building must never count as unmatched"
         );
     }
 
