@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use duckdb::Connection;
 use tracing::info;
 
+use crate::compare::in_transaction;
 use crate::compare::rule::MATCH_DISTANCE_METERS;
 use crate::utils::format_duration;
 
@@ -49,9 +50,17 @@ pub fn compare_prg(conn: &Connection) -> Result<()> {
 /// across all available threads in a single pass; no Rust-level loop is needed.
 ///
 /// Writes only unmatched rows into `prg_unmatched`, tagged with the z14 cell of
-/// their point and `computed_at`. `compare` runs offline (no concurrent
-/// readers), so this clears the table then inserts.
+/// their point and `computed_at`. This clears the table then inserts, and the
+/// pair runs in one transaction so a failed insert leaves the previous
+/// comparison in place instead of an empty serving table — see
+/// `compare::in_transaction`. (`compare` runs offline, with no concurrent
+/// readers to isolate from; the transaction is here for atomicity on failure,
+/// not for concurrency.)
 fn compare_addresses(conn: &Connection) -> Result<()> {
+    in_transaction(conn, "prg", || compare_addresses_in_txn(conn))
+}
+
+fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
     conn.execute_batch("DELETE FROM prg_unmatched;")?;
     let cx = crate::tile_math::cell_x_sql("s.geom");
     let cy = crate::tile_math::cell_y_sql("s.geom");

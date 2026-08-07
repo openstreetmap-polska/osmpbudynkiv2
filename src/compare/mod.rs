@@ -39,6 +39,61 @@ pub fn run(conn: &Connection, target: CompareTarget) -> Result<()> {
     Ok(())
 }
 
+/// Run `f` inside a DuckDB transaction, committing on success and rolling back
+/// on error.
+///
+/// **Why the full compare needs this.** Every full comparison is a
+/// clear-then-repopulate: `DELETE FROM <source>_unmatched`, then insert the
+/// current unmatched set. Without a transaction the DELETE commits on its own,
+/// so *any* later failure — a stale serving-table schema whose columns the
+/// INSERT names, a source-extent fault, a disk error mid-grid — leaves the
+/// serving table empty rather than leaving the previous contents in place.
+/// That is a silent outage: `/tiles` and `/package` then answer every request
+/// with zero features, and nothing in `/status` reports it, because `compare`
+/// writes no `job_run_log` entry. It happened for real on the Poland database
+/// (`bdot10k_unmatched` emptied by a compare against a serving table predating
+/// the carried classification columns). Wrapping the clear and the repopulate
+/// together makes a failed compare a no-op instead.
+///
+/// Scope is one source's rebuild, not the whole `compare full` run: a failure
+/// comparing egib should not discard a bdot10k rebuild that already succeeded,
+/// and the three sources share no invariant that would require them to move
+/// together. The per-cell incremental path already had this property — see
+/// `drain::drain_batch`, which pairs `incremental::recompute_cell_in_txn` with
+/// its queue delete in one transaction — so this closes the gap between the
+/// full and incremental paths rather than introducing a new idea.
+///
+/// A rollback that itself fails is logged and the original error returned:
+/// the original error is what explains the failure, and shadowing it with a
+/// cleanup error would lose that.
+pub fn in_transaction<T>(
+    conn: &Connection,
+    label: &str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    use anyhow::Context;
+
+    conn.execute_batch("BEGIN TRANSACTION")
+        .with_context(|| format!("{label}: failed to begin transaction"))?;
+    match f() {
+        Ok(value) => {
+            conn.execute_batch("COMMIT")
+                .with_context(|| format!("{label}: failed to commit"))?;
+            Ok(value)
+        }
+        Err(e) => {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK") {
+                tracing::warn!(
+                    error = %rollback_err,
+                    label,
+                    "rollback failed after a compare error; the original error follows"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
 /// The design's central correctness invariant (see
 /// docs/superpowers/specs/2026-07-24-precomputed-unmatched-serving-design.md,
 /// "Testing", and line 236: "Its output must be row-identical to draining an
@@ -415,5 +470,137 @@ mod drain_refresh_concurrency {
             served_from_drain, served_from_full,
             "after a concurrent refresh + drain, the serving table must match a full compare"
         );
+    }
+}
+
+/// A full compare is a clear-then-repopulate, so the failure mode that matters
+/// is "the clear committed and the repopulate didn't": the serving table ends
+/// up empty and `/tiles` silently answers with zero features. This is not
+/// hypothetical -- `bdot10k_unmatched` was emptied exactly this way on the
+/// Poland database, by a compare run against a serving table that predated the
+/// carried classification columns (`compare::columns`), so the INSERT failed at
+/// bind time while the DELETE had already committed.
+///
+/// Both tests reproduce that shape directly: rebuild the serving table at its
+/// pre-carried-columns schema, seed it with a previous comparison's row, and
+/// assert the failed compare leaves that row untouched. The error assertion is
+/// what pins *where* the failure happened -- a binder error naming the missing
+/// column can only come from the INSERT, which is downstream of the DELETE, so
+/// a passing test genuinely exercised the rollback rather than bailing early.
+#[cfg(test)]
+mod clear_and_repopulate_is_atomic {
+    use std::path::Path;
+
+    use duckdb::Connection;
+
+    use crate::compare::addresses::compare_prg;
+    use crate::compare::buildings::compare_bdot10k;
+    use crate::db::init_db;
+
+    fn conn() -> Connection {
+        let init = vec![
+            "INSTALL spatial".to_string(),
+            "LOAD spatial".to_string(),
+            "INSTALL icu".to_string(),
+            "LOAD icu".to_string(),
+            "SET geometry_always_xy = true".to_string(),
+        ];
+        let c = init_db(Path::new(":memory:"), &init, None).unwrap();
+        c.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
+             CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn count(c: &Connection, table: &str) -> i64 {
+        c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn failed_buildings_compare_leaves_the_previous_contents_intact() {
+        let c = conn();
+        // The real pre-carried-columns schema: no KATEGORIAISTNIENIA / NAZWA /
+        // FSBUD / INFORMACJADODATKOWA / KODKST / ZRODLODANYCHGEOMETRYCZNYCH,
+        // which is what `classification_columns` names in its INSERT.
+        c.execute_batch(
+            "DROP TABLE bdot10k_unmatched;
+             CREATE TABLE bdot10k_unmatched (
+                 LOKALNYID VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
+                 computed_at TIMESTAMPTZ, funkcja_szczegolowa VARCHAR,
+                 funkcja_ogolna VARCHAR, liczba_kondygnacji SMALLINT);
+             INSERT INTO bdot10k_unmatched
+                 (LOKALNYID, geom, cell_x, cell_y, computed_at)
+             VALUES ('previous_run', ST_Point(21.0, 52.0), 9147, 5411, now());
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
+                 ('fresh', ST_MakeEnvelope(21.0, 52.0, 21.001, 52.001));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+
+        let err = compare_bdot10k(&c).expect_err("compare must fail on the stale serving schema");
+        let chain = format!("{err:#}").to_lowercase();
+        assert!(
+            chain.contains("kategoriaistnienia"),
+            "the failure must come from the INSERT naming a missing carried column \
+             (that is what proves the DELETE had already run), got: {chain}"
+        );
+
+        assert_eq!(
+            count(&c, "bdot10k_unmatched"),
+            1,
+            "a failed compare must roll back its clear, not leave the serving table empty"
+        );
+        let surviving: String = c
+            .query_row("SELECT LOKALNYID FROM bdot10k_unmatched", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(surviving, "previous_run");
+    }
+
+    #[test]
+    fn failed_address_compare_leaves_the_previous_contents_intact() {
+        let c = conn();
+        // Same shape, address side: the real stale schema lacked
+        // wazny_od_lub_data_nadania, which compare_addresses' INSERT names.
+        c.execute_batch(
+            "DROP TABLE prg_unmatched;
+             CREATE TABLE prg_unmatched (
+                 geom GEOMETRY, lokalny_id VARCHAR, numer_porzadkowy VARCHAR,
+                 ulica VARCHAR, miejscowosc VARCHAR, kod_pocztowy VARCHAR,
+                 teryt_miejscowosc VARCHAR, cell_x INTEGER, cell_y INTEGER,
+                 computed_at TIMESTAMPTZ);
+             INSERT INTO prg_unmatched
+                 (geom, lokalny_id, numer_porzadkowy, cell_x, cell_y, computed_at)
+             VALUES (ST_Point(21.0, 52.0), 'previous_run', '1', 9147, 5411, now());
+             INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, geom) VALUES
+                 ('fresh', '2', ST_Point(21.0, 52.0));",
+        )
+        .unwrap();
+
+        let err = compare_prg(&c).expect_err("compare must fail on the stale serving schema");
+        let chain = format!("{err:#}").to_lowercase();
+        assert!(
+            chain.contains("wazny_od_lub_data_nadania"),
+            "the failure must come from the INSERT naming the missing column, got: {chain}"
+        );
+
+        assert_eq!(
+            count(&c, "prg_unmatched"),
+            1,
+            "a failed compare must roll back its clear, not leave the serving table empty"
+        );
+        let surviving: String = c
+            .query_row("SELECT lokalny_id FROM prg_unmatched", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(surviving, "previous_run");
     }
 }

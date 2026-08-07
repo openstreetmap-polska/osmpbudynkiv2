@@ -3,6 +3,7 @@ use duckdb::Connection;
 use tracing::info;
 
 use crate::compare::columns::classification_columns;
+use crate::compare::in_transaction;
 use crate::compare::rule::{BDOT10K_EKSPLOATOWANY_FILTER, unmatched_buildings_sql};
 use crate::tile_math::{cell_x_sql, cell_y_sql};
 use crate::utils::format_duration;
@@ -43,42 +44,50 @@ fn compare_buildings(
     info!(source = label, "Comparing buildings against OSM");
     let t = std::time::Instant::now();
 
-    conn.execute_batch(&format!("DELETE FROM {dest};"))
-        .with_context(|| format!("Failed to clear {dest}"))?;
+    // Clear and repopulate atomically: without the transaction the DELETE
+    // commits on its own, so a failure anywhere in the grid loop below (or in
+    // source_grid_extent) leaves `dest` empty rather than leaving the previous
+    // comparison in place. See `compare::in_transaction` for the incident this
+    // guards against.
+    in_transaction(conn, label, || {
+        conn.execute_batch(&format!("DELETE FROM {dest};"))
+            .with_context(|| format!("Failed to clear {dest}"))?;
 
-    let (min_x, min_y, max_x, max_y) = source_grid_extent(conn, source_table, GRID_STEP)
-        .with_context(|| format!("Failed to compute source extent for {source_table}"))?;
-    let cx = cell_x_sql("b.centroid");
-    let cy = cell_y_sql("b.centroid");
-    let cc = classification_columns(source_table);
-    let select = format!("b.{id_col}, b.geom, {cx}, {cy}, now(), {}", cc.source_exprs);
+        let (min_x, min_y, max_x, max_y) = source_grid_extent(conn, source_table, GRID_STEP)
+            .with_context(|| format!("Failed to compute source extent for {source_table}"))?;
+        let cx = cell_x_sql("b.centroid");
+        let cy = cell_y_sql("b.centroid");
+        let cc = classification_columns(source_table);
+        let select = format!("b.{id_col}, b.geom, {cx}, {cy}, now(), {}", cc.source_exprs);
 
-    let mut y = min_y;
-    while y < max_y {
-        let mut x = min_x;
-        while x < max_x {
-            let (x_hi, y_hi) = (x + GRID_STEP, y + GRID_STEP);
-            let area = (x, y, x_hi, y_hi);
-            let inner = unmatched_buildings_sql(source_table, &select, area, extra_filter);
-            // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
-            // closed on all four cell edges, so a centroid exactly on a grid
-            // line would satisfy two neighbouring cells' predicates. Restrict
-            // the actual write to this cell's half-open interval so a
-            // boundary row is written by exactly the cell that owns it (the
-            // z14 analogue of this guard lives in
-            // incremental::recompute_cell_in_txn).
-            conn.execute_batch(&format!(
-                "INSERT INTO {dest} ({id_col}, geom, cell_x, cell_y, computed_at, {})
-                 {inner}
-                   AND ST_X(b.centroid) >= {x} AND ST_X(b.centroid) < {x_hi}
-                   AND ST_Y(b.centroid) >= {y} AND ST_Y(b.centroid) < {y_hi};",
-                cc.dest_names
-            ))
-            .with_context(|| format!("Failed comparing {label} in cell ({x},{y})"))?;
-            x += GRID_STEP;
+        let mut y = min_y;
+        while y < max_y {
+            let mut x = min_x;
+            while x < max_x {
+                let (x_hi, y_hi) = (x + GRID_STEP, y + GRID_STEP);
+                let area = (x, y, x_hi, y_hi);
+                let inner = unmatched_buildings_sql(source_table, &select, area, extra_filter);
+                // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
+                // closed on all four cell edges, so a centroid exactly on a grid
+                // line would satisfy two neighbouring cells' predicates. Restrict
+                // the actual write to this cell's half-open interval so a
+                // boundary row is written by exactly the cell that owns it (the
+                // z14 analogue of this guard lives in
+                // incremental::recompute_cell_in_txn).
+                conn.execute_batch(&format!(
+                    "INSERT INTO {dest} ({id_col}, geom, cell_x, cell_y, computed_at, {})
+                     {inner}
+                       AND ST_X(b.centroid) >= {x} AND ST_X(b.centroid) < {x_hi}
+                       AND ST_Y(b.centroid) >= {y} AND ST_Y(b.centroid) < {y_hi};",
+                    cc.dest_names
+                ))
+                .with_context(|| format!("Failed comparing {label} in cell ({x},{y})"))?;
+                x += GRID_STEP;
+            }
+            y += GRID_STEP;
         }
-        y += GRID_STEP;
-    }
+        Ok(())
+    })?;
 
     // total is now accurate: the grid above covers the source table's full
     // extent (source_grid_extent), and the write-narrow guard means each row
