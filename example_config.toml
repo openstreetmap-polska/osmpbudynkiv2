@@ -128,7 +128,7 @@ egib_building_types = "https://raw.githubusercontent.com/openstreetmap-polska/os
 # Status is in-memory only (resets on restart) — see GET /status.
 [jobs.osm_update]
 # When true, OSM minutely diffs are applied every `interval_seconds`.
-enabled = true
+enabled = false
 # How often to start a run. Runs never overlap: the next tick waits
 # for the previous run to complete.
 interval_seconds = 60
@@ -140,7 +140,7 @@ timeout_seconds = 600
 # Prunes old rows from the /package export log (see [updates] and the
 # GET /updates endpoint below).
 [jobs.export_log_prune]
-enabled = true
+enabled = false
 interval_seconds = 86400
 # How long package_exports rows are kept before being deleted.
 retention_days = 365
@@ -155,18 +155,18 @@ retention_days = 365
 # lock so at most one runs at a time, since staging all three simultaneously
 # could exceed memory_limit.
 [jobs.bdot10k_update]
-enabled = true
+enabled = false
 interval_seconds = 86400
 timeout_seconds = 3600
 
 [jobs.egib_update]
-enabled = true
+enabled = false
 interval_seconds = 86400
 timeout_seconds = 3600
 
 # PRG streams ~16 GML files out of a ~1.7GB zip, so it gets a longer timeout.
 [jobs.prg_update]
-enabled = true
+enabled = false
 interval_seconds = 86400
 timeout_seconds = 7200
 
@@ -174,7 +174,7 @@ timeout_seconds = 7200
 # OSM updates) by recomputing the affected z14 cells' *_unmatched serving
 # tables. Keeps /tiles and /package results current between full comparisons.
 [jobs.match_refresh]
-enabled = true
+enabled = false
 interval_seconds = 30
 timeout_seconds = 300
 # Max number of distinct dirty (source, cell) recomputed per tick.

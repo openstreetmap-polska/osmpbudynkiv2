@@ -264,10 +264,160 @@ const ALL_BUILDINGS_MVT_SQL: &str = "
     WHERE t.geom IS NOT NULL
 ";
 
+// --- Tier A (z5..=z10): aggregated bins -------------------------------------
+//
+// bdot10k_unmatched/egib_unmatched/prg_unmatched all carry cell_x/cell_y: the
+// exact, duplicate-free z14 XYZ tile of the row's representative point (see
+// CLAUDE.md's "serving tables store rows, not id references" gotcha). That
+// means the parent tile at any zoom z <= 14 is a pure bit shift -- no spatial
+// index, no geometry read, no RTREE involved at all, unlike every other query
+// in this file.
+//
+// bz ("bin zoom") is the zoom at which bins are counted: z+5 capped at 14
+// (K=5, so bins are 32x32 per tile for z=5..9; z=10 is capped by the z14
+// ceiling and only gets 16x16 bins, since there's no finer cell data to
+// aggregate below z14). shift = 14 - bz is how far cell_x/cell_y are
+// right-shifted to get the bin coordinate; n = 2^bz is the bin grid's full
+// width, used to invert bin coordinates back to lon/lat via the standard Web
+// Mercator XYZ formula -- the same one `tile_math::tile_to_bbox` implements
+// in Rust, just spelled in SQL with DuckDB's degrees/atan/sinh/pi builtins
+// (all verified available).
+//
+// The filter is deliberately `cell_x BETWEEN lo AND hi`, not
+// `cell_x >> shift = x` -- same rows, but the range form is zonemap-prunable
+// (measured 0.10s vs 0.31s for the full z5..10 pyramid in one query). bz/
+// shift/n are derived from z in Rust, not user input (z is already
+// range-checked by the dispatcher below), so interpolating them directly
+// into the SQL text is safe; the four cell-range bounds stay bound `?`
+// parameters.
+//
+// agg_cells and agg_points are two different final SELECTs over the *same*
+// bins/geo CTEs (`agg_bin_ctes`, shared by both), so the frontend can switch
+// visual styles (grid vs circles vs heatmap) with no backend change -- both
+// layers always describe the same aggregate.
+fn agg_bin_ctes(shift: u32, n: u32) -> String {
+    format!(
+        "WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
+        bins AS (
+            SELECT bin_x, bin_y,
+                   sum(nb)::INTEGER AS n_bdot10k,
+                   sum(ne)::INTEGER AS n_egib,
+                   sum(np)::INTEGER AS n_prg
+            FROM (
+                SELECT cell_x >> {shift} AS bin_x, cell_y >> {shift} AS bin_y,
+                       count(*) AS nb, 0 AS ne, 0 AS np
+                  FROM bdot10k_unmatched
+                 WHERE cell_x BETWEEN ? AND ? AND cell_y BETWEEN ? AND ?
+                 GROUP BY 1, 2
+                UNION ALL
+                SELECT cell_x >> {shift}, cell_y >> {shift}, 0, count(*), 0
+                  FROM egib_unmatched
+                 WHERE cell_x BETWEEN ? AND ? AND cell_y BETWEEN ? AND ?
+                 GROUP BY 1, 2
+                UNION ALL
+                SELECT cell_x >> {shift}, cell_y >> {shift}, 0, 0, count(*)
+                  FROM prg_unmatched
+                 WHERE cell_x BETWEEN ? AND ? AND cell_y BETWEEN ? AND ?
+                 GROUP BY 1, 2
+            ) src
+            GROUP BY 1, 2
+        ),
+        geo AS (
+            SELECT bin_x, bin_y, n_bdot10k, n_egib, n_prg,
+                   (n_bdot10k + n_egib + n_prg)::INTEGER AS n_total,
+                   bin_x / {n}.0 * 360 - 180 AS lon0,
+                   (bin_x + 1) / {n}.0 * 360 - 180 AS lon1,
+                   degrees(atan(sinh(pi() * (1 - 2 * bin_y / {n}.0)))) AS lat_north,
+                   degrees(atan(sinh(pi() * (1 - 2 * (bin_y + 1) / {n}.0)))) AS lat_south
+            FROM bins
+        )
+        "
+    )
+}
+
+/// `agg_cells`: each bin as a square polygon covering its Web Mercator
+/// extent. Latitude decreases as bin_y increases, so `lat_south` (derived
+/// from `bin_y + 1`) is the envelope's min and `lat_north` (from `bin_y`) is
+/// its max -- `ST_MakeEnvelope` wants (min_lon, min_lat, max_lon, max_lat).
+fn agg_cells_sql(shift: u32, n: u32) -> String {
+    format!(
+        "{}
+        SELECT ST_AsMVT(t, 'agg_cells', 4096, 'geom') AS mvt
+        FROM (
+            SELECT ST_AsMVTGeom(
+                       ST_MakeEnvelope(geo.lon0, geo.lat_south, geo.lon1, geo.lat_north),
+                       bbox.geom, 4096, 256, true) AS geom,
+                   geo.n_bdot10k, geo.n_egib, geo.n_prg, geo.n_total
+            FROM geo, bbox
+        ) t
+        WHERE t.geom IS NOT NULL",
+        agg_bin_ctes(shift, n)
+    )
+}
+
+/// `agg_points`: each bin's centre as a point, same attributes as
+/// `agg_cells` -- the frontend picks between the two layers purely by
+/// toggling layer visibility client-side, no query difference beyond
+/// geometry shape.
+fn agg_points_sql(shift: u32, n: u32) -> String {
+    format!(
+        "{}
+        SELECT ST_AsMVT(t, 'agg_points', 4096, 'geom') AS mvt
+        FROM (
+            SELECT ST_AsMVTGeom(
+                       ST_Point((geo.lon0 + geo.lon1) / 2, (geo.lat_north + geo.lat_south) / 2),
+                       bbox.geom, 4096, 256, true) AS geom,
+                   geo.n_bdot10k, geo.n_egib, geo.n_prg, geo.n_total
+            FROM geo, bbox
+        ) t
+        WHERE t.geom IS NOT NULL",
+        agg_bin_ctes(shift, n)
+    )
+}
+
+// --- Tier B (z11..=z13): individual points ----------------------------------
+//
+// One feature per unmatched object -- same cell_x/cell_y BETWEEN filter as
+// Tier A, just not binned. Buildings are recentred to their centroid since
+// bdot10k_unmatched/egib_unmatched carry polygons; prg_unmatched's `geom` is
+// already a point (PRG addresses always were). Worst measured tile is ~14k
+// features / ~0.1s -- acceptable for a look-and-feel MVP where performance is
+// explicitly not the point.
+const POINTS_MVT_SQL: &str = "
+    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom)
+    SELECT ST_AsMVT(t, 'points', 4096, 'geom') AS mvt
+    FROM (
+        SELECT ST_AsMVTGeom(p.geom, bbox.geom, 4096, 256, true) AS geom, p.source
+        FROM (
+            SELECT ST_Centroid(b.geom) AS geom, 'bdot10k' AS source
+              FROM bdot10k_unmatched b
+             WHERE b.cell_x BETWEEN ? AND ? AND b.cell_y BETWEEN ? AND ?
+            UNION ALL
+            SELECT ST_Centroid(e.geom) AS geom, 'egib' AS source
+              FROM egib_unmatched e
+             WHERE e.cell_x BETWEEN ? AND ? AND e.cell_y BETWEEN ? AND ?
+            UNION ALL
+            SELECT a.geom AS geom, 'prg' AS source
+              FROM prg_unmatched a
+             WHERE a.cell_x BETWEEN ? AND ? AND a.cell_y BETWEEN ? AND ?
+        ) p, bbox
+    ) t
+    WHERE t.geom IS NOT NULL
+";
+
 pub async fn serve_tile(
     State(state): State<AppState>,
     Path((z, x, y)): Path<(u32, u32, u32)>,
 ) -> Response {
+    // Tiers A/B (z5..=z13) are dispatched before the z14 guard below, which
+    // is otherwise left byte-for-byte as it was -- see the module-level
+    // tiers documented above `agg_bin_ctes`/`POINTS_MVT_SQL`.
+    if (5..=10).contains(&z) {
+        return serve_tile_agg(state, z, x, y).await;
+    }
+    if (11..=13).contains(&z) {
+        return serve_tile_points(state, z, x, y).await;
+    }
     if z != 14 {
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -379,6 +529,123 @@ fn query_mvt_layer(
             Ok(blob)
         }
         None => Ok(vec![]),
+    }
+}
+
+/// Tier A dispatch (z5..=z10): two layers (`agg_cells`/`agg_points`), one
+/// shared aggregate. See `agg_bin_ctes` above for the design rationale.
+async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
+    let bz = (z + 5).min(14);
+    let shift = 14 - bz;
+    let n: u32 = 1u32 << bz;
+
+    // Tile -> z14 cell range: a plain bit shift, since cell_x/cell_y already
+    // *are* the z14 XYZ tile of each row's representative point.
+    let cell_shift = 14 - z;
+    let lo_x = (x << cell_shift) as i32;
+    let hi_x = (((x + 1) << cell_shift) - 1) as i32;
+    let lo_y = (y << cell_shift) as i32;
+    let hi_y = (((y + 1) << cell_shift) - 1) as i32;
+
+    let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
+    let cells_sql = agg_cells_sql(shift, n);
+    let points_sql = agg_points_sql(shift, n);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state
+            .pool
+            .get()
+            .context("Failed to acquire pool connection")?;
+        // Same four-bound-group shape as every other query in this file: the
+        // bbox CTE, then one (lo_x, hi_x, lo_y, hi_y) group per unioned
+        // source table.
+        let cells = query_mvt_layer(
+            &conn,
+            &cells_sql,
+            duckdb::params![
+                min_lon, min_lat, max_lon, max_lat, // bbox CTE
+                lo_x, hi_x, lo_y, hi_y, // bdot10k_unmatched filter
+                lo_x, hi_x, lo_y, hi_y, // egib_unmatched filter
+                lo_x, hi_x, lo_y, hi_y, // prg_unmatched filter
+            ],
+        )?;
+        let points = query_mvt_layer(
+            &conn,
+            &points_sql,
+            duckdb::params![
+                min_lon, min_lat, max_lon, max_lat, // bbox CTE
+                lo_x, hi_x, lo_y, hi_y, // bdot10k_unmatched filter
+                lo_x, hi_x, lo_y, hi_y, // egib_unmatched filter
+                lo_x, hi_x, lo_y, hi_y, // prg_unmatched filter
+            ],
+        )?;
+        Ok::<Vec<u8>, anyhow::Error>([cells, points].concat())
+    })
+    .await;
+
+    finish_tile_response(result, z, x, y)
+}
+
+/// Tier B dispatch (z11..=z13): one `points` layer, one feature per
+/// unmatched object (not binned).
+async fn serve_tile_points(state: AppState, z: u32, x: u32, y: u32) -> Response {
+    let cell_shift = 14 - z;
+    let lo_x = (x << cell_shift) as i32;
+    let hi_x = (((x + 1) << cell_shift) - 1) as i32;
+    let lo_y = (y << cell_shift) as i32;
+    let hi_y = (((y + 1) << cell_shift) - 1) as i32;
+
+    let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state
+            .pool
+            .get()
+            .context("Failed to acquire pool connection")?;
+        let points = query_mvt_layer(
+            &conn,
+            POINTS_MVT_SQL,
+            duckdb::params![
+                min_lon, min_lat, max_lon, max_lat, // bbox CTE
+                lo_x, hi_x, lo_y, hi_y, // bdot10k_unmatched filter
+                lo_x, hi_x, lo_y, hi_y, // egib_unmatched filter
+                lo_x, hi_x, lo_y, hi_y, // prg_unmatched filter
+            ],
+        )?;
+        Ok::<Vec<u8>, anyhow::Error>(points)
+    })
+    .await;
+
+    finish_tile_response(result, z, x, y)
+}
+
+/// Response shaping shared by the two new tiers. Deliberately duplicated
+/// rather than factored into the z14 path above, which the task keeps
+/// byte-for-byte unchanged (see the comment on `serve_tile`).
+fn finish_tile_response(
+    result: Result<anyhow::Result<Vec<u8>>, tokio::task::JoinError>,
+    z: u32,
+    x: u32,
+    y: u32,
+) -> Response {
+    match result {
+        Ok(Ok(bytes)) if bytes.is_empty() => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(bytes)) => {
+            let mut resp = bytes.into_response();
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/vnd.mapbox-vector-tile"),
+            );
+            resp
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, z, x, y, "tile query failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, z, x, y, "tile task panicked");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -608,11 +875,84 @@ mod tests {
             .unwrap()
     }
 
+    /// z5..=z13 are now served (Tiers A/B below) -- only outside that plus
+    /// z14 should a request fall through to 204. Picks z3 (below Tier A) as
+    /// the "genuinely out of range" case; z16 (above z14) would do equally
+    /// well.
     #[tokio::test]
-    async fn non_z14_returns_no_content() {
+    async fn out_of_range_zoom_returns_no_content() {
+        let state = make_state("");
+        let response = request_tile(state, 3, 1, 1).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// z10 is the top of Tier A (aggregated bins) and used to return 204
+    /// before this change (see `out_of_range_zoom_returns_no_content` above,
+    /// which used to cover z10 itself). An empty DB is enough here since
+    /// `ST_AsMVT` emits a layer header even with zero features, same as the
+    /// z14 `empty_tile_returns_ok_not_500` case below.
+    #[tokio::test]
+    async fn z10_aggregated_tile_returns_ok_not_no_content() {
         let state = make_state("");
         let response = request_tile(state, 10, 1, 1).await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Tier A (z5..=z10): seeds one row per source table at z14 cell
+    /// (8000, 4900) and requests the z6 tile that bit-shift-contains it
+    /// (31, 19 -- verified: 8000 >> 8 = 31, 4900 >> 8 = 19, matching
+    /// shift = 14 - 6 = 8). Asserts both MVT layers this tier emits are
+    /// present, sharing the one aggregate (`agg_bin_ctes`), plus at least
+    /// one of the integer count attributes they both carry.
+    #[tokio::test]
+    async fn aggregated_tile_exposes_agg_cells_and_agg_points_layers() {
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+        let seed = format!(
+            "INSERT INTO prg_unmatched (lokalny_id, numer_porzadkowy, miejscowosc, geom, cell_x, cell_y, computed_at) VALUES
+                 ('a1', '12', 'Warszawa', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
+             INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at) VALUES
+                 ('b1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
+             INSERT INTO egib_unmatched (id_budynku, geom, cell_x, cell_y, computed_at) VALUES
+                 ('e1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());"
+        );
+        let state = make_state(&seed);
+        let response = request_tile(state, 6, 31, 19).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("agg_cells"), "missing agg_cells layer");
+        assert!(body.contains("agg_points"), "missing agg_points layer");
+        for attr in ["n_bdot10k", "n_egib", "n_prg", "n_total"] {
+            assert!(body.contains(attr), "missing {attr} count attribute");
+        }
+    }
+
+    /// Tier B (z11..=z13): same seeded cell as the aggregated-tile test
+    /// above, requested at the z12 tile that contains it (2000, 1225 --
+    /// 8000 >> 2 = 2000, 4900 >> 2 = 1225, shift = 14 - 12 = 2). Asserts the
+    /// `points` layer and all three `source` values are present.
+    #[tokio::test]
+    async fn points_tile_at_z12_exposes_points_layer() {
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+        let seed = format!(
+            "INSERT INTO prg_unmatched (lokalny_id, numer_porzadkowy, miejscowosc, geom, cell_x, cell_y, computed_at) VALUES
+                 ('a1', '12', 'Warszawa', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
+             INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at) VALUES
+                 ('b1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
+             INSERT INTO egib_unmatched (id_budynku, geom, cell_x, cell_y, computed_at) VALUES
+                 ('e1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());"
+        );
+        let state = make_state(&seed);
+        let response = request_tile(state, 12, 2000, 1225).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("points"), "missing points layer");
+        for source in ["bdot10k", "egib", "prg"] {
+            assert!(body.contains(source), "missing source={source} feature");
+        }
     }
 
     /// Regression test for the two binder errors this fix addresses:

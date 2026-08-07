@@ -36,5 +36,9 @@ osmpbudynkiv2.rocksdb*
 # .env file with environment variables for TERYT API credentials
 .env
 
+# local session state/logs from `npx playwright cli` (see CLAUDE.md's
+# browser-testing procedure) -- regenerated every run, nothing to keep
+.playwright-cli/
+
 .claude
 .agents
