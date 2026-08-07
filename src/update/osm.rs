@@ -899,13 +899,16 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
-                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
              CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY,
-                 rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER);
+                 rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER,
+                 kondygnacje_podziemne INTEGER, rodzaj VARCHAR);
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
-                 geom GEOMETRY);
+                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);
              -- Sits inside way 100's footprint, so OSM currently covers it.
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('gov1', ST_MakeEnvelope(20.0002, 50.0002, 20.0008, 50.0008));

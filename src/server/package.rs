@@ -439,7 +439,7 @@ pub struct UnmatchedBuildingRow {
 
 /// The EGIB `rodzaj_kod` letter adjacency is restricted to -- the `m`
 /// (residential) class, per the design doc's Adjacency section.
-const EGIB_ADJACENCY_KEY: &str = "m";
+pub(crate) const EGIB_ADJACENCY_KEY: &str = "m";
 
 /// EGIB buildings in the request area that are unmatched against OSM, paired
 /// with the resolved tags string. Same three-CTE shape as
@@ -519,13 +519,13 @@ pub fn unmatched_egib_buildings(
 /// so it does not need to reach the neighbour's own centroid, only some part
 /// of its polygon. See "Four things the query must get right" in
 /// docs/superpowers/specs/2026-08-03-building-type-mappings-design.md.
-const ADJACENCY_READ_BUFFER_DEG: f64 = 0.0005;
+pub(crate) const ADJACENCY_READ_BUFFER_DEG: f64 = 0.0005;
 
 /// The BDOT10k tier-1 key adjacency is restricted to -- a code-level constant,
 /// not a CSV column, so a CSV row cannot silently reference a neighbour count
 /// the query never computes (enforced at load by
 /// `mappings::building_types::load_from_path`).
-const BDOT10K_ADJACENCY_KEY: &str = "budynek jednorodzinny";
+pub(crate) const BDOT10K_ADJACENCY_KEY: &str = "budynek jednorodzinny";
 
 /// BDOT10k buildings in the request area that are unmatched against OSM,
 /// paired with the `;`-separated `k=v` tags string resolved by
@@ -1368,11 +1368,14 @@ mod tests {
         CREATE TABLE bdot10k_unmatched (
             lokalnyid VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
             computed_at TIMESTAMP WITH TIME ZONE,
-            funkcja_szczegolowa VARCHAR, funkcja_ogolna VARCHAR, liczba_kondygnacji SMALLINT);
+            funkcja_szczegolowa VARCHAR, funkcja_ogolna VARCHAR, liczba_kondygnacji SMALLINT,
+            KATEGORIAISTNIENIA VARCHAR, NAZWA VARCHAR, FSBUD VARCHAR,
+            INFORMACJADODATKOWA VARCHAR, KODKST TINYINT, ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
         CREATE TABLE egib_unmatched (
             id_budynku VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
             computed_at TIMESTAMP WITH TIME ZONE,
-            rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER);
+            rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER,
+            kondygnacje_podziemne INTEGER, rodzaj VARCHAR);
         -- unmatched_bdot10k_buildings' nb CTE reads this directly (adjacency
         -- is a self-comparison against the live table, not the serving
         -- table -- see the design doc's \"Where the mapping is applied\").

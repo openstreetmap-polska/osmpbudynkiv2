@@ -77,13 +77,15 @@ mod full_vs_incremental_equivalence {
         c.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
-                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
              CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY,
-                 kondygnacje_nadziemne INTEGER);
+                 kondygnacje_nadziemne INTEGER, kondygnacje_podziemne INTEGER, rodzaj VARCHAR);
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
-                 geom GEOMETRY);",
+                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);",
         )
         .unwrap();
         c
@@ -99,13 +101,24 @@ mod full_vs_incremental_equivalence {
         }
     }
 
-    /// One comparable string per row (id/geometry-as-WKT/cell tags),
+    /// One comparable string per row (id/geometry-as-WKT/cell tags, plus
+    /// `extra_col` if given -- used to also pin a carried column between the
+    /// full-compare and incremental paths, closing the blind spot this
+    /// function otherwise has for anything beyond id/geom/cell tags),
     /// deliberately excluding `computed_at` -- the two recompute paths run at
     /// different wall-clock times, so that column is expected to differ.
-    fn snapshot(c: &Connection, table: &str, id_col: &str) -> BTreeSet<String> {
+    fn snapshot(
+        c: &Connection,
+        table: &str,
+        id_col: &str,
+        extra_col: Option<&str>,
+    ) -> BTreeSet<String> {
+        let extra = extra_col
+            .map(|col| format!(" || '|' || COALESCE({col}::VARCHAR, '')"))
+            .unwrap_or_default();
         let sql = format!(
             "SELECT {id_col} || '|' || ST_AsText(geom) || '|' ||
-                    CAST(cell_x AS VARCHAR) || '|' || CAST(cell_y AS VARCHAR)
+                    CAST(cell_x AS VARCHAR) || '|' || CAST(cell_y AS VARCHAR){extra}
              FROM {table}"
         );
         let mut stmt = c.prepare(&sql).unwrap();
@@ -134,7 +147,7 @@ mod full_vs_incremental_equivalence {
         .unwrap();
 
         compare_bdot10k(&c).unwrap();
-        let full = snapshot(&c, "bdot10k_unmatched", "LOKALNYID");
+        let full = snapshot(&c, "bdot10k_unmatched", "LOKALNYID", None);
         assert_eq!(
             full.len(),
             2,
@@ -144,7 +157,7 @@ mod full_vs_incremental_equivalence {
         c.execute_batch("DELETE FROM bdot10k_unmatched;").unwrap();
         enqueue_all(&c).unwrap();
         drain_all(&c);
-        let incremental = snapshot(&c, "bdot10k_unmatched", "LOKALNYID");
+        let incremental = snapshot(&c, "bdot10k_unmatched", "LOKALNYID", None);
 
         assert_eq!(
             full, incremental,
@@ -156,20 +169,25 @@ mod full_vs_incremental_equivalence {
     fn full_compare_and_reconcile_drain_agree_on_prg() {
         let c = conn();
         c.execute_batch(
-            "INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, geom) VALUES
-                 ('matched', '12', ST_Point(21.010, 52.210)),
-                 ('unmatched', '7', ST_Point(21.050, 52.250)),
+            "INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, wazny_od_lub_data_nadania, geom) VALUES
+                 ('matched', '12', DATE '2012-04-27', ST_Point(21.010, 52.210)),
+                 ('unmatched', '7', DATE '2021-03-09', ST_Point(21.050, 52.250)),
                  -- Far outside Poland; PRG's full compare has never had a
                  -- bbox clamp, but this keeps the fixture parallel to the
                  -- bdot10k test above and exercises a far-away point anyway.
-                 ('far', '3', ST_Point(30.0, 60.0));
+                 ('far', '3', NULL, ST_Point(30.0, 60.0));
              INSERT INTO osm_addresses VALUES
                  (1,'node','12',NULL,NULL,NULL, ST_Point(21.010, 52.2102));",
         )
         .unwrap();
 
         compare_prg(&c).unwrap();
-        let full = snapshot(&c, "prg_unmatched", "lokalny_id");
+        let full = snapshot(
+            &c,
+            "prg_unmatched",
+            "lokalny_id",
+            Some("wazny_od_lub_data_nadania"),
+        );
         assert_eq!(
             full.len(),
             2,
@@ -179,7 +197,12 @@ mod full_vs_incremental_equivalence {
         c.execute_batch("DELETE FROM prg_unmatched;").unwrap();
         enqueue_all(&c).unwrap();
         drain_all(&c);
-        let incremental = snapshot(&c, "prg_unmatched", "lokalny_id");
+        let incremental = snapshot(
+            &c,
+            "prg_unmatched",
+            "lokalny_id",
+            Some("wazny_od_lub_data_nadania"),
+        );
 
         assert_eq!(
             full, incremental,
@@ -221,7 +244,12 @@ mod drain_refresh_concurrency {
                     NULL::VARCHAR AS PRZEWAZAJACAFUNKCJABUDYNKU,
                     NULL::VARCHAR AS FUNKCJAOGOLNABUDYNKU,
                     NULL::SMALLINT AS LICZBAKONDYGNACJI,
-                    'eksploatowany' AS KATEGORIAISTNIENIA
+                    'eksploatowany' AS KATEGORIAISTNIENIA,
+                    NULL::VARCHAR AS NAZWA,
+                    NULL::VARCHAR AS FSBUD,
+                    NULL::VARCHAR AS INFORMACJADODATKOWA,
+                    NULL::TINYINT AS KODKST,
+                    NULL::VARCHAR AS ZRODLODANYCHGEOMETRYCZNYCH
              FROM range({n}) t(i)"
         )
     }
@@ -252,7 +280,7 @@ mod drain_refresh_concurrency {
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
-                 geom GEOMETRY);",
+                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);",
             BDOT10K.with_centroid_select(&hashed_select(&rows_sql(n, "v1")))
         ))
         .unwrap();

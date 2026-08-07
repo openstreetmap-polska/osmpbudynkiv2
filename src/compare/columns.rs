@@ -1,13 +1,18 @@
-//! Classification columns carried from a live building table into
+//! Carried columns: raw fields copied from a live building table into
 //! `*_unmatched` at compare time, so `server::package::building_tags` can
-//! resolve an OSM building tag at serve time without joining back to the live
-//! table (barred by the serving-table invariant -- see `CLAUDE.md`).
+//! resolve an OSM building tag at serve time, and `/tiles` can display them as
+//! attributes, without joining back to the live table (barred by the
+//! serving-table invariant -- see `CLAUDE.md`). Despite the name of this
+//! struct/module, not every carried column is used for classification --
+//! existence status, free-text names/descriptions, cartographic codes, and
+//! geometry provenance are along for the ride too, purely for `/tiles`
+//! display (see `docs/vector_tile_attributes.md`).
 //!
 //! Defined once, beside `rule.rs`, because `compare::buildings` and
 //! `compare::incremental` both build the buildings serving-table INSERT and
 //! must agree on it column-for-column -- `compare::full_vs_incremental_equivalence`
 //! pins the two together. If they drifted, one path would keep serving stale
-//! or absent classification while the other did not.
+//! or absent columns while the other did not.
 
 /// `dest_names`/`source_exprs` are positional, comma-separated, and must list
 /// the same number of columns in the same order: the INSERT lists explicit
@@ -25,12 +30,16 @@ pub struct ClassificationColumns {
 pub fn classification_columns(source_table: &str) -> ClassificationColumns {
     match source_table {
         "bdot10k_buildings" => ClassificationColumns {
-            dest_names: "funkcja_szczegolowa, funkcja_ogolna, liczba_kondygnacji",
-            source_exprs: "b.PRZEWAZAJACAFUNKCJABUDYNKU, b.FUNKCJAOGOLNABUDYNKU, b.LICZBAKONDYGNACJI",
+            dest_names: "funkcja_szczegolowa, funkcja_ogolna, liczba_kondygnacji, \
+                         KATEGORIAISTNIENIA, NAZWA, FSBUD, INFORMACJADODATKOWA, KODKST, \
+                         ZRODLODANYCHGEOMETRYCZNYCH",
+            source_exprs: "b.PRZEWAZAJACAFUNKCJABUDYNKU, b.FUNKCJAOGOLNABUDYNKU, b.LICZBAKONDYGNACJI, \
+                           b.KATEGORIAISTNIENIA, b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA, b.KODKST, \
+                           b.ZRODLODANYCHGEOMETRYCZNYCH",
         },
         "egib_buildings" => ClassificationColumns {
-            dest_names: "rodzaj_kod, kondygnacje_nadziemne",
-            source_exprs: "b.rodzaj_kod, b.kondygnacje_nadziemne",
+            dest_names: "rodzaj_kod, kondygnacje_nadziemne, kondygnacje_podziemne, rodzaj",
+            source_exprs: "b.rodzaj_kod, b.kondygnacje_nadziemne, b.kondygnacje_podziemne, b.rodzaj",
         },
         other => panic!("classification_columns: unknown source table {other}"),
     }

@@ -200,7 +200,9 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
-                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('inside', ST_MakeEnvelope(20.0002,52.0002,20.0008,52.0008)),
                  ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));
@@ -238,7 +240,9 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
-                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201));
              UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
@@ -262,7 +266,9 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
-                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('sane', ST_MakeEnvelope(20.0,52.0,20.001,52.001)),
                  ('wild', ST_MakeEnvelope(-180.0,-90.0,-179.999,-89.999));
@@ -291,7 +297,9 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
-                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('stray', ST_MakeEnvelope(30.0,60.0,30.001,60.001));
              UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
@@ -327,7 +335,9 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
-                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  -- centroid (14.5, 52.25): x = 14.5 is the boundary between
                  -- the [14.0,14.5) and [14.5,15.0) grid columns; y = 52.25 is
@@ -367,7 +377,9 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
-                 KATEGORIAISTNIENIA VARCHAR);
+                 KATEGORIAISTNIENIA VARCHAR,
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
              INSERT INTO bdot10k_buildings (LOKALNYID, geom, KATEGORIAISTNIENIA) VALUES
                  ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201), 'eksploatowany'),
                  ('under_construction', ST_MakeEnvelope(22.0,53.2,22.001,53.201), 'w budowie');

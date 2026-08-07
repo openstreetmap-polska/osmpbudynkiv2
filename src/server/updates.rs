@@ -456,11 +456,14 @@ mod tests {
              CREATE TABLE bdot10k_unmatched (
                  lokalnyid VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
                  computed_at TIMESTAMP WITH TIME ZONE,
-                 funkcja_szczegolowa VARCHAR, funkcja_ogolna VARCHAR, liczba_kondygnacji SMALLINT);
+                 funkcja_szczegolowa VARCHAR, funkcja_ogolna VARCHAR, liczba_kondygnacji SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR, NAZWA VARCHAR, FSBUD VARCHAR,
+                 INFORMACJADODATKOWA VARCHAR, KODKST TINYINT, ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
              CREATE TABLE egib_unmatched (
                  id_budynku VARCHAR, geom GEOMETRY, cell_x INTEGER, cell_y INTEGER,
                  computed_at TIMESTAMP WITH TIME ZONE,
-                 rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER);
+                 rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER,
+                 kondygnacje_podziemne INTEGER, rodzaj VARCHAR);
              CREATE TABLE bdot10k_buildings (
                  LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR);

@@ -119,14 +119,23 @@ fn create_schema(conn: &Connection) -> Result<()> {
         -- Only unmatched rows are stored, tagged with the z14 cell of their
         -- representative point and the time that cell was last recomputed.
         --
-        -- funkcja_szczegolowa/funkcja_ogolna/liczba_kondygnacji and
-        -- rodzaj_kod/kondygnacje_nadziemne are the raw classification columns
-        -- carried over at compare time so server::package::building_tags can
-        -- resolve an OSM building tag at serve time -- see
-        -- docs/superpowers/specs/2026-08-03-building-type-mappings-design.md.
-        -- egib_unmatched.rodzaj_kod is populated once `import egib` computes
-        -- `egib_buildings.rodzaj_kod`; until then it stays NULL, same as any
-        -- column added ahead of the compare that first populates it.
+        -- funkcja_szczegolowa/funkcja_ogolna/liczba_kondygnacji,
+        -- rodzaj_kod/kondygnacje_nadziemne, and everything below them in each
+        -- CREATE TABLE are 'carried columns' -- raw government fields copied
+        -- over at compare time (not computed/classified) so both
+        -- server::package::building_tags (tag resolution) and /tiles (raw
+        -- attribute display) can read them at serve time without joining back
+        -- to the live table -- see
+        -- docs/superpowers/specs/2026-08-03-building-type-mappings-design.md
+        -- and docs/vector_tile_attributes.md. The column list is positional in
+        -- `compare::columns::classification_columns` for bdot10k/egib (append
+        -- there, both compare paths pick it up automatically) and hand-edited
+        -- in `compare::addresses`/`compare::incremental` for prg (no shared
+        -- mechanism exists for a single column). egib_unmatched.rodzaj_kod is
+        -- populated once `import egib` computes `egib_buildings.rodzaj_kod`;
+        -- until then it stays NULL, same as any column added ahead of the
+        -- compare that first populates it. No migration path exists for a
+        -- database predating a given column -- see the CLAUDE.md gotcha.
         CREATE TABLE IF NOT EXISTS bdot10k_unmatched (
             LOKALNYID VARCHAR,
             geom GEOMETRY,
@@ -135,7 +144,13 @@ fn create_schema(conn: &Connection) -> Result<()> {
             computed_at TIMESTAMP WITH TIME ZONE,
             funkcja_szczegolowa VARCHAR,
             funkcja_ogolna VARCHAR,
-            liczba_kondygnacji SMALLINT
+            liczba_kondygnacji SMALLINT,
+            KATEGORIAISTNIENIA VARCHAR,
+            NAZWA VARCHAR,
+            FSBUD VARCHAR,
+            INFORMACJADODATKOWA VARCHAR,
+            KODKST TINYINT,
+            ZRODLODANYCHGEOMETRYCZNYCH VARCHAR
         );
         CREATE TABLE IF NOT EXISTS egib_unmatched (
             id_budynku VARCHAR,
@@ -144,7 +159,9 @@ fn create_schema(conn: &Connection) -> Result<()> {
             cell_y INTEGER,
             computed_at TIMESTAMP WITH TIME ZONE,
             rodzaj_kod VARCHAR,
-            kondygnacje_nadziemne INTEGER
+            kondygnacje_nadziemne INTEGER,
+            kondygnacje_podziemne INTEGER,
+            rodzaj VARCHAR
         );
         CREATE TABLE IF NOT EXISTS prg_unmatched (
             geom GEOMETRY,
@@ -154,6 +171,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             miejscowosc VARCHAR,
             kod_pocztowy VARCHAR,
             teryt_miejscowosc VARCHAR,
+            wazny_od_lub_data_nadania DATE,
             cell_x INTEGER,
             cell_y INTEGER,
             computed_at TIMESTAMP WITH TIME ZONE

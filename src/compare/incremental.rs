@@ -59,7 +59,7 @@ pub fn recompute_cell_in_txn(
             let cy = cell_y_sql("a.geom");
             let select = format!(
                 "a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc, \
-                 a.kod_pocztowy, a.teryt_miejscowosc, {cx}, {cy}, now()"
+                 a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania, {cx}, {cy}, now()"
             );
             // Same write-narrow guard as the buildings branch above.
             let inner = format!(
@@ -69,7 +69,7 @@ pub fn recompute_cell_in_txn(
             (
                 "prg_unmatched",
                 "geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy, \
-                 teryt_miejscowosc, cell_x, cell_y, computed_at"
+                 teryt_miejscowosc, wazny_od_lub_data_nadania, cell_x, cell_y, computed_at"
                     .to_string(),
                 inner,
             )
@@ -129,7 +129,9 @@ mod tests {
         c.execute_batch(
             "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
-                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany');",
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);",
         )
         .unwrap();
         c
