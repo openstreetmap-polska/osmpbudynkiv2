@@ -803,11 +803,31 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
   // ---- package download ----
 
   const downloadBtn = document.getElementById("download-btn");
+  const drawBtn = document.getElementById("draw-btn");
+  const downloadZoomHint = document.getElementById("download-zoom-hint");
   const downloadFeedback = document.getElementById("download-feedback");
   const downloadFeedbackBbox = document.getElementById("download-feedback-bbox");
   const downloadFeedbackLayers = document.getElementById("download-feedback-layers");
   const downloadFeedbackText = document.getElementById("download-feedback-text");
   const downloadFeedbackClose = document.getElementById("download-feedback-close");
+
+  // /package rejects any request whose bbox exceeds config.package.max_area_sq_deg
+  // (0.04 by default -- see check_area in src/server/package.rs). At z0-11 the
+  // visible viewport is already far larger than that, so "Pobierz widoczny
+  // obszar" would just 400. Gate both download buttons on zoom instead of
+  // letting that request go out and fail.
+  const MIN_DOWNLOAD_ZOOM = 12;
+  let downloadInFlight = false;
+
+  function applyDownloadZoomGating() {
+    const tooFarOut = map.getZoom() < MIN_DOWNLOAD_ZOOM;
+    downloadBtn.disabled = tooFarOut || downloadInFlight;
+    drawBtn.disabled = tooFarOut;
+    downloadZoomHint.hidden = !tooFarOut;
+  }
+
+  map.on("zoom", applyDownloadZoomGating);
+  applyDownloadZoomGating();
 
   // Keys match the `datasets` values /package accepts (src/server/package.rs
   // parse_datasets) and what activeAggSources() above returns.
@@ -870,7 +890,8 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
       return;
     }
 
-    downloadBtn.disabled = true;
+    downloadInFlight = true;
+    applyDownloadZoomGating();
     setFeedback("Pobieranie…", null);
     try {
       const res = await fetch(`/package?bbox=${encodeURIComponent(bbox)}&datasets=${datasets.join(",")}`);
@@ -920,7 +941,8 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
       setFeedback(`Błąd sieci: ${err.message || err}`, "error");
       console.error("package download failed", err);
     } finally {
-      downloadBtn.disabled = false;
+      downloadInFlight = false;
+      applyDownloadZoomGating();
     }
   });
 })();
