@@ -105,6 +105,11 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
     ))
     .context("Failed to run address comparison query")?;
 
+    // Inside the same transaction as the rows it counts, so a cell's numerator
+    // and denominator always come from one comparison.
+    crate::compare::totals::rebuild_all_in_txn(conn, "prg")
+        .context("Failed to rebuild cell totals for prg")?;
+
     Ok(())
 }
 

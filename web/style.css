@@ -7,30 +7,70 @@
   --line-strong: #b7ae94;
   --building-all: #5b6570;
   --building-unmatched: #c81e1e;
+  /* buildings-all-outline only. Not redefined for dark mode -- like the
+     ratio ramp above, this paints onto the OSM raster basemap, which is
+     always light, so a literal black reads the same in both UI themes. */
+  --building-outline-all: #000000;
   --address-all: #6f5a9e;
   --address-unmatched: #1a56db;
   --accent: #17324d;
   --accent-soft: #23496b;
   --danger: #a8402a;
   --ok: #1f7a45;
-  /* Sequential ramp for the z5-13 aggregate layers (agg-grid-fill,
-     agg-heatmap): low-density gold through to high-density wine, read by
-     app.js via getComputedStyle since MapLibre paint properties don't
-     resolve CSS var() -- see the "MapLibre paint properties" gotcha in
-     CLAUDE.md. --agg-accent is a separate single hue (not part of the ramp)
-     used for the "Kółka" circle style's fixed fill, so the three low-zoom
-     styles read as genuinely different options rather than re-skins of one
-     another. --egib-accent exists only for points-dots (z11-13), which shows
-     all three sources at once and needs a third hue distinct from
-     --building-unmatched (bdot10k) and --address-unmatched (prg).
+  /* Sequential ramp for the z5-10 aggregate grid (agg-grid-fill in its
+     "Liczba" colour mode): low-density gold through to high-density wine,
+     read by app.js via getComputedStyle since MapLibre paint properties
+     don't resolve CSS var() -- see the "MapLibre paint properties" gotcha in
+     CLAUDE.md. points-dots (z11-13) shows egib with the same
+     --building-unmatched hue as bdot10k -- both are unmatched buildings, so
+     they read as one category there; only prg (addresses) gets a distinct
+     hue (--address-unmatched).
   */
   --ramp-1: #f2c14e;
   --ramp-2: #e8883b;
   --ramp-3: #d4552f;
   --ramp-4: #b02e3c;
   --ramp-5: #6e1b3d;
-  --agg-accent: #c1442c;
-  --egib-accent: #1f8a6f;
+  /* Separate ramp for the completeness ratio (unmatched / total), which is a
+     different quantity from --ramp-1.._5's density and must not look like it.
+     Light->dark: pale = almost everything is already in OSM, deep = much of
+     it is missing. Multi-hue (pale blue -> lavender -> violet -> purple ->
+     magenta) rather than one hue's tints: these fills are semi-transparent
+     over a busy raster basemap, where lightness alone is not salient enough
+     to read a regional pattern -- a single-hue version of this ramp was
+     tried in-browser and washed out. Hue travel carries the pattern for
+     full-colour vision while monotone lightness carries it under CVD.
+     This replaced a green->yellow->red ramp, which was doubly broken. Measured
+     (OKLab, Machado 2009 at severity 1.0): its worst pair was #9bb43c (~5%
+     missing) vs #de7f3c (~20% missing) at deuteranopic dE 3.3, against a
+     target of 8 -- red-green deficiency is the common one, and those two bands
+     collapsed into each other for it. Its lightness was also non-monotone,
+     peaking at the yellow middle (L 0.569 -> 0.828 -> 0.507), so the two ends
+     nearly matched in lightness and the ramp carried no signal at all once
+     hue was discounted. This ramp is monotone in lightness (L 0.911 -> 0.336
+     in even steps), which is what makes a sequential scale readable under any
+     colour deficiency, and its worst pair measures dE 13.4.
+     The blue-purple axis specifically: a warm yellow->red ramp scored better
+     still, but is the density ramp above, which the same layer shows in count
+     mode; and a yellow->green->blue one collides with --building-unmatched
+     and --address-unmatched, drawn over these same bins by the z11-13 points
+     tier. Blue-purple is the axis nothing else on the map spends.
+     Deliberately not redefined for dark mode: unlike every other token here,
+     these paint onto the OSM raster basemap, which is always the light one
+     (see the `osm` source in app.js) -- there is no dark ground to re-anchor
+     against, and flipping the ramp would invert the ratio's meaning.
+     --ratio-unknown is the sentinel colour for a bin with no denominator,
+     which is what a database whose cell_totals has not been built yet returns
+     for every bin -- it has to be visibly *not* part of the ramp, since
+     reading it as "done" would be exactly backwards. Kept neutral-warm so it
+     reads as off-ramp against the cool purples rather than as a step in
+     them. */
+  --ratio-0: #edf0f8;
+  --ratio-1: #b8bce0;
+  --ratio-2: #a077c4;
+  --ratio-3: #8a3f9e;
+  --ratio-4: #5e1258;
+  --ratio-unknown: #9b968a;
   --font-label: ui-sans-serif, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --font-data: ui-monospace, "SFMono-Regular", "IBM Plex Mono", Menlo, Consolas, monospace;
 }
@@ -54,8 +94,10 @@
     --ramp-3: #ff7d54;
     --ramp-4: #ef5b6b;
     --ramp-5: #b8496f;
-    --agg-accent: #e2673f;
-    --egib-accent: #57d1ac;
+    /* --ratio-0.._4 are intentionally absent -- see their definition above:
+       they paint onto a basemap that is light in both themes. Only the
+       sentinel is re-tuned, since it also has to hold up in the legend. */
+    --ratio-unknown: #7d7869;
   }
 }
 
@@ -201,11 +243,11 @@ body {
   color: var(--paper-raised);
 }
 
-/* "Niskie zoomy" group (z5-13 aggregate style/metric pickers). Distinct from
-   .source-toggle/.source-btn above (a connected two-segment control) because
-   these rows hold 3-4 buttons of uneven label length ("Mapa ciepła", "Adresy
-   PRG") -- individually bordered buttons that wrap via flexbox cope with
-   that better than a segmented control sized to its content. */
+/* "Niskie zoomy" group (z5-13 metric pickers -- just "Kolor" now; "Dane" was
+   dropped in favor of the Budynki/Adresy toggles above). Distinct from
+   .source-toggle/.source-btn above (a connected, content-sized segmented
+   control) because individually bordered buttons that wrap via flexbox cope
+   better with uneven label lengths ("% braków" vs "Liczba"). */
 .legend-subrow {
   margin-top: 8px;
 }
@@ -218,6 +260,77 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   margin-bottom: 4px;
+}
+
+/* Scale key for the aggregate grid's colour mode. #ratio-legend shows
+   RATIO_STOPS for "% braków"; #count-legend shows the count quantiles for
+   "Liczba" (its own bar/caption below) -- only one of the two is visible at
+   a time, toggled in app.js's applyAggMetric alongside the aggColor state. */
+.ratio-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--ink-soft);
+}
+
+.ratio-legend[hidden] {
+  display: none;
+}
+
+.ratio-legend-scale {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ratio-legend-end {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.ratio-legend-caption {
+  opacity: 0.8;
+}
+
+/* Stops are the app's RATIO_STOPS rescaled onto the bar's 0..20% span
+   (0.03/0.2 = 15%, 0.06/0.2 = 30%, and so on), so the key is linear in
+   ratio the same way the map is -- change one and the other has to follow.
+   The flat run to 15% is real, not padding: RATIO_STOPS starts at 0.03, so
+   everything below that genuinely paints --ratio-0. */
+.ratio-legend-bar {
+  flex: 1;
+  height: 8px;
+  border-radius: 2px;
+  border: 1px solid var(--line);
+  background: linear-gradient(
+    to right,
+    var(--ratio-0),
+    var(--ratio-0) 15%,
+    var(--ratio-1) 30%,
+    var(--ratio-2) 45%,
+    var(--ratio-3) 65%,
+    var(--ratio-4)
+  );
+}
+
+/* Stops are COUNT_DOMAIN_Z6/Z9's own anchors -- the p10/p25/p50/p75/p90
+   percentiles of the real distribution (see app.js) -- placed at their own
+   percentile rank along the bar, so the key reads directly as "10% of cells
+   are lighter than this, 90% are darker than this point", not a made-up
+   scale. */
+.count-legend-bar {
+  background: linear-gradient(
+    to right,
+    var(--ramp-1),
+    var(--ramp-1) 10%,
+    var(--ramp-2) 25%,
+    var(--ramp-3) 50%,
+    var(--ramp-4) 75%,
+    var(--ramp-5) 90%,
+    var(--ramp-5)
+  );
 }
 
 .metric-toggle {
@@ -248,17 +361,13 @@ body {
   border-color: var(--accent);
 }
 
+/* Static keys now -- visibility is driven by the single source-toggle above
+   each group (Wyłącz/BDOT10k/EGiB, Wyłącz/PRG), not per-row checkboxes. */
 .legend-row {
   display: flex;
   align-items: center;
   gap: 7px;
   padding: 3px 0;
-  cursor: pointer;
-}
-
-.legend-row input[type="checkbox"] {
-  margin: 0;
-  accent-color: var(--accent);
 }
 
 .swatch {
@@ -274,7 +383,7 @@ body {
 }
 .swatch[data-swatch="buildings"].swatch-all {
   background: color-mix(in srgb, var(--building-all) 30%, transparent);
-  border-left-color: var(--building-unmatched);
+  border-left-color: var(--building-outline-all);
 }
 
 .swatch[data-swatch="addresses"] {
@@ -284,8 +393,13 @@ body {
   background: var(--address-unmatched);
   border-left-color: var(--address-unmatched);
 }
+/* Full opacity, border-left the same color as the fill (so it reads as a
+   plain disc, not a ringed one) -- matches addresses-all-circle on the map,
+   which paints a solid var(--address-all) fill with no stroke. This used to
+   be a 55%-alpha fill with a solid border, which didn't match what the layer
+   actually renders. */
 .swatch[data-swatch="addresses"].swatch-all {
-  background: color-mix(in srgb, var(--address-all) 55%, transparent);
+  background: var(--address-all);
   border-left-color: var(--address-all);
 }
 
@@ -297,7 +411,9 @@ body {
 
 .panel-download {
   right: 16px;
-  bottom: 16px;
+  /* Clears the compact AttributionControl MapLibre auto-adds in the same
+     corner (~24px button + 10px margin from the map edge). */
+  bottom: 44px;
   width: 240px;
 }
 
@@ -309,7 +425,7 @@ button {
   cursor: pointer;
 }
 
-#download-btn {
+.download-btn {
   width: 100%;
   margin-top: 4px;
   padding: 8px 10px;
@@ -318,30 +434,85 @@ button {
   border: 1px solid var(--accent);
   transition: background-color 0.15s ease;
 }
-#download-btn:hover {
+.download-btn:hover {
   background: var(--accent-soft);
 }
-#download-btn:disabled {
+.download-btn:disabled {
   opacity: 0.6;
   cursor: progress;
 }
 
-.feedback {
-  margin: 8px 0 0;
-  font-family: var(--font-data);
-  font-size: 11px;
-  min-height: 1.4em;
+.feedback-modal {
+  min-width: 220px;
+  max-width: min(90vw, 360px);
+  padding: 18px 20px;
+  background: var(--paper-raised);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
 }
-.feedback[data-state="error"] {
+.feedback-modal::backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+.feedback-modal[data-state="error"] {
+  border-color: var(--danger);
+}
+.feedback-modal[data-state="ok"] {
+  border-color: var(--ok);
+}
+#download-feedback-title {
+  margin: 0 0 10px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-soft);
+}
+.feedback-modal-details {
+  margin: 0 0 12px;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+}
+.feedback-modal-details div + div {
+  margin-top: 6px;
+}
+.feedback-modal-details dt {
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+.feedback-modal-details dd {
+  margin: 1px 0 0;
+  font-family: var(--font-data);
+}
+#download-feedback-text {
+  margin: 0 0 14px;
+  font-family: var(--font-data);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.feedback-modal[data-state="error"] #download-feedback-text {
   color: var(--danger);
 }
-.feedback[data-state="ok"] {
+.feedback-modal[data-state="ok"] #download-feedback-text {
   color: var(--ok);
+}
+.feedback-modal-close {
+  padding: 6px 14px;
+  background: var(--accent);
+  color: var(--paper-raised);
+  border: 1px solid var(--accent);
+}
+.feedback-modal-close:hover {
+  background: var(--accent-soft);
 }
 
 .panel-status {
   top: 16px;
-  right: 16px;
+  /* Clears the NavigationControl MapLibre adds at "top-right" (29px wide,
+     10px margin from the map edge, so its left edge sits at right:39px). */
+  right: 50px;
   padding: 0;
   width: 280px;
   overflow: hidden;
@@ -446,6 +617,12 @@ button {
   .panel-legend {
     bottom: 16px;
   }
+  .panel-status {
+    /* Full-width at this size, so the right:50px desktop clearance would push
+       its left edge off-screen -- back to a plain 16px inset like the other
+       panels. */
+    right: 16px;
+  }
   .panel-download {
     left: 16px;
     right: 16px;
@@ -481,25 +658,53 @@ button {
 
 .feature-popup h3 {
   margin: 0 0 6px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.12em;
   color: var(--ink-soft);
 }
+
+/* Match status, which is not one of the feature's attributes -- it comes from
+   which layer was clicked. Kept in the header so the <dl> below is purely
+   what the tile carries. */
+.feature-status {
+  flex: none;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  padding: 1px 4px;
+}
+
+/* The popup now lists every attribute on the feature (13-14 for a building),
+   so it needs a scroll bound -- without one a click near the bottom of the
+   map opens a popup taller than the viewport. minmax(0, ...) on both columns
+   lets a long label ("Zrodlo danych geometrycznych") wrap instead of forcing
+   the grid wider than the popup's max-width. */
 .feature-popup dl {
   margin: 0;
   display: grid;
-  grid-template-columns: auto 1fr;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
   gap: 3px 12px;
   font-size: 12px;
+  max-height: 45vh;
+  overflow-y: auto;
 }
 .feature-popup dt {
   color: var(--ink-soft);
+  overflow-wrap: anywhere;
 }
 .feature-popup dd {
   margin: 0;
   font-family: var(--font-data);
   text-align: right;
   overflow-wrap: anywhere;
+  /* `tags` is rendered one k=v per line -- see formatValue in app.js. */
+  white-space: pre-line;
 }

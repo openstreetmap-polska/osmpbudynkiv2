@@ -264,7 +264,7 @@ const ALL_BUILDINGS_MVT_SQL: &str = "
     WHERE t.geom IS NOT NULL
 ";
 
-// --- Tier A (z5..=z10): aggregated bins -------------------------------------
+// --- Tier A (z5..=z11): aggregated bins -------------------------------------
 //
 // bdot10k_unmatched/egib_unmatched/prg_unmatched all carry cell_x/cell_y: the
 // exact, duplicate-free z14 XYZ tile of the row's representative point (see
@@ -274,14 +274,15 @@ const ALL_BUILDINGS_MVT_SQL: &str = "
 // in this file.
 //
 // bz ("bin zoom") is the zoom at which bins are counted: z+5 capped at 14
-// (K=5, so bins are 32x32 per tile for z=5..9; z=10 is capped by the z14
-// ceiling and only gets 16x16 bins, since there's no finer cell data to
-// aggregate below z14). shift = 14 - bz is how far cell_x/cell_y are
-// right-shifted to get the bin coordinate; n = 2^bz is the bin grid's full
-// width, used to invert bin coordinates back to lon/lat via the standard Web
-// Mercator XYZ formula -- the same one `tile_math::tile_to_bbox` implements
-// in Rust, just spelled in SQL with DuckDB's degrees/atan/sinh/pi builtins
-// (all verified available).
+// (K=5, so bins are 32x32 per tile for z=5..9; z=10 and z=11 are both capped
+// by the z14 ceiling and get progressively fewer bins per tile -- 16x16 and
+// 8x8 respectively -- since there's no finer cell data to aggregate below
+// z14). shift = 14 - bz is how far cell_x/cell_y are right-shifted to get
+// the bin coordinate; n = 2^bz is the bin grid's full width, used to invert
+// bin coordinates back to lon/lat via the standard Web Mercator XYZ formula
+// -- the same one `tile_math::tile_to_bbox` implements in Rust, just spelled
+// in SQL with DuckDB's degrees/atan/sinh/pi builtins (all verified
+// available).
 //
 // The filter is deliberately `cell_x BETWEEN lo AND hi`, not
 // `cell_x >> shift = x` -- same rows, but the range form is zonemap-prunable
@@ -302,21 +303,36 @@ fn agg_bin_ctes(shift: u32, n: u32) -> String {
             SELECT bin_x, bin_y,
                    sum(nb)::INTEGER AS n_bdot10k,
                    sum(ne)::INTEGER AS n_egib,
-                   sum(np)::INTEGER AS n_prg
+                   sum(np)::INTEGER AS n_prg,
+                   sum(tb)::INTEGER AS t_bdot10k,
+                   sum(te)::INTEGER AS t_egib,
+                   sum(tp)::INTEGER AS t_prg
             FROM (
                 SELECT cell_x >> {shift} AS bin_x, cell_y >> {shift} AS bin_y,
-                       count(*) AS nb, 0 AS ne, 0 AS np
+                       count(*) AS nb, 0 AS ne, 0 AS np,
+                       0 AS tb, 0 AS te, 0 AS tp
                   FROM bdot10k_unmatched
                  WHERE cell_x BETWEEN ? AND ? AND cell_y BETWEEN ? AND ?
                  GROUP BY 1, 2
                 UNION ALL
-                SELECT cell_x >> {shift}, cell_y >> {shift}, 0, count(*), 0
+                SELECT cell_x >> {shift}, cell_y >> {shift}, 0, count(*), 0, 0, 0, 0
                   FROM egib_unmatched
                  WHERE cell_x BETWEEN ? AND ? AND cell_y BETWEEN ? AND ?
                  GROUP BY 1, 2
                 UNION ALL
-                SELECT cell_x >> {shift}, cell_y >> {shift}, 0, 0, count(*)
+                SELECT cell_x >> {shift}, cell_y >> {shift}, 0, 0, count(*), 0, 0, 0
                   FROM prg_unmatched
+                 WHERE cell_x BETWEEN ? AND ? AND cell_y BETWEEN ? AND ?
+                 GROUP BY 1, 2
+                UNION ALL
+                -- Denominators. One row per (source, cell) rather than one per
+                -- object, so all three sources come from a single scan with a
+                -- CASE fan-out instead of three unioned subqueries.
+                SELECT cell_x >> {shift}, cell_y >> {shift}, 0, 0, 0,
+                       sum(CASE WHEN source = 'bdot10k' THEN total ELSE 0 END),
+                       sum(CASE WHEN source = 'egib' THEN total ELSE 0 END),
+                       sum(CASE WHEN source = 'prg' THEN total ELSE 0 END)
+                  FROM cell_totals
                  WHERE cell_x BETWEEN ? AND ? AND cell_y BETWEEN ? AND ?
                  GROUP BY 1, 2
             ) src
@@ -325,15 +341,53 @@ fn agg_bin_ctes(shift: u32, n: u32) -> String {
         geo AS (
             SELECT bin_x, bin_y, n_bdot10k, n_egib, n_prg,
                    (n_bdot10k + n_egib + n_prg)::INTEGER AS n_total,
+                   t_bdot10k, t_egib, t_prg,
+                   (t_bdot10k + t_egib + t_prg)::INTEGER AS t_total,
+                   {r_bdot10k}, {r_egib}, {r_prg}, {r_total},
                    bin_x / {n}.0 * 360 - 180 AS lon0,
                    (bin_x + 1) / {n}.0 * 360 - 180 AS lon1,
                    degrees(atan(sinh(pi() * (1 - 2 * bin_y / {n}.0)))) AS lat_north,
                    degrees(atan(sinh(pi() * (1 - 2 * (bin_y + 1) / {n}.0)))) AS lat_south
             FROM bins
         )
-        "
+        ",
+        r_bdot10k = ratio_sql("n_bdot10k", "t_bdot10k", "r_bdot10k"),
+        r_egib = ratio_sql("n_egib", "t_egib", "r_egib"),
+        r_prg = ratio_sql("n_prg", "t_prg", "r_prg"),
+        r_total = ratio_sql(
+            "(n_bdot10k + n_egib + n_prg)",
+            "(t_bdot10k + t_egib + t_prg)",
+            "r_total"
+        ),
     )
 }
+
+/// Completeness ratio (`unmatched ÷ total`) as a DOUBLE in 0..1, or
+/// `RATIO_UNKNOWN` when the bin has no denominator.
+///
+/// The unknown case is not hypothetical and must not read as 0: `cell_totals`
+/// is populated by `compare` (or reconcile + drain), so any database whose
+/// serving tables predate this feature has unmatched rows and no totals at all
+/// — see CLAUDE.md's standing note that this codebase has no `ALTER TABLE` or
+/// backfill path. Emitting 0.0 there would paint the entire country as fully
+/// imported, which is both wrong and indistinguishable from the genuinely
+/// finished case; a sentinel lets the frontend render it as its own state.
+///
+/// The `least(..., 1.0)` clamp is defensive rather than expected: numerator and
+/// denominator are always written in one transaction (`compare::totals`), so a
+/// bin should never exceed its own total. If one ever does, clamping keeps the
+/// colour ramp's domain intact instead of letting a single bin stretch it.
+fn ratio_sql(numerator: &str, denominator: &str, alias: &str) -> String {
+    format!(
+        "CASE WHEN {denominator} > 0 \
+              THEN least({numerator}::DOUBLE / {denominator}, 1.0) \
+              ELSE {RATIO_UNKNOWN} END AS {alias}"
+    )
+}
+
+/// Sentinel emitted for a bin with unmatched rows but no denominator. Negative
+/// so it can never collide with a real ratio; the frontend tests for `< 0`.
+const RATIO_UNKNOWN: f64 = -1.0;
 
 /// `agg_cells`: each bin as a square polygon covering its Web Mercator
 /// extent. Latitude decreases as bin_y increases, so `lat_south` (derived
@@ -347,7 +401,9 @@ fn agg_cells_sql(shift: u32, n: u32) -> String {
             SELECT ST_AsMVTGeom(
                        ST_MakeEnvelope(geo.lon0, geo.lat_south, geo.lon1, geo.lat_north),
                        bbox.geom, 4096, 256, true) AS geom,
-                   geo.n_bdot10k, geo.n_egib, geo.n_prg, geo.n_total
+                   geo.n_bdot10k, geo.n_egib, geo.n_prg, geo.n_total,
+                   geo.t_bdot10k, geo.t_egib, geo.t_prg, geo.t_total,
+                   geo.r_bdot10k, geo.r_egib, geo.r_prg, geo.r_total
             FROM geo, bbox
         ) t
         WHERE t.geom IS NOT NULL",
@@ -367,7 +423,9 @@ fn agg_points_sql(shift: u32, n: u32) -> String {
             SELECT ST_AsMVTGeom(
                        ST_Point((geo.lon0 + geo.lon1) / 2, (geo.lat_north + geo.lat_south) / 2),
                        bbox.geom, 4096, 256, true) AS geom,
-                   geo.n_bdot10k, geo.n_egib, geo.n_prg, geo.n_total
+                   geo.n_bdot10k, geo.n_egib, geo.n_prg, geo.n_total,
+                   geo.t_bdot10k, geo.t_egib, geo.t_prg, geo.t_total,
+                   geo.r_bdot10k, geo.r_egib, geo.r_prg, geo.r_total
             FROM geo, bbox
         ) t
         WHERE t.geom IS NOT NULL",
@@ -375,7 +433,7 @@ fn agg_points_sql(shift: u32, n: u32) -> String {
     )
 }
 
-// --- Tier B (z11..=z13): individual points ----------------------------------
+// --- Tier B (z12..=z13): individual points ----------------------------------
 //
 // One feature per unmatched object -- same cell_x/cell_y BETWEEN filter as
 // Tier A, just not binned. Buildings are recentred to their centroid since
@@ -412,10 +470,10 @@ pub async fn serve_tile(
     // Tiers A/B (z5..=z13) are dispatched before the z14 guard below, which
     // is otherwise left byte-for-byte as it was -- see the module-level
     // tiers documented above `agg_bin_ctes`/`POINTS_MVT_SQL`.
-    if (5..=10).contains(&z) {
+    if (5..=11).contains(&z) {
         return serve_tile_agg(state, z, x, y).await;
     }
-    if (11..=13).contains(&z) {
+    if (12..=13).contains(&z) {
         return serve_tile_points(state, z, x, y).await;
     }
     if z != 14 {
@@ -532,7 +590,7 @@ fn query_mvt_layer(
     }
 }
 
-/// Tier A dispatch (z5..=z10): two layers (`agg_cells`/`agg_points`), one
+/// Tier A dispatch (z5..=z11): two layers (`agg_cells`/`agg_points`), one
 /// shared aggregate. See `agg_bin_ctes` above for the design rationale.
 async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
     let bz = (z + 5).min(14);
@@ -567,6 +625,7 @@ async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
                 lo_x, hi_x, lo_y, hi_y, // bdot10k_unmatched filter
                 lo_x, hi_x, lo_y, hi_y, // egib_unmatched filter
                 lo_x, hi_x, lo_y, hi_y, // prg_unmatched filter
+                lo_x, hi_x, lo_y, hi_y, // cell_totals filter (denominators)
             ],
         )?;
         let points = query_mvt_layer(
@@ -577,6 +636,7 @@ async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
                 lo_x, hi_x, lo_y, hi_y, // bdot10k_unmatched filter
                 lo_x, hi_x, lo_y, hi_y, // egib_unmatched filter
                 lo_x, hi_x, lo_y, hi_y, // prg_unmatched filter
+                lo_x, hi_x, lo_y, hi_y, // cell_totals filter (denominators)
             ],
         )?;
         Ok::<Vec<u8>, anyhow::Error>([cells, points].concat())
@@ -586,7 +646,7 @@ async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
     finish_tile_response(result, z, x, y)
 }
 
-/// Tier B dispatch (z11..=z13): one `points` layer, one feature per
+/// Tier B dispatch (z12..=z13): one `points` layer, one feature per
 /// unmatched object (not binned).
 async fn serve_tile_points(state: AppState, z: u32, x: u32, y: u32) -> Response {
     let cell_shift = 14 - z;
@@ -886,8 +946,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
-    /// z10 is the top of Tier A (aggregated bins) and used to return 204
-    /// before this change (see `out_of_range_zoom_returns_no_content` above,
+    /// z10 sits inside Tier A (aggregated bins) and used to return 204 before
+    /// Tiers A/B existed (see `out_of_range_zoom_returns_no_content` above,
     /// which used to cover z10 itself). An empty DB is enough here since
     /// `ST_AsMVT` emits a layer header even with zero features, same as the
     /// z14 `empty_tile_returns_ok_not_500` case below.
@@ -898,7 +958,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// Tier A (z5..=z10): seeds one row per source table at z14 cell
+    /// z11 is the top of Tier A (grid features stay legible one zoom further
+    /// in than the original z5..=z10 cutoff, before handing off to Tier B's
+    /// unbinned points at z12) -- pins the moved boundary directly, since
+    /// nothing else here would catch a dispatcher off-by-one at z11 itself.
+    #[tokio::test]
+    async fn z11_aggregated_tile_returns_ok_not_no_content() {
+        let state = make_state("");
+        let response = request_tile(state, 11, 1, 1).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("agg_cells"), "missing agg_cells layer");
+    }
+
+    /// Tier A (z5..=z11): seeds one row per source table at z14 cell
     /// (8000, 4900) and requests the z6 tile that bit-shift-contains it
     /// (31, 19 -- verified: 8000 >> 8 = 31, 4900 >> 8 = 19, matching
     /// shift = 14 - 6 = 8). Asserts both MVT layers this tier emits are
@@ -926,9 +1000,70 @@ mod tests {
         for attr in ["n_bdot10k", "n_egib", "n_prg", "n_total"] {
             assert!(body.contains(attr), "missing {attr} count attribute");
         }
+        for attr in ["t_bdot10k", "t_egib", "t_prg", "t_total"] {
+            assert!(body.contains(attr), "missing {attr} total attribute");
+        }
+        for attr in ["r_bdot10k", "r_egib", "r_prg", "r_total"] {
+            assert!(body.contains(attr), "missing {attr} ratio attribute");
+        }
     }
 
-    /// Tier B (z11..=z13): same seeded cell as the aggregated-tile test
+    /// The payoff of carrying denominators at all: a cell whose government
+    /// objects are *all* matched has a `cell_totals` row and no unmatched rows,
+    /// and must still produce a bin. Without this the unmatched tables alone
+    /// cannot distinguish a finished area from one holding no government data
+    /// -- both are simply absent -- and the map can never render "done".
+    #[tokio::test]
+    async fn a_bin_with_only_totals_and_no_unmatched_rows_still_renders() {
+        let seed = "INSERT INTO cell_totals (source, cell_x, cell_y, total) VALUES
+                        ('bdot10k', 8000, 4900, 42);";
+        let state = make_state(seed);
+        let response = request_tile(state, 6, 31, 19).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            !bytes.is_empty(),
+            "a fully-matched cell must still produce a tile, not an empty one"
+        );
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("agg_cells"), "missing agg_cells layer");
+    }
+
+    /// `ratio_sql`'s four cases, evaluated as SQL rather than inferred from
+    /// the encoded tile (MVT attribute *values* are protobuf-encoded, so the
+    /// string matching the tile tests above use can only see attribute names).
+    /// The unknown case is the one that matters most: it is what any database
+    /// whose `cell_totals` has not been built yet will hit on every bin.
+    #[test]
+    fn ratio_handles_missing_denominators_full_matches_and_overflow() {
+        let conn = crate::db::init_db(
+            std::path::Path::new(":memory:"),
+            &["INSTALL spatial".to_string(), "LOAD spatial".to_string()],
+            None,
+        )
+        .unwrap();
+        // (case, numerator, denominator), ordered by `case` so the expected
+        // vector below reads in the same order as the comments.
+        let sql = format!(
+            "SELECT {} FROM (VALUES
+                 (1, 0, 5),   -- every object matched -> 0.0
+                 (2, 3, 12),  -- a quarter still missing -> 0.25
+                 (3, 7, 7),   -- nothing matched yet -> 1.0
+                 (4, 9, 4),   -- numerator > denominator, clamped -> 1.0
+                 (5, 7, 0)    -- no denominator at all -> the sentinel
+             ) v(case_no, n, t) ORDER BY case_no",
+            ratio_sql("n", "t", "r")
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let got: Vec<f64> = stmt
+            .query_map([], |r| r.get::<_, f64>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got, vec![0.0, 0.25, 1.0, 1.0, RATIO_UNKNOWN]);
+    }
+
+    /// Tier B (z12..=z13): same seeded cell as the aggregated-tile test
     /// above, requested at the z12 tile that contains it (2000, 1225 --
     /// 8000 >> 2 = 2000, 4900 >> 2 = 1225, shift = 14 - 12 = 2). Asserts the
     /// `points` layer and all three `source` values are present.

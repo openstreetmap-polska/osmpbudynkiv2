@@ -230,6 +230,26 @@ fn create_schema(conn: &Connection) -> Result<()> {
             enqueued_at TIMESTAMP WITH TIME ZONE
         );
 
+        -- Denominator for the low-zoom completeness ratio: how many government
+        -- objects a z14 cell holds *in total*, against which <source>_unmatched
+        -- is the numerator. Written by exactly the two paths that write the
+        -- unmatched rows themselves and always in the same transaction as them
+        -- (compare::totals) -- see that module for why the ratio needs its own
+        -- table at all rather than being counted at serve time.
+        --
+        -- source is 'bdot10k'|'egib'|'prg', spelled identically to
+        -- match_dirty_cells.source. A cell with government objects but nothing
+        -- unmatched has a row here and none in <source>_unmatched: that pair is
+        -- what lets /tiles tell a fully-imported area apart from one with no
+        -- government data at all, which the unmatched tables alone cannot
+        -- express -- both are simply absent from them.
+        CREATE TABLE IF NOT EXISTS cell_totals (
+            source VARCHAR,
+            cell_x INTEGER,
+            cell_y INTEGER,
+            total INTEGER
+        );
+
         ",
     )
     .context("Failed to create schema")?;

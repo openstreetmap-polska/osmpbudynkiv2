@@ -5,6 +5,7 @@ use tracing::info;
 use crate::compare::columns::classification_columns;
 use crate::compare::in_transaction;
 use crate::compare::rule::{BDOT10K_EKSPLOATOWANY_FILTER, unmatched_buildings_sql};
+use crate::compare::totals;
 use crate::tile_math::{cell_x_sql, cell_y_sql};
 use crate::utils::format_duration;
 
@@ -86,6 +87,10 @@ fn compare_buildings(
             }
             y += GRID_STEP;
         }
+        // Inside the same transaction as the rows it counts, so a cell's
+        // numerator and denominator always come from one comparison.
+        totals::rebuild_all_in_txn(conn, label)
+            .with_context(|| format!("Failed to rebuild cell totals for {label}"))?;
         Ok(())
     })?;
 

@@ -82,6 +82,11 @@ pub fn recompute_cell_in_txn(
         duckdb::params![cell_x, cell_y],
     )?;
     conn.execute_batch(&format!("INSERT INTO {dest} ({insert_cols}) {inner};"))?;
+    // The cell's denominator, recomputed in the caller's transaction alongside
+    // the numerator above so the two can never be read from different passes.
+    // Cheap: it re-reads the same envelope through the same RTREE index the
+    // INSERT just used.
+    crate::compare::totals::recompute_cell_in_txn(conn, source, cell_x, cell_y)?;
     Ok(())
 }
 

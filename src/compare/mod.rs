@@ -5,6 +5,7 @@ pub mod drain;
 pub mod incremental;
 pub mod reconcile;
 pub mod rule;
+pub mod totals;
 
 use anyhow::Result;
 use duckdb::Connection;
@@ -183,6 +184,25 @@ mod full_vs_incremental_equivalence {
             .collect()
     }
 
+    /// `cell_totals` for one source, as comparable strings. The ratio served
+    /// at low zoom is `<source>_unmatched ÷ cell_totals`, so the denominator
+    /// has to survive a path switch just as the numerator does — and it is
+    /// written by genuinely different SQL on each path (a whole-table GROUP BY
+    /// in the full compare, an envelope-filtered count per cell in the drain).
+    fn totals_snapshot(c: &Connection, source: &str) -> BTreeSet<String> {
+        let mut stmt = c
+            .prepare(
+                "SELECT CAST(cell_x AS VARCHAR) || '|' || CAST(cell_y AS VARCHAR)
+                        || '|' || CAST(total AS VARCHAR)
+                 FROM cell_totals WHERE source = ?",
+            )
+            .unwrap();
+        stmt.query_map(duckdb::params![source], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
     #[test]
     fn full_compare_and_reconcile_drain_agree_on_bdot10k() {
         let c = conn();
@@ -203,13 +223,20 @@ mod full_vs_incremental_equivalence {
 
         compare_bdot10k(&c).unwrap();
         let full = snapshot(&c, "bdot10k_unmatched", "LOKALNYID", None);
+        let full_totals = totals_snapshot(&c, "bdot10k");
         assert_eq!(
             full.len(),
             2,
             "sanity: 'inside' matched, 'lonely' and 'stray' unmatched"
         );
+        assert_eq!(
+            full_totals.len(),
+            3,
+            "sanity: all three buildings count towards a denominator, matched or not"
+        );
 
-        c.execute_batch("DELETE FROM bdot10k_unmatched;").unwrap();
+        c.execute_batch("DELETE FROM bdot10k_unmatched; DELETE FROM cell_totals;")
+            .unwrap();
         enqueue_all(&c).unwrap();
         drain_all(&c);
         let incremental = snapshot(&c, "bdot10k_unmatched", "LOKALNYID", None);
@@ -217,6 +244,11 @@ mod full_vs_incremental_equivalence {
         assert_eq!(
             full, incremental,
             "full compare and reconcile+drain must produce row-identical bdot10k_unmatched"
+        );
+        assert_eq!(
+            full_totals,
+            totals_snapshot(&c, "bdot10k"),
+            "full compare and reconcile+drain must produce identical cell_totals"
         );
     }
 
@@ -243,13 +275,20 @@ mod full_vs_incremental_equivalence {
             "lokalny_id",
             Some("wazny_od_lub_data_nadania"),
         );
+        let full_totals = totals_snapshot(&c, "prg");
         assert_eq!(
             full.len(),
             2,
             "sanity: 'matched' excluded, 'unmatched' and 'far' present"
         );
+        assert_eq!(
+            full_totals.len(),
+            3,
+            "sanity: all three addresses count towards a denominator, matched or not"
+        );
 
-        c.execute_batch("DELETE FROM prg_unmatched;").unwrap();
+        c.execute_batch("DELETE FROM prg_unmatched; DELETE FROM cell_totals;")
+            .unwrap();
         enqueue_all(&c).unwrap();
         drain_all(&c);
         let incremental = snapshot(
@@ -262,6 +301,11 @@ mod full_vs_incremental_equivalence {
         assert_eq!(
             full, incremental,
             "full compare and reconcile+drain must produce row-identical prg_unmatched"
+        );
+        assert_eq!(
+            full_totals,
+            totals_snapshot(&c, "prg"),
+            "full compare and reconcile+drain must produce identical cell_totals"
         );
     }
 }

@@ -4,6 +4,10 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>osmpbudynkiv2 — status danych</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="icon" href="favicon-16.png" type="image/png" sizes="16x16" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -11,7 +15,6 @@
   <div id="map"></div>
 
   <header class="masthead">
-    <span class="crosshair" aria-hidden="true"></span>
     <div>
       <h1>osmpbudynkiv2</h1>
       <p>Rejestry publiczne a OpenStreetMap &mdash; niedopasowane budynki i adresy</p>
@@ -24,74 +27,95 @@
     <div class="legend-group" data-building-source="bdot10k">
       <div class="legend-group-header">
         <span class="legend-title">Budynki</span>
-        <div class="source-toggle" role="group" aria-label="Źródło danych o budynkach">
-          <button type="button" class="source-btn" data-source="bdot10k" aria-pressed="true">BDOT10k</button>
-          <button type="button" class="source-btn" data-source="egib" aria-pressed="false">EGIB</button>
-        </div>
       </div>
-      <label class="legend-row">
-        <input type="checkbox" id="buildings-all-checkbox" checked />
+      <div class="source-toggle" role="group" aria-label="Źródło danych o budynkach">
+        <button type="button" class="source-btn" data-source="off" aria-pressed="false">Wyłącz</button>
+        <button type="button" class="source-btn" data-source="bdot10k" aria-pressed="true">BDOT10k</button>
+        <button type="button" class="source-btn" data-source="egib" aria-pressed="false">EGiB</button>
+      </div>
+      <div class="legend-row">
         <span class="swatch swatch-all" data-swatch="buildings"></span>
         Wszystkie
-      </label>
-      <label class="legend-row">
-        <input type="checkbox" id="buildings-unmatched-checkbox" checked />
+      </div>
+      <div class="legend-row">
         <span class="swatch swatch-unmatched" data-swatch="buildings"></span>
         Niedopasowane
-      </label>
+      </div>
     </div>
 
-    <div class="legend-group">
+    <div class="legend-group" data-address-source="prg">
       <div class="legend-group-header">
         <span class="legend-title">Adresy</span>
       </div>
-      <label class="legend-row">
-        <input type="checkbox" id="addresses-all-checkbox" checked />
+      <div class="source-toggle" role="group" aria-label="Źródło danych o adresach">
+        <button type="button" class="source-btn" data-address-source="off" aria-pressed="false">Wyłącz</button>
+        <button type="button" class="source-btn" data-address-source="prg" aria-pressed="true">PRG</button>
+      </div>
+      <div class="legend-row">
         <span class="swatch swatch-all" data-swatch="addresses"></span>
         Wszystkie
-      </label>
-      <label class="legend-row">
-        <input type="checkbox" id="addresses-unmatched-checkbox" checked />
+      </div>
+      <div class="legend-row">
         <span class="swatch swatch-unmatched" data-swatch="addresses"></span>
         Niedopasowane
-      </label>
+      </div>
     </div>
 
     <div class="legend-group" data-agg>
       <div class="legend-group-header">
-        <span class="legend-title">Niskie zoomy (5&ndash;13)</span>
+        <span class="legend-title">Niskie zoomy (5&ndash;11)</span>
       </div>
       <div class="legend-subrow">
-        <span class="legend-subrow-label">Styl</span>
-        <div class="metric-toggle" id="agg-style-toggle" role="group" aria-label="Styl agregacji">
-          <button type="button" class="metric-btn" data-style="grid" aria-pressed="true">Siatka</button>
-          <button type="button" class="metric-btn" data-style="circles" aria-pressed="false">Kółka</button>
-          <button type="button" class="metric-btn" data-style="heatmap" aria-pressed="false">Mapa ciepła</button>
+        <span class="legend-subrow-label">Kolor</span>
+        <div class="metric-toggle" id="agg-color-toggle" role="group" aria-label="Co oznacza kolor">
+          <button type="button" class="metric-btn" data-color="ratio" aria-pressed="true">% braków</button>
+          <button type="button" class="metric-btn" data-color="count" aria-pressed="false">Liczba</button>
         </div>
       </div>
-      <div class="legend-subrow">
-        <span class="legend-subrow-label">Dane</span>
-        <div class="metric-toggle" id="agg-metric-toggle" role="group" aria-label="Źródło danych do agregacji">
-          <button type="button" class="metric-btn" data-metric="n_total" aria-pressed="true">Wszystko</button>
-          <button type="button" class="metric-btn" data-metric="n_bdot10k" aria-pressed="false">BDOT10k</button>
-          <button type="button" class="metric-btn" data-metric="n_egib" aria-pressed="false">EGIB</button>
-          <button type="button" class="metric-btn" data-metric="n_prg" aria-pressed="false">Adresy PRG</button>
+      <div class="ratio-legend" id="ratio-legend">
+        <div class="ratio-legend-scale">
+          <span class="ratio-legend-end">0%</span>
+          <span class="ratio-legend-bar" aria-hidden="true"></span>
+          <span class="ratio-legend-end">20%+</span>
         </div>
+        <span class="ratio-legend-caption">Udział obiektów niedopasowanych</span>
+      </div>
+      <div class="ratio-legend" id="count-legend" hidden>
+        <div class="ratio-legend-scale">
+          <span class="ratio-legend-bar count-legend-bar" aria-hidden="true"></span>
+        </div>
+        <span class="ratio-legend-caption">Liczba niedopasowanych obiektów</span>
       </div>
     </div>
 
     <p class="hint">
-      Zagregowane liczby (siatka/kółka/mapa ciepła) od powiększenia 5,
-      pojedyncze punkty od 11, pełne dane (poligony, tagi) od 14.
+      Siatka pokazuje zagregowane informacje.
+      <br>
+      Przy % braków kolor pokazuje udział obiektów niedopasowanych, a nasycenie ich liczbę.
     </p>
   </section>
 
   <section class="panel panel-download" aria-label="Pobierz paczkę">
     <h2>Pobierz paczkę</h2>
-    <p class="hint">Niedopasowane obiekty z widocznego obszaru w formacie GeoJSON dla JOSM.</p>
-    <button id="download-btn" type="button">Pobierz widoczny obszar</button>
-    <p id="download-feedback" class="feedback" role="status" aria-live="polite"></p>
+    <button id="download-btn" type="button" class="download-btn">Pobierz widoczny obszar</button>
+    <button id="draw-btn" type="button" class="download-btn">Narysuj obszar do pobrania</button>
   </section>
+
+  <dialog id="download-feedback" class="feedback-modal">
+    <h2 id="download-feedback-title">Pobieranie paczki</h2>
+    <dl class="feedback-modal-details">
+      <div>
+        <dt>Obszar (dł. szer. geo)</dt>
+        <dd id="download-feedback-bbox"></dd>
+      </div>
+      <div>
+        <dt>Warstwy</dt>
+        <dd id="download-feedback-layers"></dd>
+      </div>
+    </dl>
+    <p id="download-feedback-text" role="status" aria-live="polite"></p>
+    <button id="download-feedback-close" type="button" class="feedback-modal-close">Zamknij</button>
+  </dialog>
 
   <section class="panel panel-status" aria-label="Status zadań">
     <button
