@@ -1,3 +1,9 @@
+// v6 dropped the UMD bundle (`maplibre-gl.js`) that used to expose a
+// `maplibregl` global -- only the ESM build (`maplibre-gl.mjs`) is published
+// now, so this file has to be a module and import it itself instead of index.html
+// loading a separate global-exposing <script> before this one.
+import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mjs";
+
 (() => {
   const TILE_URL = `${location.origin}/tiles/{z}/{x}/{y}`;
   const DEFAULT_BUILDING_SOURCE = "bdot10k";
@@ -496,11 +502,15 @@
   // ---- state <-> URL hash ----
   //
   // MapLibre owns the `map=` hash entry (`hash: "map"` above). Its own Hash
-  // class rewrites the URL by splitting the fragment on `&`, replacing only
-  // the part whose key matches its own, and leaving every other `&`-joined
-  // part untouched -- so a second entry here coexists safely as long as our
-  // reads/writes follow that same "split on &, touch only our own key"
-  // discipline, which readStateHash/writeStateHash below do.
+  // class only ever touches its own key and leaves every other entry
+  // untouched -- so a second entry here coexists safely as long as our
+  // reads/writes follow that same "touch only our own key" discipline, which
+  // readStateHash/writeStateHash below do. (As of MapLibre v6 the Hash class
+  // round-trips the whole fragment through `URLSearchParams` internally
+  // rather than splitting the raw string on `&` as it did pre-v6, but it
+  // percent-decodes the result before writing it back, which is lossless for
+  // our comma-separated values -- verified against v6's hash.ts source, not
+  // merely assumed.)
   const STATE_HASH_KEY = "layers";
   const VALID_BUILDING_SOURCES = ["off", "bdot10k", "egib"];
   const VALID_ADDRESS_SOURCES = ["off", "prg"];
