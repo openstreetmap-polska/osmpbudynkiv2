@@ -301,7 +301,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
       minzoom: 12,
       maxzoom: 14,
       paint: {
-        "circle-radius": ["interpolate", ["linear"], ["zoom"], 12, 1.4, 13, 3],
+        "circle-radius": ["interpolate", ["linear"], ["zoom"], 12, 3, 13, 4],
         "circle-color": [
           "match",
           ["get", "source"],
