@@ -708,3 +708,9 @@ button {
   /* `tags` is rendered one k=v per line -- see formatValue in app.js. */
   white-space: pre-line;
 }
+/* KODKST's hover hint -- see kstHint in app.js. Native `title` tooltip, so
+   this is purely a visual affordance marking the value as hoverable. */
+.kst-hint {
+  cursor: help;
+  color: var(--accent-soft);
+}

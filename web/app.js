@@ -397,43 +397,86 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     return el.innerHTML;
   }
 
-  // Popup labels are derived from the tile attribute's *own* name -- re-cased
-  // and spaced, never swapped for a different word -- so what the popup calls
-  // a field is what the government dataset calls it, and a value can be traced
-  // back to its column without a glossary.
-  //
-  // Two shapes need help. snake_case (`numer_porzadkowy`,
-  // `levels_above_ground`) splits on "_" generically and needs no table.
-  // BDOT10k's glued uppercase column names carry no separator at all, so where
-  // the word boundaries fall is knowledge only a table has; the entries below
-  // therefore only insert spaces and lower letters. Acronyms (FSBUD, KST) stay
-  // upper, since lowering them would be changing the word.
-  //
-  // Anything not listed falls through to the generic transform, so a new tile
-  // attribute appears in the popup by itself under its raw name rather than
-  // silently going missing -- which is the failure this replaced (the popup
-  // used to render a hardcoded 3-4 rows out of the 13-14 attributes the tile
-  // carries; see src/server/tiles.rs's MVT selects for the full set).
+  // Every key any of the four MVT selects in src/server/tiles.rs can produce
+  // (ADDRESSES_MVT_SQL, BUILDINGS_MVT_SQL, ALL_ADDRESSES_MVT_SQL,
+  // ALL_BUILDINGS_MVT_SQL), spelled out by hand instead of derived from the
+  // column name -- a translated label doesn't have to agree with whatever
+  // shape the government schema happens to use (snake_case here, glued
+  // uppercase there), and a missing key is a visible untranslated row instead
+  // of a plausible-looking guess.
   const ATTRIBUTE_LABELS = {
+    // shared identity/meta
     id: "ID",
-    lokalny_id: "Lokalny ID",
-    NAZWA: "Nazwa",
+    lokalny_id: "ID",
+    source: "Zbiór danych",
+    tags: "Tagi",
+
+    // addresses -- prg_unmatched / prg_addresses
+    numer_porzadkowy: "Numer porządkowy",
+    ulica: "Ulica",
+    miejscowosc: "Miejscowość",
+    kod_pocztowy: "Kod pocztowy",
+    wazny_od_lub_data_nadania: "Ważny od / data nadania",
+
+    // addresses -- OSM tag preview. Literal tag keys, shown unchanged: this
+    // is naming the tag /package would write, not a column, so translating
+    // it would stop it naming the tag it names.
+    "addr:housenumber": "addr:housenumber",
+    "addr:street": "addr:street",
+    "addr:city": "addr:city",
+    "addr:place": "addr:place",
+    "addr:postcode": "addr:postcode",
+    "addr:city:simc": "addr:city:simc",
+    "source:addr": "source:addr",
+
+    // buildings -- classification columns carried by bdot10k_unmatched /
+    // egib_unmatched (see CLAUDE.md's building-type-mapping gotcha)
+    funkcja_szczegolowa: "Przeważająca funkcja budynku",
+    funkcja_ogolna: "Funkcja ogólna budynku",
+    levels_above_ground: "Kondygnacje nadziemne",
+    kondygnacje_podziemne: "Kondygnacje podziemne",
+    rodzaj: "Rodzaj budynku",
+
+    // buildings -- raw BDOT10k columns (also used by the buildings_all legend layer)
+    PRZEWAZAJACAFUNKCJABUDYNKU: "Przeważająca funkcja budynku",
+    FUNKCJAOGOLNABUDYNKU: "Funkcja ogólna budynku",
     KATEGORIAISTNIENIA: "Kategoria istnienia",
+    NAZWA: "Nazwa",
+    FSBUD: "Funkcje szczegółowe budynku",
     INFORMACJADODATKOWA: "Informacja dodatkowa",
     KODKST: "Kod KST",
-    ZRODLODANYCHGEOMETRYCZNYCH: "Zrodlo danych geometrycznych",
-    PRZEWAZAJACAFUNKCJABUDYNKU: "Przewazajaca funkcja budynku",
-    FUNKCJAOGOLNABUDYNKU: "Funkcja ogolna budynku",
+    ZRODLODANYCHGEOMETRYCZNYCH: "Źródło geometrii",
   };
 
   function attributeLabel(key) {
-    if (key in ATTRIBUTE_LABELS) return ATTRIBUTE_LABELS[key];
-    // addr:street, addr:city:simc, source:addr -- literal OSM tag keys, not
-    // column names. Re-casing one would stop it naming the tag it names, so
-    // anything with a colon is shown exactly as the tile spells it.
-    if (key.includes(":")) return key;
-    const spaced = key.replace(/_/g, " ");
-    return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+    // Falls through to the raw key for anything not listed above, so a new
+    // tile attribute appears in the popup by itself under its raw name
+    // rather than silently going missing.
+    return key in ATTRIBUTE_LABELS ? ATTRIBUTE_LABELS[key] : key;
+  }
+
+  // GUS Klasyfikacja Środków Trwałych (KŚT) group-1 names for the codes
+  // BDOT10k's KODKST carries, copied from example_data/mappings/kst_mapping.csv.
+  const KST_NAMES = {
+    101: "Budynki przemysłowe",
+    102: "Budynki transportu i łączności",
+    103: "Budynki handlowo-usługowe",
+    104: "Zbiorniki, silosy i budynki magazynowe",
+    105: "Budynki biurowe",
+    106: "Budynki szpitali i inne budynki opieki zdrowotnej",
+    107: "Budynki oświaty, nauki i kultury oraz budynki sportowe",
+    108: "Budynki produkcyjne, usługowe i gospodarcze dla rolnictwa",
+    109: "Pozostałe budynki niemieszkalne",
+    110: "Budynki mieszkalne",
+  };
+
+  // A hoverable "ⓘ" appended after KODKST's value, decoding the numeric code
+  // to its KŚT category name. KST_NAMES is a fixed table baked into this
+  // file, not tile data, so unlike escapeHtml's inputs it needs no escaping.
+  function kstHint(key, value) {
+    const name = KST_NAMES[String(value).trim()];
+    if (key !== "KODKST" || !name) return "";
+    return ` <span class="kst-hint" title="${name}">ⓘ</span>`;
   }
 
   function formatValue(key, value) {
@@ -457,13 +500,18 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
       // ST_AsMVT drops NULL attributes, so this is exactly the set that
       // feature actually has: an EGIB building carries `rodzaj`, a BDOT10k
       // one carries FSBUD/KODKST/..., and neither shows the other's blanks.
-      rows: Object.keys(props).map((key) => [attributeLabel(key), formatValue(key, props[key])]),
+      // The raw key rides along (not shown) so popupHtml can special-case
+      // KODKST for the KST hover hint below.
+      rows: Object.keys(props).map((key) => [key, attributeLabel(key), formatValue(key, props[key])]),
     };
   }
 
   function popupHtml({ title, status, rows }) {
     const rowsHtml = rows
-      .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`)
+      .map(
+        ([key, label, value]) =>
+          `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}${kstHint(key, value)}</dd>`
+      )
       .join("");
     return (
       `<div class="feature-popup"><h3>${escapeHtml(title)}` +
