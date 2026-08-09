@@ -71,6 +71,22 @@
   --ratio-3: #8a3f9e;
   --ratio-4: #5e1258;
   --ratio-unknown: #9b968a;
+  /* "Draw an area to download" overlay (draw-fill, draw-outline-drawing,
+     draw-outline-committed, draw-vertices, draw-rubberband layers in
+     app.js). Same reasoning as --ratio-0.._4 and
+     --building-outline-all above: this paints on top of the OSM raster
+     basemap, which is always light, so it is not redefined for dark mode --
+     a dark-mode teal would vanish against the still-light map underneath it.
+     Teal was picked because it's the one hue nothing else on the map already
+     spends: red is unmatched buildings, blue is unmatched addresses/EGiB
+     dots, orange-red is the count ramp, purple is the ratio ramp. --draw-fill
+     reuses the same value as --draw-outline (paint layers apply their own
+     opacity, so one colour serves both). --draw-invalid deliberately reuses
+     --danger rather than inventing a fourth colour -- "this polygon can't be
+     downloaded" is the same semantic as the feedback modal's error state. */
+  --draw-outline: #0f8a6b;
+  --draw-fill: #0f8a6b;
+  --draw-invalid: var(--danger);
   --font-label: ui-sans-serif, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --font-data: ui-monospace, "SFMono-Regular", "IBM Plex Mono", Menlo, Consolas, monospace;
 }
@@ -223,6 +239,18 @@ body {
   border: 1px solid var(--line-strong);
   border-radius: 3px;
   overflow: hidden;
+}
+
+/* #draw-mode-picker is a .source-toggle that also toggles the [hidden]
+   attribute (app.js's applyDownloadPanelState). Same fix as .ratio-legend
+   [hidden] below: the UA stylesheet's `[hidden] { display: none }` and this
+   class's `display: flex` are equal specificity (one attribute selector,
+   one class selector), and author CSS beats the UA sheet on a tie -- so
+   without this override [hidden] silently loses and the picker stays a
+   visible empty-ish flex row. The legend's own .source-toggle instances
+   never hit this because they're never [hidden]. */
+#draw-mode-picker[hidden] {
+  display: none;
 }
 
 .source-btn {

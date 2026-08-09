@@ -25,6 +25,11 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
   const rampColors = [1, 2, 3, 4, 5].map((i) => rootStyle.getPropertyValue(`--ramp-${i}`).trim());
   const ratioColors = [0, 1, 2, 3, 4].map((i) => rootStyle.getPropertyValue(`--ratio-${i}`).trim());
   const ratioUnknownColor = rootStyle.getPropertyValue("--ratio-unknown").trim();
+  // "Draw an area to download" overlay -- see the draw layers below and the
+  // token comment in style.css.
+  const drawOutlineColor = rootStyle.getPropertyValue("--draw-outline").trim();
+  const drawFillColor = rootStyle.getPropertyValue("--draw-fill").trim();
+  const drawInvalidColor = rootStyle.getPropertyValue("--draw-invalid").trim();
 
   // agg_cells carries integer count attributes, but what a given
   // count *means* changes sharply across z5-11: bz = min(z + 5, 14) caps at
@@ -318,6 +323,85 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     },
   ];
 
+  // ---- "draw an area to download" overlay ----
+  //
+  // One plain GeoJSON source holding whatever the current drawing/selection
+  // needs to render, swapped wholesale via .setData() on every geometry
+  // change (see setDrawSourceData in the package-download section below) --
+  // there's never more than a handful of features, so there's no case here
+  // for the vector-tile-style "filter a big source" approach the rest of
+  // this file uses. Features carry a `kind` property (polygon/vertex/
+  // rubberband) and, for polygons, `phase` (drawing/committed) and `valid`
+  // (false once the envelope exceeds MAX_AREA_SQ_DEG) -- separate layers key
+  // off those instead of feature-state, since the whole source is rebuilt on
+  // every change anyway.
+  //
+  // line-dasharray is a camera-only MapLibre property (not data-driven), so
+  // "dashed while drawing, solid once committed" needs two line layers, not
+  // one with a `["case", ["get","phase"], ...]` expression -- draw-outline-
+  // drawing and draw-outline-committed each filter to their own phase.
+  const drawLayers = [
+    {
+      id: "draw-fill",
+      type: "fill",
+      source: "draw",
+      filter: ["==", ["get", "kind"], "polygon"],
+      paint: {
+        "fill-color": ["case", ["==", ["get", "valid"], false], drawInvalidColor, drawFillColor],
+        "fill-opacity": 0.18,
+      },
+    },
+    {
+      id: "draw-outline-drawing",
+      type: "line",
+      source: "draw",
+      filter: ["all", ["==", ["get", "kind"], "polygon"], ["==", ["get", "phase"], "drawing"]],
+      paint: {
+        "line-color": ["case", ["==", ["get", "valid"], false], drawInvalidColor, drawOutlineColor],
+        "line-width": 2,
+        "line-dasharray": [2, 2],
+      },
+    },
+    {
+      id: "draw-outline-committed",
+      type: "line",
+      source: "draw",
+      filter: ["all", ["==", ["get", "kind"], "polygon"], ["==", ["get", "phase"], "committed"]],
+      paint: {
+        "line-color": ["case", ["==", ["get", "valid"], false], drawInvalidColor, drawOutlineColor],
+        "line-width": 2.4,
+      },
+    },
+    {
+      // Two things reuse this layer: the last-vertex-to-cursor segment in
+      // "Punkty" mode, and the open in-progress path in "Odręcznie" mode
+      // before it has the 3 points needed to close into a polygon -- both
+      // are "not a polygon yet" line previews, so one dashed-line layer
+      // covers both instead of two near-identical ones.
+      id: "draw-rubberband",
+      type: "line",
+      source: "draw",
+      filter: ["==", ["get", "kind"], "rubberband"],
+      paint: {
+        "line-color": drawOutlineColor,
+        "line-width": 1.4,
+        "line-dasharray": [1, 1.5],
+      },
+    },
+    {
+      id: "draw-vertices",
+      type: "circle",
+      source: "draw",
+      filter: ["==", ["get", "kind"], "vertex"],
+      paint: {
+        "circle-radius": 4,
+        "circle-color": paperRaisedColor,
+        "circle-stroke-color": drawOutlineColor,
+        "circle-stroke-width": 2,
+      },
+    },
+  ];
+
   const map = new maplibregl.Map({
     container: "map",
     style: {
@@ -338,6 +422,10 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
           tiles: [TILE_URL],
           minzoom: 5,
           maxzoom: 14,
+        },
+        draw: {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
         },
       },
       layers: [
@@ -370,6 +458,10 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
           },
         },
         ...aggLayers,
+        // Last, so the draw overlay always renders on top of every data
+        // layer -- it's a UI affordance the user is actively interacting
+        // with, not another data series to blend with the rest.
+        ...drawLayers,
       ],
     },
     center: [19.4, 52.0],
@@ -529,7 +621,18 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
   // depend on handler registration order.
   const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: false, maxWidth: "320px" });
 
+  // Guarded on appDrawState rather than wired up/down per drawing mode (see
+  // setupModeHandlers/teardownDrawMode further down): these two listeners are
+  // registered once at startup and every drawing mode -- even rectangle and
+  // freehand, whose drags don't normally emit a `click` -- can still produce
+  // one on a small or jittery gesture. Without the guard, a "Punkty" vertex
+  // click landing on a building opens a feature popup that then follows every
+  // subsequent vertex click, covering the area being drawn. appDrawState is
+  // declared later in this file but that's fine: these callbacks only run in
+  // response to a later user click, by which point the whole module has
+  // finished its initial pass and the `let` is live.
   map.on("click", CLICKABLE_LAYERS, (e) => {
+    if (appDrawState === "drawing") return;
     const feature = e.features[0];
     popup
       .setLngLat(e.lngLat)
@@ -537,14 +640,24 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
       .addTo(map);
   });
   map.on("click", (e) => {
+    if (appDrawState === "drawing") return;
     if (!map.queryRenderedFeatures(e.point, { layers: CLICKABLE_LAYERS }).length) {
       popup.remove();
     }
   });
+  // Same guard, and for the same reason the cursor is handled here rather
+  // than in setupModeHandlers/teardownDrawMode: while drawing, enterDrawingMode
+  // sets a crosshair cursor as a "click places a vertex" affordance, and
+  // hovering a building would otherwise flip it to "pointer" (reading as
+  // "click for info") via this pair -- mouseleave would then hand back ""
+  // instead of the crosshair it stomped. Leaving the cursor alone here while
+  // drawing keeps the crosshair set by enterDrawingMode in place untouched.
   map.on("mouseenter", CLICKABLE_LAYERS, () => {
+    if (appDrawState === "drawing") return;
     map.getCanvas().style.cursor = "pointer";
   });
   map.on("mouseleave", CLICKABLE_LAYERS, () => {
+    if (appDrawState === "drawing") return;
     map.getCanvas().style.cursor = "";
   });
 
@@ -853,6 +966,11 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
 
   const downloadBtn = document.getElementById("download-btn");
   const drawBtn = document.getElementById("draw-btn");
+  const drawModePicker = document.getElementById("draw-mode-picker");
+  const drawModeButtons = drawModePicker.querySelectorAll(".source-btn");
+  const drawCancelBtn = document.getElementById("draw-cancel-btn");
+  const drawClearBtn = document.getElementById("draw-clear-btn");
+  const drawHint = document.getElementById("draw-hint");
   const downloadZoomHint = document.getElementById("download-zoom-hint");
   const downloadFeedback = document.getElementById("download-feedback");
   const downloadFeedbackBbox = document.getElementById("download-feedback-bbox");
@@ -860,23 +978,548 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
   const downloadFeedbackText = document.getElementById("download-feedback-text");
   const downloadFeedbackClose = document.getElementById("download-feedback-close");
 
-  // /package rejects any request whose bbox exceeds config.package.max_area_sq_deg
-  // (0.04 by default -- see check_area in src/server/package.rs). At z0-11 the
-  // visible viewport is already far larger than that, so "Pobierz widoczny
-  // obszar" would just 400. Gate both download buttons on zoom instead of
-  // letting that request go out and fail.
+  // /package rejects any request whose bbox (GET) or polygon envelope (POST)
+  // exceeds config.package.max_area_sq_deg (0.04 by default -- see check_area
+  // in src/server/package.rs). At z0-11 the visible viewport is already far
+  // larger than that, so "Pobierz widoczny obszar" would just 400 -- that
+  // button stays gated on zoom below.
   const MIN_DOWNLOAD_ZOOM = 12;
   let downloadInFlight = false;
 
-  function applyDownloadZoomGating() {
-    const tooFarOut = map.getZoom() < MIN_DOWNLOAD_ZOOM;
-    downloadBtn.disabled = tooFarOut || downloadInFlight;
-    drawBtn.disabled = tooFarOut;
-    downloadZoomHint.hidden = !tooFarOut;
+  // Mirrors config.package.max_area_sq_deg's default (0.04, see
+  // check_area/RequestArea::bbox_area_sq_deg in src/server/package.rs) the
+  // same way MIN_DOWNLOAD_ZOOM above mirrors a server constraint -- this only
+  // avoids sending a request the server is guaranteed to reject; the server
+  // stays authoritative (a deployment with a different configured limit still
+  // 400s and that surfaces through the existing feedback modal, same as any
+  // other request error). Server-side the limit is the *envelope* area, not
+  // the polygon's true area (bbox_area_sq_deg), so that's what's mirrored
+  // here too -- a diagonal sliver polygon can have a huge envelope and a tiny
+  // true area, and the server would still reject it.
+  const MAX_AREA_SQ_DEG = 0.04;
+
+  // ---- draw-an-area-to-download state machine ----
+  //
+  // Three states -- idle (no polygon), drawing (one of the three modes is
+  // live), selected (a polygon has been committed) -- see the state table in
+  // the design doc this shipped from. One primary button (#download-btn)
+  // covers idle+selected (its label and click behaviour change); #draw-btn
+  // covers idle ("Narysuj obszar") and selected ("Narysuj ponownie"); the
+  // mode picker + Anuluj only show while drawing; Usuń zaznaczenie only shows
+  // once selected. applyDownloadPanelState (below) is the single place that
+  // reconciles all of that against {appDrawState, map zoom, downloadInFlight}
+  // -- every state-changing function in this section ends by calling it
+  // rather than poking DOM visibility itself, so the panel can never drift
+  // out of sync with the state variables.
+  let appDrawState = "idle"; // 'idle' | 'drawing' | 'selected'
+
+  // Last-used mode, remembered only for this page session (module-level, not
+  // localStorage -- this frontend has no persisted-preference pattern
+  // elsewhere and adding one just for this would be scope creep). Rectangle
+  // is the default first mode since it needs no explanation.
+  let drawMode = "rectangle";
+
+  // In-progress geometry, one set of fields per mode -- only the fields for
+  // the active mode are ever populated; resetInProgressGeometry (called on
+  // every entry into "drawing" and on every commit) clears all of them.
+  let rectStartLngLat = null; // [lng, lat] of the rectangle's anchor corner
+  let rectStartPoint = null; // screen Point of the same corner, for the drag-threshold check
+  let clickVertices = []; // "Punkty": committed [lng, lat] vertices so far
+  let clickVertexPoints = []; // parallel screen Points, for the double-click dedupe below
+  let freehandPoints = []; // "Odręcznie": thinned [lng, lat] samples so far
+  let lastFreehandScreenPoint = null; // screen Point of the last kept sample, for thinning
+  let isMouseDown = false;
+  let currentDrawAreaSqDeg = null; // envelope area of the in-progress polygon, or null before one exists
+  let currentDrawValid = true;
+
+  // The committed polygon, once selected -- a plain GeoJSON Polygon geometry
+  // (the exact object POSTed to /package), plus the bits the UI needs to
+  // describe it without recomputing them on every render.
+  let committedPolygon = null;
+  let committedEnvelope = null; // {minLng, minLat, maxLng, maxLat}
+  let committedAreaSqDeg = 0;
+  let committedVertexCount = 0;
+  let committedValid = true;
+
+  // Handlers currently attached for the active drawing mode, so teardownDrawMode
+  // can remove exactly those (and only those) on every exit path.
+  let activeModeHandlers = null; // { handlers: [[event, fn], ...] }
+
+  const MIN_DRAG_PX = 3; // "Prostokąt": below this, treat mousedown+mouseup as a stray click, not a rectangle
+  const CLOSE_DEDUPE_PX = 6; // "Punkty": see pointsDblClick's comment
+  const FREEHAND_MIN_PX = 4; // "Odręcznie": see freehandMouseMove's comment
+
+  function pointDistance(a, b) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
   }
 
-  map.on("zoom", applyDownloadZoomGating);
-  applyDownloadZoomGating();
+  function envelopeOf(positions) {
+    let minLng = Infinity;
+    let minLat = Infinity;
+    let maxLng = -Infinity;
+    let maxLat = -Infinity;
+    for (const [lng, lat] of positions) {
+      minLng = Math.min(minLng, lng);
+      maxLng = Math.max(maxLng, lng);
+      minLat = Math.min(minLat, lat);
+      maxLat = Math.max(maxLat, lat);
+    }
+    return { minLng, minLat, maxLng, maxLat };
+  }
+
+  function envelopeAreaSqDeg(env) {
+    return (env.maxLng - env.minLng) * (env.maxLat - env.minLat);
+  }
+
+  function closeRing(positions) {
+    return [...positions, positions[0]];
+  }
+
+  // Two opposite corners -> a 5-position closed ring. Always axis-aligned and
+  // always valid (even a zero-size drag just yields a degenerate ring the
+  // mouseup handler below discards before it's ever committed).
+  function rectRing(a, b) {
+    const minLng = Math.min(a[0], b[0]);
+    const maxLng = Math.max(a[0], b[0]);
+    const minLat = Math.min(a[1], b[1]);
+    const maxLat = Math.max(a[1], b[1]);
+    return [
+      [minLng, minLat],
+      [maxLng, minLat],
+      [maxLng, maxLat],
+      [minLng, maxLat],
+      [minLng, minLat],
+    ];
+  }
+
+  function polygonFeature(ring, phase, valid) {
+    return {
+      type: "Feature",
+      properties: { kind: "polygon", phase, valid },
+      geometry: { type: "Polygon", coordinates: [ring] },
+    };
+  }
+
+  function vertexFeature(position) {
+    return { type: "Feature", properties: { kind: "vertex" }, geometry: { type: "Point", coordinates: position } };
+  }
+
+  function rubberbandFeature(positions) {
+    return {
+      type: "Feature",
+      properties: { kind: "rubberband" },
+      geometry: { type: "LineString", coordinates: positions },
+    };
+  }
+
+  function setDrawSourceData(features) {
+    map.getSource("draw").setData({ type: "FeatureCollection", features });
+  }
+
+  function renderCommittedPolygon() {
+    setDrawSourceData(
+      committedPolygon ? [polygonFeature(committedPolygon.coordinates[0], "committed", committedValid)] : [],
+    );
+  }
+
+  function resetInProgressGeometry() {
+    rectStartLngLat = null;
+    rectStartPoint = null;
+    clickVertices = [];
+    clickVertexPoints = [];
+    freehandPoints = [];
+    lastFreehandScreenPoint = null;
+    isMouseDown = false;
+    currentDrawAreaSqDeg = null;
+    currentDrawValid = true;
+  }
+
+  // ---- rectangle mode ----
+
+  function refreshRectanglePreview(corner) {
+    if (!rectStartLngLat) {
+      setDrawSourceData([]);
+      currentDrawAreaSqDeg = null;
+      currentDrawValid = true;
+      updateDrawHint();
+      return;
+    }
+    const ring = rectRing(rectStartLngLat, corner);
+    const env = envelopeOf(ring);
+    const area = envelopeAreaSqDeg(env);
+    const valid = area <= MAX_AREA_SQ_DEG;
+    setDrawSourceData([polygonFeature(ring, "drawing", valid)]);
+    currentDrawAreaSqDeg = area;
+    currentDrawValid = valid;
+    updateDrawHint();
+  }
+
+  function rectMouseDown(e) {
+    isMouseDown = true;
+    rectStartLngLat = [e.lngLat.lng, e.lngLat.lat];
+    rectStartPoint = e.point;
+    refreshRectanglePreview(rectStartLngLat);
+  }
+
+  function rectMouseMove(e) {
+    if (!isMouseDown || !rectStartLngLat) return;
+    refreshRectanglePreview([e.lngLat.lng, e.lngLat.lat]);
+  }
+
+  function rectMouseUp(e) {
+    if (!isMouseDown || !rectStartLngLat) return;
+    isMouseDown = false;
+    if (pointDistance(rectStartPoint, e.point) < MIN_DRAG_PX) {
+      // A drag too small to be deliberate (or a stray click) -- discard and
+      // stay in drawing mode rather than committing a sliver.
+      rectStartLngLat = null;
+      rectStartPoint = null;
+      setDrawSourceData([]);
+      currentDrawAreaSqDeg = null;
+      updateDrawHint();
+      return;
+    }
+    commitDrawnPolygon(rectRing(rectStartLngLat, [e.lngLat.lng, e.lngLat.lat]), 4);
+  }
+
+  // ---- points (click-polygon) mode ----
+
+  function refreshPointsPreview(cursorLngLat) {
+    const features = clickVertices.map(vertexFeature);
+    if (clickVertices.length >= 1 && cursorLngLat) {
+      const last = clickVertices[clickVertices.length - 1];
+      features.push(rubberbandFeature([last, [cursorLngLat.lng, cursorLngLat.lat]]));
+    }
+    if (clickVertices.length >= 3) {
+      const ring = closeRing(clickVertices);
+      const env = envelopeOf(ring);
+      const area = envelopeAreaSqDeg(env);
+      const valid = area <= MAX_AREA_SQ_DEG;
+      features.push(polygonFeature(ring, "drawing", valid));
+      currentDrawAreaSqDeg = area;
+      currentDrawValid = valid;
+    } else {
+      currentDrawAreaSqDeg = null;
+      currentDrawValid = true;
+    }
+    setDrawSourceData(features);
+    updateDrawHint();
+  }
+
+  function pointsClick(e) {
+    clickVertices.push([e.lngLat.lng, e.lngLat.lat]);
+    clickVertexPoints.push(e.point);
+    refreshPointsPreview(e.lngLat);
+  }
+
+  function pointsMouseMove(e) {
+    refreshPointsPreview(e.lngLat);
+  }
+
+  // MapLibre fires `click` twice (at essentially the same point) before the
+  // `dblclick` that's meant to close the polygon, so pointsClick above has
+  // already appended two near-duplicate vertices by the time this runs. Pop
+  // trailing vertices while each is within CLOSE_DEDUPE_PX of the one before
+  // it, so the closing gesture leaves the ring ending where the user actually
+  // double-clicked instead of with a spurious near-duplicate point.
+  function dedupeTrailingClickVertices() {
+    while (clickVertexPoints.length >= 2) {
+      const last = clickVertexPoints[clickVertexPoints.length - 1];
+      const prev = clickVertexPoints[clickVertexPoints.length - 2];
+      if (pointDistance(last, prev) >= CLOSE_DEDUPE_PX) break;
+      clickVertexPoints.pop();
+      clickVertices.pop();
+    }
+  }
+
+  function tryClosePointsPolygon() {
+    if (clickVertices.length < 3) return; // not enough vertices to form a polygon yet
+    commitDrawnPolygon(closeRing(clickVertices), clickVertices.length);
+  }
+
+  function pointsDblClick(e) {
+    e.preventDefault();
+    dedupeTrailingClickVertices();
+    tryClosePointsPolygon();
+  }
+
+  // ---- freehand mode ----
+
+  function refreshFreehandPreview() {
+    if (freehandPoints.length >= 3) {
+      const ring = closeRing(freehandPoints);
+      const env = envelopeOf(ring);
+      const area = envelopeAreaSqDeg(env);
+      const valid = area <= MAX_AREA_SQ_DEG;
+      setDrawSourceData([polygonFeature(ring, "drawing", valid)]);
+      currentDrawAreaSqDeg = area;
+      currentDrawValid = valid;
+    } else if (freehandPoints.length === 2) {
+      // Not enough points for a polygon yet -- reuse the rubberband line
+      // layer for the open in-progress path (see its comment near drawLayers).
+      setDrawSourceData([rubberbandFeature(freehandPoints)]);
+      currentDrawAreaSqDeg = null;
+      currentDrawValid = true;
+    } else {
+      setDrawSourceData([]);
+      currentDrawAreaSqDeg = null;
+      currentDrawValid = true;
+    }
+    updateDrawHint();
+  }
+
+  function freehandMouseDown(e) {
+    isMouseDown = true;
+    freehandPoints = [[e.lngLat.lng, e.lngLat.lat]];
+    lastFreehandScreenPoint = e.point;
+    refreshFreehandPreview();
+  }
+
+  function freehandMouseMove(e) {
+    if (!isMouseDown) return;
+    // Thinning has to happen here, at collection time -- not as a post-pass
+    // after mouseup -- because a single drag gesture fires one mousemove per
+    // pixel of travel; without this a short gesture yields thousands of
+    // vertices, most of them well under a pixel apart.
+    if (lastFreehandScreenPoint && pointDistance(lastFreehandScreenPoint, e.point) < FREEHAND_MIN_PX) return;
+    freehandPoints.push([e.lngLat.lng, e.lngLat.lat]);
+    lastFreehandScreenPoint = e.point;
+    refreshFreehandPreview();
+  }
+
+  function freehandMouseUp() {
+    if (!isMouseDown) return;
+    isMouseDown = false;
+    if (freehandPoints.length < 3) {
+      freehandPoints = [];
+      lastFreehandScreenPoint = null;
+      setDrawSourceData([]);
+      currentDrawAreaSqDeg = null;
+      updateDrawHint();
+      return;
+    }
+    commitDrawnPolygon(closeRing(freehandPoints), freehandPoints.length);
+  }
+
+  // ---- mode setup/teardown ----
+
+  function setupModeHandlers(mode) {
+    const handlers = [];
+    if (mode === "rectangle") {
+      // Otherwise the drag pans the map instead of drawing a rectangle.
+      map.dragPan.disable();
+      handlers.push(["mousedown", rectMouseDown], ["mousemove", rectMouseMove], ["mouseup", rectMouseUp]);
+    } else if (mode === "points") {
+      // Otherwise the closing double-click also zooms the map.
+      map.doubleClickZoom.disable();
+      handlers.push(["click", pointsClick], ["dblclick", pointsDblClick], ["mousemove", pointsMouseMove]);
+    } else if (mode === "freehand") {
+      map.dragPan.disable();
+      handlers.push(["mousedown", freehandMouseDown], ["mousemove", freehandMouseMove], ["mouseup", freehandMouseUp]);
+    }
+    for (const [evt, fn] of handlers) map.on(evt, fn);
+    activeModeHandlers = handlers;
+    document.addEventListener("keydown", onDrawKeyDown);
+  }
+
+  // Called on every exit from "drawing" -- commit, cancel, Escape, or a mode
+  // switch mid-draw -- so no path can leave the map stuck with dragPan or
+  // doubleClickZoom disabled, or a stale listener attached. Re-enabling both
+  // unconditionally (rather than only the one the active mode disabled) is
+  // deliberate: it's a no-op if already enabled, and it means this function
+  // never has to know which mode was active to be correct.
+  function teardownDrawMode() {
+    if (activeModeHandlers) {
+      for (const [evt, fn] of activeModeHandlers) map.off(evt, fn);
+      activeModeHandlers = null;
+    }
+    document.removeEventListener("keydown", onDrawKeyDown);
+    map.dragPan.enable();
+    map.doubleClickZoom.enable();
+    isMouseDown = false;
+    // Undo enterDrawingMode's crosshair the same unconditional way as
+    // dragPan/doubleClickZoom above -- every exit path (commit, cancel,
+    // Escape, mode switch) runs through here, so restoring to "" rather than
+    // whatever the CLICKABLE_LAYERS hover pair would have set is correct: if
+    // the cursor is still over a clickable feature, that pair's own next
+    // mouseenter/mousemove will put "pointer" back.
+    map.getCanvas().style.cursor = "";
+  }
+
+  function onDrawKeyDown(e) {
+    if (appDrawState !== "drawing") return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelDrawing();
+    } else if (drawMode === "points" && e.key === "Enter") {
+      e.preventDefault();
+      tryClosePointsPolygon();
+    } else if (drawMode === "points" && e.key === "Backspace") {
+      e.preventDefault();
+      if (clickVertices.length > 0) {
+        clickVertices.pop();
+        clickVertexPoints.pop();
+        refreshPointsPreview(null);
+      }
+    }
+  }
+
+  function updateModeButtonsPressed() {
+    for (const btn of drawModeButtons) {
+      btn.setAttribute("aria-pressed", String(btn.dataset.drawMode === drawMode));
+    }
+  }
+
+  // Mouse-only: rectangle and freehand both need drag, which touch has no
+  // equivalent for in MapLibre's event model. "Punkty" works on touch too --
+  // MapLibre's `click` still fires on tap -- but building an actual touch
+  // gesture set (long-press, pinch-safe dragging, ...) for the other two
+  // modes is out of scope here.
+  function enterDrawingMode(mode) {
+    teardownDrawMode(); // in case a different mode's handlers are still attached
+    popup.remove(); // a popup left open from before drawing started would cover the area being drawn
+    drawMode = mode;
+    resetInProgressGeometry();
+    appDrawState = "drawing";
+    updateModeButtonsPressed();
+    setupModeHandlers(mode);
+    setDrawSourceData([]); // hide any previous committed polygon while drawing
+    // "Click to place a vertex", not "click for info" -- see the comment on
+    // the CLICKABLE_LAYERS mouseenter/mouseleave pair above for why those
+    // don't fight this. teardownDrawMode restores it on every exit path.
+    map.getCanvas().style.cursor = "crosshair";
+    applyDownloadPanelState();
+  }
+
+  // Cancelling restores the previous committed polygon if one existed --
+  // "Narysuj ponownie" doesn't discard the old selection until a new one is
+  // actually committed, so backing out of a re-draw isn't destructive.
+  function cancelDrawing() {
+    teardownDrawMode();
+    resetInProgressGeometry();
+    appDrawState = committedPolygon ? "selected" : "idle";
+    renderCommittedPolygon();
+    applyDownloadPanelState();
+  }
+
+  function commitDrawnPolygon(ring, vertexCount) {
+    teardownDrawMode();
+    const env = envelopeOf(ring);
+    const area = envelopeAreaSqDeg(env);
+    committedPolygon = { type: "Polygon", coordinates: [ring] };
+    committedEnvelope = env;
+    committedAreaSqDeg = area;
+    committedVertexCount = vertexCount;
+    committedValid = area <= MAX_AREA_SQ_DEG;
+    resetInProgressGeometry();
+    appDrawState = "selected";
+    renderCommittedPolygon();
+    applyDownloadPanelState();
+  }
+
+  function clearSelection() {
+    committedPolygon = null;
+    committedEnvelope = null;
+    committedAreaSqDeg = 0;
+    committedVertexCount = 0;
+    committedValid = true;
+    appDrawState = "idle";
+    renderCommittedPolygon();
+    applyDownloadPanelState();
+  }
+
+  // ---- panel chrome ----
+
+  function areaText(sqDeg) {
+    return `${sqDeg.toFixed(4)} °²`;
+  }
+
+  function modeInstructions(mode) {
+    switch (mode) {
+      case "rectangle":
+        return "Przeciągnij, aby narysować prostokąt.";
+      case "points":
+        return "Klikaj, aby dodawać punkty. Podwójne kliknięcie lub Enter zamyka obszar, Backspace usuwa ostatni punkt, Escape anuluje.";
+      case "freehand":
+        return "Przytrzymaj przycisk myszy i przeciągnij, aby narysować obszar odręcznie.";
+      default:
+        return "";
+    }
+  }
+
+  function updateDrawHint() {
+    if (appDrawState !== "drawing") return;
+    let text = modeInstructions(drawMode);
+    if (currentDrawAreaSqDeg !== null) {
+      text += ` Powierzchnia obwiedni: ${areaText(currentDrawAreaSqDeg)} (limit ${areaText(MAX_AREA_SQ_DEG)}).`;
+      if (!currentDrawValid) text += " Przekroczono limit powierzchni — zmniejsz obszar.";
+    }
+    drawHint.textContent = text;
+  }
+
+  function formatEnvelope(env) {
+    const fmt = (n) => n.toFixed(4);
+    return `${fmt(env.minLng)}, ${fmt(env.minLat)} — ${fmt(env.maxLng)}, ${fmt(env.maxLat)}`;
+  }
+
+  function selectedHintText() {
+    let text = `Powierzchnia obwiedni: ${areaText(committedAreaSqDeg)} (limit ${areaText(MAX_AREA_SQ_DEG)}).`;
+    if (!committedValid) text += " Przekroczono limit powierzchni — narysuj mniejszy obszar, aby pobrać.";
+    return text;
+  }
+
+  // The single place that reconciles the whole download panel (both buttons,
+  // the mode picker, Anuluj/Usuń zaznaczenie, both hints) against
+  // {appDrawState, map zoom, downloadInFlight} -- see the state-machine
+  // comment above appDrawState's declaration. Renamed from the original
+  // applyDownloadZoomGating, which only ever toggled zoom-based disabling:
+  // that gate is real but now applies to the viewport path alone --
+  // drawing/selecting a polygon is legal at any zoom (a small polygon framed
+  // at z10 has a perfectly legal envelope), so it would be wrong to keep
+  // disabling the draw button below z12 the way the old function did.
+  function applyDownloadPanelState() {
+    const tooFarOut = map.getZoom() < MIN_DOWNLOAD_ZOOM;
+    const idle = appDrawState === "idle";
+    const drawing = appDrawState === "drawing";
+    const selected = appDrawState === "selected";
+
+    downloadBtn.hidden = drawing;
+    if (idle) {
+      downloadBtn.textContent = "Pobierz widoczny obszar";
+      downloadBtn.disabled = tooFarOut || downloadInFlight;
+    } else if (selected) {
+      downloadBtn.textContent = "Pobierz zaznaczony obszar";
+      // Gated on the polygon's own envelope, never on zoom -- see the
+      // function comment above.
+      downloadBtn.disabled = !committedValid || downloadInFlight;
+    }
+    // Only the idle/viewport path is zoom-gated -- see the function comment.
+    downloadZoomHint.hidden = !(idle && tooFarOut);
+
+    drawBtn.hidden = drawing;
+    drawBtn.textContent = selected ? "Narysuj ponownie" : "Narysuj obszar";
+    drawBtn.disabled = downloadInFlight;
+
+    drawModePicker.hidden = !drawing;
+    drawCancelBtn.hidden = !drawing;
+    drawClearBtn.hidden = !selected;
+    drawClearBtn.disabled = downloadInFlight;
+
+    drawHint.hidden = idle;
+    if (drawing) updateDrawHint();
+    else if (selected) drawHint.textContent = selectedHintText();
+  }
+
+  map.on("zoom", applyDownloadPanelState);
+
+  drawBtn.addEventListener("click", () => enterDrawingMode(drawMode));
+  drawCancelBtn.addEventListener("click", cancelDrawing);
+  drawClearBtn.addEventListener("click", clearSelection);
+  for (const btn of drawModeButtons) {
+    btn.addEventListener("click", () => enterDrawingMode(btn.dataset.drawMode));
+  }
+
+  applyDownloadPanelState();
 
   // Keys match the `datasets` values /package accepts (src/server/package.rs
   // parse_datasets) and what activeAggSources() above returns.
@@ -919,19 +1562,17 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
   }
 
   function formatBbox(b) {
-    const fmt = (n) => n.toFixed(4);
-    return `${fmt(b.getWest())}, ${fmt(b.getSouth())} — ${fmt(b.getEast())}, ${fmt(b.getNorth())}`;
+    return formatEnvelope({ minLng: b.getWest(), minLat: b.getSouth(), maxLng: b.getEast(), maxLat: b.getNorth() });
   }
 
-  downloadBtn.addEventListener("click", async () => {
-    const b = map.getBounds();
-    const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(",");
-    // Download only whatever the legend currently has switched on, same set
-    // activeAggSources() derives for the z5-13 aggregate layers -- otherwise
-    // the package could silently include a registry the user just turned off.
-    const datasets = activeAggSources();
-
-    downloadFeedbackBbox.textContent = formatBbox(b);
+  // Shared by both the GET-bbox (viewport) and POST-polygon (drawn area)
+  // paths -- everything past "issue the request" (in-flight disabling, blob/
+  // filename handling, the error-body text-then-JSON fallback, the feedback
+  // modal's rows) is identical between them, so `request` is the only thing
+  // that varies: a plain URL for GET, or {url, init} with a POST body for the
+  // drawn-polygon path.
+  async function runDownload(request, datasets, areaLabel) {
+    downloadFeedbackBbox.textContent = areaLabel;
     downloadFeedbackLayers.textContent = formatLayers(datasets);
 
     if (datasets.length === 0) {
@@ -940,10 +1581,10 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     }
 
     downloadInFlight = true;
-    applyDownloadZoomGating();
+    applyDownloadPanelState();
     setFeedback("Pobieranie…", null);
     try {
-      const res = await fetch(`/package?bbox=${encodeURIComponent(bbox)}&datasets=${datasets.join(",")}`);
+      const res = await fetch(request.url, request.init);
       if (!res.ok) {
         // Read the body as text first -- res.json() consumes the same stream,
         // so a failed .json() parse would leave no way to fall back to raw text.
@@ -991,7 +1632,36 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
       console.error("package download failed", err);
     } finally {
       downloadInFlight = false;
-      applyDownloadZoomGating();
+      applyDownloadPanelState();
+    }
+  }
+
+  downloadBtn.addEventListener("click", () => {
+    // Download only whatever the legend currently has switched on, same set
+    // activeAggSources() derives for the z5-13 aggregate layers -- otherwise
+    // the package could silently include a registry the user just turned off.
+    const datasets = activeAggSources();
+    if (appDrawState === "selected" && committedPolygon) {
+      runDownload(
+        {
+          url: `/package?datasets=${datasets.join(",")}`,
+          init: {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(committedPolygon),
+          },
+        },
+        datasets,
+        `${formatEnvelope(committedEnvelope)} (narysowany, ${committedVertexCount} pkt.)`,
+      );
+    } else {
+      const b = map.getBounds();
+      const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(",");
+      runDownload(
+        { url: `/package?bbox=${encodeURIComponent(bbox)}&datasets=${datasets.join(",")}` },
+        datasets,
+        formatBbox(b),
+      );
     }
   });
 })();

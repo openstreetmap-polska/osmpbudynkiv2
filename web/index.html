@@ -98,8 +98,27 @@
   <section class="panel panel-download" aria-label="Pobierz paczkę">
     <h2>Pobierz paczkę</h2>
     <button id="download-btn" type="button" class="download-btn">Pobierz widoczny obszar</button>
-    <button id="draw-btn" type="button" class="download-btn">Narysuj obszar do pobrania</button>
-    <p id="download-zoom-hint" class="hint" hidden>Przybliż mapę (zoom 12+), aby pobrać paczkę.</p>
+    <button id="draw-btn" type="button" class="download-btn">Narysuj obszar</button>
+
+    <!-- Mode picker follows the legend's building/address source-toggle
+         pattern exactly (role="group" + .source-toggle wrapper + .source-btn
+         children + aria-pressed) rather than inventing new UI vocabulary for
+         a second segmented control. Only shown in the "drawing" state --
+         app.js's applyDownloadPanelState toggles [hidden] on all of the
+         draw-specific controls below. -->
+    <div id="draw-mode-picker" class="source-toggle" role="group" aria-label="Sposób rysowania obszaru" hidden>
+      <button type="button" class="source-btn" data-draw-mode="rectangle" aria-pressed="false">Prostokąt</button>
+      <button type="button" class="source-btn" data-draw-mode="points" aria-pressed="false">Punkty</button>
+      <button type="button" class="source-btn" data-draw-mode="freehand" aria-pressed="false">Odręcznie</button>
+    </div>
+    <button id="draw-cancel-btn" type="button" class="download-btn" hidden>Anuluj</button>
+    <p id="download-zoom-hint" class="hint" hidden>Przybliż mapę (zoom 12+), aby pobrać paczkę z widocznego obszaru.</p>
+    <button id="draw-clear-btn" type="button" class="download-btn" hidden>Usuń zaznaczenie</button>
+
+    <!-- Mode instructions + live envelope-area readout while drawing, and the
+         committed polygon's envelope + vertex count once selected -- see
+         updateDrawHint/selectedHintText in app.js. -->
+    <p id="draw-hint" class="hint" hidden></p>
   </section>
 
   <dialog id="download-feedback" class="feedback-modal">
