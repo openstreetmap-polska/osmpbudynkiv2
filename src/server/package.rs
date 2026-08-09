@@ -50,6 +50,15 @@ pub struct RequestArea {
     pub max_lon: f64,
     pub max_lat: f64,
     pub polygon_geojson: String,
+    /// Whether `polygon_geojson` came from arbitrary client-drawn coordinates
+    /// (`parse_polygon_body`, POST) rather than being built by `from_envelope`
+    /// from a `bbox` query param (`parse_bbox`, GET). `check_request_geometry`
+    /// (see `serve_package`) only needs to run against the former -- a bbox
+    /// envelope is a rectangle this code constructed itself from four
+    /// range-checked floats, so it cannot be topologically invalid, and
+    /// running the GEOS round trip on it anyway would just be a wasted pool
+    /// acquisition and query on every `GET /package`.
+    pub is_user_supplied: bool,
 }
 
 impl RequestArea {
@@ -71,6 +80,7 @@ impl RequestArea {
             max_lon,
             max_lat,
             polygon_geojson,
+            is_user_supplied: false,
         }
     }
 
@@ -207,6 +217,7 @@ pub fn parse_polygon_body(body: &str) -> Result<RequestArea, String> {
         max_lon,
         max_lat,
         polygon_geojson: geometry.to_string(),
+        is_user_supplied: true,
     })
 }
 
@@ -390,6 +401,18 @@ pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<
     // index scan, the same pattern used in compare::buildings/compare::rule.
     // The polygon itself stays a bound parameter (`?`), since it is
     // arbitrary-length user-supplied geometry, not a handful of numbers.
+    // ST_MakeValid: the request polygon comes straight from the browser's
+    // freehand/polygon drawing tool (parse_polygon_body checks JSON shape,
+    // geometry type, coordinate ranges and a non-degenerate envelope, but not
+    // topological validity), so a self-intersecting ("bowtie") ring is easy
+    // to produce. DuckDB spatial is GEOS-backed and GEOS throws on an invalid
+    // argument to ST_Intersects, which would surface as a 500 -- the same
+    // class of failure as docs/invalid_geometry_tile_500s.md. Repairing here
+    // rather than rejecting in parse_polygon_body protects the endpoint from
+    // any client, not just our own frontend. Note ST_MakeValid on a bowtie
+    // Polygon legitimately returns a MultiPolygon (it splits at the
+    // self-intersection) -- that's the correct, intended repair, not
+    // something to normalise away.
     let sql = format!(
         "SELECT ST_AsGeoJSON(a.geom), a.numer_porzadkowy,
                 COALESCE(loc.osm_street_name, gl.osm_street_name, a.ulica),
@@ -402,7 +425,7 @@ pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<
                 ON lower(trim(gl.prg_street_name)) = lower(trim(a.ulica))
                AND gl.teryt_simc_code IS NULL
          WHERE ST_Intersects(a.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-           AND ST_Intersects(a.geom, ST_GeomFromGeoJSON(?))"
+           AND ST_Intersects(a.geom, ST_MakeValid(ST_GeomFromGeoJSON(?)))"
     );
     let mut stmt = conn
         .prepare(&sql)
@@ -464,8 +487,16 @@ pub fn unmatched_egib_buildings(
                     ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
                     b.rodzaj_kod, b.kondygnacje_nadziemne
              FROM egib_unmatched b
+             -- Membership is intersection, not centroid containment: a building
+             -- clipped by the edge of the request area is exported. The user
+             -- chooses the area explicitly, so anything the selection touches
+             -- is the intent; a building appearing in two separate exports the
+             -- user deliberately made is their call to resolve, not something
+             -- this query should pre-empt by dropping edge buildings.
+             -- ST_MakeValid: see the comment in unmatched_addresses above --
+             -- the request polygon may be a self-intersecting user-drawn ring.
              WHERE ST_Intersects(b.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-               AND ST_Intersects(ST_Centroid(b.geom), ST_GeomFromGeoJSON(?))
+               AND ST_Intersects(b.geom, ST_MakeValid(ST_GeomFromGeoJSON(?)))
          ), nb AS (
              SELECT geom, ST_X(centroid) AS cx, ST_Y(centroid) AS cy
              FROM egib_buildings
@@ -558,8 +589,14 @@ pub fn unmatched_bdot10k_buildings(
                     ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
                     b.funkcja_szczegolowa, b.funkcja_ogolna, b.liczba_kondygnacji
              FROM bdot10k_unmatched b
+             -- Membership is intersection, not centroid containment: the user
+             -- picks the area deliberately, so anything their selection touches
+             -- is what they asked for. See the comment in
+             -- unmatched_egib_buildings.
+             -- ST_MakeValid: see the comment in unmatched_addresses above --
+             -- the request polygon may be a self-intersecting user-drawn ring.
              WHERE ST_Intersects(b.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-               AND ST_Intersects(ST_Centroid(b.geom), ST_GeomFromGeoJSON(?))
+               AND ST_Intersects(b.geom, ST_MakeValid(ST_GeomFromGeoJSON(?)))
          ), nb AS (
              SELECT geom, ST_X(centroid) AS cx, ST_Y(centroid) AS cy
              FROM bdot10k_buildings
@@ -656,6 +693,41 @@ async fn serve_package(state: AppState, area: RequestArea, datasets: Vec<Dataset
     if let Err(e) = check_area(&area, state.config.package.max_area_sq_deg) {
         return error_response(StatusCode::BAD_REQUEST, &e);
     }
+    // Topological validity needs GEOS, so it can't live in parse_polygon_body
+    // (pure serde, no DB connection) -- run it here, off the async thread,
+    // same spawn_blocking pattern as the build_package call below. Silently
+    // repairing whatever arrives (the ST_MakeValid wrappers in the queries)
+    // is the right move for a self-intersecting bowtie, but the wrong end
+    // state for a repair that no longer resembles a shape with an interior --
+    // see check_request_geometry's doc comment. Only user-supplied (POST)
+    // geometry needs this: a bbox (GET) area is a rectangle this code built
+    // itself from range-checked floats (see `RequestArea::is_user_supplied`),
+    // so paying for a pool connection and a GEOS round trip on every GET
+    // would just be validating something that cannot be invalid.
+    if area.is_user_supplied {
+        let validity_state = state.clone();
+        let validity_area = area.clone();
+        let validity = tokio::task::spawn_blocking(move || {
+            let conn = validity_state
+                .pool
+                .get()
+                .context("Failed to acquire pool connection")?;
+            Ok::<Option<String>, anyhow::Error>(check_request_geometry(&conn, &validity_area))
+        })
+        .await;
+        match validity {
+            Ok(Ok(Some(message))) => return error_response(StatusCode::BAD_REQUEST, &message),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "package geometry validity check failed");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "package geometry validity check task panicked");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            }
+        }
+    }
     let result = tokio::task::spawn_blocking(move || build_package(&state, &area, &datasets)).await;
     match result {
         Ok(Ok(body)) => {
@@ -679,6 +751,69 @@ async fn serve_package(state: AppState, area: RequestArea, datasets: Vec<Dataset
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
+}
+
+/// Rejects a request polygon whose GEOS repair can't be trusted to still
+/// mean what the user drew, instead of letting it flow through to the
+/// per-query `ST_MakeValid` wrappers unconditionally.
+///
+/// `ST_MakeValid` at every query site (see `unmatched_addresses`) repairs
+/// invalid geometry rather than rejecting it -- that's deliberate, it
+/// protects the endpoint from any client. But repairing *everything*
+/// silently is the wrong end state: a freehand scribble whose points are
+/// effectively collinear repairs to a zero-area LineString, and "everything
+/// intersecting a line" is not the package the user asked for. So this runs
+/// the one query that decides, before any `*_unmatched` query does real
+/// work: geometry already valid -> proceed unchanged; invalid but repairs to
+/// a non-degenerate Polygon/MultiPolygon (a self-intersecting bowtie ring
+/// correctly repairs to a MultiPolygon -- see the comment above, that's the
+/// intended outcome, not something to second-guess here) -> proceed, the
+/// per-query wrappers do the same repair again; anything else (empty,
+/// zero-area, or a repair that isn't polygonal at all) -> reject.
+///
+/// `ST_GeomFromGeoJSON` itself can throw -- not just return invalid geometry
+/// -- on coordinates that are syntactically valid JSON but not a legal
+/// geometry (e.g. a ring with fewer than 4 points, or one that isn't
+/// closed). `parse_polygon_body` never catches that, since it only inspects
+/// the JSON and never touches GEOS, so any such throw is caught here too and
+/// folded into the same rejection rather than bubbling up as a 500.
+///
+/// Returns `None` to proceed, `Some(message)` to reject with that message as
+/// the 400 body -- the frontend shows it verbatim in a feedback modal.
+/// Rejection message for a geometry `ST_GeomFromGeoJSON` itself throws on --
+/// syntactically valid JSON that isn't a legal geometry. Named so the test
+/// pinning it can assert equality without a second copy of the literal.
+const INVALID_GEOMETRY_MESSAGE: &str = "polygon geometry is invalid and could not be processed by the spatial engine \
+     (check that every ring is closed and has at least 4 points)";
+
+/// Rejection message for a geometry that parses but is invalid and doesn't
+/// repair into a non-degenerate Polygon/MultiPolygon. Named for the same
+/// reason as `INVALID_GEOMETRY_MESSAGE`.
+const DEGENERATE_GEOMETRY_MESSAGE: &str = "polygon geometry is self-intersecting or degenerate and does not repair into a shape \
+     with area -- check for collinear points or a crossed outline";
+
+fn check_request_geometry(conn: &Connection, area: &RequestArea) -> Option<String> {
+    let probe: duckdb::Result<(bool, String, f64)> = conn.query_row(
+        "SELECT ST_IsValid(g), ST_GeometryType(ST_MakeValid(g)), ST_Area(ST_MakeValid(g))
+         FROM (SELECT ST_GeomFromGeoJSON(?) AS g)",
+        [area.polygon_geojson.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    let (is_valid, repaired_type, repaired_area) = match probe {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "request polygon rejected by the spatial engine");
+            return Some(INVALID_GEOMETRY_MESSAGE.to_string());
+        }
+    };
+    if is_valid {
+        return None;
+    }
+    let repairs_to_polygon = repaired_type == "POLYGON" || repaired_type == "MULTIPOLYGON";
+    if repairs_to_polygon && repaired_area > 0.0 {
+        return None;
+    }
+    Some(DEGENERATE_GEOMETRY_MESSAGE.to_string())
 }
 
 fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> Result<String> {
@@ -754,9 +889,12 @@ fn log_export(
             return;
         }
     };
+    // ST_MakeValid: same as the query sites in unmatched_addresses above --
+    // the logged area must be the geometry actually queried (post-repair), so
+    // the two can never disagree.
     let sql = format!(
         "INSERT INTO package_exports (exported_at, area, datasets, address_count, building_count)
-         VALUES (now(), ST_GeomFromGeoJSON(?), {datasets_sql}, ?, ?)"
+         VALUES (now(), ST_MakeValid(ST_GeomFromGeoJSON(?)), {datasets_sql}, ?, ?)"
     );
     if let Err(e) = conn.execute(
         &sql,
@@ -860,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_bdot10k_buildings_centroid_containment() {
+    fn unmatched_bdot10k_buildings_returns_row_in_area() {
         let conn = setup_db();
         conn.execute_batch(
             "CREATE TABLE bdot10k_buildings (
@@ -877,6 +1015,48 @@ mod tests {
         let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].geometry_geojson.contains("\"Polygon\""));
+    }
+
+    /// Membership is intersection, not centroid containment: a building the
+    /// request polygon merely clips is exported, because the user chose that
+    /// area deliberately and everything it touches is what they asked for.
+    /// Mirrored by `unmatched_egib_buildings_includes_building_clipped_by_edge`
+    /// -- the two queries must not drift apart on this.
+    #[test]
+    fn unmatched_bdot10k_buildings_includes_building_clipped_by_edge() {
+        let conn = setup_db();
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (
+                 LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR);
+             INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at)
+             VALUES
+                 -- Straddles the triangle's hypotenuse: centroid (21.0055,
+                 -- 52.2055) is outside it, the low corner is inside.
+                 ('clipped', ST_MakeEnvelope(21.0040, 52.2040, 21.0070, 52.2070),
+                  8000, 4900, now()),
+                 -- Wholly beyond the hypotenuse, inside the bbox only.
+                 ('outside', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082),
+                  8000, 4900, now());",
+        )
+        .unwrap();
+
+        let triangle = parse_polygon_body(
+            r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unmatched_bdot10k_buildings(&conn, &triangle).unwrap().len(),
+            1
+        );
+        // The polygon still filters -- this is not just the bbox passing
+        // everything through.
+        assert_eq!(
+            unmatched_bdot10k_buildings(&conn, &test_area())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     /// `unmatched_bdot10k_buildings` tests. `bdot10k_buildings` is the live
@@ -1646,6 +1826,78 @@ mod tests {
         assert_eq!(features[0]["properties"]["addr:housenumber"], "12");
     }
 
+    /// A self-intersecting ("bowtie") ring -- the shape a browser
+    /// freehand/polygon drawing tool can easily produce, and which
+    /// `parse_polygon_body` deliberately does not reject (see its doc
+    /// comment) -- must not 500. `ST_MakeValid` around the request geometry
+    /// in the query SQL is what prevents GEOS from throwing on it, and this
+    /// also pins that `check_request_geometry`'s pre-flight check does NOT
+    /// reject it: a bowtie repairs to a non-degenerate MultiPolygon, which is
+    /// exactly the "invalid but repairs to a real shape" case that's allowed
+    /// through.
+    #[tokio::test]
+    async fn post_package_bowtie_polygon_does_not_500() {
+        let state = make_seeded_state();
+        let bowtie = r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.21],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#;
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from(bowtie))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["type"], "FeatureCollection");
+        assert!(json["features"].as_array().is_some());
+    }
+
+    /// A ring whose points are collinear -- e.g. a degenerate freehand
+    /// scribble -- repairs under `ST_MakeValid` to a zero-area
+    /// `MULTILINESTRING`, not a polygon. Downloading "everything
+    /// intersecting a line" is not what the user drew, so
+    /// `check_request_geometry` must reject this with 400 rather than let it
+    /// flow through to the queries.
+    ///
+    /// The ring must clear two upstream guards before it can exercise this
+    /// one, or the test passes for the wrong reason:
+    /// - `parse_polygon_body`'s degenerate-envelope check (min==max on an
+    ///   axis) -- so lon and lat both have to vary, not just one.
+    /// - `serve_package`'s `check_area` cap (0.04 sq deg default) -- so the
+    ///   envelope has to stay under that.
+    /// The three points here (0, 0.0625, 0.125 offsets -- eighths of a
+    /// degree, exact binary fractions) are collinear along a diagonal, are
+    /// exactly representable in `f64`, and were confirmed empirically
+    /// (temporary probe, since removed) to make `ST_IsValid` report false and
+    /// `ST_MakeValid` repair to a zero-area `MULTILINESTRING`. A first
+    /// attempt with ordinary decimals (`21.005`, `21.01`) looked collinear on
+    /// paper but rounds to a non-collinear point in `f64`, so GEOS reported
+    /// it as a *valid*, non-degenerate sliver polygon and the request
+    /// returned 200 -- worth calling out since it's the same trap the message
+    /// assertion below is designed to catch (exact equality, not a substring
+    /// that a different rejection path could also satisfy).
+    #[tokio::test]
+    async fn post_package_collinear_ring_is_rejected_not_silently_repaired() {
+        let state = make_seeded_state();
+        let collinear = r#"{"type":"Polygon","coordinates":[[[21.0,52.0],[21.0625,52.0625],[21.125,52.125],[21.0,52.0]]]}"#;
+        let response = package_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from(collinear))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert_eq!(json["error"].as_str().unwrap(), DEGENERATE_GEOMETRY_MESSAGE);
+    }
+
     #[tokio::test]
     async fn post_package_accepts_feature_wrapper() {
         let state = make_seeded_state();
@@ -1879,16 +2131,21 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_egib_buildings_respects_polygon_via_centroid() {
+    fn unmatched_egib_buildings_includes_building_clipped_by_edge() {
         let conn = setup_db();
         conn.execute_batch(
             "CREATE TABLE egib_buildings (
                  id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY, rodzaj_kod VARCHAR);
-             -- Centroid (21.0081, 52.2081) is inside the triangle's envelope
-             -- but outside the triangle → excluded.
              INSERT INTO egib_unmatched (id_budynku, geom, cell_x, cell_y, computed_at)
              VALUES
-                 ('e1', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082), 8000, 4900, now());",
+                 -- Straddles the triangle's hypotenuse: centroid (21.0055,
+                 -- 52.2055) is outside it, the low corner is inside. Exported
+                 -- anyway -- membership is intersection, not containment.
+                 ('clipped', ST_MakeEnvelope(21.0040, 52.2040, 21.0070, 52.2070),
+                  8000, 4900, now()),
+                 -- Wholly beyond the hypotenuse, inside the bbox only.
+                 ('outside', ST_MakeEnvelope(21.0080, 52.2080, 21.0082, 52.2082),
+                  8000, 4900, now());",
         )
         .unwrap();
 
@@ -1896,11 +2153,12 @@ mod tests {
             r#"{"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.0,52.21],[21.0,52.2]]]}"#,
         )
         .unwrap();
-        assert_eq!(unmatched_egib_buildings(&conn, &triangle).unwrap().len(), 0);
-        // Sanity check: the plain bbox does include it.
+        assert_eq!(unmatched_egib_buildings(&conn, &triangle).unwrap().len(), 1);
+        // The polygon still filters -- this is not just the bbox passing
+        // everything through.
         assert_eq!(
             unmatched_egib_buildings(&conn, &test_area()).unwrap().len(),
-            1
+            2
         );
     }
 
@@ -2145,6 +2403,10 @@ mod tests {
         // The envelope is materialized as a GeoJSON Polygon for the query path.
         assert!(area.polygon_geojson.contains("\"Polygon\""));
         assert!(area.polygon_geojson.contains("20.9"));
+        // A bbox rectangle is built by this code from range-checked floats,
+        // never client-drawn -- serve_package skips check_request_geometry
+        // for it on exactly this flag.
+        assert!(!area.is_user_supplied);
     }
 
     #[test]
@@ -2219,6 +2481,9 @@ mod tests {
         assert_eq!(area.max_lon, 21.01);
         assert_eq!(area.max_lat, 52.21);
         assert!(area.polygon_geojson.contains("\"Polygon\""));
+        // Client-drawn geometry -- serve_package must run check_request_geometry
+        // against it, unlike a bbox rectangle.
+        assert!(area.is_user_supplied);
     }
 
     #[test]
