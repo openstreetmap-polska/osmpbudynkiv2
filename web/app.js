@@ -390,10 +390,11 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
   ];
 
   function escapeHtml(value) {
-    return String(value).replace(
-      /[&<>"']/g,
-      (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
-    );
+    // Defers to the browser's own text-node serialization instead of a
+    // hand-maintained character map, so it can't miss a special character.
+    const el = document.createElement("span");
+    el.textContent = String(value);
+    return el.innerHTML;
   }
 
   // Popup labels are derived from the tile attribute's *own* name -- re-cased
