@@ -547,6 +547,21 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     return key in ATTRIBUTE_LABELS ? ATTRIBUTE_LABELS[key] : key;
   }
 
+  // ADDRESSES_MVT_SQL has no single `tags` column like BUILDINGS_MVT_SQL --
+  // it projects the OSM tag preview as separate addr:*/source:addr columns
+  // directly on the feature (see the "addresses -- OSM tag preview" group in
+  // ATTRIBUTE_LABELS above). describeFeature routes these into the same OSM
+  // tags section as buildings' `tags` column, keyed on this set.
+  const ADDRESS_TAG_KEYS = new Set([
+    "addr:housenumber",
+    "addr:street",
+    "addr:city",
+    "addr:place",
+    "addr:postcode",
+    "addr:city:simc",
+    "source:addr",
+  ]);
+
   // GUS Klasyfikacja Środków Trwałych (KŚT) group-1 names for the codes
   // BDOT10k's KODKST carries, copied from example_data/mappings/kst_mapping.csv.
   const KST_NAMES = {
@@ -573,42 +588,80 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
 
   function formatValue(key, value) {
     if (value === null || value === undefined || value === "") return "—";
-    // `tags` is the resolved k=v;k=v string the building-type mapping
-    // produced -- the tags /package would export for this object. One per
-    // line beats a run-on cell; .feature-popup dd is `white-space: pre-line`.
-    if (key === "tags") return String(value).split(";").join("\n");
     return String(value);
   }
 
+  // `tags` is the resolved k=v;k=v string the building-type mapping produced
+  // -- the tags /package would export for this object. Split into individual
+  // [key, value] pairs so the OSM-tags section can list one tag per row
+  // instead of one blob cell, matching the attributes section's layout.
+  function parseTags(value) {
+    if (value === null || value === undefined || value === "") return [];
+    return String(value)
+      .split(";")
+      .filter((pair) => pair !== "")
+      .map((pair) => {
+        const i = pair.indexOf("=");
+        return i === -1 ? [pair, ""] : [pair.slice(0, i), pair.slice(i + 1)];
+      });
+  }
+
   function describeFeature(layerId, props) {
+    const attributes = [];
+    let tags = [];
+    // Insertion order is the tile's attribute order, which follows the
+    // SELECT in src/server/tiles.rs (identity, then classification, then
+    // the resolved tags) -- more useful than sorting alphabetically.
+    // ST_AsMVT drops NULL attributes, so this is exactly the set that
+    // feature actually has: an EGIB building carries `rodzaj`, a BDOT10k
+    // one carries FSBUD/KODKST/..., and neither shows the other's blanks.
+    // The raw key rides along (not shown) so popupHtml can special-case
+    // KODKST for the KST hover hint below.
+    for (const key of Object.keys(props)) {
+      if (key === "tags") {
+        tags = parseTags(props[key]);
+        continue;
+      }
+      if (ADDRESS_TAG_KEYS.has(key)) {
+        tags.push([key, formatValue(key, props[key])]);
+        continue;
+      }
+      attributes.push([key, attributeLabel(key), formatValue(key, props[key])]);
+    }
     return {
       title: layerId.startsWith("buildings-") ? "Budynek" : "Adres",
       // Not an attribute -- it comes from which layer was clicked, not from
       // the data -- so it sits in the header rather than among the rows.
       status: layerId.includes("unmatched") ? "Niedopasowany" : "W rejestrze",
-      // Insertion order is the tile's attribute order, which follows the
-      // SELECT in src/server/tiles.rs (identity, then classification, then
-      // the resolved tags) -- more useful than sorting alphabetically.
-      // ST_AsMVT drops NULL attributes, so this is exactly the set that
-      // feature actually has: an EGIB building carries `rodzaj`, a BDOT10k
-      // one carries FSBUD/KODKST/..., and neither shows the other's blanks.
-      // The raw key rides along (not shown) so popupHtml can special-case
-      // KODKST for the KST hover hint below.
-      rows: Object.keys(props).map((key) => [key, attributeLabel(key), formatValue(key, props[key])]),
+      attributes,
+      tags,
     };
   }
 
-  function popupHtml({ title, status, rows }) {
+  function popupSection(heading, rows) {
+    if (!rows.length) return "";
     const rowsHtml = rows
       .map(
         ([key, label, value]) =>
           `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}${kstHint(key, value)}</dd>`
       )
       .join("");
+    return `<h4 class="feature-popup-section">${escapeHtml(heading)}</h4><dl>${rowsHtml}</dl>`;
+  }
+
+  function popupHtml({ title, status, attributes, tags }) {
+    // Each present only when it has rows -- a feature with no OSM-tag preview
+    // (or, in principle, no plain attributes) shows a single section rather
+    // than an empty one with nothing under its heading.
+    const attributesHtml = popupSection("Atrybuty", attributes);
+    const tagsHtml = popupSection(
+      "Tagi OSM",
+      tags.map(([key, value]) => [key, key, value === "" ? "—" : value])
+    );
     return (
       `<div class="feature-popup"><h3>${escapeHtml(title)}` +
       `<span class="feature-status">${escapeHtml(status)}</span></h3>` +
-      `<dl>${rowsHtml}</dl></div>`
+      `<div class="feature-popup-body">${attributesHtml}${tagsHtml}</div></div>`
     );
   }
 

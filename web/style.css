@@ -710,19 +710,24 @@ button {
   padding: 1px 4px;
 }
 
-/* The popup now lists every attribute on the feature (13-14 for a building),
-   so it needs a scroll bound -- without one a click near the bottom of the
-   map opens a popup taller than the viewport. minmax(0, ...) on both columns
-   lets a long label ("Zrodlo danych geometrycznych") wrap instead of forcing
-   the grid wider than the popup's max-width. */
+/* The popup now lists every attribute on the feature (13-14 for a building)
+   plus its OSM-tags preview, split into two <dl>s (see popupSection in
+   app.js) -- so the scroll bound lives on the wrapping body, not on each
+   individual <dl>, to cap the combined height rather than letting each
+   section separately grow up to 45vh. */
+.feature-popup-body {
+  max-height: 45vh;
+  overflow-y: auto;
+}
+/* minmax(0, ...) on both columns lets a long label ("Zrodlo danych
+   geometrycznych") wrap instead of forcing the grid wider than the popup's
+   max-width. */
 .feature-popup dl {
   margin: 0;
   display: grid;
   grid-template-columns: minmax(0, auto) minmax(0, 1fr);
   gap: 3px 12px;
   font-size: 12px;
-  max-height: 45vh;
-  overflow-y: auto;
 }
 .feature-popup dt {
   color: var(--ink-soft);
@@ -733,8 +738,24 @@ button {
   font-family: var(--font-data);
   text-align: right;
   overflow-wrap: anywhere;
-  /* `tags` is rendered one k=v per line -- see formatValue in app.js. */
-  white-space: pre-line;
+}
+/* Section heading above each of the two <dl>s (attributes / OSM tags). Every
+   section but the first gets a divider line, pulled up to the top of its
+   margin so the line -- not the heading -- reads as the section boundary. */
+.feature-popup-section {
+  margin: 14px 0 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-soft);
+}
+.feature-popup-section:first-child {
+  margin-top: 0;
+}
+.feature-popup-section:not(:first-child) {
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
 }
 /* KODKST's hover hint -- see kstHint in app.js. Native `title` tooltip, so
    this is purely a visual affordance marking the value as hoverable. */
