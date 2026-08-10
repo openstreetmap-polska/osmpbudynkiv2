@@ -33,18 +33,46 @@ pub fn buffer(b: Bounds, deg: f64) -> Bounds {
 /// unmatched. EGIB carries no equivalent column, so its callers pass `None`.
 pub const BDOT10K_EKSPLOATOWANY_FILTER: &str = "b.KATEGORIAISTNIENIA = 'eksploatowany'";
 
-/// Unmatched building rows: government centroid within `area` and NOT contained
-/// by any osm_buildings polygon (osm filtered to `area` for the R-tree scan —
-/// no buffer needed: any polygon containing an in-`area` point has a bbox that
-/// intersects `area`).
+/// Minimum fraction of a government building's footprint area that an
+/// OSM building's footprint must cover for `unmatched_buildings_sql` to
+/// count it as matched. Guards the full-geometry `ST_Intersects` test below
+/// against bare edge/corner touches — two adjacent, genuinely distinct
+/// buildings sharing a party wall (or a digitization sliver between them)
+/// intersect with ~0 overlap area, and that must not count as a match.
+/// Chosen empirically (see the investigation behind this predicate,
+/// id `146518_8.0502.122_BUD`): on a dense Warsaw sample, sweeping this from
+/// 2% to 50% moved the unmatched count by only ~10% end to end — there is no
+/// sharp elbow, so this is a round middle-of-the-curve value, not a
+/// precisely derived one.
+pub const MIN_OVERLAP_FRACTION: f64 = 0.10;
+
+/// Unmatched building rows: government centroid within `area`, and no
+/// osm_buildings polygon whose footprint covers at least
+/// `MIN_OVERLAP_FRACTION` of the government building's own footprint (osm
+/// filtered to `area` for the R-tree scan).
+///
+/// Matching on full-geometry overlap rather than centroid-containment is
+/// deliberate: a government building's centroid can legitimately fall
+/// outside every individual OSM building polygon when OSM has split the
+/// same physical building into multiple adjacent ways (e.g. a tenement
+/// block mapped as separate wings) — the true footprint is covered, but no
+/// single OSM polygon contains the centroid point. See
+/// `146518_8.0502.122_BUD`, where two adjacent OSM ways together covered
+/// 99.98% of the government footprint yet neither contained its centroid.
 ///
 /// `source_table` must carry a `centroid GEOMETRY` column (bdot10k_buildings
 /// and egib_buildings both do — see `DatasetSpec::with_centroid_select`).
-/// Reading the stored column instead of computing `ST_Centroid(b.geom)` here
-/// is the fix for the full-table-scan bottleneck in
-/// docs/per_cell_recompute_full_scan.md: an RTREE index cannot be used
-/// through a function wrapped around the indexed column, but it can be used
-/// against a plain column reference.
+/// The *outer* `ST_Intersects(b.centroid, ...)` scoping filter (which cells'
+/// worth of government buildings to even consider) still reads that stored
+/// column rather than computing `ST_Centroid(b.geom)` inline, for the same
+/// RTREE-index reason as before (docs/per_cell_recompute_full_scan.md): an
+/// RTREE index cannot be used through a function wrapped around the indexed
+/// column, but it can be used against a plain column reference. The *match*
+/// test itself now reads `b.geom`/`osm.geom` directly — DuckDB lowers a
+/// correlated `ST_Intersects(indexed_col, expr)` to a dedicated
+/// `SPATIAL_JOIN` physical operator fed by both sides' RTREE-narrowed
+/// candidates rather than a nested loop (verified via `EXPLAIN`), so this
+/// stays index-accelerated on both `b.geom` and `osm.geom`.
 ///
 /// `extra_filter`, when set, is ANDed into the WHERE clause alongside the
 /// `b`-aliased source row (see `BDOT10K_EKSPLOATOWANY_FILTER`).
@@ -65,7 +93,8 @@ pub fn unmatched_buildings_sql(
            {extra}AND NOT EXISTS (
                SELECT 1 FROM osm_buildings osm
                WHERE ST_Intersects(osm.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-                 AND ST_Contains(osm.geom, b.centroid)
+                 AND ST_Intersects(osm.geom, b.geom)
+                 AND ST_Area(ST_Intersection(osm.geom, b.geom)) / ST_Area(b.geom) >= {MIN_OVERLAP_FRACTION}
            )"
     )
 }
@@ -142,6 +171,88 @@ mod tests {
             ids,
             vec!["out".to_string()],
             "only the uncontained building is unmatched"
+        );
+    }
+
+    /// Reproduces `146518_8.0502.122_BUD`: OSM maps the same physical
+    /// building as two adjacent ways ('a' and 'b') with a small gap between
+    /// them, and the government building's centroid falls in that gap —
+    /// so neither way *contains* the centroid, but each individually covers
+    /// well over `MIN_OVERLAP_FRACTION` of the government footprint. Under
+    /// the old centroid-containment rule this building was (wrongly)
+    /// unmatched.
+    #[test]
+    fn building_split_across_two_osm_ways_is_matched_via_overlap() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO osm_buildings VALUES
+                 (1,'way',NULL, ST_MakeEnvelope(20.0,52.0,20.001,52.002)),
+                 (2,'way',NULL, ST_MakeEnvelope(20.0015,52.0,20.0025,52.002));
+             INSERT INTO bsrc (LOKALNYID, geom) VALUES
+                 ('split', ST_MakeEnvelope(20.0,52.0,20.0025,52.002));
+             UPDATE bsrc SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+        // Sanity check the fixture actually reproduces the gap: the
+        // centroid must land outside both OSM ways for this test to be
+        // exercising the fix rather than the old behaviour by accident.
+        let centroid_uncontained: bool = c
+            .query_row(
+                "SELECT NOT EXISTS (
+                     SELECT 1 FROM osm_buildings osm, bsrc b
+                     WHERE b.LOKALNYID = 'split' AND ST_Contains(osm.geom, b.centroid)
+                 )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            centroid_uncontained,
+            "fixture must reproduce a centroid landing outside every OSM way"
+        );
+
+        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let ids: Vec<String> = {
+            let mut s = c.prepare(&sql).unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            Vec::<String>::new(),
+            "a building split across adjacent OSM ways must count as matched"
+        );
+    }
+
+    /// The overlap-fraction floor's other side: a government building that
+    /// merely clips the corner of an unrelated OSM building (well under
+    /// `MIN_OVERLAP_FRACTION`) must still count as unmatched — plain
+    /// `ST_Intersects` with no floor would wrongly match it.
+    #[test]
+    fn building_barely_touching_osm_neighbor_stays_unmatched() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO osm_buildings VALUES
+                 (1,'way',NULL, ST_MakeEnvelope(20.0,52.0,20.001,52.001));
+             INSERT INTO bsrc (LOKALNYID, geom) VALUES
+                 ('barely_touching', ST_MakeEnvelope(20.0005,52.0005,20.0505,52.0105));
+             UPDATE bsrc SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let ids: Vec<String> = {
+            let mut s = c.prepare(&sql).unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["barely_touching".to_string()],
+            "a mere corner-clip below MIN_OVERLAP_FRACTION must not count as a match"
         );
     }
 
