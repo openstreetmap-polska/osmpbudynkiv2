@@ -542,7 +542,7 @@ button {
      10px margin from the map edge, so its left edge sits at right:39px). */
   right: 50px;
   padding: 0;
-  width: 280px;
+  width: 500px;
   overflow: hidden;
 }
 
@@ -757,9 +757,27 @@ button {
   padding-top: 10px;
   border-top: 1px solid var(--line);
 }
-/* KODKST's hover hint -- see kstHint in app.js. Native `title` tooltip, so
-   this is purely a visual affordance marking the value as hoverable. */
-.kst-hint {
+/* Shared box for the inline SVG hint icons (kstHint/exclusionHint in
+   app.js) -- both icons render at the same viewBox/size, but this fixes
+   their layout box explicitly so hover/click hit-testing lines up with what
+   renders regardless of the icon's own geometry, unlike the bare Unicode
+   glyphs (ⓘ/⚠) this replaced, whose rendered size varied by font/platform.
+   Native `title` tooltip, so this is purely a visual affordance marking the
+   value as hoverable. */
+.kst-hint,
+.exclusion-hint {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: -2px;
   cursor: help;
+}
+/* KODKST's hover hint -- see kstHint in app.js. */
+.kst-hint {
   color: var(--accent-soft);
+}
+/* KATEGORIAISTNIENIA's exclusion warning -- see exclusionHint in app.js.
+   --danger (not --accent-soft) so it reads as a warning, not just a decode
+   hint: the building is excluded from the OSM comparison outright. */
+.exclusion-hint {
+  color: var(--danger);
 }

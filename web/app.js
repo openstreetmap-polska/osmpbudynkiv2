@@ -2,7 +2,11 @@
 // `maplibregl` global -- only the ESM build (`maplibre-gl.mjs`) is published
 // now, so this file has to be a module and import it itself instead of index.html
 // loading a separate global-exposing <script> before this one.
-import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mjs";
+// Vendored locally (web/vendor/maplibre-gl/) rather than loaded from unpkg,
+// so the app works with no outbound network. The .mjs also needs its sibling
+// maplibre-gl-shared.mjs and maplibre-gl-worker.mjs to stay in the same
+// directory, both fetched by relative URL at runtime.
+import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
 (() => {
   const TILE_URL = `${location.origin}/tiles/{z}/{x}/{y}`;
@@ -20,6 +24,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
   const addressAllColor = rootStyle.getPropertyValue("--address-all").trim();
   const addressUnmatchedColor = rootStyle.getPropertyValue("--address-unmatched").trim();
   const paperRaisedColor = rootStyle.getPropertyValue("--paper-raised").trim();
+  const inkColor = rootStyle.getPropertyValue("--ink").trim();
   // Sequential ramp for the z5-11 aggregate grid (low -> high density), used
   // by the "Liczba" colour mode.
   const rampColors = [1, 2, 3, 4, 5].map((i) => rootStyle.getPropertyValue(`--ramp-${i}`).trim());
@@ -406,10 +411,11 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     container: "map",
     style: {
       version: 8,
-      // No `glyphs` endpoint: the style has no symbol layer since the circle
-      // style (and its per-bin percentage labels) was dropped. Adding any
-      // text-field layer back means restoring it -- MapLibre can't fetch
-      // glyph PBFs without one.
+      // Self-hosted under web/fonts, served by the same static ServeDir as
+      // app.js -- keeps the deploy self-contained rather than depending on a
+      // third-party glyph host. Only the housenumber label layer below needs
+      // this; every other layer stays glyph-free.
+      glyphs: "/fonts/{fontstack}/{range}.pbf",
       sources: {
         osm: {
           type: "raster",
@@ -457,6 +463,34 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
             "circle-stroke-width": 1.2,
           },
         },
+        {
+          // Housenumber label for unmatched PRG addresses only -- addresses_all
+          // (the "every PRG address" legend layer) never gets tag/label
+          // preview treatment, same reasoning as ALL_ADDRESSES_MVT_SQL not
+          // applying the street-name mapping (see CLAUDE.md). Gated on z17+:
+          // below that the circles are too close together for text to stay
+          // legible (ADDRESSES_MVT_SQL has no per-zoom decimation, so density
+          // near z14 would be all overlapping labels).
+          id: "addresses-unmatched-label",
+          type: "symbol",
+          source: "unmatched",
+          "source-layer": "addresses",
+          minzoom: 17,
+          layout: {
+            visibility: "none",
+            "text-field": ["get", "addr:housenumber"],
+            "text-font": ["Klokantech Noto Sans Regular"],
+            "text-size": 11,
+            "text-anchor": "top",
+            "text-offset": [0, 0.6],
+            "text-optional": true,
+          },
+          paint: {
+            "text-color": inkColor,
+            "text-halo-color": paperRaisedColor,
+            "text-halo-width": 1.2,
+          },
+        },
         ...aggLayers,
         // Last, so the draw overlay always renders on top of every data
         // layer -- it's a UI affordance the user is actively interacting
@@ -471,6 +505,14 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     hash: "map"
   });
   map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+  // Mouse-wheel zoom speed. MapLibre's default wheelZoomRate (1/450) maps a
+  // typical notch (~100 deltaY) to ~0.15 zoom levels -- roughly 6-7 notches
+  // per level. The mapping is an asymptotic sigmoid
+  // (ScrollZoomHandler#_computeZoom in maplibre-gl), so exactly 1 level/notch
+  // is unreachable, but this rate lands close to it (~0.9 levels/notch at a
+  // 100-deltaY notch).
+  map.scrollZoom.setWheelZoomRate(1 / 38);
 
   // ---- feature popups ----
 
@@ -577,13 +619,59 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     110: "Budynki mieszkalne",
   };
 
-  // A hoverable "ⓘ" appended after KODKST's value, decoding the numeric code
-  // to its KŚT category name. KST_NAMES is a fixed table baked into this
-  // file, not tile data, so unlike escapeHtml's inputs it needs no escaping.
+  // Hand-drawn in place of relying on a Unicode glyph (previously "ⓘ"/"⚠")
+  // -- emoji-block characters like U+26A0 render at wildly different sizes
+  // across fonts/platforms depending on whether a colour-emoji font is
+  // available, which made the two hints' hoverable areas visually
+  // inconsistent even though their CSS `cursor: help` was identical. Both
+  // icons share the same 16x16 viewBox/14px box so they line up regardless
+  // of glyph. `currentColor` picks up each span's `color` (see style.css),
+  // so no fill/stroke colour is hardcoded here.
+  const INFO_ICON_SVG =
+    '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">' +
+    '<circle cx="8" cy="8" r="6.3" fill="none" stroke="currentColor" stroke-width="1.3"/>' +
+    '<line x1="8" y1="7.1" x2="8" y2="11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>' +
+    '<circle cx="8" cy="4.7" r="0.9" fill="currentColor"/>' +
+    "</svg>";
+  const WARNING_ICON_SVG =
+    '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">' +
+    '<polygon points="8,2 14.5,13.3 1.5,13.3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>' +
+    '<line x1="8" y1="6.3" x2="8" y2="9.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>' +
+    '<circle cx="8" cy="11.6" r="0.9" fill="currentColor"/>' +
+    "</svg>";
+
+  // A hoverable info icon appended after KODKST's value, decoding the
+  // numeric code to its KŚT category name. KST_NAMES is a fixed table baked
+  // into this file, not tile data, so unlike escapeHtml's inputs it needs no
+  // escaping.
   function kstHint(key, value) {
     const name = KST_NAMES[String(value).trim()];
     if (key !== "KODKST" || !name) return "";
-    return ` <span class="kst-hint" title="${name}">ⓘ</span>`;
+    return ` <span class="kst-hint" title="${name}">${INFO_ICON_SVG}</span>`;
+  }
+
+  // BDOT10K_EKSPLOATOWANY_FILTER in src/compare/rule.rs -- the one value of
+  // KATEGORIAISTNIENIA the match rule accepts. Any other value (w budowie,
+  // nieczynny, zniszczony) is filtered out of the comparison entirely, so the
+  // building can never appear as matched *or* unmatched, no matter what's on
+  // the ground in OSM. Kept in sync by hand since this is the frontend's only
+  // link to that Rust constant.
+  const BDOT10K_EKSPLOATOWANY = "eksploatowany";
+
+  // A hoverable warning icon appended after KATEGORIAISTNIENIA's value on
+  // the buildings_all legend layer, flagging that this building is excluded
+  // from the OSM comparison outright (see the CLAUDE.md gotcha on this
+  // filter). Only bdot10k carries this column -- egib rows have it NULL --
+  // and only a non-"eksploatowany" value is exclusion-worthy, so an in-use
+  // building shows no hint at all.
+  function exclusionHint(key, value) {
+    if (key !== "KATEGORIAISTNIENIA") return "";
+    const v = String(value).trim();
+    if (!v || v === BDOT10K_EKSPLOATOWANY) return "";
+    return (
+      ` <span class="exclusion-hint" title="Budynek pominięty w porównaniu z OSM ` +
+      `(kategoria inna niż „eksploatowany”)">${WARNING_ICON_SVG}</span>`
+    );
   }
 
   function formatValue(key, value) {
@@ -643,7 +731,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     const rowsHtml = rows
       .map(
         ([key, label, value]) =>
-          `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}${kstHint(key, value)}</dd>`
+          `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}${kstHint(key, value)}${exclusionHint(key, value)}</dd>`
       )
       .join("");
     return `<h4 class="feature-popup-section">${escapeHtml(heading)}</h4><dl>${rowsHtml}</dl>`;
@@ -815,6 +903,7 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     const visible = addressSource !== "off";
     setLayerVisible("addresses-all-circle", visible);
     setLayerVisible("addresses-unmatched-circle", visible);
+    setLayerVisible("addresses-unmatched-label", visible);
   }
 
   function wireLegend() {
@@ -948,11 +1037,19 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
   const statusDot = document.getElementById("status-dot");
   const statusTableBody = document.querySelector("#status-table tbody");
   const stalenessHint = document.getElementById("staleness-hint");
+  const osmReplicationHint = document.getElementById("osm-replication-hint");
 
   const JOB_STATE_LABELS = {
     idle: "bezczynne",
     running: "w trakcie",
     disabled: "wyłączone",
+  };
+
+  const STATUS_DOT_TITLES = {
+    error: "Błąd",
+    running: "W trakcie",
+    idle: "Bezczynne",
+    "": "Wyłączone",
   };
 
   statusToggle.addEventListener("click", () => {
@@ -972,16 +1069,18 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
     const jobs = data.jobs || [];
     const anyError = jobs.some((j) => j.last_outcome && j.last_outcome.kind === "Error");
     const anyRunning = jobs.some((j) => j.state === "running");
-    statusDot.dataset.state = anyError ? "error" : anyRunning ? "running" : "idle";
+    const overallState = anyError ? "error" : anyRunning ? "running" : "idle";
+    statusDot.dataset.state = overallState;
+    statusDot.title = STATUS_DOT_TITLES[overallState] || overallState;
 
     statusTableBody.innerHTML = "";
     for (const job of jobs) {
       const row = document.createElement("tr");
       const stateLabel = JOB_STATE_LABELS[job.state] || job.state;
+      const dotState = job.state === "running" ? "running" : job.enabled ? "idle" : "";
+      const dotTitle = STATUS_DOT_TITLES[dotState] || dotState;
       const stateCell = document.createElement("td");
-      stateCell.innerHTML = `<span class="job-state"><span class="status-dot" data-state="${
-        job.state === "running" ? "running" : job.enabled ? "idle" : ""
-      }"></span>${stateLabel}</span>`;
+      stateCell.innerHTML = `<span class="job-state"><span class="status-dot" data-state="${dotState}" title="${dotTitle}"></span>${stateLabel}</span>`;
       row.innerHTML = `<td>${job.name}</td>`;
       row.appendChild(stateCell);
       const lastRun = document.createElement("td");
@@ -995,9 +1094,18 @@ import * as maplibregl from "https://unpkg.com/maplibre-gl@6/dist/maplibre-gl.mj
 
     const staleness = data.match_staleness;
     if (staleness && staleness.pending_total > 0) {
-      stalenessHint.textContent = `${staleness.pending_total} komórek oczekuje na odświeżenie dopasowań.`;
+      stalenessHint.textContent = `Kolejka: ${staleness.pending_total} komórek oczekujących na odświeżenie.`;
     } else {
-      stalenessHint.textContent = "Tabele danych są aktualne.";
+      stalenessHint.textContent = "Kolejka: 0 komórek oczekujących na odświeżenie.";
+    }
+
+    const osmReplication = data.osm_replication;
+    if (osmReplication && osmReplication.sequence_number != null) {
+      osmReplicationHint.textContent = `OSM: sekwencja ${osmReplication.sequence_number} (${fmtTimestamp(
+        osmReplication.timestamp
+      )}).`;
+    } else {
+      osmReplicationHint.textContent = "OSM: brak danych o sekwencji replikacji.";
     }
   }
 
