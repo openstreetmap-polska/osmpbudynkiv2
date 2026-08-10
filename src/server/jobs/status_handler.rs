@@ -95,6 +95,48 @@ fn match_staleness_or_default(state: &AppState) -> MatchStaleness {
     }
 }
 
+#[derive(Serialize, Default)]
+pub struct OsmReplicationState {
+    pub sequence_number: Option<i64>,
+    pub timestamp: Option<String>,
+}
+
+/// Reads the OSM replication watermark last written by `update osm` /
+/// `import osm` (`metadata` keys `osm_replication_sequence` /
+/// `osm_replication_timestamp`, set in `update::osm::apply_sequence`). Falls
+/// back to an empty state for the same reason `match_staleness_or_default`
+/// does: this is a secondary diagnostic, not a reason for `/status` to fail.
+fn osm_replication_state_or_default(state: &AppState) -> OsmReplicationState {
+    let outcome = (|| -> Result<OsmReplicationState> {
+        let conn = state
+            .pool
+            .get()
+            .context("Failed to acquire pool connection")?;
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM metadata
+             WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp')",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut result = OsmReplicationState::default();
+        for row in rows {
+            let (key, value) = row?;
+            match key.as_str() {
+                "osm_replication_sequence" => result.sequence_number = value.parse().ok(),
+                "osm_replication_timestamp" => result.timestamp = Some(value),
+                _ => {}
+            }
+        }
+        Ok(result)
+    })();
+    match outcome {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read OSM replication state for /status; falling back to empty");
+            OsmReplicationState::default()
+        }
+    }
+}
+
 /// Acquires a pool connection and reads `job_run_log`, falling back to an
 /// empty map (rather than propagating an error) for the same reason
 /// `match_staleness_or_default` does: this is a secondary diagnostic, not a
@@ -121,14 +163,16 @@ pub struct StatusResponse {
     pub jobs: Vec<JobStatus>,
     pub match_staleness: MatchStaleness,
     pub job_run_log: BTreeMap<String, JobRunLogEntry>,
+    pub osm_replication: OsmReplicationState,
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let jobs = state.registry.snapshot();
-    let (match_staleness, job_run_log) = tokio::task::spawn_blocking(move || {
+    let (match_staleness, job_run_log, osm_replication) = tokio::task::spawn_blocking(move || {
         (
             match_staleness_or_default(&state),
             job_run_log_or_default(&state),
+            osm_replication_state_or_default(&state),
         )
     })
     .await
@@ -137,6 +181,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         jobs,
         match_staleness,
         job_run_log,
+        osm_replication,
     })
 }
 
@@ -192,5 +237,51 @@ mod tests {
         let entry = log.get("import:bdot10k").expect("entry must be present");
         assert_eq!(entry.outcome, "Success");
         assert_eq!(entry.message.as_deref(), Some("no invalid geometry"));
+    }
+
+    #[test]
+    fn osm_replication_state_or_default_reads_metadata() {
+        use crate::server::jobs::JobRegistry;
+        use std::sync::Arc;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "INSERT INTO metadata VALUES
+                 ('osm_replication_sequence', '6543210'),
+                 ('osm_replication_timestamp', '2026-08-09T12:34:56Z');",
+        )
+        .unwrap();
+
+        let pool = crate::server::build_pool(conn, 2).unwrap();
+        let state = AppState {
+            pool,
+            registry: Arc::new(JobRegistry::new_for_tests(vec![])),
+            config: Arc::new(crate::config::Config::default()),
+        };
+
+        let s = osm_replication_state_or_default(&state);
+        assert_eq!(s.sequence_number, Some(6543210));
+        assert_eq!(s.timestamp.as_deref(), Some("2026-08-09T12:34:56Z"));
+    }
+
+    #[test]
+    fn osm_replication_state_or_default_falls_back_when_unset() {
+        use crate::server::jobs::JobRegistry;
+        use std::sync::Arc;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        let pool = crate::server::build_pool(conn, 2).unwrap();
+        let state = AppState {
+            pool,
+            registry: Arc::new(JobRegistry::new_for_tests(vec![])),
+            config: Arc::new(crate::config::Config::default()),
+        };
+
+        let s = osm_replication_state_or_default(&state);
+        assert_eq!(s.sequence_number, None);
+        assert_eq!(s.timestamp, None);
     }
 }
