@@ -297,13 +297,45 @@ fn stream_gml_into(
     Ok(())
 }
 
+/// Strip the redundant street-type prefix PRG embeds in `ulica`.
+///
+/// Warsaw's EMUiA operator writes `TERYTNazwa1` as `ulica Wał Miedzeszyński`
+/// while *also* declaring `<prgad:rodzaj>1</prgad:rodzaj>` (= ulica), so the
+/// type word arrives duplicated inside the name. `prg_convert` only ever
+/// prepends a *missing* type word, never removes an embedded one, so it
+/// faithfully passes the duplicate through and we strip it here. See
+/// `docs/prg_ulica_prefix.md`.
+///
+/// Deliberately narrow: only `ulica` / `ul.` are removed. The other cecha
+/// words Warsaw spells out — `Aleja`, `Aleje`, `Trakt`, `Osiedle` — are part
+/// of the correct name and are used verbatim by OSM.
+///
+/// The trailing `\S` keeps a bare `"ulica"` (nothing after the prefix) intact
+/// rather than turning it into an empty string.
+const ULICA_PREFIX_STRIP_SQL: &str = r"CASE
+        WHEN regexp_matches(ulica, '^(?i)(ulica|ul\.)\s+\S')
+            THEN regexp_replace(ulica, '^(?i)(ulica|ul\.)\s+', '')
+        ELSE ulica
+     END";
+
 /// Build `target_table` from the streamed `raw_table`, adding a geometry
 /// column built from EPSG:4326 lon/lat (the parser already reprojected from
 /// EPSG:2180) and the `_row_hash` column. Drops `raw_table` afterwards.
 /// Does NOT create an index.
+///
+/// Also normalizes `ulica` via [`ULICA_PREFIX_STRIP_SQL`]. This is the one
+/// funnel both `import` and `update`'s staging load pass through, so the
+/// normalization lands on both paths from a single site. It sits INSIDE
+/// `hashed_select`'s projection — unlike `DatasetSpec::with_centroid_select`
+/// and `mappings::egib::with_rodzaj_kod_select`, which wrap it from outside —
+/// because it rewrites a stored value rather than deriving an extra column:
+/// hashing the value as stored is what lets `ROW_HASH_VERSION` catch a future
+/// edit to the expression and self-heal on the next refresh. **Editing
+/// `ULICA_PREFIX_STRIP_SQL` therefore requires bumping `ROW_HASH_VERSION`.**
 pub fn materialize_into(conn: &Connection, target_table: &str, raw_table: &str) -> Result<()> {
     let inner = format!(
-        "SELECT *, ST_Point(dlugosc_geograficzna, szerokosc_geograficzna) AS geom \
+        "SELECT * REPLACE (({ULICA_PREFIX_STRIP_SQL}) AS ulica), \
+                ST_Point(dlugosc_geograficzna, szerokosc_geograficzna) AS geom \
          FROM {raw_table} \
          WHERE dlugosc_geograficzna IS NOT NULL \
            AND szerokosc_geograficzna IS NOT NULL"
@@ -338,4 +370,137 @@ fn collect_gml_indices(archive: &mut ZipArchive<File>) -> Result<Vec<usize>> {
         }
     }
     Ok(indices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_db;
+
+    /// Materialize `inputs` (raw `ulica` values) through the real
+    /// `materialize_into` and read the resulting column back, so the tests
+    /// exercise the actual import SQL rather than a copy of the expression.
+    fn materialized_ulica(inputs: &[Option<&str>]) -> Vec<Option<String>> {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prg_raw (
+                 ord INTEGER,
+                 ulica VARCHAR,
+                 dlugosc_geograficzna DOUBLE,
+                 szerokosc_geograficzna DOUBLE
+             );",
+        )
+        .unwrap();
+        for (i, value) in inputs.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO prg_raw VALUES (?, ?, 21.0, 52.0)",
+                duckdb::params![i as i32, value],
+            )
+            .unwrap();
+        }
+
+        materialize_into(&conn, "prg_out", "prg_raw").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT ulica FROM prg_out ORDER BY ord")
+            .unwrap();
+        let rows: Vec<Option<String>> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn materialize_strips_the_redundant_ulica_prefix() {
+        assert_eq!(
+            materialized_ulica(&[
+                Some("ulica Wał Miedzeszyński"),
+                Some("Ulica Szkółka Brzeźnica"),
+                Some("ul. Szkolna"),
+                Some("UL. Szkolna"),
+            ]),
+            vec![
+                Some("Wał Miedzeszyński".to_string()),
+                Some("Szkółka Brzeźnica".to_string()),
+                Some("Szkolna".to_string()),
+                Some("Szkolna".to_string()),
+            ]
+        );
+    }
+
+    /// The other cecha words Warsaw spells out are part of the correct name —
+    /// OSM uses "Aleja Krakowska" and "Aleje Jerozolimskie" itself — so the
+    /// strip must not generalize to them.
+    #[test]
+    fn materialize_keeps_other_street_type_words() {
+        let names = ["Aleja Krakowska", "Aleje Jerozolimskie", "Trakt Lubelski"];
+        assert_eq!(
+            materialized_ulica(&names.map(Some)),
+            names.map(|n| Some(n.to_string())).to_vec()
+        );
+    }
+
+    /// `Ulanów` shares a prefix with `ulica` but is a whole different word;
+    /// the `\s+` in the pattern is what keeps it intact.
+    #[test]
+    fn materialize_does_not_strip_a_word_merely_starting_with_ul() {
+        assert_eq!(
+            materialized_ulica(&[Some("Ulanów"), Some("Ulica Ulanowska")]),
+            vec![Some("Ulanów".to_string()), Some("Ulanowska".to_string()),]
+        );
+    }
+
+    /// A bare `"ulica"` has nothing to strip down to, and a NULL street has
+    /// nothing to strip at all — neither may become an empty string.
+    #[test]
+    fn materialize_leaves_degenerate_street_names_alone() {
+        assert_eq!(
+            materialized_ulica(&[Some("ulica"), Some("ul."), None]),
+            vec![Some("ulica".to_string()), Some("ul.".to_string()), None]
+        );
+    }
+
+    /// The `* REPLACE` rewrite must not disturb the rest of the projection:
+    /// every row still needs a hash, and the geometry column still has to be
+    /// built from the lon/lat pair.
+    #[test]
+    fn materialize_still_writes_row_hash_and_geometry() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prg_raw (
+                 ulica VARCHAR,
+                 dlugosc_geograficzna DOUBLE,
+                 szerokosc_geograficzna DOUBLE
+             );
+             INSERT INTO prg_raw VALUES
+                 ('ulica Herbaciana', 21.0, 52.0),
+                 ('Aleja Krakowska', 21.5, 52.5),
+                 -- filtered out: no coordinates
+                 ('ulica Bezdomna', NULL, NULL);",
+        )
+        .unwrap();
+
+        materialize_into(&conn, "prg_out", "prg_raw").unwrap();
+
+        let (rows, null_hashes, null_geoms): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COUNT(*) FILTER (WHERE _row_hash IS NULL),
+                        COUNT(*) FILTER (WHERE geom IS NULL)
+                 FROM prg_out",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 2,
+            "the coordinate-less row must still be filtered out"
+        );
+        assert_eq!(null_hashes, 0, "every row must carry a hash");
+        assert_eq!(null_geoms, 0, "every row must carry a geometry");
+    }
 }
