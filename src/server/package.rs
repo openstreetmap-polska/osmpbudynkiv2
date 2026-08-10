@@ -267,7 +267,11 @@ pub struct AddressRow {
 }
 
 const SOURCE_ADDR: &str = "gugik.gov.pl";
-const SOURCE_BUILDING: &str = "geoportal.gov.pl";
+/// `source:building` values -- the established OSM spellings for these two
+/// registries, not our own dataset names (`Dataset::sql_name`'s "bdot10k" /
+/// "egib" are internal identifiers, not tagging conventions).
+const SOURCE_BUILDING_BDOT10K: &str = "BDOT";
+const SOURCE_BUILDING_EGIB: &str = "EGiB";
 
 fn non_empty(v: &Option<String>) -> Option<&str> {
     v.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -302,11 +306,12 @@ pub fn address_tags(row: &AddressRow) -> BTreeMap<String, String> {
 /// produced (see `unmatched_bdot10k_buildings`), or `None` when the source
 /// has no mapping resolution yet (EGIB, until the design doc's step 5) or the
 /// lookup found no matching row. Splits on `;`, then on the first `=`, and
-/// always inserts `source:building`. `None` or an empty string yields
-/// `building=yes` -- this never warns, since the loader already reports drift
-/// once per load (see `mappings::building_types`), which is strictly more
-/// useful than a warning per packaged feature.
-pub fn building_tags(resolved: Option<&str>) -> BTreeMap<String, String> {
+/// always inserts `source:building` as `source` (`SOURCE_BUILDING_BDOT10K`
+/// or `SOURCE_BUILDING_EGIB`). `None` or an empty string for `resolved`
+/// yields `building=yes` -- this never warns, since the loader already
+/// reports drift once per load (see `mappings::building_types`), which is
+/// strictly more useful than a warning per packaged feature.
+pub fn building_tags(resolved: Option<&str>, source: &str) -> BTreeMap<String, String> {
     let mut tags = BTreeMap::new();
     let pairs = resolved
         .filter(|s| !s.trim().is_empty())
@@ -321,7 +326,7 @@ pub fn building_tags(resolved: Option<&str>) -> BTreeMap<String, String> {
             tags.insert("building".to_string(), "yes".to_string());
         }
     }
-    tags.insert("source:building".to_string(), SOURCE_BUILDING.to_string());
+    tags.insert("source:building".to_string(), source.to_string());
     tags
 }
 
@@ -835,16 +840,20 @@ fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> 
             }
             Dataset::Bdot10k => {
                 for row in unmatched_bdot10k_buildings(&conn, area)? {
-                    let properties =
-                        with_building_levels(building_tags(row.tags.as_deref()), row.levels);
+                    let properties = with_building_levels(
+                        building_tags(row.tags.as_deref(), SOURCE_BUILDING_BDOT10K),
+                        row.levels,
+                    );
                     features.push(feature(row.geometry_geojson, properties)?);
                     building_count += 1;
                 }
             }
             Dataset::Egib => {
                 for row in unmatched_egib_buildings(&conn, area)? {
-                    let properties =
-                        with_building_levels(building_tags(row.tags.as_deref()), row.levels);
+                    let properties = with_building_levels(
+                        building_tags(row.tags.as_deref(), SOURCE_BUILDING_EGIB),
+                        row.levels,
+                    );
                     features.push(feature(row.geometry_geojson, properties)?);
                     building_count += 1;
                 }
@@ -1356,7 +1365,7 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].tags, None);
             assert_eq!(
-                building_tags(rows[0].tags.as_deref())
+                building_tags(rows[0].tags.as_deref(), SOURCE_BUILDING_BDOT10K)
                     .get("building")
                     .unwrap(),
                 "yes"
@@ -1389,7 +1398,10 @@ mod tests {
                 Some(4),
                 "the storey count must come through regardless"
             );
-            let tags = with_building_levels(building_tags(rows[0].tags.as_deref()), rows[0].levels);
+            let tags = with_building_levels(
+                building_tags(rows[0].tags.as_deref(), SOURCE_BUILDING_BDOT10K),
+                rows[0].levels,
+            );
             assert_eq!(tags.get("building").unwrap(), "yes");
             assert_eq!(tags.get("building:levels").unwrap(), "4");
         }
@@ -1440,7 +1452,7 @@ mod tests {
 
             let rows = unmatched_bdot10k_buildings(&conn, &test_area()).unwrap();
             assert_eq!(rows.len(), 1);
-            let tags = building_tags(rows[0].tags.as_deref());
+            let tags = building_tags(rows[0].tags.as_deref(), SOURCE_BUILDING_BDOT10K);
             assert_eq!(tags.get("building").unwrap(), "silo");
             assert_eq!(tags.get("man_made").unwrap(), "silo");
         }
@@ -1661,11 +1673,9 @@ mod tests {
         assert_eq!(addr["properties"]["addr:city:simc"], "0918123");
         assert_eq!(addr["properties"]["source:addr"], "gugik.gov.pl");
         assert_eq!(features[1]["properties"]["building"], "yes");
-        assert_eq!(
-            features[1]["properties"]["source:building"],
-            "geoportal.gov.pl"
-        );
+        assert_eq!(features[1]["properties"]["source:building"], "BDOT");
         assert_eq!(features[2]["geometry"]["type"], "Polygon");
+        assert_eq!(features[2]["properties"]["source:building"], "EGiB");
     }
 
     #[tokio::test]
@@ -2387,7 +2397,10 @@ mod tests {
                 Some(2),
                 "the storey count must come through regardless"
             );
-            let tags = with_building_levels(building_tags(rows[0].tags.as_deref()), rows[0].levels);
+            let tags = with_building_levels(
+                building_tags(rows[0].tags.as_deref(), SOURCE_BUILDING_EGIB),
+                rows[0].levels,
+            );
             assert_eq!(tags.get("building").unwrap(), "yes");
             assert_eq!(tags.get("building:levels").unwrap(), "2");
         }
@@ -2584,39 +2597,45 @@ mod tests {
 
     #[test]
     fn building_tags_none_yields_plain_building_yes() {
-        let tags = building_tags(None);
+        let tags = building_tags(None, SOURCE_BUILDING_BDOT10K);
         assert_eq!(tags.get("building").unwrap(), "yes");
-        assert_eq!(tags.get("source:building").unwrap(), "geoportal.gov.pl");
+        assert_eq!(tags.get("source:building").unwrap(), "BDOT");
         assert_eq!(tags.len(), 2);
     }
 
     #[test]
     fn building_tags_empty_string_yields_plain_building_yes() {
-        let tags = building_tags(Some("  "));
+        let tags = building_tags(Some("  "), SOURCE_BUILDING_BDOT10K);
         assert_eq!(tags.get("building").unwrap(), "yes");
         assert_eq!(tags.len(), 2);
     }
 
     #[test]
     fn building_tags_resolved_string_overrides_the_default() {
-        let tags = building_tags(Some("building=detached"));
+        let tags = building_tags(Some("building=detached"), SOURCE_BUILDING_BDOT10K);
         assert_eq!(tags.get("building").unwrap(), "detached");
-        assert_eq!(tags.get("source:building").unwrap(), "geoportal.gov.pl");
+        assert_eq!(tags.get("source:building").unwrap(), "BDOT");
         assert_eq!(tags.len(), 2);
     }
 
     #[test]
     fn building_tags_resolved_multi_pair_round_trips() {
-        let tags = building_tags(Some("building=silo;man_made=silo"));
+        let tags = building_tags(Some("building=silo;man_made=silo"), SOURCE_BUILDING_BDOT10K);
         assert_eq!(tags.get("building").unwrap(), "silo");
         assert_eq!(tags.get("man_made").unwrap(), "silo");
-        assert_eq!(tags.get("source:building").unwrap(), "geoportal.gov.pl");
+        assert_eq!(tags.get("source:building").unwrap(), "BDOT");
         assert_eq!(tags.len(), 3);
     }
 
     #[test]
+    fn building_tags_uses_the_egib_source_label() {
+        let tags = building_tags(None, SOURCE_BUILDING_EGIB);
+        assert_eq!(tags.get("source:building").unwrap(), "EGiB");
+    }
+
+    #[test]
     fn with_building_levels_inserts_a_positive_count() {
-        let tags = with_building_levels(building_tags(None), Some(3));
+        let tags = with_building_levels(building_tags(None, SOURCE_BUILDING_BDOT10K), Some(3));
         assert_eq!(tags.get("building:levels").unwrap(), "3");
         assert_eq!(tags.get("building").unwrap(), "yes");
     }
@@ -2625,13 +2644,13 @@ mod tests {
     fn with_building_levels_omits_zero() {
         // "budynek nie posiada kondygnacji" -- nothing to report, the same
         // way a missing value is nothing to report.
-        let tags = with_building_levels(building_tags(None), Some(0));
+        let tags = with_building_levels(building_tags(None, SOURCE_BUILDING_BDOT10K), Some(0));
         assert!(!tags.contains_key("building:levels"));
     }
 
     #[test]
     fn with_building_levels_omits_none() {
-        let tags = with_building_levels(building_tags(None), None);
+        let tags = with_building_levels(building_tags(None, SOURCE_BUILDING_BDOT10K), None);
         assert!(!tags.contains_key("building:levels"));
     }
 
@@ -2639,7 +2658,7 @@ mod tests {
     fn with_building_levels_survives_an_unresolved_classification() {
         // No mapping row matched (tags is None -> building=yes), but the
         // storey count is still real data and must still be reported.
-        let tags = with_building_levels(building_tags(None), Some(2));
+        let tags = with_building_levels(building_tags(None, SOURCE_BUILDING_BDOT10K), Some(2));
         assert_eq!(tags.get("building").unwrap(), "yes");
         assert_eq!(tags.get("building:levels").unwrap(), "2");
     }
@@ -2648,7 +2667,7 @@ mod tests {
     fn feature_collection_serializes_valid_geojson() {
         let f = feature(
             r#"{"type":"Point","coordinates":[21.0,52.2]}"#.to_string(),
-            building_tags(None),
+            building_tags(None, SOURCE_BUILDING_BDOT10K),
         )
         .unwrap();
         let fc = FeatureCollection {
@@ -2666,7 +2685,13 @@ mod tests {
 
     #[test]
     fn feature_rejects_invalid_geometry_json() {
-        assert!(feature("not json".to_string(), building_tags(None)).is_err());
+        assert!(
+            feature(
+                "not json".to_string(),
+                building_tags(None, SOURCE_BUILDING_BDOT10K)
+            )
+            .is_err()
+        );
     }
 
     #[test]

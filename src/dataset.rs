@@ -14,15 +14,24 @@
 //! gaining or losing a column cannot silently desynchronize the import and
 //! update expressions.
 
-/// Bumped whenever [`hashed_select`] changes in a way that alters its output.
+/// Bumped whenever the hashed row content changes for any source.
+///
+/// That is [`hashed_select`] itself, but also anything feeding *into* it: a
+/// source's inner select is part of the hash input, so a change there moves
+/// the stored hashes just as surely (version 2 is such a case — PRG's import
+/// gained a street-name normalization inside its inner select, see
+/// `import::prg::ULICA_PREFIX_STRIP_SQL`). Transformations deliberately
+/// wrapped *outside* `hashed_select` — [`DatasetSpec::with_centroid_select`],
+/// `mappings::egib::with_rodzaj_kod_select` — do not count.
 ///
 /// The value in force when a live table was built is stamped into
 /// `metadata.row_hash_version` by [`stamp_row_hash_version`]. A mismatch
 /// against this constant means the stored `_row_hash` values were produced by
 /// a different expression, so every row will compare as modified; the refresh
 /// warns, rewrites the table wholesale, and re-stamps — so the warning fires
-/// once per bump rather than forever.
-pub const ROW_HASH_VERSION: i64 = 1;
+/// once per bump rather than forever. The stamp is global, so a bump made for
+/// one source also costs the others one full-rewrite refresh apiece.
+pub const ROW_HASH_VERSION: i64 = 2;
 pub const ROW_HASH_VERSION_KEY: &str = "row_hash_version";
 
 /// Record that the live dataset tables were built with the current

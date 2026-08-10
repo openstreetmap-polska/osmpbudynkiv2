@@ -106,5 +106,7 @@ fn test_import_bdot10k_writes_row_hash() {
             |row| row.get(0),
         )
         .expect("import must stamp row_hash_version");
-    assert_eq!(stamp, "1");
+    // Tracks `dataset::ROW_HASH_VERSION` by hand — this is an integration test
+    // against the binary, so the constant isn't importable. Bump both together.
+    assert_eq!(stamp, "2");
 }
