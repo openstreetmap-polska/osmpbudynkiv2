@@ -12,21 +12,29 @@ use duckdb::Connection;
 use crate::cli::UpdateSource;
 use crate::config::{Config, DownloadUrls};
 use crate::dataset as spec;
-use crate::download::{download_file, download_file_as};
+use crate::download::{
+    download_file, download_file_as, download_file_as_quiet, download_file_quiet,
+};
 use crate::osm::kvstore::RocksDB;
 
+/// `show_progress` distinguishes the interactive CLI path (`main.rs`'s
+/// `Command::Update`, `true`) from the scheduled background path
+/// (`server::jobs::dataset_update::DatasetUpdateJob`, `false`), same
+/// rationale as `osm::update`'s parameter of the same name -- a redrawn
+/// progress bar is fine on a terminal but just spams a log file. Note OSM's
+/// *background* job bypasses `run` entirely and calls `osm::update` directly
+/// (see `server::jobs::osm_update`), so this only ever reaches the `Osm` arm
+/// from the CLI; the other three arms are reachable from both paths.
 pub fn run(
     conn: &Connection,
     kv: &RocksDB,
     source: UpdateSource,
     config: &Config,
     urls: &DownloadUrls,
+    show_progress: bool,
 ) -> Result<()> {
     match source {
-        // `update::run` is only ever reached from the interactive CLI path
-        // (`main.rs`'s `Command::Update`) -- the background job calls
-        // `osm::update` directly instead, see `server::jobs::osm_update`.
-        UpdateSource::Osm => osm::update(conn, kv, config, &urls.osm_replication, true),
+        UpdateSource::Osm => osm::update(conn, kv, config, &urls.osm_replication, show_progress),
         UpdateSource::Bdot10k { file } => {
             let mut etag = None;
             if file.is_none() {
@@ -42,7 +50,8 @@ pub fn run(
                     return Ok(());
                 }
             }
-            let (path, was_downloaded) = resolve(file.as_deref(), config, &urls.bdot10k, None)?;
+            let (path, was_downloaded) =
+                resolve(file.as_deref(), config, &urls.bdot10k, None, show_progress)?;
             let p = path_str(&path)?;
             let result = dataset::refresh(
                 conn,
@@ -67,7 +76,8 @@ pub fn run(
                     return Ok(());
                 }
             }
-            let (path, was_downloaded) = resolve(file.as_deref(), config, &urls.egib, None)?;
+            let (path, was_downloaded) =
+                resolve(file.as_deref(), config, &urls.egib, None, show_progress)?;
             let p = path_str(&path)?;
             let result = dataset::refresh(
                 conn,
@@ -99,6 +109,7 @@ pub fn run(
                 terc_file.as_deref(),
                 &urls.prg,
                 etag.as_deref(),
+                show_progress,
             )
         }
     }
@@ -185,13 +196,16 @@ fn resolve(
     config: &Config,
     url: &str,
     download_as: Option<&str>,
+    show_progress: bool,
 ) -> Result<(PathBuf, bool)> {
     let (path, was_downloaded) = match file {
         Some(p) => (p.to_path_buf(), false),
         None => {
-            let path = match download_as {
-                Some(name) => download_file_as(url, &config.download_dir(), name)?,
-                None => download_file(url, &config.download_dir())?,
+            let path = match (download_as, show_progress) {
+                (Some(name), true) => download_file_as(url, &config.download_dir(), name)?,
+                (Some(name), false) => download_file_as_quiet(url, &config.download_dir(), name)?,
+                (None, true) => download_file(url, &config.download_dir())?,
+                (None, false) => download_file_quiet(url, &config.download_dir())?,
             };
             (path, true)
         }
@@ -290,7 +304,7 @@ mod tests {
         let config = config_with_download_dir(dir.path());
         let url = serve_body_once(b"snapshot data", "resolve_download.bin");
 
-        let (path, was_downloaded) = resolve(None, &config, &url, None).unwrap();
+        let (path, was_downloaded) = resolve(None, &config, &url, None, true).unwrap();
 
         assert!(was_downloaded);
         assert!(path.exists());
@@ -304,7 +318,8 @@ mod tests {
         let mut local = tempfile::NamedTempFile::new().unwrap();
         local.write_all(b"local snapshot").unwrap();
 
-        let (path, was_downloaded) = resolve(Some(local.path()), &config, "unused", None).unwrap();
+        let (path, was_downloaded) =
+            resolve(Some(local.path()), &config, "unused", None, true).unwrap();
 
         assert!(!was_downloaded);
         assert_eq!(path, local.path());

@@ -13,7 +13,7 @@ use tracing::info;
 use zip::ZipArchive;
 
 use crate::config::Config;
-use crate::download::download_file_as;
+use crate::download::{download_file_as, download_file_as_quiet};
 use crate::utils::format_duration;
 
 const PRG_DOWNLOAD_FILENAME: &str = "PRG-punkty_adresowe.zip";
@@ -42,7 +42,7 @@ pub fn import(
 ) -> Result<()> {
     let total = std::time::Instant::now();
 
-    let (zip_path, was_downloaded, terc) = prepare_source(config, file, terc_file, url)?;
+    let (zip_path, was_downloaded, terc) = prepare_source(config, file, terc_file, url, true)?;
 
     let raw_table = "prg_addresses_raw";
     stream_gml_into(conn, &zip_path, &terc, raw_table)?;
@@ -82,6 +82,7 @@ pub fn import(
 /// `source_etag` is the validator observed by the caller's HEAD check (see
 /// `update::source_unchanged`), if any; it is threaded through unchanged to
 /// `dataset::refresh` so it lands in `dataset_refreshes.source_etag`.
+#[allow(clippy::too_many_arguments)]
 pub fn update_prg(
     conn: &Connection,
     config: &Config,
@@ -89,8 +90,10 @@ pub fn update_prg(
     terc_file: Option<&Path>,
     url: &str,
     source_etag: Option<&str>,
+    show_progress: bool,
 ) -> Result<()> {
-    let (zip_path, was_downloaded, terc) = prepare_source(config, file, terc_file, url)?;
+    let (zip_path, was_downloaded, terc) =
+        prepare_source(config, file, terc_file, url, show_progress)?;
     let result = crate::update::dataset::refresh(
         conn,
         &crate::dataset::PRG,
@@ -122,13 +125,18 @@ fn prepare_source(
     file: Option<&Path>,
     terc_file: Option<&Path>,
     url: &str,
+    show_progress: bool,
 ) -> Result<PreparedSource> {
     let (zip_path, was_downloaded) = match file {
         Some(p) => (PathBuf::from(p), false),
         None => {
             info!(url, "Downloading PRG data");
-            let path = download_file_as(url, &config.download_dir(), PRG_DOWNLOAD_FILENAME)
-                .context("Failed to download PRG data")?;
+            let path = if show_progress {
+                download_file_as(url, &config.download_dir(), PRG_DOWNLOAD_FILENAME)
+            } else {
+                download_file_as_quiet(url, &config.download_dir(), PRG_DOWNLOAD_FILENAME)
+            }
+            .context("Failed to download PRG data")?;
             (path, true)
         }
     };

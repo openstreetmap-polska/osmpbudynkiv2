@@ -59,7 +59,7 @@ impl Job for StreetMappingsUpdateJob {
         // as `import::bdot10k::import`, so a download failure gets reported to
         // `job_run_log` just like a load failure -- not just successes.
         let outcome = (|| -> Result<LoadStats> {
-            let path = crate::download::download_file_as(
+            let path = crate::download::download_file_as_quiet(
                 url,
                 &ctx.config.download_dir(),
                 "street_names_mappings.csv",

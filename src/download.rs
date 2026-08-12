@@ -50,10 +50,31 @@ fn download_file_impl(url: &str, dest_dir: &Path, show_progress: bool) -> Result
 /// Download a file from `url` to `dest_dir` with an explicit `file_name`.
 /// Useful when the URL doesn't contain a clean filename (e.g. query-string URLs).
 pub fn download_file_as(url: &str, dest_dir: &Path, file_name: &str) -> Result<PathBuf> {
+    download_file_as_impl(url, dest_dir, file_name, true)
+}
+
+/// Same as [`download_file_as`], but without a progress bar. For callers
+/// that only ever run as a background job (e.g. the street-name/building-type
+/// mapping refreshes), where a redrawn bar just spams the log. See
+/// [`download_file_quiet`].
+pub fn download_file_as_quiet(url: &str, dest_dir: &Path, file_name: &str) -> Result<PathBuf> {
+    download_file_as_impl(url, dest_dir, file_name, false)
+}
+
+fn download_file_as_impl(
+    url: &str,
+    dest_dir: &Path,
+    file_name: &str,
+    show_progress: bool,
+) -> Result<PathBuf> {
     let dest_path = dest_dir.join(file_name);
 
     if dest_path.exists() {
-        info!(path = %dest_path.display(), "File already exists, skipping download");
+        if show_progress {
+            info!(path = %dest_path.display(), "File already exists, skipping download");
+        } else {
+            debug!(path = %dest_path.display(), "File already exists, skipping download");
+        }
         return Ok(dest_path);
     }
 
@@ -61,7 +82,7 @@ pub fn download_file_as(url: &str, dest_dir: &Path, file_name: &str) -> Result<P
         .with_context(|| format!("Failed to create directory {dest_dir:?}"))?;
 
     let rt = Runtime::new().context("Failed to create tokio runtime")?;
-    rt.block_on(download_with_retry(url, &dest_path, true))?;
+    rt.block_on(download_with_retry(url, &dest_path, show_progress))?;
 
     Ok(dest_path)
 }

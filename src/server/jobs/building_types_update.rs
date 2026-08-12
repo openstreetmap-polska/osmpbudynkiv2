@@ -96,8 +96,11 @@ fn refresh_one(
     }
 
     let outcome = (|| -> Result<BuildingTypeStats> {
-        let path =
-            crate::download::download_file_as(url, &ctx.config.download_dir(), download_filename)?;
+        let path = crate::download::download_file_as_quiet(
+            url,
+            &ctx.config.download_dir(),
+            download_filename,
+        )?;
         let stats = crate::mappings::building_types::load_from_path(conn, source, &path)?;
 
         if ctx.config.cleanup_downloaded_files {

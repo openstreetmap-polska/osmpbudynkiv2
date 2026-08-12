@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             import::run(&conn, &kv, source, &config, &config.download_urls)?
         }
         Command::Update { source } => {
-            update::run(&conn, &kv, source, &config, &config.download_urls)?
+            update::run(&conn, &kv, source, &config, &config.download_urls, true)?
         }
         Command::Compare { target } => compare::run(&conn, target)?,
         Command::Run => {

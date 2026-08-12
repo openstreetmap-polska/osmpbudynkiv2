@@ -61,6 +61,7 @@ impl Job for DatasetUpdateJob {
             self.source(),
             &ctx.config,
             &ctx.config.download_urls,
+            false,
         )
     }
 }
