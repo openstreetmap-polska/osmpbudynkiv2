@@ -1101,11 +1101,11 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
     const osmReplication = data.osm_replication;
     if (osmReplication && osmReplication.sequence_number != null) {
-      osmReplicationHint.textContent = `OSM: sekwencja ${osmReplication.sequence_number} (${fmtTimestamp(
+      osmReplicationHint.textContent = `Stan zapisanych danych OSM: numer sekwencji ${osmReplication.sequence_number} (${fmtTimestamp(
         osmReplication.timestamp
       )}).`;
     } else {
-      osmReplicationHint.textContent = "OSM: brak danych o sekwencji replikacji.";
+      osmReplicationHint.textContent = "Stan zapisanych danych OSM: brak danych o sekwencji replikacji.";
     }
   }
 
