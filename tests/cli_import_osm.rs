@@ -37,7 +37,8 @@ fn test_import_osm_from_fixture() {
         .stdout(
             predicate::str::contains("OSM import complete")
                 .and(predicate::str::contains("buildings=2"))
-                .and(predicate::str::contains("addresses=3")),
+                .and(predicate::str::contains("addresses=3"))
+                .and(predicate::str::contains("former_buildings=1")),
         );
 }
 
@@ -86,11 +87,15 @@ fn test_import_osm_twice_reimports_cleanly() {
 
     // First import succeeds
     cmd().args(args.iter()).assert().success().stdout(
-        predicate::str::contains("buildings=2").and(predicate::str::contains("addresses=3")),
+        predicate::str::contains("buildings=2")
+            .and(predicate::str::contains("addresses=3"))
+            .and(predicate::str::contains("former_buildings=1")),
     );
 
     // Second import also succeeds — tables are dropped and recreated, counts stay the same
     cmd().args(args.iter()).assert().success().stdout(
-        predicate::str::contains("buildings=2").and(predicate::str::contains("addresses=3")),
+        predicate::str::contains("buildings=2")
+            .and(predicate::str::contains("addresses=3"))
+            .and(predicate::str::contains("former_buildings=1")),
     );
 }

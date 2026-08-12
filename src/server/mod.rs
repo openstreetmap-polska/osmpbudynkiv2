@@ -288,6 +288,35 @@ fn check_startup_conditions(pool: &DbPool) -> Result<()> {
         }
     }
 
+    // osm_former_buildings backs compare::rule's suppression veto (see
+    // CLAUDE.md). Like the UNMATCHED_TABLES loop above, it always exists
+    // (CREATE TABLE IF NOT EXISTS in db::create_schema) so there is nothing
+    // to bail on, only "empty" to flag -- but unlike those tables, a freshly
+    // initialized, never-yet-imported database also has it empty, and that
+    // is not worth a warning. Gate on osm_buildings being non-empty instead:
+    // that is the real signal an operator cares about, "you upgraded to a
+    // binary that understands former buildings but have not re-run
+    // `import osm` yet", since only a full `import osm` populates this table.
+    let osm_buildings_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM osm_buildings", [], |row| row.get(0))
+        .context("Failed to count rows in table 'osm_buildings'")?;
+    if osm_buildings_rows > 0 {
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM osm_former_buildings", [], |row| {
+                row.get(0)
+            })
+            .context("Failed to count rows in table 'osm_former_buildings'")?;
+
+        info!("Table osm_former_buildings has {} rows.", rows);
+        if rows == 0 {
+            tracing::warn!(
+                "osm_former_buildings is empty even though osm_buildings is not -- this \
+                 database predates the former-building suppression veto; run `import osm` \
+                 to backfill it (see README)"
+            );
+        }
+    }
+
     info!("Startup checks passed: pool connection OK, all required tables present");
     Ok(())
 }

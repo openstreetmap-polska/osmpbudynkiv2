@@ -75,6 +75,27 @@ fn create_schema(conn: &Connection) -> Result<()> {
             geom GEOMETRY
         );
 
+        -- OSM ways/relations tagged with a lifecycle-prefixed building key
+        -- (demolished:building, ruins:building, ...). Not buildings -- the OSM
+        -- record that a building here is gone. Read only by compare::rule's
+        -- suppression veto. Kept in sync with import::osm::reset_osm_tables,
+        -- which DROPs and re-CREATEs it.
+        --
+        -- Note the index asymmetry: this creates the table without an RTREE
+        -- index -- create_serving_indexes below covers only the three
+        -- `*_unmatched` tables. The index only appears when `import osm` runs
+        -- create_spatial_indexes. Empty + unindexed is harmless (there is
+        -- nothing to scan), but on an in-place upgrade it also means the veto
+        -- silently never fires until a re-import, which looks identical to
+        -- 'no former buildings nearby'.
+        CREATE TABLE IF NOT EXISTS osm_former_buildings (
+            osm_id BIGINT,
+            osm_type VARCHAR,
+            lifecycle_key VARCHAR,
+            lifecycle_value VARCHAR,
+            geom GEOMETRY
+        );
+
         -- Export log for the /package endpoint (see GET /updates). Requires
         -- the spatial extension to already be loaded (via duckdb_init_commands)
         -- before this runs, since GEOMETRY('epsg:4326') needs spatial to
@@ -311,6 +332,7 @@ mod tests {
             "metadata",
             "osm_addresses",
             "osm_buildings",
+            "osm_former_buildings",
             "package_exports",
             "job_run_log",
         ];

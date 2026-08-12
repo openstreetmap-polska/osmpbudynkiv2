@@ -209,6 +209,9 @@ mod full_vs_incremental_equivalence {
         c.execute_batch(
             "INSERT INTO osm_buildings VALUES
                  (1, 'way', NULL, ST_MakeEnvelope(20.0, 52.0, 20.001, 52.001));
+             INSERT INTO osm_former_buildings VALUES
+                 (2, 'way', 'demolished:building', 'yes',
+                  ST_MakeEnvelope(22.9999,53.9999,23.0011,54.0011));
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
                  ('inside', ST_MakeEnvelope(20.0002,52.0002,20.0008,52.0008)),
                  ('lonely', ST_MakeEnvelope(21.0,52.2,21.001,52.201)),
@@ -216,7 +219,11 @@ mod full_vs_incremental_equivalence {
                  -- bbox: the extent-divergence scenario the extent fix
                  -- exists to close, and the scenario this test must be able
                  -- to catch a regression of.
-                 ('stray', ST_MakeEnvelope(30.0,60.0,30.001,60.001));
+                 ('stray', ST_MakeEnvelope(30.0,60.0,30.001,60.001)),
+                 -- Suppressed by the former-building veto: covered by
+                 -- osm_former_buildings above, not by osm_buildings, so it
+                 -- must be neither matched nor unmatched under either path.
+                 ('former', ST_MakeEnvelope(23.0,54.0,23.001,54.001));
              UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
@@ -227,12 +234,12 @@ mod full_vs_incremental_equivalence {
         assert_eq!(
             full.len(),
             2,
-            "sanity: 'inside' matched, 'lonely' and 'stray' unmatched"
+            "sanity: 'inside' matched, 'former' suppressed, 'lonely' and 'stray' unmatched"
         );
         assert_eq!(
             full_totals.len(),
-            3,
-            "sanity: all three buildings count towards a denominator, matched or not"
+            4,
+            "sanity: all four buildings count towards a denominator, matched, unmatched or suppressed"
         );
 
         c.execute_batch("DELETE FROM bdot10k_unmatched; DELETE FROM cell_totals;")

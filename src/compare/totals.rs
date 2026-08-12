@@ -31,6 +31,13 @@
 //! `compare::addresses` for the full rebuild, `compare::incremental` for the
 //! drain — so a cell's numerator and denominator can never be observed from
 //! different comparisons.
+//!
+//! **Deliberately does not mirror the former-building veto.** A building
+//! suppressed by `rule::suppressed_buildings_sql` is comparable and OSM has
+//! effectively handled it, unlike a `BDOT10K_EKSPLOATOWANY_FILTER`-excluded
+//! row, which is not comparable at all — so it stays in this denominator
+//! exactly as a matched building does. Do not "fix" this parity later; see
+//! Step 6 of the design for the reasoning.
 
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;

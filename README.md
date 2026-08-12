@@ -29,13 +29,13 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] Street name corrections for addresses to match the osm conventions (`import street-mappings`)
 - [x] Mappings of building types in egib/bdot10k to osm tags (`import building-types`)
 - [x] Web map frontend (MapLibre GL JS, `web/`) — layer legend, per-feature popups showing source attributes and the tags an import would write, status panel, and package download for either the visible area or a drawn one (rectangle, polygon or freehand)
+- [x] Ignore buildings that are mapped as no longer existing or ruins — OSM ways/relations tagged with a lifecycle-prefixed key (`demolished:building`, `destroyed:building`, `abandoned:building`, `was:building`, `razed:building`, `removed:building`, `disused:building`, `ruins:building`) are imported into `osm_former_buildings` and suppress the government building they overlap from `compare buildings`, instead of proposing it for import. Requires an `import osm` re-run to populate on a database from before this feature (see [`docs/former_buildings.md`](docs/former_buildings.md))
 
 ## Not yet implemented
 
 - [ ] Tile caching
 - [ ] Endpoint for reporting records to exclude (bad source data, comparison mismatches)
 - [ ] Random location endpoint (jump to an area with data to review)
-- [ ] Ignore buildings that are map as no longer existing or ruins
 
 ## Building
 

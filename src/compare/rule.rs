@@ -46,10 +46,82 @@ pub const BDOT10K_EKSPLOATOWANY_FILTER: &str = "b.KATEGORIAISTNIENIA = 'eksploat
 /// precisely derived one.
 pub const MIN_OVERLAP_FRACTION: f64 = 0.10;
 
+/// Minimum fraction of a government building's footprint that an
+/// `osm_former_buildings` polygon must cover for that building to be
+/// *suppressed* — neither matched nor offered for import, because OSM mappers
+/// have recorded that a building here is gone.
+///
+/// Deliberately separate from MIN_OVERLAP_FRACTION even though it holds the
+/// same value: this answers "is this veto trustworthy", not "did OSM already
+/// map this", and the two must be free to move apart. See
+/// docs/former_buildings.md for the measured sweep behind 0.10, and note the
+/// asymmetry if it is ever retuned: a false veto costs a missed import (the
+/// building simply is not proposed, and returns as soon as the OSM tag is
+/// corrected); a missed veto costs a wrong import.
+pub const FORMER_BUILDING_MIN_OVERLAP_FRACTION: f64 = 0.10;
+
+/// Which side of the former-building veto `buildings_predicate` builds:
+/// `Veto` excludes a suppressed building (what `unmatched_buildings_sql`
+/// serves), `Only` selects exactly the rows `Veto` excludes on top of the
+/// `osm_buildings` anti-join (what `suppressed_buildings_sql` serves), so
+/// `matched + unmatched + suppressed = total` holds by construction.
+enum FormerMode {
+    Veto,
+    Only,
+}
+
+/// Shared builder behind `unmatched_buildings_sql` and
+/// `suppressed_buildings_sql`: both read the same `osm_buildings` anti-join
+/// and the same `osm_former_buildings` overlap clause, differing only in
+/// whether the former-building clause is a `NOT EXISTS` (excluding a
+/// suppressed row) or an `EXISTS` (selecting only a suppressed row). Keeping
+/// both polarities behind one function is what keeps the veto text itself in
+/// one place.
+fn buildings_predicate(
+    source_table: &str,
+    select_list: &str,
+    area: Bounds,
+    extra_filter: Option<&str>,
+    mode: FormerMode,
+) -> String {
+    let (x1, y1, x2, y2) = area;
+    let extra = extra_filter
+        .map(|f| format!("AND {f}\n           "))
+        .unwrap_or_default();
+    let former_exists = format!(
+        "EXISTS (
+               SELECT 1 FROM osm_former_buildings f
+               WHERE ST_Intersects(f.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+                 AND ST_Intersects(f.geom, b.geom)
+                 AND ST_Area(ST_Intersection(f.geom, b.geom)) / ST_Area(b.geom) >= {FORMER_BUILDING_MIN_OVERLAP_FRACTION}
+           )"
+    );
+    let former_clause = match mode {
+        FormerMode::Veto => format!("AND NOT {former_exists}"),
+        FormerMode::Only => format!("AND {former_exists}"),
+    };
+    format!(
+        "SELECT {select_list}
+         FROM {source_table} b
+         WHERE ST_Intersects(b.centroid, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+           {extra}AND NOT EXISTS (
+               SELECT 1 FROM osm_buildings osm
+               WHERE ST_Intersects(osm.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+                 AND ST_Intersects(osm.geom, b.geom)
+                 AND ST_Area(ST_Intersection(osm.geom, b.geom)) / ST_Area(b.geom) >= {MIN_OVERLAP_FRACTION}
+           )
+           {former_clause}"
+    )
+}
+
 /// Unmatched building rows: government centroid within `area`, and no
 /// osm_buildings polygon whose footprint covers at least
 /// `MIN_OVERLAP_FRACTION` of the government building's own footprint (osm
-/// filtered to `area` for the R-tree scan).
+/// filtered to `area` for the R-tree scan), and no `osm_former_buildings`
+/// polygon covers at least `FORMER_BUILDING_MIN_OVERLAP_FRACTION` of it
+/// either — a building OSM mappers have recorded as gone is suppressed, not
+/// offered for import (see `suppressed_buildings_sql`, which selects exactly
+/// what this clause excludes).
 ///
 /// Matching on full-geometry overlap rather than centroid-containment is
 /// deliberate: a government building's centroid can legitimately fall
@@ -72,7 +144,9 @@ pub const MIN_OVERLAP_FRACTION: f64 = 0.10;
 /// correlated `ST_Intersects(indexed_col, expr)` to a dedicated
 /// `SPATIAL_JOIN` physical operator fed by both sides' RTREE-narrowed
 /// candidates rather than a nested loop (verified via `EXPLAIN`), so this
-/// stays index-accelerated on both `b.geom` and `osm.geom`.
+/// stays index-accelerated on both `b.geom` and `osm.geom`; the former-building
+/// clause uses the same constant-envelope scoping so it stays index-accelerated
+/// too.
 ///
 /// `extra_filter`, when set, is ANDed into the WHERE clause alongside the
 /// `b`-aliased source row (see `BDOT10K_EKSPLOATOWANY_FILTER`).
@@ -82,20 +156,34 @@ pub fn unmatched_buildings_sql(
     area: Bounds,
     extra_filter: Option<&str>,
 ) -> String {
-    let (x1, y1, x2, y2) = area;
-    let extra = extra_filter
-        .map(|f| format!("AND {f}\n           "))
-        .unwrap_or_default();
-    format!(
-        "SELECT {select_list}
-         FROM {source_table} b
-         WHERE ST_Intersects(b.centroid, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-           {extra}AND NOT EXISTS (
-               SELECT 1 FROM osm_buildings osm
-               WHERE ST_Intersects(osm.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-                 AND ST_Intersects(osm.geom, b.geom)
-                 AND ST_Area(ST_Intersection(osm.geom, b.geom)) / ST_Area(b.geom) >= {MIN_OVERLAP_FRACTION}
-           )"
+    buildings_predicate(
+        source_table,
+        select_list,
+        area,
+        extra_filter,
+        FormerMode::Veto,
+    )
+}
+
+/// The mirror image of `unmatched_buildings_sql`'s former-building clause:
+/// rows that are "unmatched but for the veto" — no `osm_buildings` polygon
+/// covers them, but an `osm_former_buildings` polygon does. This is exactly
+/// the row set the veto removes from `unmatched_buildings_sql`, so
+/// `matched + unmatched + suppressed = total` is exact: a plain "overlaps a
+/// former polygon" count would double-count rows also covered by a live OSM
+/// building and could push `matched` negative.
+pub fn suppressed_buildings_sql(
+    source_table: &str,
+    select_list: &str,
+    area: Bounds,
+    extra_filter: Option<&str>,
+) -> String {
+    buildings_predicate(
+        source_table,
+        select_list,
+        area,
+        extra_filter,
+        FormerMode::Only,
     )
 }
 
@@ -285,6 +373,161 @@ mod tests {
         assert!(
             plan.contains("RTREE_INDEX_SCAN"),
             "the predicate must be able to use the centroid RTREE index, got plan: {plan}"
+        );
+    }
+
+    /// The veto's basic shape: an `osm_former_buildings` polygon that fully
+    /// covers the government building's footprint suppresses it — it must not
+    /// count as unmatched, mirroring `extra_filter_excludes_non_eksploatowany_buildings`
+    /// but for the former-building clause instead of `extra_filter`.
+    #[test]
+    fn former_building_fully_overlapping_suppresses_the_government_building() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO bsrc (LOKALNYID, geom) VALUES
+                 ('gone', ST_MakeEnvelope(21.0,52.0,21.001,52.001));
+             UPDATE bsrc SET centroid = ST_Centroid(geom);
+             INSERT INTO osm_former_buildings VALUES
+                 (1, 'way', 'demolished:building', 'yes',
+                  ST_MakeEnvelope(20.9999,51.9999,21.0011,52.0011));",
+        )
+        .unwrap();
+        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let ids: Vec<String> = {
+            let mut s = c.prepare(&sql).unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            Vec::<String>::new(),
+            "a government building fully covered by a former-building polygon must be suppressed"
+        );
+    }
+
+    /// The overlap-fraction floor's other side, for the former-building clause
+    /// this time: a government building that merely clips the corner of an
+    /// unrelated former-building polygon (well under
+    /// `FORMER_BUILDING_MIN_OVERLAP_FRACTION`) must still count as unmatched.
+    /// A bare `ST_Intersects` veto (no floor) would wrongly suppress it —
+    /// this is the test that catches someone "simplifying" the veto that way.
+    /// Modelled on `building_barely_touching_osm_neighbor_stays_unmatched`,
+    /// reusing the same fixture numbers against `osm_former_buildings`
+    /// instead of `osm_buildings`.
+    #[test]
+    fn building_barely_touching_former_neighbor_stays_unmatched() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO osm_former_buildings VALUES
+                 (1, 'way', 'demolished:building', 'yes',
+                  ST_MakeEnvelope(20.0,52.0,20.001,52.001));
+             INSERT INTO bsrc (LOKALNYID, geom) VALUES
+                 ('barely_touching', ST_MakeEnvelope(20.0005,52.0005,20.0505,52.0105));
+             UPDATE bsrc SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let ids: Vec<String> = {
+            let mut s = c.prepare(&sql).unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["barely_touching".to_string()],
+            "a mere corner-clip below FORMER_BUILDING_MIN_OVERLAP_FRACTION must not suppress it"
+        );
+    }
+
+    /// The two `NOT EXISTS` clauses in `unmatched_buildings_sql` are
+    /// independent: the former-building veto must fire even when
+    /// `osm_buildings` is completely empty (no match rule to interact with).
+    #[test]
+    fn former_building_veto_fires_with_osm_buildings_empty() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO bsrc (LOKALNYID, geom) VALUES
+                 ('gone', ST_MakeEnvelope(21.0,52.0,21.001,52.001));
+             UPDATE bsrc SET centroid = ST_Centroid(geom);
+             INSERT INTO osm_former_buildings VALUES
+                 (1, 'way', 'demolished:building', 'yes',
+                  ST_MakeEnvelope(20.9999,51.9999,21.0011,52.0011));",
+        )
+        .unwrap();
+        let empty_osm_buildings: i64 = c
+            .query_row("SELECT COUNT(*) FROM osm_buildings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(empty_osm_buildings, 0, "sanity: osm_buildings is empty");
+
+        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let ids: Vec<String> = {
+            let mut s = c.prepare(&sql).unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            Vec::<String>::new(),
+            "the former-building veto must fire independently of osm_buildings"
+        );
+    }
+
+    /// `suppressed_buildings_sql` returns exactly what the veto removes from
+    /// `unmatched_buildings_sql`, so on a small fixture with one matched, one
+    /// suppressed and one plain-unmatched building, matched + unmatched +
+    /// suppressed must equal total.
+    #[test]
+    fn suppressed_plus_unmatched_plus_matched_equals_total() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO osm_buildings VALUES
+                 (1,'way',NULL, ST_MakeEnvelope(20.0,52.0,20.001,52.001));
+             INSERT INTO osm_former_buildings VALUES
+                 (2, 'way', 'demolished:building', 'yes',
+                  ST_MakeEnvelope(21.9999,52.9999,22.0011,53.0011));
+             INSERT INTO bsrc (LOKALNYID, geom) VALUES
+                 ('matched', ST_MakeEnvelope(20.0002,52.0002,20.0008,52.0008)),
+                 ('suppressed', ST_MakeEnvelope(22.0,53.0,22.001,53.001)),
+                 ('plain_unmatched', ST_MakeEnvelope(23.0,54.0,23.001,54.001));
+             UPDATE bsrc SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+        let area = (14.0, 49.0, 25.0, 55.0);
+
+        let unmatched_sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", area, None);
+        let unmatched: Vec<String> = {
+            let mut s = c.prepare(&unmatched_sql).unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(unmatched, vec!["plain_unmatched".to_string()]);
+
+        let suppressed_sql = suppressed_buildings_sql("bsrc", "b.LOKALNYID", area, None);
+        let suppressed: Vec<String> = {
+            let mut s = c.prepare(&suppressed_sql).unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(suppressed, vec!["suppressed".to_string()]);
+
+        let total: i64 = c
+            .query_row("SELECT COUNT(*) FROM bsrc", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3);
+        let matched = total - unmatched.len() as i64 - suppressed.len() as i64;
+        assert_eq!(
+            matched, 1,
+            "matched + unmatched + suppressed must equal total"
         );
     }
 

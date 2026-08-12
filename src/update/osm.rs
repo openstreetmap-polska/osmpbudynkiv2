@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use duckdb::Connection;
+use duckdb::{Connection, OptionalExt};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::info;
@@ -11,6 +11,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::download::download_file_quiet;
 use crate::osm::kvstore::RocksDB;
+use crate::osm::lifecycle;
 use crate::osm::replication::{
     ChangeAction, OsmChange, RelationChange, WayChange, parse_osc, parse_state_txt,
     sequence_to_path,
@@ -241,12 +242,23 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
                 kvstore::delete_way(kv, way.id)?;
                 dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way.id, "way")?;
                 dirty.note_existing(conn, Layer::Addresses, "osm_addresses", way.id, "way")?;
+                dirty.note_existing(
+                    conn,
+                    Layer::Buildings,
+                    "osm_former_buildings",
+                    way.id,
+                    "way",
+                )?;
                 conn.execute(
                     "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way'",
                     [way.id],
                 )?;
                 conn.execute(
                     "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'way'",
+                    [way.id],
+                )?;
+                conn.execute(
+                    "DELETE FROM osm_former_buildings WHERE osm_id = ? AND osm_type = 'way'",
                     [way.id],
                 )?;
             }
@@ -281,12 +293,23 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
                 kvstore::delete_relation(kv, rel.id)?;
                 dirty.note_existing(conn, Layer::Buildings, "osm_buildings", rel.id, "relation")?;
                 dirty.note_existing(conn, Layer::Addresses, "osm_addresses", rel.id, "relation")?;
+                dirty.note_existing(
+                    conn,
+                    Layer::Buildings,
+                    "osm_former_buildings",
+                    rel.id,
+                    "relation",
+                )?;
                 conn.execute(
                     "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'relation'",
                     [rel.id],
                 )?;
                 conn.execute(
                     "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'relation'",
+                    [rel.id],
+                )?;
+                conn.execute(
+                    "DELETE FROM osm_former_buildings WHERE osm_id = ? AND osm_type = 'relation'",
                     [rel.id],
                 )?;
             }
@@ -359,13 +382,19 @@ fn rebuild_way_geometry(
     // Determine tags: from the change if directly affected, else from DuckDB existence.
     // For indirectly affected ways, check DuckDB BEFORE deleting old entries.
     let way_change = way_changes.iter().find(|w| w.id == way_id);
-    let (building_tag, housenumber, street, city, postcode) = match way_change {
+    let (building_tag, housenumber, street, city, postcode, former) = match way_change {
         Some(wc) => (
             tag_value(&wc.tags, "building"),
             tag_value(&wc.tags, "addr:housenumber"),
             tag_value(&wc.tags, "addr:street"),
             tag_value(&wc.tags, "addr:city").or_else(|| tag_value(&wc.tags, "addr:place")),
             tag_value(&wc.tags, "addr:postcode"),
+            lifecycle::key_of(&wc.tags).map(|key| {
+                (
+                    key.to_string(),
+                    tag_value(&wc.tags, key).unwrap_or_default(),
+                )
+            }),
         ),
         None => {
             let has_building: bool = conn
@@ -382,8 +411,23 @@ fn rebuild_way_geometry(
                     |row| row.get(0),
                 )
                 .unwrap_or(false);
+            // Unlike has_building/has_address, keep the stored key/value rather
+            // than throwing them away: the tag determination further down
+            // still needs them to re-insert with the SAME lifecycle key, not a
+            // hardcoded default the way the building arm does with 'yes'.
+            let former: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT lifecycle_key, lifecycle_value FROM osm_former_buildings
+                     WHERE osm_id = ? AND osm_type = 'way'",
+                    [way_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
 
-            if !has_building && !has_address {
+            // Load-bearing: without `&& former.is_none()`, a former-building
+            // way whose node moved would return here before the delete/
+            // re-insert below, so its row would keep stale pre-move geometry.
+            if !has_building && !has_address && former.is_none() {
                 return Ok(());
             }
             (
@@ -400,18 +444,27 @@ fn rebuild_way_geometry(
                 None,
                 None,
                 None,
+                former,
             )
         }
     };
 
-    // No early return when both tags are absent: that is the de-tag case (a
-    // Modify stripped building/addr:housenumber off a way we serve), and it
-    // still has to delete the base row and note the cell it left -- otherwise
-    // the government object this way was matching stays suppressed until the
-    // next full compare. The re-inserts below are already guarded by their own
-    // is_some() checks, so falling through simply deletes and stops.
+    // No early return when all of building/address/former are absent: that is
+    // the de-tag case (a Modify stripped building/addr:housenumber/a lifecycle
+    // key off a way we serve), and it still has to delete the base row and
+    // note the cell it left -- otherwise the government object this way was
+    // matching (or vetoing) stays wrong until the next full compare. The
+    // re-inserts below are already guarded by their own is_some() checks, so
+    // falling through simply deletes and stops.
     dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way_id, "way")?;
     dirty.note_existing(conn, Layer::Addresses, "osm_addresses", way_id, "way")?;
+    dirty.note_existing(
+        conn,
+        Layer::Buildings,
+        "osm_former_buildings",
+        way_id,
+        "way",
+    )?;
 
     conn.execute(
         "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way'",
@@ -419,6 +472,10 @@ fn rebuild_way_geometry(
     )?;
     conn.execute(
         "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'way'",
+        [way_id],
+    )?;
+    conn.execute(
+        "DELETE FROM osm_former_buildings WHERE osm_id = ? AND osm_type = 'way'",
         [way_id],
     )?;
 
@@ -436,6 +493,33 @@ fn rebuild_way_geometry(
         dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way_id, "way")?;
     }
 
+    if let Some((lifecycle_key, lifecycle_value)) = &former {
+        conn.execute(
+            "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+             SELECT ?, 'way', ?, ?,
+                    ST_MakePolygon(ST_GeomFromWKB(resolve_way_coords(?)))
+             WHERE resolve_way_coords(?) IS NOT NULL
+               AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords(?))) >= 4
+               AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords(?)))",
+            duckdb::params![
+                way_id,
+                lifecycle_key,
+                lifecycle_value,
+                way_id,
+                way_id,
+                way_id,
+                way_id
+            ],
+        )?;
+        dirty.note_existing(
+            conn,
+            Layer::Buildings,
+            "osm_former_buildings",
+            way_id,
+            "way",
+        )?;
+    }
+
     if housenumber.is_some() {
         conn.execute(
             "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
@@ -448,6 +532,43 @@ fn rebuild_way_geometry(
     }
 
     Ok(())
+}
+
+/// The multipolygon assembly CTE chain shared by every relation geometry
+/// INSERT that reconstructs a polygon from way members by unioning the
+/// 'outer' ways, unioning the 'inner' ways, and differencing them --
+/// `osm_buildings` and `osm_former_buildings`' relation inserts both build
+/// this way. `osm_addresses`' relation insert does not: it wants a centroid,
+/// not a polygon, so it is deliberately left out of this shared home.
+/// `values_sql` is the `(way_id, role)` VALUES list built from the relation's
+/// way members. Callers append their own final `SELECT ... FROM outer_polys o
+/// LEFT JOIN inner_polys i ON true WHERE o.outer_geom IS NOT NULL`, since the
+/// non-geometry columns (and whether they come from a literal or a bind
+/// parameter) differ per caller.
+fn relation_multipolygon_geom_sql(values_sql: &str) -> String {
+    format!(
+        "WITH way_members(way_id, member_role) AS (VALUES {values_sql}),
+         way_geoms AS (
+             SELECT way_id, member_role,
+                    ST_GeomFromWKB(resolve_way_coords(way_id)) AS line_geom
+             FROM way_members
+             WHERE resolve_way_coords(way_id) IS NOT NULL
+         ),
+         outer_polys AS (
+             SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS outer_geom
+             FROM way_geoms
+             WHERE (member_role = 'outer' OR member_role = '')
+               AND ST_NPoints(line_geom) >= 4
+               AND ST_IsClosed(line_geom)
+         ),
+         inner_polys AS (
+             SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS inner_geom
+             FROM way_geoms
+             WHERE member_role = 'inner'
+               AND ST_NPoints(line_geom) >= 4
+               AND ST_IsClosed(line_geom)
+         )"
+    )
 }
 
 fn rebuild_relation_geometry(
@@ -465,13 +586,19 @@ fn rebuild_relation_geometry(
     // Determine tags: from the change if directly affected, else from DuckDB existence.
     // Check DuckDB BEFORE deleting old entries.
     let rel_change = relation_changes.iter().find(|r| r.id == relation_id);
-    let (building_tag, housenumber, street, city, postcode) = match rel_change {
+    let (building_tag, housenumber, street, city, postcode, former) = match rel_change {
         Some(rc) => (
             tag_value(&rc.tags, "building"),
             tag_value(&rc.tags, "addr:housenumber"),
             tag_value(&rc.tags, "addr:street"),
             tag_value(&rc.tags, "addr:city").or_else(|| tag_value(&rc.tags, "addr:place")),
             tag_value(&rc.tags, "addr:postcode"),
+            lifecycle::key_of(&rc.tags).map(|key| {
+                (
+                    key.to_string(),
+                    tag_value(&rc.tags, key).unwrap_or_default(),
+                )
+            }),
         ),
         None => {
             let has_building: bool = conn
@@ -488,8 +615,21 @@ fn rebuild_relation_geometry(
                     |row| row.get(0),
                 )
                 .unwrap_or(false);
+            // Keep the stored key/value, mirroring rebuild_way_geometry's
+            // inferred arm -- do not collapse to a hardcoded default.
+            let former: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT lifecycle_key, lifecycle_value FROM osm_former_buildings
+                     WHERE osm_id = ? AND osm_type = 'relation'",
+                    [relation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
 
-            if !has_building && !has_address {
+            // Load-bearing, same as rebuild_way_geometry: without
+            // `&& former.is_none()`, a former-building relation whose member
+            // way moved would return here before the delete/re-insert below.
+            if !has_building && !has_address && former.is_none() {
                 return Ok(());
             }
             (
@@ -506,12 +646,14 @@ fn rebuild_relation_geometry(
                 None,
                 None,
                 None,
+                former,
             )
         }
     };
 
-    // No early return when both tags are absent -- the de-tag case still has to
-    // delete and note the vacated cell. See rebuild_way_geometry.
+    // No early return when all of building/address/former are absent -- the
+    // de-tag case still has to delete and note the vacated cell. See
+    // rebuild_way_geometry.
     dirty.note_existing(
         conn,
         Layer::Buildings,
@@ -526,6 +668,13 @@ fn rebuild_relation_geometry(
         relation_id,
         "relation",
     )?;
+    dirty.note_existing(
+        conn,
+        Layer::Buildings,
+        "osm_former_buildings",
+        relation_id,
+        "relation",
+    )?;
 
     conn.execute(
         "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'relation'",
@@ -533,6 +682,10 @@ fn rebuild_relation_geometry(
     )?;
     conn.execute(
         "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'relation'",
+        [relation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM osm_former_buildings WHERE osm_id = ? AND osm_type = 'relation'",
         [relation_id],
     )?;
 
@@ -558,27 +711,7 @@ fn rebuild_relation_geometry(
         let building_sql = building.replace('\'', "''");
         conn.execute_batch(&format!(
             "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
-             WITH way_members(way_id, member_role) AS (VALUES {values_sql}),
-             way_geoms AS (
-                 SELECT way_id, member_role,
-                        ST_GeomFromWKB(resolve_way_coords(way_id)) AS line_geom
-                 FROM way_members
-                 WHERE resolve_way_coords(way_id) IS NOT NULL
-             ),
-             outer_polys AS (
-                 SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS outer_geom
-                 FROM way_geoms
-                 WHERE (member_role = 'outer' OR member_role = '')
-                   AND ST_NPoints(line_geom) >= 4
-                   AND ST_IsClosed(line_geom)
-             ),
-             inner_polys AS (
-                 SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS inner_geom
-                 FROM way_geoms
-                 WHERE member_role = 'inner'
-                   AND ST_NPoints(line_geom) >= 4
-                   AND ST_IsClosed(line_geom)
-             )
+             {cte}
              SELECT
                  {relation_id}, 'relation', '{building_sql}',
                  CASE
@@ -587,12 +720,41 @@ fn rebuild_relation_geometry(
                  END
              FROM outer_polys o
              LEFT JOIN inner_polys i ON true
-             WHERE o.outer_geom IS NOT NULL"
+             WHERE o.outer_geom IS NOT NULL",
+            cte = relation_multipolygon_geom_sql(&values_sql),
         ))?;
         dirty.note_existing(
             conn,
             Layer::Buildings,
             "osm_buildings",
+            relation_id,
+            "relation",
+        )?;
+    }
+
+    if let Some((lifecycle_key, lifecycle_value)) = &former {
+        let sql = format!(
+            "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+             {cte}
+             SELECT
+                 ?, 'relation', ?, ?,
+                 CASE
+                     WHEN i.inner_geom IS NOT NULL THEN ST_Difference(o.outer_geom, i.inner_geom)
+                     ELSE o.outer_geom
+                 END
+             FROM outer_polys o
+             LEFT JOIN inner_polys i ON true
+             WHERE o.outer_geom IS NOT NULL",
+            cte = relation_multipolygon_geom_sql(&values_sql),
+        );
+        conn.execute(
+            &sql,
+            duckdb::params![relation_id, lifecycle_key, lifecycle_value],
+        )?;
+        dirty.note_existing(
+            conn,
+            Layer::Buildings,
+            "osm_former_buildings",
             relation_id,
             "relation",
         )?;
@@ -1106,6 +1268,353 @@ mod tests {
                 "de-tagged relation must enqueue the cell it left for {source}, got {n}"
             );
         }
+
+        Ok(())
+    }
+
+    /// Retagging `building=yes` -> `demolished:building=yes` via replication
+    /// XML: the OSM building disappears and a former-building row takes its
+    /// place. Modelled on
+    /// `osc_xml_flows_through_parse_apply_drain_into_the_serving_table`, which
+    /// seeds `gov1` inside way 100's footprint.
+    ///
+    /// Stops at what `update osm` itself is responsible for: the building row
+    /// is gone, the former-building row exists with the right lifecycle key,
+    /// and the vacated cell got enqueued. The suppression half -- that `gov1`
+    /// must stay OUT of `bdot10k_unmatched` once the veto (Step 5 of the plan)
+    /// sees the new `osm_former_buildings` row -- is its own end-to-end test
+    /// below, `test_apply_way_retag_building_to_demolished_suppresses_the_government_building`,
+    /// the single most valuable assertion in the whole change.
+    #[test]
+    fn test_apply_way_retag_building_to_demolished_creates_former_row() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <modify>
+    <way id="100" version="2">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <nd ref="3"/>
+      <nd ref="4"/>
+      <nd ref="1"/>
+      <tag k="demolished:building" v="yes"/>
+    </way>
+  </modify>
+</osmChange>"#;
+        let changes = parse_osc(osc)?;
+        assert_eq!(changes.ways.len(), 1, "parse_osc must see the modified way");
+
+        apply_changes(&conn, &kv, &changes)?;
+
+        let building_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 100 AND osm_type = 'way'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(building_count, 0, "retag must remove the osm_buildings row");
+
+        let (lifecycle_key, lifecycle_value): (String, String) = conn.query_row(
+            "SELECT lifecycle_key, lifecycle_value FROM osm_former_buildings
+             WHERE osm_id = 100 AND osm_type = 'way'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(lifecycle_key, "demolished:building");
+        assert_eq!(lifecycle_value, "yes");
+
+        for source in ["bdot10k", "egib"] {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = ?",
+                duckdb::params![source],
+                |row| row.get(0),
+            )?;
+            assert_eq!(n, 9, "retag must enqueue the vacated cell for {source}");
+        }
+
+        Ok(())
+    }
+
+    /// The suppression half of the retag scenario above, run end to end
+    /// through `compare` + the drain: once `update osm` turns way 100 into a
+    /// former-building row, the government building it used to match must
+    /// stay OUT of `bdot10k_unmatched`, not reappear as unmatched the way a
+    /// plain OSM deletion would (see
+    /// `osc_xml_flows_through_parse_apply_drain_into_the_serving_table`, whose
+    /// `gov1` fixture this reuses). Under pre-veto code this assertion would
+    /// fail with `served_after == 1` -- this is the single most valuable test
+    /// in the whole change.
+    #[test]
+    fn test_apply_way_retag_building_to_demolished_suppresses_the_government_building() -> Result<()>
+    {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER,
+                 kondygnacje_podziemne INTEGER, rodzaj VARCHAR);
+             CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);
+             -- Sits inside way 100's footprint, so OSM currently covers it.
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
+                 ('gov1', ST_MakeEnvelope(20.0002, 50.0002, 20.0008, 50.0008));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
+        )?;
+
+        // Baseline: the government building is matched by the live way 100, so it is NOT served.
+        crate::compare::buildings::compare_bdot10k(&conn)?;
+        let served: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM bdot10k_unmatched WHERE LOKALNYID = 'gov1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            served, 0,
+            "precondition: gov1 is covered by OSM way 100, so it must not be served"
+        );
+
+        // An editor retags the OSM building as demolished, arriving as replication XML.
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <modify>
+    <way id="100" version="2">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <nd ref="3"/>
+      <nd ref="4"/>
+      <nd ref="1"/>
+      <tag k="demolished:building" v="yes"/>
+    </way>
+  </modify>
+</osmChange>"#;
+        let changes = parse_osc(osc)?;
+        assert_eq!(changes.ways.len(), 1, "parse_osc must see the modified way");
+
+        apply_changes(&conn, &kv, &changes)?;
+
+        let building_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 100 AND osm_type = 'way'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            building_count, 0,
+            "the retag must remove the osm_buildings row"
+        );
+
+        let former_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_former_buildings WHERE osm_id = 100 AND osm_type = 'way'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            former_count, 1,
+            "the retag must create the former-building row"
+        );
+
+        // apply_changes only enqueues; the drain is what rebuilds the cell.
+        let queued: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'bdot10k'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(queued > 0, "the retag must enqueue the vacated cell");
+
+        let stats = crate::compare::drain::drain_batch(&conn, 100, &|| false)?;
+        assert_eq!(stats.failed, 0, "no cell may fail to recompute");
+        assert!(stats.cells > 0, "the drain must have recomputed something");
+
+        // gov1 is now covered by a former-building polygon instead of a live
+        // OSM building -- the veto must keep it suppressed, not let it
+        // reappear as unmatched.
+        let served_after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM bdot10k_unmatched WHERE LOKALNYID = 'gov1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            served_after, 0,
+            "after the retag, gov1 must stay suppressed rather than reappear as unmatched"
+        );
+
+        Ok(())
+    }
+
+    /// Tagging a plain (previously untagged) way `demolished:building` must
+    /// create the `osm_former_buildings` row and must NOT also land in
+    /// `osm_buildings` -- the disjointness decision from Step 3 of the plan
+    /// applies identically on the `update osm` side.
+    #[test]
+    fn test_apply_way_create_with_demolished_building_tag_creates_former_row() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        let changes = OsmChange {
+            ways: vec![WayChange {
+                action: ChangeAction::Create,
+                id: 300,
+                node_refs: vec![1, 2, 3, 4, 1],
+                tags: vec![("demolished:building".into(), "house".into())],
+            }],
+            ..Default::default()
+        };
+
+        apply_changes(&conn, &kv, &changes)?;
+
+        let (lifecycle_key, lifecycle_value): (String, String) = conn.query_row(
+            "SELECT lifecycle_key, lifecycle_value FROM osm_former_buildings
+             WHERE osm_id = 300 AND osm_type = 'way'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(lifecycle_key, "demolished:building");
+        assert_eq!(lifecycle_value, "house");
+
+        let building_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 300 AND osm_type = 'way'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            building_count, 0,
+            "a former-building way must not also land in osm_buildings"
+        );
+
+        Ok(())
+    }
+
+    /// A node move on a former-building way must go through
+    /// `rebuild_way_geometry`'s INFERRED arm (the way itself is not directly
+    /// in the changeset), and the row must survive with its lifecycle_key
+    /// intact and its geometry reflecting the move. This is the direct guard
+    /// for edit 3's early-return extension: without `&& former.is_none()`,
+    /// the function returns before the delete/re-insert, so the geometry
+    /// would stay stale at the pre-move position.
+    #[test]
+    fn test_apply_node_move_on_former_building_way_keeps_row_with_moved_geometry() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        // A separate former-building way (150), independent from way 100's square.
+        kvstore::put_node(&kv, 11, 21.0, 51.0)?;
+        kvstore::put_node(&kv, 12, 21.001, 51.0)?;
+        kvstore::put_node(&kv, 13, 21.001, 51.001)?;
+        kvstore::put_node(&kv, 14, 21.0, 51.001)?;
+        kvstore::put_way(&kv, 150, &[11, 12, 13, 14, 11])?;
+        for &nid in &[11i64, 12, 13, 14] {
+            kvstore::add_node_to_ways(&kv, nid, 150)?;
+        }
+        conn.execute_batch(
+            "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+             VALUES (150, 'way', 'demolished:building', 'yes', ST_MakePolygon(ST_MakeLine(
+                 list_value(ST_Point(21.0, 51.0), ST_Point(21.001, 51.0),
+                            ST_Point(21.001, 51.001), ST_Point(21.0, 51.001),
+                            ST_Point(21.0, 51.0))
+             )));",
+        )?;
+
+        // Move node 11 far east -- the way itself is not in the changeset, so
+        // rebuild_way_geometry takes the INFERRED (None) arm for way 150.
+        let changes = OsmChange {
+            nodes: vec![NodeChange {
+                action: ChangeAction::Modify,
+                id: 11,
+                lon: 22.5,
+                lat: 51.0,
+                tags: vec![],
+            }],
+            ..Default::default()
+        };
+        apply_changes(&conn, &kv, &changes)?;
+
+        let (lifecycle_key, count): (String, i64) = conn.query_row(
+            "SELECT lifecycle_key, COUNT(*) OVER ()
+             FROM osm_former_buildings WHERE osm_id = 150 AND osm_type = 'way'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(count, 1, "row must survive the node move");
+        assert_eq!(
+            lifecycle_key, "demolished:building",
+            "lifecycle_key must not be rewritten to a default"
+        );
+
+        let after_xmax: f64 = conn.query_row(
+            "SELECT ST_XMax(geom) FROM osm_former_buildings
+             WHERE osm_id = 150 AND osm_type = 'way'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            after_xmax > 22.0,
+            "geometry must reflect the moved node, got xmax={after_xmax}"
+        );
+
+        Ok(())
+    }
+
+    /// Deleting a former-building way must remove its `osm_former_buildings`
+    /// row and enqueue the vacated cell's 3x3 neighbourhood under both
+    /// building sources, mirroring `test_apply_way_delete_enqueues_building_dirty_cells`.
+    #[test]
+    fn test_apply_way_delete_removes_former_building_row_and_enqueues_dirty_cells() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        kvstore::put_node(&kv, 21, 22.0, 52.0)?;
+        kvstore::put_node(&kv, 22, 22.001, 52.0)?;
+        kvstore::put_node(&kv, 23, 22.001, 52.001)?;
+        kvstore::put_node(&kv, 24, 22.0, 52.001)?;
+        kvstore::put_way(&kv, 160, &[21, 22, 23, 24, 21])?;
+        for &nid in &[21i64, 22, 23, 24] {
+            kvstore::add_node_to_ways(&kv, nid, 160)?;
+        }
+        conn.execute_batch(
+            "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+             VALUES (160, 'way', 'demolished:building', 'yes', ST_MakePolygon(ST_MakeLine(
+                 list_value(ST_Point(22.0, 52.0), ST_Point(22.001, 52.0),
+                            ST_Point(22.001, 52.001), ST_Point(22.0, 52.001),
+                            ST_Point(22.0, 52.0))
+             )));",
+        )?;
+
+        let changes = OsmChange {
+            ways: vec![WayChange {
+                action: ChangeAction::Delete,
+                id: 160,
+                node_refs: vec![],
+                tags: vec![],
+            }],
+            ..Default::default()
+        };
+        apply_changes(&conn, &kv, &changes)?;
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_former_buildings WHERE osm_id = 160",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            count, 0,
+            "deleted former-building way must not leave a stale row"
+        );
+
+        for source in ["bdot10k", "egib"] {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = ?",
+                duckdb::params![source],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                n, 9,
+                "deleting a former-building way must enqueue the cell it left for {source}"
+            );
+        }
+
+        assert!(kvstore::get_way(&kv, 160)?.is_none());
 
         Ok(())
     }

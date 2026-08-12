@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::download::download_file;
 use crate::osm::kvstore;
 use crate::osm::kvstore::RocksDB;
+use crate::osm::lifecycle;
 use crate::osm::pbf_header::read_replication_info;
 use crate::utils::format_duration;
 
@@ -50,6 +51,7 @@ fn reset_osm_tables(conn: &Connection, kv: &RocksDB) -> Result<()> {
         "
         DROP TABLE IF EXISTS osm_addresses;
         DROP TABLE IF EXISTS osm_buildings;
+        DROP TABLE IF EXISTS osm_former_buildings;
         CREATE TABLE osm_addresses (
             osm_id BIGINT,
             osm_type VARCHAR,
@@ -63,6 +65,19 @@ fn reset_osm_tables(conn: &Connection, kv: &RocksDB) -> Result<()> {
             osm_id BIGINT,
             osm_type VARCHAR,
             building VARCHAR,
+            geom GEOMETRY
+        );
+        -- OSM ways/relations tagged with a lifecycle-prefixed building key
+        -- (demolished:building, ruins:building, ...). Not buildings -- the OSM
+        -- record that a building here is gone. Read only by compare::rule's
+        -- suppression veto. Kept in sync with db::create_schema, which
+        -- declares this table too (as CREATE TABLE IF NOT EXISTS, for a
+        -- database that has never run `import osm`).
+        CREATE TABLE osm_former_buildings (
+            osm_id BIGINT,
+            osm_type VARCHAR,
+            lifecycle_key VARCHAR,
+            lifecycle_value VARCHAR,
             geom GEOMETRY
         );
         ",
@@ -147,6 +162,14 @@ pub fn import(
     check_shutdown()?;
 
     let t = std::time::Instant::now();
+    import_way_former_buildings(conn, pbf_str)?;
+    info!(
+        elapsed = %format_duration(t.elapsed()),
+        "Step done: import way former buildings"
+    );
+    check_shutdown()?;
+
+    let t = std::time::Instant::now();
     stream_relations_to_rocksdb(conn, kv, pbf_str)?;
     info!(
         elapsed = %format_duration(t.elapsed()),
@@ -159,6 +182,14 @@ pub fn import(
     info!(
         elapsed = %format_duration(t.elapsed()),
         "Step done: import relation buildings and addresses"
+    );
+    check_shutdown()?;
+
+    let t = std::time::Instant::now();
+    import_relation_former_buildings(conn, pbf_str)?;
+    info!(
+        elapsed = %format_duration(t.elapsed()),
+        "Step done: import relation former buildings"
     );
     check_shutdown()?;
 
@@ -338,6 +369,41 @@ fn import_way_buildings_and_addresses(conn: &Connection, pbf_path: &str) -> Resu
     Ok(())
 }
 
+/// Ways carrying a lifecycle-prefixed building key (`demolished:building`,
+/// `ruins:building`, ...) — the OSM record that a building here is gone, not
+/// a building itself. Kept disjoint from `osm_buildings` (see the
+/// disjointness decision in the plan): an object also carrying a live
+/// `building` key stays a normal `osm_buildings` row.
+fn import_way_former_buildings(conn: &Connection, pbf_path: &str) -> Result<()> {
+    info!("Importing way former buildings");
+    conn.execute_batch(&format!(
+        "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+         SELECT id, 'way',
+                {matched_key},
+                element_at(tags, {matched_key})[1],
+                ST_MakePolygon(ST_GeomFromWKB(resolve_node_coords(refs)))
+         FROM ST_ReadOSM('{pbf_path}')
+         WHERE kind = 'way'
+           AND refs IS NOT NULL
+           AND len(refs) >= 4
+           AND refs[1] = refs[len(refs)]
+           AND {is_former_building}
+           AND resolve_node_coords(refs) IS NOT NULL",
+        matched_key = lifecycle::matched_key_sql("tags"),
+        is_former_building = lifecycle::is_former_building_sql("tags"),
+    ))
+    .context("Failed to import way former buildings")?;
+
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM osm_former_buildings WHERE osm_type = 'way'",
+        [],
+        |row| row.get(0),
+    )?;
+    info!(count, "Way former buildings imported");
+
+    Ok(())
+}
+
 fn import_relation_buildings_and_addresses(conn: &Connection, pbf_path: &str) -> Result<()> {
     info!("Importing relation buildings");
     conn.execute_batch(&format!(
@@ -444,6 +510,78 @@ fn import_relation_buildings_and_addresses(conn: &Connection, pbf_path: &str) ->
     Ok(())
 }
 
+/// Relations carrying a lifecycle-prefixed building key. Same CTE chain as
+/// `import_relation_buildings_and_addresses`'s building half, with the
+/// `building` tag replaced by the lifecycle key/value pair, carried through
+/// `way_geoms` and `outer_polys`' `GROUP BY` the same way `building` is.
+fn import_relation_former_buildings(conn: &Connection, pbf_path: &str) -> Result<()> {
+    info!("Importing relation former buildings");
+    conn.execute_batch(&format!(
+        "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+         WITH rel_members AS (
+             SELECT
+                 id AS relation_id,
+                 {matched_key} AS lifecycle_key,
+                 element_at(tags, {matched_key})[1] AS lifecycle_value,
+                 unnest(refs) AS ref_id,
+                 unnest(ref_types) AS ref_type,
+                 unnest(ref_roles) AS ref_role
+             FROM ST_ReadOSM('{pbf_path}')
+             WHERE kind = 'relation'
+               AND refs IS NOT NULL
+               AND len(refs) > 0
+               AND {is_former_building}
+         ),
+         way_geoms AS (
+             SELECT
+                 relation_id, lifecycle_key, lifecycle_value, ref_role,
+                 ST_GeomFromWKB(resolve_way_coords(ref_id)) AS line_geom
+             FROM rel_members
+             WHERE ref_type = 'way'
+               AND resolve_way_coords(ref_id) IS NOT NULL
+         ),
+         outer_polys AS (
+             SELECT relation_id, lifecycle_key, lifecycle_value,
+                    ST_Union_Agg(ST_MakePolygon(line_geom)) AS outer_geom
+             FROM way_geoms
+             WHERE (ref_role = 'outer' OR ref_role = '')
+               AND ST_NPoints(line_geom) >= 4
+               AND ST_IsClosed(line_geom)
+             GROUP BY relation_id, lifecycle_key, lifecycle_value
+         ),
+         inner_polys AS (
+             SELECT relation_id,
+                    ST_Union_Agg(ST_MakePolygon(line_geom)) AS inner_geom
+             FROM way_geoms
+             WHERE ref_role = 'inner'
+               AND ST_NPoints(line_geom) >= 4
+               AND ST_IsClosed(line_geom)
+             GROUP BY relation_id
+         )
+         SELECT
+             o.relation_id, 'relation', o.lifecycle_key, o.lifecycle_value,
+             CASE
+                 WHEN i.inner_geom IS NOT NULL THEN ST_Difference(o.outer_geom, i.inner_geom)
+                 ELSE o.outer_geom
+             END AS geom
+         FROM outer_polys o
+         LEFT JOIN inner_polys i ON o.relation_id = i.relation_id
+         WHERE o.outer_geom IS NOT NULL",
+        matched_key = lifecycle::matched_key_sql("tags"),
+        is_former_building = lifecycle::is_former_building_sql("tags"),
+    ))
+    .context("Failed to import relation former buildings")?;
+
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM osm_former_buildings WHERE osm_type = 'relation'",
+        [],
+        |row| row.get(0),
+    )?;
+    info!(count, "Relation former buildings imported");
+
+    Ok(())
+}
+
 fn string_to_member_type(member_type: &str) -> u8 {
     match member_type {
         "node" => 0,
@@ -520,6 +658,7 @@ fn create_spatial_indexes(conn: &Connection) -> Result<()> {
         "
         CREATE INDEX osm_buildings_geom_idx ON osm_buildings USING RTREE (geom);
         CREATE INDEX osm_addresses_geom_idx ON osm_addresses USING RTREE (geom);
+        CREATE INDEX osm_former_buildings_geom_idx ON osm_former_buildings USING RTREE (geom);
         ",
     )
     .context("Failed to create spatial indexes")?;
@@ -531,7 +670,11 @@ fn log_import_stats(conn: &Connection) -> Result<()> {
         conn.query_row("SELECT COUNT(*) FROM osm_buildings", [], |row| row.get(0))?;
     let addresses: i64 =
         conn.query_row("SELECT COUNT(*) FROM osm_addresses", [], |row| row.get(0))?;
-    info!(buildings, addresses, "OSM import totals");
+    let former_buildings: i64 =
+        conn.query_row("SELECT COUNT(*) FROM osm_former_buildings", [], |row| {
+            row.get(0)
+        })?;
+    info!(buildings, addresses, former_buildings, "OSM import totals");
     Ok(())
 }
 
@@ -613,6 +756,64 @@ mod tests {
             |row| row.get(0),
         )?;
         assert!(area > 0.0, "School building should have positive area");
+
+        Ok(())
+    }
+
+    /// Verify the fixture's lifecycle-tagged way (w664679941,
+    /// `demolished:building=yes`, its only tag) lands in
+    /// `osm_former_buildings` and nowhere near `osm_buildings` — the
+    /// disjointness invariant from the plan's Step 3.
+    #[test]
+    fn test_import_fixture_former_building_details() -> Result<()> {
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
+        run_import_with_fixture(&conn, Path::new("fixtures/osm.pbf"))?;
+
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM osm_former_buildings", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(count, 1, "Expected 1 former building (way 664679941)");
+
+        let (osm_type, lifecycle_key, lifecycle_value, geom_type): (
+            String,
+            String,
+            String,
+            String,
+        ) = conn.query_row(
+            "SELECT osm_type, lifecycle_key, lifecycle_value, ST_GeometryType(geom)
+             FROM osm_former_buildings WHERE osm_id = 664679941",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(osm_type, "way");
+        assert_eq!(lifecycle_key, "demolished:building");
+        assert_eq!(lifecycle_value, "yes");
+        assert_eq!(geom_type, "POLYGON");
+
+        let geom_valid: bool = conn.query_row(
+            "SELECT ST_IsValid(geom) FROM osm_former_buildings WHERE osm_id = 664679941",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(geom_valid, "Former building geometry should be valid");
+
+        // Disjointness: osm_buildings still has exactly the 2 real buildings,
+        // and the former-building way must not have leaked into it.
+        let buildings: i64 =
+            conn.query_row("SELECT COUNT(*) FROM osm_buildings", [], |row| row.get(0))?;
+        assert_eq!(buildings, 2, "osm_buildings should be unaffected");
+
+        let leaked: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 664679941",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            leaked, 0,
+            "Former building must not appear in osm_buildings"
+        );
 
         Ok(())
     }

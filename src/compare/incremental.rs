@@ -280,4 +280,40 @@ mod tests {
             "the under-construction building must never be served as unmatched"
         );
     }
+
+    /// The per-cell recompute must apply the same former-building veto as the
+    /// full compare -- a government building fully covered by an
+    /// `osm_former_buildings` polygon must not be served here either, or an
+    /// incremental recompute could disagree with `full_vs_incremental_equivalence`.
+    #[test]
+    fn recompute_excludes_former_buildings() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
+                 ('suppressed', ST_MakeEnvelope(21.0,52.0,21.001,52.001));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             INSERT INTO osm_former_buildings VALUES
+                 (1, 'way', 'demolished:building', 'yes',
+                  ST_MakeEnvelope(20.9999,51.9999,21.0011,52.0011));",
+        )
+        .unwrap();
+        let (cx, cy) = lonlat_to_tile(21.0005, 52.0005, CHANGE_CELL_ZOOM);
+
+        recompute_cell(&c, "bdot10k", cx as i32, cy as i32).unwrap();
+
+        let ids: Vec<String> = {
+            let mut s = c
+                .prepare("SELECT LOKALNYID FROM bdot10k_unmatched ORDER BY LOKALNYID")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            Vec::<String>::new(),
+            "a former-building-suppressed building must never be served as unmatched"
+        );
+    }
 }

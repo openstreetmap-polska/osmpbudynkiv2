@@ -4,7 +4,9 @@ use tracing::info;
 
 use crate::compare::columns::classification_columns;
 use crate::compare::in_transaction;
-use crate::compare::rule::{BDOT10K_EKSPLOATOWANY_FILTER, unmatched_buildings_sql};
+use crate::compare::rule::{
+    BDOT10K_EKSPLOATOWANY_FILTER, suppressed_buildings_sql, unmatched_buildings_sql,
+};
 use crate::compare::totals;
 use crate::tile_math::{cell_x_sql, cell_y_sql};
 use crate::utils::format_duration;
@@ -50,12 +52,16 @@ fn compare_buildings(
     // source_grid_extent) leaves `dest` empty rather than leaving the previous
     // comparison in place. See `compare::in_transaction` for the incident this
     // guards against.
-    in_transaction(conn, label, || {
+    // Returned from the closure (`in_transaction` is generic in T) so the log
+    // line below can reuse it for `suppressed_buildings_sql` rather than
+    // recomputing an `ST_Extent_Agg` over the whole source table again.
+    let extent = in_transaction(conn, label, || {
         conn.execute_batch(&format!("DELETE FROM {dest};"))
             .with_context(|| format!("Failed to clear {dest}"))?;
 
-        let (min_x, min_y, max_x, max_y) = source_grid_extent(conn, source_table, GRID_STEP)
-            .with_context(|| format!("Failed to compute source extent for {source_table}"))?;
+        let extent @ (min_x, min_y, max_x, max_y) =
+            source_grid_extent(conn, source_table, GRID_STEP)
+                .with_context(|| format!("Failed to compute source extent for {source_table}"))?;
         let cx = cell_x_sql("b.centroid");
         let cy = cell_y_sql("b.centroid");
         let cc = classification_columns(source_table);
@@ -91,15 +97,17 @@ fn compare_buildings(
         // numerator and denominator always come from one comparison.
         totals::rebuild_all_in_txn(conn, label)
             .with_context(|| format!("Failed to rebuild cell totals for {label}"))?;
-        Ok(())
+        Ok(extent)
     })?;
 
     // total is now accurate: the grid above covers the source table's full
     // extent (source_grid_extent), and the write-narrow guard means each row
-    // is written by exactly one cell, so matched = total - unmatched holds.
-    // `total` applies the same extra_filter as the comparison itself
+    // is written by exactly one cell, so matched = total - unmatched - suppressed
+    // holds. `total` applies the same extra_filter as the comparison itself
     // (e.g. BDOT10K_EKSPLOATOWANY_FILTER), so a filtered-out row is neither
-    // matched nor unmatched -- it's simply excluded from both counts.
+    // matched nor unmatched nor suppressed -- it's simply excluded from every
+    // count. `total` itself is unchanged by suppression: a suppressed building
+    // is still a government building, just one OSM has recorded as gone.
     let total_where = extra_filter
         .map(|f| format!("WHERE {f}"))
         .unwrap_or_default();
@@ -111,8 +119,29 @@ fn compare_buildings(
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    // Gated on an instant read of osm_former_buildings so a database that has
+    // not been re-imported -- and every test fixture -- pays nothing extra:
+    // suppressed_buildings_sql runs one whole-extent query instead of the
+    // grid's 264 cell-scoped ones, see Step 6 of the design for the cost
+    // caveat and its decision rule if this ever measures as too slow on the
+    // Poland database.
+    let former_building_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM osm_former_buildings", [], |r| {
+            r.get(0)
+        })
+        .context("Failed to count osm_former_buildings")?;
+    let suppressed: i64 = if former_building_rows > 0 {
+        conn.query_row(
+            &suppressed_buildings_sql(source_table, "COUNT(*)", extent, extra_filter),
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("Failed to count suppressed rows for {label}"))?
+    } else {
+        0
+    };
     info!(
-        source = label, total, unmatched, matched = total - unmatched,
+        source = label, total, unmatched, suppressed, matched = total - unmatched - suppressed,
         elapsed = %format_duration(t.elapsed()),
         "buildings comparison complete"
     );
@@ -414,6 +443,62 @@ mod tests {
             ids,
             vec!["lonely".to_string()],
             "the under-construction building must never be served as unmatched"
+        );
+    }
+
+    /// A government building fully covered by an `osm_former_buildings`
+    /// polygon must be excluded from `bdot10k_unmatched` (the veto), but --
+    /// unlike a `KATEGORIAISTNIENIA`-filtered row -- it must still count
+    /// towards `cell_totals`: it is comparable, and OSM has effectively
+    /// handled it, so the denominator stays whole (see `compare::totals`'s
+    /// module doc for why `cell_totals` deliberately does not mirror the veto).
+    /// The second assertion below is what pins that denominator decision.
+    #[test]
+    fn former_building_excludes_from_unmatched_but_cell_totals_still_counts_it() {
+        let conn = setup();
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
+                 ('suppressed', ST_MakeEnvelope(22.0,53.0,22.001,53.001));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             INSERT INTO osm_former_buildings VALUES
+                 (1, 'way', 'demolished:building', 'yes',
+                  ST_MakeEnvelope(21.9999,52.9999,22.0011,53.0011));",
+        )
+        .unwrap();
+        compare_bdot10k(&conn).unwrap();
+
+        let ids: Vec<String> = {
+            let mut s = conn
+                .prepare("SELECT LOKALNYID FROM bdot10k_unmatched")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            Vec::<String>::new(),
+            "a former-building-suppressed building must never be served as unmatched"
+        );
+
+        let (cx, cy) =
+            crate::tile_math::lonlat_to_tile(22.0005, 53.0005, crate::tile_math::CHANGE_CELL_ZOOM);
+        let total: i64 = conn
+            .query_row(
+                "SELECT total FROM cell_totals WHERE source = 'bdot10k' AND cell_x = ? AND cell_y = ?",
+                duckdb::params![cx as i32, cy as i32],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total, 1,
+            "a suppressed building must still count towards its cell's denominator"
         );
     }
 }
