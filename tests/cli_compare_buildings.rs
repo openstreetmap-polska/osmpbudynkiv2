@@ -221,11 +221,14 @@ fn test_compare_buildings_all() {
 
 /// Correctness: verify the comparison actually produces the expected unmatched
 /// set (not just that the command runs and logs "complete"). The fixture has
-/// 74 rows in each source table and exactly one real match against OSM
-/// building 947235698 (a way), with the other OSM building — relation
-/// 1891415, a school — never matching because no government centroid falls
-/// inside it. So each `*_unmatched` serving table ends up with 73 rows, and
-/// the matched id is absent from it.
+/// 74 rows in each source table and two real matches against OSM: way
+/// 947235698 covers one government building in each source almost exactly,
+/// and relation 1891415 (a school) covers another almost exactly by
+/// footprint overlap even though its centroid falls outside the relation's
+/// outline — a match the old centroid-containment rule missed (see
+/// `rule::unmatched_buildings_sql`'s overlap-based matching, git 6416e69).
+/// So each `*_unmatched` serving table ends up with 72 rows, and the two
+/// matched ids are absent from it.
 #[test]
 fn test_compare_buildings_correctness() {
     let (cfg, _db_dir, _rocksdb_dir, db_path) = persistent_config();
@@ -237,45 +240,49 @@ fn test_compare_buildings_correctness() {
         .assert()
         .success();
 
-    // Row counts: 73 of 74 are unmatched (1 real match).
+    // Row counts: 72 of 74 are unmatched (2 real matches).
     assert_eq!(
         unmatched_count(&db_path, "bdot10k_unmatched"),
-        73,
-        "bdot10k_unmatched: expected 73 unmatched rows"
+        72,
+        "bdot10k_unmatched: expected 72 unmatched rows"
     );
     assert_eq!(
         unmatched_count(&db_path, "egib_unmatched"),
-        73,
-        "egib_unmatched: expected 73 unmatched rows"
+        72,
+        "egib_unmatched: expected 72 unmatched rows"
     );
 
     let conn = Connection::open(&db_path).unwrap();
 
-    // The matched BDOT10k row must be absent from the serving table.
+    // The matched BDOT10k rows must be absent from the serving table.
     let bdot10k_matched_present: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM bdot10k_unmatched
-             WHERE LOKALNYID = '38F62226-DC07-F520-E053-CA2BA8C0BE14'",
+             WHERE LOKALNYID IN (
+                 '38F62226-DC07-F520-E053-CA2BA8C0BE14',
+                 '38F62224-FC6D-F520-E053-CA2BA8C0BE14'
+             )",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(
         bdot10k_matched_present, 0,
-        "the matched BDOT10k building must not appear in bdot10k_unmatched"
+        "the matched BDOT10k buildings must not appear in bdot10k_unmatched"
     );
 
-    // The matched EGIB row must be absent from the serving table.
+    // The matched EGIB rows must be absent from the serving table.
     let egib_matched_present: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM egib_unmatched WHERE id_budynku = '146505_8.0110.32_BUD'",
+            "SELECT COUNT(*) FROM egib_unmatched
+             WHERE id_budynku IN ('146505_8.0110.32_BUD', '146505_8.0110.1186_BUD')",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(
         egib_matched_present, 0,
-        "the matched EGIB building must not appear in egib_unmatched"
+        "the matched EGIB buildings must not appear in egib_unmatched"
     );
 
     // Every row in the serving tables must carry cell tags and a timestamp.
@@ -364,7 +371,7 @@ fn test_compare_buildings_partial_imports_fails_after_bdot10k_ran() {
 
     // BDOT10k stage wrote its full output before EGIB stage failed.
     assert!(table_exists(&db_path, "bdot10k_unmatched"));
-    assert_eq!(unmatched_count(&db_path, "bdot10k_unmatched"), 73);
+    assert_eq!(unmatched_count(&db_path, "bdot10k_unmatched"), 72);
 
     // egib_unmatched exists (created by init_db) but stayed empty: the
     // stage's DELETE ran, but the source-reading INSERT failed.
