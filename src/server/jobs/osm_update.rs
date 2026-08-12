@@ -26,6 +26,7 @@ impl Job for OsmUpdateJob {
             &ctx.kv,
             &ctx.config,
             &ctx.config.download_urls.osm_replication,
+            false,
         )
     }
 }

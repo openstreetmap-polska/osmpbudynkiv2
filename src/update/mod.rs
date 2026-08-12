@@ -23,7 +23,10 @@ pub fn run(
     urls: &DownloadUrls,
 ) -> Result<()> {
     match source {
-        UpdateSource::Osm => osm::update(conn, kv, config, &urls.osm_replication),
+        // `update::run` is only ever reached from the interactive CLI path
+        // (`main.rs`'s `Command::Update`) -- the background job calls
+        // `osm::update` directly instead, see `server::jobs::osm_update`.
+        UpdateSource::Osm => osm::update(conn, kv, config, &urls.osm_replication, true),
         UpdateSource::Bdot10k { file } => {
             let mut etag = None;
             if file.is_none() {

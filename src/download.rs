@@ -5,13 +5,24 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::runtime::Runtime;
-use tracing::info;
+use tracing::{debug, info};
 
 const MAX_RETRIES: u32 = 3;
 
 /// Download a file from `url` to `dest_dir`, returning the path to the downloaded file.
 /// Uses exponential backoff on failure.
 pub fn download_file(url: &str, dest_dir: &Path) -> Result<PathBuf> {
+    download_file_impl(url, dest_dir, true)
+}
+
+/// Same as [`download_file`], but without a progress bar. For callers that
+/// download many small files in a loop (e.g. OSM replication diffs), where a
+/// bar per file is just noise rather than useful progress.
+pub fn download_file_quiet(url: &str, dest_dir: &Path) -> Result<PathBuf> {
+    download_file_impl(url, dest_dir, false)
+}
+
+fn download_file_impl(url: &str, dest_dir: &Path, show_progress: bool) -> Result<PathBuf> {
     let file_name = url
         .rsplit('/')
         .next()
@@ -19,7 +30,11 @@ pub fn download_file(url: &str, dest_dir: &Path) -> Result<PathBuf> {
     let dest_path = dest_dir.join(file_name);
 
     if dest_path.exists() {
-        info!(path = %dest_path.display(), "File already exists, skipping download");
+        if show_progress {
+            info!(path = %dest_path.display(), "File already exists, skipping download");
+        } else {
+            debug!(path = %dest_path.display(), "File already exists, skipping download");
+        }
         return Ok(dest_path);
     }
 
@@ -27,7 +42,7 @@ pub fn download_file(url: &str, dest_dir: &Path) -> Result<PathBuf> {
         .with_context(|| format!("Failed to create directory {dest_dir:?}"))?;
 
     let rt = Runtime::new().context("Failed to create tokio runtime")?;
-    rt.block_on(download_with_retry(url, &dest_path))?;
+    rt.block_on(download_with_retry(url, &dest_path, show_progress))?;
 
     Ok(dest_path)
 }
@@ -46,19 +61,23 @@ pub fn download_file_as(url: &str, dest_dir: &Path, file_name: &str) -> Result<P
         .with_context(|| format!("Failed to create directory {dest_dir:?}"))?;
 
     let rt = Runtime::new().context("Failed to create tokio runtime")?;
-    rt.block_on(download_with_retry(url, &dest_path))?;
+    rt.block_on(download_with_retry(url, &dest_path, true))?;
 
     Ok(dest_path)
 }
 
-async fn download_with_retry(url: &str, dest_path: &Path) -> Result<()> {
+async fn download_with_retry(url: &str, dest_path: &Path, show_progress: bool) -> Result<()> {
     let client = reqwest::Client::new();
     let mut last_error = None;
 
     for attempt in 1..=MAX_RETRIES {
-        info!(url, attempt, "Downloading");
+        if show_progress {
+            info!(url, attempt, "Downloading");
+        } else {
+            debug!(url, attempt, "Downloading");
+        }
 
-        match do_download(&client, url, dest_path).await {
+        match do_download(&client, url, dest_path, show_progress).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(attempt, error = %e, "Download failed");
@@ -78,38 +97,49 @@ async fn download_with_retry(url: &str, dest_path: &Path) -> Result<()> {
     ))
 }
 
-async fn do_download(client: &reqwest::Client, url: &str, dest_path: &Path) -> Result<()> {
+async fn do_download(
+    client: &reqwest::Client,
+    url: &str,
+    dest_path: &Path,
+    show_progress: bool,
+) -> Result<()> {
     let response = client.get(url).send().await?.error_for_status()?;
 
     let total_size = response.content_length();
 
-    let pb = match total_size {
-        Some(size) => {
-            let pb = ProgressBar::new(size);
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-                )
-                .unwrap()
-                .progress_chars("=>-"),
-            );
-            pb
-        }
-        None => {
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{msg}\n{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})",
-                )
-                .unwrap(),
-            );
-            pb
-        }
+    let pb = if show_progress {
+        Some(match total_size {
+            Some(size) => {
+                let pb = ProgressBar::new(size);
+                pb.set_style(
+                    ProgressStyle::with_template(
+                        "{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                    )
+                    .unwrap()
+                    .progress_chars("=>-"),
+                );
+                pb
+            }
+            None => {
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(
+                    ProgressStyle::with_template(
+                        "{msg}\n{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})",
+                    )
+                    .unwrap(),
+                );
+                pb
+            }
+        })
+    } else {
+        None
     };
-    pb.set_message(format!(
-        "Downloading {}",
-        dest_path.file_name().unwrap_or_default().to_string_lossy()
-    ));
+    if let Some(pb) = &pb {
+        pb.set_message(format!(
+            "Downloading {}",
+            dest_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
 
     let file = std::fs::File::create(dest_path)
         .with_context(|| format!("Failed to create {dest_path:?}"))?;
@@ -121,18 +151,26 @@ async fn do_download(client: &reqwest::Client, url: &str, dest_path: &Path) -> R
         writer
             .write_all(&chunk)
             .with_context(|| format!("Failed to write to {dest_path:?}"))?;
-        pb.inc(chunk.len() as u64);
+        if let Some(pb) = &pb {
+            pb.inc(chunk.len() as u64);
+        }
     }
 
     writer
         .flush()
         .with_context(|| format!("Failed to flush {dest_path:?}"))?;
 
-    pb.finish_with_message(format!(
-        "Downloaded {}",
-        dest_path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    info!(path = %dest_path.display(), "Download complete");
+    if let Some(pb) = &pb {
+        pb.finish_with_message(format!(
+            "Downloaded {}",
+            dest_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+    if show_progress {
+        info!(path = %dest_path.display(), "Download complete");
+    } else {
+        debug!(path = %dest_path.display(), "Download complete");
+    }
     Ok(())
 }
 
@@ -196,7 +234,7 @@ mod tests {
         // download_file uses block_on internally; call do_download directly to avoid nested runtime
         let client = reqwest::Client::new();
         let dest = tmp.path().join("testfile.bin");
-        do_download(&client, &url, &dest).await.unwrap();
+        do_download(&client, &url, &dest, true).await.unwrap();
         std::fs::read(&dest).unwrap()
     }
 

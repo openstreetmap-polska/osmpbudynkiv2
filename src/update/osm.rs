@@ -5,10 +5,11 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;
 use flate2::read::GzDecoder;
+use indicatif::{ProgressBar, ProgressStyle};
 use tracing::info;
 
 use crate::config::Config;
-use crate::download::download_file;
+use crate::download::download_file_quiet;
 use crate::osm::kvstore::RocksDB;
 use crate::osm::replication::{
     ChangeAction, OsmChange, RelationChange, WayChange, parse_osc, parse_state_txt,
@@ -17,11 +18,20 @@ use crate::osm::replication::{
 use crate::osm::{encoding, kvstore};
 use crate::update::dirty_cells::{DirtyCells, Layer};
 
+/// Apply pending OSM replication sequences.
+///
+/// `show_progress` gates a single overall progress bar covering the whole
+/// run (as opposed to one per downloaded `.osc.gz`, which would just be
+/// noise). Pass `true` only from an interactive CLI invocation -- a
+/// background job renders no terminal, and a progress bar's carriage-return
+/// redraws would otherwise pollute its log output. Individual sequence
+/// downloads never get their own bar either way; see `download_file_quiet`.
 pub fn update(
     conn: &Connection,
     kv: &RocksDB,
     config: &Config,
     replication_base_url: &str,
+    show_progress: bool,
 ) -> Result<()> {
     let download_dir = config.download_dir();
     let current_seq = get_current_sequence(conn)?;
@@ -39,9 +49,27 @@ pub fn update(
     let pending = latest_seq - current_seq;
     info!(pending, "Sequences to apply");
 
+    let pb = if show_progress {
+        let pb = ProgressBar::new(pending);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        pb.set_message("Applying OSM replication sequences");
+        Some(pb)
+    } else {
+        None
+    };
+
     for seq in (current_seq + 1)..=latest_seq {
         if crate::shutdown::is_requested() {
             info!("Shutdown requested, stopping update");
+            if let Some(pb) = &pb {
+                pb.abandon_with_message("Shutdown requested");
+            }
             return Ok(());
         }
 
@@ -54,7 +82,9 @@ pub fn update(
             &latest_timestamp,
         )?;
 
-        if (seq - current_seq) % 100 == 0 {
+        if let Some(pb) = &pb {
+            pb.inc(1);
+        } else if (seq - current_seq) % 100 == 0 {
             info!(
                 seq,
                 progress = format!("{}/{}", seq - current_seq, pending),
@@ -63,6 +93,9 @@ pub fn update(
         }
     }
 
+    if let Some(pb) = &pb {
+        pb.finish_with_message("OSM update complete");
+    }
     info!(final_seq = latest_seq, "OSM update complete");
     Ok(())
 }
@@ -84,7 +117,7 @@ fn get_current_sequence(conn: &Connection) -> Result<u64> {
 
 fn fetch_latest_sequence(replication_base_url: &str, download_dir: &Path) -> Result<(u64, String)> {
     let url = format!("{replication_base_url}/state.txt");
-    let state_path = download_file(&url, download_dir)?;
+    let state_path = download_file_quiet(&url, download_dir)?;
     let text = std::fs::read_to_string(&state_path).context("Failed to read state.txt")?;
     let _ = std::fs::remove_file(&state_path);
     parse_state_txt(&text)
@@ -102,7 +135,7 @@ fn apply_sequence(
     let path = sequence_to_path(seq);
     let url = format!("{replication_base_url}/{path}");
 
-    let osc_gz_path = download_file(&url, download_dir)?;
+    let osc_gz_path = download_file_quiet(&url, download_dir)?;
     let osc_xml = decompress_gz(&osc_gz_path)?;
     let _ = std::fs::remove_file(&osc_gz_path);
 
