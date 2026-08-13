@@ -17,10 +17,12 @@ pub fn tile_to_bbox(z: u32, x: u32, y: u32) -> (f64, f64, f64, f64) {
 
 /// XYZ tile containing a lon/lat point. Inverse of [`tile_to_bbox`].
 ///
-/// Test-only in the binary: the production change-area path computes tiles in
-/// SQL (see `update::changeset`), and this is the Rust side that keeps those
-/// two projections honest via round-trip assertions.
-#[allow(dead_code)]
+/// Not test-only: `update::dirty_cells::DirtyCells::note_point` calls this
+/// directly for the node fast path (no query), so it's on the production
+/// enqueue path for every OSM address create/modify. It's also the Rust side
+/// used throughout this codebase's tests to keep the SQL projection (see
+/// `cell_x_sql`/`cell_y_sql` below, and `update::changeset`'s SQL-side tile
+/// computation) honest via round-trip assertions.
 pub fn lonlat_to_tile(lon: f64, lat: f64, z: u32) -> (u32, u32) {
     let n = 2f64.powi(z as i32);
     let x = ((lon + 180.0) / 360.0 * n).floor();

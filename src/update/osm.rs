@@ -1355,8 +1355,9 @@ mod tests {
         Ok(())
     }
 
-    /// An OSM diff that adds a served address node must enqueue the 3x3
-    /// z14 neighbourhood of its cell under source 'prg', and must NOT touch
+    /// An OSM diff that adds a served address node, well inside a single z14
+    /// cell (further from every edge than `OSM_MATCH_BUFFER_DEG`), must
+    /// enqueue exactly that one cell under source 'prg', and must NOT touch
     /// the building sources.
     ///
     /// A `.osc.gz`-driven CLI test was tried first: `fixtures/osm.osc.gz`
@@ -1366,16 +1367,34 @@ mod tests {
     /// `.osc.gz` would just re-encode this same `OsmChange` value in XML+gz
     /// for no added assurance, so this unit test exercises `apply_changes`
     /// directly instead (per the task's documented fallback).
+    ///
+    /// The fixture point is deliberately NOT the original (21.0, 51.0):
+    /// verified that point sits at z14 cell (9147, 5484), but the buffered
+    /// read at 51.0 - OSM_MATCH_BUFFER_DEG lands in cell_y 5485 -- a real
+    /// latitude boundary just 0.001 degrees south of it. That would make
+    /// this test assert 2 for reasons that have nothing to do with the
+    /// layer-gating it's meant to cover, and everything to do with an
+    /// accident of the fixture's position. Repositioning to the interior of
+    /// the same cell (its `tile_to_bbox` midpoint, the technique
+    /// `compare::incremental`'s tests already use) keeps the assertion about
+    /// layer gating rather than boundary geometry.
     #[test]
     fn test_apply_node_create_enqueues_prg_dirty_cells() -> Result<()> {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        let (cx, cy) =
+            crate::tile_math::lonlat_to_tile(21.0, 51.0, crate::tile_math::CHANGE_CELL_ZOOM);
+        let (min_lon, min_lat, max_lon, max_lat) =
+            crate::tile_math::tile_to_bbox(crate::tile_math::CHANGE_CELL_ZOOM, cx, cy);
+        let lon = (min_lon + max_lon) / 2.0;
+        let lat = (min_lat + max_lat) / 2.0;
 
         let changes = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Create,
                 id: 10,
-                lon: 21.0,
-                lat: 51.0,
+                lon,
+                lat,
                 tags: vec![
                     ("addr:housenumber".into(), "5".into()),
                     ("addr:street".into(), "Nowa".into()),
@@ -1387,13 +1406,21 @@ mod tests {
         apply_changes(&conn, &kv, &changes)?;
 
         let (px, py) =
-            crate::tile_math::lonlat_to_tile(21.0, 51.0, crate::tile_math::CHANGE_CELL_ZOOM);
+            crate::tile_math::lonlat_to_tile(lon, lat, crate::tile_math::CHANGE_CELL_ZOOM);
+        assert_eq!(
+            (px, py),
+            (cx, cy),
+            "sanity: the cell midpoint must remain in the same cell as the original fixture point"
+        );
         let prg: i64 = conn.query_row(
             "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'prg'",
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(prg, 9, "3x3 neighbourhood should be enqueued for prg");
+        assert_eq!(
+            prg, 1,
+            "an address well inside a single cell must enqueue only that cell"
+        );
         let center: i64 = conn.query_row(
             "SELECT COUNT(*) FROM match_dirty_cells
              WHERE source = 'prg' AND cell_x = ? AND cell_y = ?",
@@ -1415,9 +1442,10 @@ mod tests {
         Ok(())
     }
 
-    /// Deleting a served building way must enqueue the 3x3 neighbourhood of
-    /// the cell it left under BOTH building sources (bdot10k + egib), and
-    /// must NOT touch prg (the way carries no address in this fixture).
+    /// Deleting a served building way must enqueue exactly the cell it left
+    /// (way 100's fixture square sits well inside a single z14 cell) under
+    /// BOTH building sources (bdot10k + egib), and must NOT touch prg (the
+    /// way carries no address in this fixture).
     #[test]
     fn test_apply_way_delete_enqueues_building_dirty_cells() -> Result<()> {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;
@@ -1440,7 +1468,10 @@ mod tests {
                 duckdb::params![source],
                 |row| row.get(0),
             )?;
-            assert_eq!(n, 9, "3x3 neighbourhood should be enqueued for {source}");
+            assert_eq!(
+                n, 1,
+                "exactly the vacated cell should be enqueued for {source}"
+            );
         }
         let prg: i64 = conn.query_row(
             "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'prg'",
@@ -1538,6 +1569,160 @@ mod tests {
         Ok(())
     }
 
+    /// The real gap the fixed-3x3-removal left uncovered: every other test
+    /// in this file that exercises the *serving* consequence of an edit
+    /// (`osc_xml_flows_through_parse_apply_drain_into_the_serving_table`
+    /// above, plus `compare::full_vs_incremental_equivalence` and
+    /// `compare::drain_refresh_concurrency`) seeds `match_dirty_cells` either
+    /// with a single-cell fixture or via `reconcile::enqueue_all`, which
+    /// builds cells straight in SQL and never calls `DirtyCells` at all. None
+    /// of them would notice if `note_existing` regressed to recording only a
+    /// row's centroid cell instead of its whole (buffered) bbox range.
+    ///
+    /// Here way 300's bbox straddles the boundary between z14 cells A (its
+    /// own home cell, where its centroid lands) and B (a neighbour it only
+    /// barely pokes into), while the government building it matches, gov1,
+    /// sits entirely inside B. Deleting way 300 must enqueue BOTH cells: A
+    /// (empty, a no-op recompute) and B, where gov1 must come back as
+    /// unmatched. Under a hypothetical regression that recorded only way
+    /// 300's centroid cell (A), B would never be enqueued and the drain would
+    /// never touch it -- confirmed by temporarily reverting `note_existing`
+    /// to the old `ST_Centroid`-based single-cell query and re-running this
+    /// test: it fails at the `queued == 2` sanity check first (1, not 2 --
+    /// that assertion alone already pins the regression), and would fail at
+    /// the final `served_after` assertion too (`0`, not `1`) if the earlier
+    /// one were removed.
+    ///
+    /// Boundary coordinates come from `tile_to_bbox`'s own computed f64
+    /// output, offset by a dyadic (exact in f64) fraction, per the CLAUDE.md
+    /// gotcha on hand-written geometry fixtures -- same technique as
+    /// `dirty_cells::tests::note_existing_records_both_cells_a_straddling_bbox_touches`.
+    #[test]
+    fn osc_xml_straddling_cell_boundary_updates_the_neighbouring_cells_serving_table() -> Result<()>
+    {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER,
+                 kondygnacje_podziemne INTEGER, rodzaj VARCHAR);
+             CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);",
+        )?;
+
+        let (min_lon_a, min_lat, max_lon_a, max_lat) =
+            crate::tile_math::tile_to_bbox(crate::tile_math::CHANGE_CELL_ZOOM, 9147, 5411);
+        let mid_lat = (min_lat + max_lat) / 2.0;
+        let shift = 1.0 / 8192.0; // ~13.7m at this latitude; exact in f64.
+
+        // Way 300: deep inside cell A on its west side, poking just past the
+        // A/B boundary (max_lon_a) to the east.
+        let way_min_lon = min_lon_a + 0.002;
+        let way_max_lon = max_lon_a + shift;
+        let way_min_lat = mid_lat - 0.001;
+        let way_max_lat = mid_lat + 0.001;
+
+        // gov1: entirely inside B, inside the sliver way 300 pokes into, so
+        // it starts out fully covered (matched).
+        let gov_min_lon = max_lon_a + shift / 4.0;
+        let gov_max_lon = max_lon_a + shift / 2.0;
+        let gov_min_lat = mid_lat - shift / 4.0;
+        let gov_max_lat = mid_lat + shift / 4.0;
+
+        conn.execute_batch(&format!(
+            "INSERT INTO osm_buildings VALUES (300, 'way', 'yes', ST_MakeEnvelope(
+                 {way_min_lon}, {way_min_lat}, {way_max_lon}, {way_max_lat}));
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
+                 ('gov1', ST_MakeEnvelope({gov_min_lon}, {gov_min_lat}, {gov_max_lon}, {gov_max_lat}));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);"
+        ))?;
+
+        // Sanity check the fixture: way 300's bbox really does straddle
+        // cells 9147/9148, and gov1 really does sit in the neighbouring
+        // cell B (9148), not way 300's own home cell A (9147).
+        let (way_cx_west, way_cy) = crate::tile_math::lonlat_to_tile(
+            way_min_lon,
+            mid_lat,
+            crate::tile_math::CHANGE_CELL_ZOOM,
+        );
+        let (way_cx_east, _) = crate::tile_math::lonlat_to_tile(
+            way_max_lon,
+            mid_lat,
+            crate::tile_math::CHANGE_CELL_ZOOM,
+        );
+        assert_eq!(
+            (way_cx_west, way_cy, way_cx_east),
+            (9147, 5411, 9148),
+            "sanity: way 300's bbox must straddle cells 9147 and 9148"
+        );
+        let (gov_cx, gov_cy) = crate::tile_math::lonlat_to_tile(
+            (gov_min_lon + gov_max_lon) / 2.0,
+            (gov_min_lat + gov_max_lat) / 2.0,
+            crate::tile_math::CHANGE_CELL_ZOOM,
+        );
+        assert_eq!(
+            (gov_cx, gov_cy),
+            (9148, 5411),
+            "sanity: gov1 must sit in the neighbouring cell B, not way 300's home cell A"
+        );
+
+        // Baseline: gov1 is covered by way 300, so it is matched and not served.
+        crate::compare::buildings::compare_bdot10k(&conn)?;
+        let served: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM bdot10k_unmatched WHERE LOKALNYID = 'gov1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            served, 0,
+            "precondition: gov1 is covered by way 300, so it must not be served"
+        );
+
+        // An editor deletes the OSM way, arriving as replication XML.
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <delete>
+    <way id="300" version="2"/>
+  </delete>
+</osmChange>"#;
+        let changes = parse_osc(osc)?;
+        apply_changes(&conn, &kv, &changes)?;
+
+        // Both cells must be enqueued: way 300's own bbox spans exactly 2
+        // cells and buildings carry no OSM read buffer (layer_buffer_deg).
+        let queued: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'bdot10k'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            queued, 2,
+            "the delete must enqueue exactly the 2 cells way 300's bbox touched"
+        );
+
+        let stats = crate::compare::drain::drain_batch(&conn, 100, &|| false)?;
+        assert_eq!(stats.failed, 0, "no cell may fail to recompute");
+
+        // gov1, in the NEIGHBOURING cell, must reappear as unmatched.
+        let served_after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM bdot10k_unmatched WHERE LOKALNYID = 'gov1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            served_after, 1,
+            "after way 300 was deleted, gov1 in the neighbouring cell must reappear as unmatched"
+        );
+
+        Ok(())
+    }
+
     /// A Modify that strips every building/address tag off a served way is a
     /// de-tag: the OSM building is gone even though the way still exists. The
     /// base row must go with it, and the cell must be enqueued so the
@@ -1576,7 +1761,7 @@ mod tests {
                 |row| row.get(0),
             )?;
             assert_eq!(
-                n, 9,
+                n, 1,
                 "de-tagged way must enqueue the cell it left for {source}"
             );
         }
@@ -1641,8 +1826,8 @@ mod tests {
                 duckdb::params![source],
                 |row| row.get(0),
             )?;
-            assert!(
-                n >= 9,
+            assert_eq!(
+                n, 1,
                 "de-tagged relation must enqueue the cell it left for {source}, got {n}"
             );
         }
@@ -1707,7 +1892,7 @@ mod tests {
                 duckdb::params![source],
                 |row| row.get(0),
             )?;
-            assert_eq!(n, 9, "retag must enqueue the vacated cell for {source}");
+            assert_eq!(n, 1, "retag must enqueue the vacated cell for {source}");
         }
 
         Ok(())
@@ -1936,8 +2121,9 @@ mod tests {
     }
 
     /// Deleting a former-building way must remove its `osm_former_buildings`
-    /// row and enqueue the vacated cell's 3x3 neighbourhood under both
-    /// building sources, mirroring `test_apply_way_delete_enqueues_building_dirty_cells`.
+    /// row and enqueue exactly the cell it left (fixture square sits well
+    /// inside a single z14 cell) under both building sources, mirroring
+    /// `test_apply_way_delete_enqueues_building_dirty_cells`.
     #[test]
     fn test_apply_way_delete_removes_former_building_row_and_enqueues_dirty_cells() -> Result<()> {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;
@@ -1987,7 +2173,7 @@ mod tests {
                 |row| row.get(0),
             )?;
             assert_eq!(
-                n, 9,
+                n, 1,
                 "deleting a former-building way must enqueue the cell it left for {source}"
             );
         }
