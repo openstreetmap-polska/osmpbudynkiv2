@@ -11,7 +11,8 @@ use crate::utils::format_duration;
 
 /// Create `target_table` from a BDOT10k GeoParquet file, including the
 /// `_row_hash` column, then delete any invalid-geometry rows (see
-/// `docs/invalid_geometry_tile_500s.md`). Does NOT create an index --
+/// `docs/invalid_geometry_tile_500s.md`) and any oversized-geometry rows
+/// (see `dataset::filter_oversized_geometry`). Does NOT create an index --
 /// callers that need one create it themselves, and the update path
 /// deliberately does not.
 ///
@@ -43,7 +44,9 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
     ))
     .with_context(|| format!("Failed to load BDOT10k data into {target_table}"))?;
 
-    crate::dataset::filter_invalid_geometry(conn, target_table, "LOKALNYID")
+    let stats = crate::dataset::filter_invalid_geometry(conn, target_table, "LOKALNYID")?;
+    let oversized = crate::dataset::filter_oversized_geometry(conn, target_table, "LOKALNYID")?;
+    Ok(stats.merge_oversized(oversized))
 }
 
 pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str) -> Result<()> {
@@ -109,24 +112,30 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
     outcome.map(|_| ())
 }
 
-/// Human-readable message for the `job_run_log` row.
+/// Human-readable message for the `job_run_log` row. Reports both skip
+/// reasons `load_into` can produce -- invalid geometry and oversized
+/// geometry -- via the shared `dataset::format_skip_clause`, so a change to
+/// one clause's wording can't drift from the other's.
 fn summarize(stats: &LoadStats) -> String {
-    if stats.skipped_invalid_geometry == 0 {
-        return "no invalid geometry".to_string();
+    let mut parts = Vec::new();
+    if stats.skipped_invalid_geometry > 0 {
+        parts.push(crate::dataset::format_skip_clause(
+            "invalid-geometry",
+            stats.skipped_invalid_geometry,
+            &stats.skipped_example_ids,
+        ));
     }
-    let shown = stats.skipped_example_ids.join(", ");
-    let more =
-        (stats.skipped_invalid_geometry as usize).saturating_sub(stats.skipped_example_ids.len());
-    if more > 0 {
-        format!(
-            "skipped {} invalid-geometry rows (ids: {shown}, +{more} more)",
-            stats.skipped_invalid_geometry
-        )
+    if stats.skipped_oversized_geometry > 0 {
+        parts.push(crate::dataset::format_skip_clause(
+            "oversized-geometry",
+            stats.skipped_oversized_geometry,
+            &stats.skipped_oversized_example_ids,
+        ));
+    }
+    if parts.is_empty() {
+        "no invalid or oversized geometry".to_string()
     } else {
-        format!(
-            "skipped {} invalid-geometry rows (ids: {shown})",
-            stats.skipped_invalid_geometry
-        )
+        parts.join("; ")
     }
 }
 
@@ -202,6 +211,42 @@ mod tests {
         assert_eq!(stats.skipped_example_ids, vec!["bad".to_string()]);
     }
 
+    /// Same rationale and shape as `load_into_drops_a_deliberately_invalid_row`
+    /// above, for the second filter `load_into` runs -- this is what proves
+    /// the filter also runs on the *update* staging path, not just import:
+    /// `update::dataset::refresh` calls this same `load_into` with the
+    /// staging table as `target_table` (see `update::mod::run`'s `Bdot10k`
+    /// arm), so whatever `load_into` does to `target_table` here it does to
+    /// `<table>__staging` there too -- one funnel, no separate call site to
+    /// keep in sync.
+    #[test]
+    fn load_into_drops_a_deliberately_oversized_row() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY);
+             INSERT INTO bdot10k_buildings VALUES
+                 ('ok', ST_GeomFromText('POLYGON((21.0 52.0, 21.001 52.0, 21.001 52.001, 21.0 52.001, 21.0 52.0))')),
+                 ('glued', ST_GeomFromText(
+                     'MULTIPOLYGON(
+                          ((19.875 52.0, 19.876 52.0, 19.876 52.001, 19.875 52.001, 19.875 52.0)),
+                          ((20.5 52.0, 20.501 52.0, 20.501 52.001, 20.5 52.001, 20.5 52.0))
+                      )'
+                 ));",
+        )
+        .unwrap();
+
+        let stats =
+            crate::dataset::filter_oversized_geometry(&conn, "bdot10k_buildings", "LOKALNYID")
+                .unwrap();
+
+        assert_eq!(stats.skipped_oversized_geometry, 1);
+        assert_eq!(
+            stats.skipped_oversized_example_ids,
+            vec!["glued".to_string()]
+        );
+    }
+
     #[test]
     fn import_records_success_with_no_skips_in_job_run_log() {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
@@ -219,7 +264,10 @@ mod tests {
         let log = crate::job_log::read_all(&conn).unwrap();
         let entry = log.get("import:bdot10k").expect("entry must be present");
         assert_eq!(entry.outcome, "Success");
-        assert_eq!(entry.message.as_deref(), Some("no invalid geometry"));
+        assert_eq!(
+            entry.message.as_deref(),
+            Some("no invalid or oversized geometry")
+        );
     }
 
     #[test]
