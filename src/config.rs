@@ -111,10 +111,13 @@ impl Default for JobConfig {
 /// Config for the `osm_update` background job (OSM minutely replication
 /// catch-up). Same three fields and defaults as the generic [`JobConfig`] it
 /// replaces (`enabled = true`, `interval_seconds = 60`, `timeout_seconds =
-/// 600`), plus three fields consumed by a follow-up task (prefetching diff
-/// downloads ahead of the sequence being applied, and batching commits during
-/// catch-up) -- this change only adds the config plumbing, not the behaviour,
-/// so the three new fields are read by nothing yet.
+/// 600`), plus three catch-up tuning fields read by
+/// [`crate::update::osm::update`]: `prefetch_ahead` bounds the background
+/// prefetch window (`spawn_prefetcher`), and `batch_commit_threshold` /
+/// `batch_size` feed `catch_up_chunk_size`, which decides how many sequences
+/// share one DuckDB transaction. All three affect catch-up only -- at
+/// `pending == 1` the chunk size is 1, i.e. today's one-sequence-per-
+/// transaction path.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct OsmUpdateConfig {
@@ -732,10 +735,10 @@ interval_seconds = 120
         assert_eq!(config.jobs.osm_update.batch_size, 20);
     }
 
-    /// The three fields added for the prefetch/batched-commit follow-up
-    /// (unread by any code yet -- this pins only that they parse and
-    /// default correctly) round-trip through TOML, and omitting one of them
-    /// still falls back to its own default rather than to zero.
+    /// The three catch-up tuning fields round-trip through TOML, and
+    /// omitting one of them still falls back to its own default rather than
+    /// to zero. (Their *behaviour* is covered in `update::osm`; this pins
+    /// only parsing and defaulting.)
     #[test]
     fn osm_update_config_prefetch_and_batch_fields_parse_from_toml() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
