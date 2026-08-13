@@ -9,6 +9,7 @@ mod job_log;
 mod mappings;
 mod osm;
 mod server;
+mod serving_version;
 mod shutdown;
 mod tile_math;
 mod update;

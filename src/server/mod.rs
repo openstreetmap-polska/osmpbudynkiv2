@@ -1,16 +1,19 @@
+mod http_cache;
 pub mod jobs;
 mod package;
+mod tile_cache;
 mod tiles;
 mod updates;
 
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use axum::http::header;
 use axum::{Router, http::StatusCode};
 use duckdb::Connection;
 use r2d2::Pool;
 use tokio::net::TcpListener;
-use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::info;
 
 use crate::config::Config as AppConfig;
@@ -83,6 +86,46 @@ pub struct AppState {
     pub pool: DbPool,
     pub registry: Arc<jobs::JobRegistry>,
     pub config: Arc<AppConfig>,
+    /// Precomputed `Cache-Control` values derived from `config.cache` (see
+    /// `http_cache::CacheHeaders`). `build_router` always rebuilds this from
+    /// whatever `config` it was handed right before constructing the router,
+    /// so this field's initial value here doesn't need to stay in sync with
+    /// `config` by hand -- there's exactly one place
+    /// (`CacheHeaders::from_config`, called from `build_router`) that turns
+    /// cache config into header bytes.
+    pub cache_headers: Arc<http_cache::CacheHeaders>,
+    /// Bounded in-process byte cache for z14 `/tiles` responses -- see
+    /// `tile_cache` module doc for the design. `TileCache::new(0)` (i.e.
+    /// `config.cache.tile_cache_max_bytes == 0`) is a working no-op, so this
+    /// field is never `Option` and callers never need to branch on whether
+    /// caching is enabled.
+    pub tile_cache: Arc<tile_cache::TileCache>,
+}
+
+impl AppState {
+    /// Test-only constructor. Every Router-building test helper across the
+    /// server module tree (`server::tiles`, `server::updates`,
+    /// `server::package`, plus this module's own tests) builds its
+    /// `AppState` through here rather than writing out the struct literal,
+    /// so the next field added to `AppState` only has to be threaded through
+    /// one place instead of four. `#[cfg(test)]` here reaches all of them:
+    /// this crate has no lib target, so `cargo test` compiles the whole
+    /// binary crate with `--cfg test`, not just this module.
+    #[cfg(test)]
+    pub fn for_tests(pool: DbPool) -> Self {
+        let config = Arc::new(AppConfig::default());
+        let cache_headers = Arc::new(http_cache::CacheHeaders::from_config(&config.cache));
+        let tile_cache = Arc::new(tile_cache::TileCache::new(
+            config.cache.tile_cache_max_bytes,
+        ));
+        Self {
+            pool,
+            registry: Arc::new(jobs::JobRegistry::new_for_tests(vec![])),
+            config,
+            cache_headers,
+            tile_cache,
+        }
+    }
 }
 
 pub async fn run(
@@ -173,31 +216,27 @@ pub async fn run(
     let registry = scheduler.registry.clone();
     let shutdown_notify = scheduler.shutdown_notify();
 
+    let cache_headers = Arc::new(http_cache::CacheHeaders::from_config(&config.cache));
+    // Rebuilt again (redundantly) inside `build_router` from whatever
+    // `config` it's handed, same as `cache_headers` above -- but unlike
+    // `cache_headers` (stateless, cheap to recompute), `build_router`
+    // deliberately does NOT rebuild this: it's stateful (the cache's actual
+    // contents), and `build_router` is called per-test in some places, so
+    // rebuilding it there would silently discard whatever was cached
+    // in-between calls. Its struct-update `..state` just carries this Arc
+    // through unchanged.
+    let tile_cache = Arc::new(tile_cache::TileCache::new(
+        config.cache.tile_cache_max_bytes,
+    ));
     let state = AppState {
         pool,
         registry,
         config: config.clone(),
+        cache_headers,
+        tile_cache,
     };
 
-    let app = Router::new()
-        .route("/health", axum::routing::get(|| async { StatusCode::OK }))
-        .route(
-            "/status",
-            axum::routing::get(jobs::status_handler::get_status),
-        )
-        .route("/tiles/{z}/{x}/{y}", axum::routing::get(tiles::serve_tile))
-        .route(
-            "/package",
-            axum::routing::get(package::get_package).post(package::post_package),
-        )
-        .route("/updates", axum::routing::get(updates::get_updates))
-        .with_state(state)
-        // Static frontend assets, served from a directory deployed alongside
-        // the binary (see Config::web_dir) rather than embedded at compile
-        // time. Mounted as a fallback so it never shadows the API routes
-        // above; a missing directory just makes every request 404 instead of
-        // failing startup.
-        .fallback_service(ServeDir::new(&config.web_dir));
+    let app = build_router(state);
 
     let listener = TcpListener::bind(&config.http_listen_addr).await?;
     info!(addr = %config.http_listen_addr, "HTTP server listening");
@@ -219,6 +258,66 @@ pub async fn run(
         .await;
 
     Ok(())
+}
+
+/// The single home for the shipping route set. Building it from `state`
+/// alone (rather than threading `config` separately) means every caller --
+/// production `run()` and every test helper across `server::tiles`,
+/// `server::updates`, `server::package` -- goes through the exact same
+/// construction, so a test (in particular the static-fallback /
+/// path-traversal tests below) exercises the router that actually ships
+/// instead of a hand-rolled stand-in that could silently drift from it.
+///
+/// Always rebuilds `state.cache_headers` from `state.config.cache` before
+/// handing `state` to any handler -- the one place `CacheConfig` turns into
+/// actual `HeaderValue`s (see `http_cache::CacheHeaders::from_config`), so a
+/// caller that hands in a custom `config` never needs to remember to
+/// separately rebuild `cache_headers` to match.
+///
+/// The outer `.layer(SetResponseHeaderLayer::if_not_present(...))` wraps the
+/// *entire* router, including the static fallback and axum's own 404/405/
+/// extractor-rejection responses (`Router::layer` wraps `path_router`,
+/// `fallback_router` and `catch_all_fallback` alike -- verified against
+/// axum 0.8's `Router::layer` source, not assumed) -- that is what makes
+/// `no-store` the true default for anything that didn't already set its own
+/// `Cache-Control` (tiles, `/updates`, and the static-asset middleware in
+/// `http_cache::static_router` all set theirs first, so `if_not_present`
+/// leaves them alone). It has to be the *last* call in this chain: applying
+/// it before `.fallback_service(...)` would only wrap the API routes that
+/// existed at that point, not the fallback added afterwards.
+pub fn build_router(state: AppState) -> Router {
+    let web_dir = state.config.web_dir.clone();
+    let cache_headers = Arc::new(http_cache::CacheHeaders::from_config(&state.config.cache));
+    let state = AppState {
+        cache_headers: cache_headers.clone(),
+        ..state
+    };
+    Router::new()
+        .route("/health", axum::routing::get(|| async { StatusCode::OK }))
+        .route(
+            "/status",
+            axum::routing::get(jobs::status_handler::get_status),
+        )
+        .route("/tiles/{z}/{x}/{y}", axum::routing::get(tiles::serve_tile))
+        .route(
+            "/package",
+            axum::routing::get(package::get_package).post(package::post_package),
+        )
+        .route("/updates", axum::routing::get(updates::get_updates))
+        .with_state(state)
+        // Static frontend assets, served from a directory deployed alongside
+        // the binary (see Config::web_dir) rather than embedded at compile
+        // time. Mounted as a fallback so it never shadows the API routes
+        // above; a missing directory just makes every request 404 instead of
+        // failing startup. Its own Cache-Control policy (fonts/vendor/known
+        // entry files) lives in http_cache::static_router.
+        .fallback_service(http_cache::static_router(&web_dir, cache_headers))
+        // API default: no-store. Must stay the last call -- see doc comment
+        // above.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            http_cache::NO_STORE,
+        ))
 }
 
 const REQUIRED_TABLES: &[&str] = &[
@@ -323,30 +422,37 @@ fn check_startup_conditions(pool: &DbPool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode};
-    use axum::{Router, routing::get};
+    use axum::http::{Request, StatusCode, header};
     use duckdb::Connection;
     use tower::ServiceExt;
 
     use super::jobs::{JobOutcome, JobRegistry, JobState, JobStatus};
-    use super::{AppState, ServeDir, build_pool, jobs};
+    use super::{AppState, build_pool, build_router};
 
-    fn make_test_state(initial: Vec<JobStatus>) -> AppState {
+    /// `web_dir` is a parameter (not baked into a fixed default) so the
+    /// static-fallback tests below can point it at a tempdir while
+    /// non-static tests (`health_returns_200`, `status_returns_jobs_json`)
+    /// pass one that is simply never touched.
+    fn make_test_state(initial: Vec<JobStatus>, web_dir: &Path) -> AppState {
         let conn = Connection::open_in_memory().unwrap();
         let pool = build_pool(conn, 2).unwrap();
-        AppState {
-            pool,
-            registry: Arc::new(JobRegistry::new_for_tests(initial)),
-            config: Arc::new(crate::config::Config::default()),
-        }
+        let mut state = AppState::for_tests(pool);
+        state.registry = Arc::new(JobRegistry::new_for_tests(initial));
+        state.config = Arc::new(crate::config::Config {
+            web_dir: web_dir.to_string_lossy().into_owned(),
+            ..crate::config::Config::default()
+        });
+        state
     }
 
     #[tokio::test]
     async fn health_returns_200() {
-        let app = Router::new().route("/health", get(|| async { StatusCode::OK }));
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(make_test_state(vec![], dir.path()));
 
         let response = app
             .oneshot(
@@ -376,11 +482,8 @@ mod tests {
             next_run_at: Some("2026-05-28T12:01:03Z".to_string()),
             run_count: 7,
         };
-        let state = make_test_state(vec![preset]);
-
-        let app = Router::new()
-            .route("/status", get(jobs::status_handler::get_status))
-            .with_state(state);
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(make_test_state(vec![preset], dir.path()));
 
         let response = app
             .oneshot(
@@ -406,15 +509,15 @@ mod tests {
     /// The static frontend is mounted as a `fallback_service`, so it must
     /// never shadow an API route — a request for `/health` has to keep
     /// hitting the handler even when a file named `health` happens to sit in
-    /// `web_dir`.
+    /// `web_dir`. Built via `build_router` (the real, shipping router) rather
+    /// than a hand-rolled stand-in, so this pins the actual precedence, not a
+    /// copy of it that could drift.
     #[tokio::test]
     async fn static_fallback_does_not_shadow_api_routes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("health"), b"not the api response").unwrap();
 
-        let app = Router::new()
-            .route("/health", get(|| async { StatusCode::OK }))
-            .fallback_service(ServeDir::new(dir.path()));
+        let app = build_router(make_test_state(vec![], dir.path()));
 
         let response = app
             .oneshot(
@@ -439,9 +542,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), b"<h1>hello</h1>").unwrap();
 
-        let app = Router::new()
-            .route("/health", get(|| async { StatusCode::OK }))
-            .fallback_service(ServeDir::new(dir.path()));
+        let app = build_router(make_test_state(vec![], dir.path()));
 
         let response = app
             .oneshot(
@@ -461,9 +562,7 @@ mod tests {
     /// the server — the config doc promises this is not a startup error.
     #[tokio::test]
     async fn static_fallback_404s_when_web_dir_is_missing() {
-        let app = Router::new()
-            .route("/health", get(|| async { StatusCode::OK }))
-            .fallback_service(ServeDir::new("/nonexistent/web/dir"));
+        let app = build_router(make_test_state(vec![], Path::new("/nonexistent/web/dir")));
 
         let response = app
             .oneshot(
@@ -492,6 +591,8 @@ mod tests {
         // standing in for a config file or the DuckDB database next to it.
         std::fs::write(root.path().join("secret.txt"), b"SECRET").unwrap();
 
+        let state = make_test_state(vec![], &web);
+
         // Raw `..`, single-encoded, mixed-case, encoded separator, and
         // double-encoded. The last one decodes to the literal name `%2e%2e`,
         // which is a normal component and simply does not exist.
@@ -504,9 +605,7 @@ mod tests {
             "/subdir/../../secret.txt",
             "/etc/passwd",
         ] {
-            let app = Router::new()
-                .route("/health", get(|| async { StatusCode::OK }))
-                .fallback_service(ServeDir::new(&web));
+            let app = build_router(state.clone());
 
             let response = app
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -521,6 +620,249 @@ mod tests {
             let body = to_bytes(response.into_body(), 1024).await.unwrap();
             assert_ne!(&body[..], b"SECRET", "{uri} leaked a file outside web_dir");
         }
+    }
+
+    // --- Phase 2: [cache] config + Cache-Control on every response --------
+
+    #[tokio::test]
+    async fn health_and_status_default_to_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(make_test_state(vec![], dir.path()));
+
+        for uri in ["/health", "/status"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers()["cache-control"],
+                "no-store",
+                "{uri} must default to no-store"
+            );
+        }
+    }
+
+    /// `/package` must never be cached: a cached response never reaches
+    /// `package::log_export`, so `package_exports` would under-count and
+    /// `/updates` would silently under-report real exports (see
+    /// `http_cache`'s module doc). Both verbs 400 before touching the DB
+    /// here (missing `bbox` / an unparsable body), which is enough to prove
+    /// the header without seeding a schema.
+    #[tokio::test]
+    async fn package_is_no_store_on_both_verbs() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(make_test_state(vec![], dir.path()));
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/package")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(get_response.headers()["cache-control"], "no-store");
+
+        let post_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/package")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(post_response.headers()["cache-control"], "no-store");
+    }
+
+    /// A request that matches no API route and no known static path
+    /// (`http_cache::classify_static_path` returns `None` for it) must still
+    /// come back `no-store` -- proving the outer
+    /// `SetResponseHeaderLayer::if_not_present` really is the default for
+    /// "nothing else claimed this response", not just a decoration on the
+    /// five API routes. Paired with a 405 (a route that exists, wrong verb)
+    /// to cover axum's own rejection path too.
+    #[tokio::test]
+    async fn unmatched_routes_and_method_rejections_default_to_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(make_test_state(vec![], dir.path()));
+
+        let not_found = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/this/path/does/not/exist/anywhere")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        assert_eq!(not_found.headers()["cache-control"], "no-store");
+
+        let method_not_allowed = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(method_not_allowed.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(method_not_allowed.headers()["cache-control"], "no-store");
+    }
+
+    // `/updates` and `/tiles` keeping their own `Cache-Control` through
+    // `if_not_present` is pinned where the headers actually originate:
+    // `server::updates::tests::get_updates_returns_recent_exports_with_cache_header`
+    // and `server::tiles::tests::{z14_tile_carries_the_configured_tile_cache_control,
+    // agg_and_points_tiles_carry_the_configured_aggregate_cache_control}` all go
+    // through this module's `build_router`, so if the outer no-store layer ever
+    // stopped being `if_not_present` (or ran before those handlers set their
+    // header instead of after), those assertions -- which check for the
+    // *configured* value, not `no-store` -- would fail there instead.
+
+    #[tokio::test]
+    async fn fonts_get_immutable_cache_control_including_percent_encoded_space() {
+        let dir = tempfile::tempdir().unwrap();
+        // The real font path contains a literal space, so a browser request
+        // arrives percent-encoded -- exercise that, not a sanitized stand-in.
+        let font_dir = dir
+            .path()
+            .join("fonts")
+            .join("Klokantech Noto Sans Regular");
+        std::fs::create_dir_all(&font_dir).unwrap();
+        std::fs::write(font_dir.join("0-255.pbf"), b"glyph-bytes").unwrap();
+
+        let app = build_router(make_test_state(vec![], dir.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/fonts/Klokantech%20Noto%20Sans%20Regular/0-255.pbf")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[tokio::test]
+    async fn vendor_assets_get_one_week_cache_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor").join("maplibre-gl");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        std::fs::write(vendor_dir.join("maplibre-gl.mjs"), b"export default {};").unwrap();
+
+        let app = build_router(make_test_state(vec![], dir.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/vendor/maplibre-gl/maplibre-gl.mjs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["cache-control"],
+            "public, max-age=604800"
+        );
+    }
+
+    #[tokio::test]
+    async fn frontend_entry_files_get_no_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["index.html", "app.js", "style.css"] {
+            std::fs::write(dir.path().join(name), b"content").unwrap();
+        }
+
+        let app = build_router(make_test_state(vec![], dir.path()));
+        for path in ["/index.html", "/app.js", "/style.css"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()["cache-control"], "no-cache", "{path}");
+        }
+    }
+
+    /// The §5 unknown from the Phase 2 plan, settled empirically: tower-http
+    /// 0.6's `ServeDir` DOES honour `If-Modified-Since` and answers `304 Not
+    /// Modified` rather than re-sending the file -- confirmed by reading
+    /// `ServeDir`'s own `open_file.rs`/`future.rs` (an `IfModifiedSince`
+    /// check that short-circuits to `StatusCode::NOT_MODIFIED`) and pinned
+    /// here end to end. Since this holds, `no-cache` on `app.js`/
+    /// `index.html`/`style.css` costs one small conditional round trip per
+    /// load, not a full re-send -- had this NOT held, those three would need
+    /// a short `max-age` instead of `no-cache`.
+    #[tokio::test]
+    async fn static_assets_revalidate_via_if_modified_since() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.js"), b"console.log('hi');").unwrap();
+
+        let app = build_router(make_test_state(vec![], dir.path()));
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()["cache-control"], "no-cache");
+        let last_modified = first
+            .headers()
+            .get(header::LAST_MODIFIED)
+            .expect("ServeDir must set Last-Modified")
+            .clone();
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app.js")
+                    .header(header::IF_MODIFIED_SINCE, last_modified)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::NOT_MODIFIED,
+            "tower-http 0.6's ServeDir must honour If-Modified-Since and answer 304"
+        );
+    }
+
+    /// `build_router` must not panic when `web_dir` doesn't exist -- the
+    /// config doc promises this is not a startup error (see
+    /// `static_fallback_404s_when_web_dir_is_missing` for the corresponding
+    /// per-request behavior). Constructing `http_cache::static_router` --
+    /// `ServeDir::new` plus the `from_fn_with_state` middleware -- must stay
+    /// lazy about the directory's existence.
+    #[test]
+    fn build_router_does_not_panic_on_missing_web_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = build_router(make_test_state(vec![], &dir.path().join("does-not-exist")));
     }
 
     /// An in-place upgrade of an existing database gains the `*_unmatched`

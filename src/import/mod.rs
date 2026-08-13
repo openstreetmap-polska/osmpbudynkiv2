@@ -22,11 +22,13 @@ pub fn run(
         ImportSource::Osm { file } => osm::import(conn, kv, config, file.as_deref(), &urls.osm_pbf),
         ImportSource::Bdot10k { file } => {
             bdot10k::import(conn, config, file.as_deref(), &urls.bdot10k)?;
-            stamp_row_hash_version(conn)
+            stamp_row_hash_version(conn)?;
+            bump_serving_epoch(conn)
         }
         ImportSource::Egib { file } => {
             egib::import(conn, config, file.as_deref(), &urls.egib)?;
-            stamp_row_hash_version(conn)
+            stamp_row_hash_version(conn)?;
+            bump_serving_epoch(conn)
         }
         ImportSource::Prg { file, terc_file } => {
             prg::import(
@@ -36,7 +38,8 @@ pub fn run(
                 terc_file.as_deref(),
                 &urls.prg,
             )?;
-            stamp_row_hash_version(conn)
+            stamp_row_hash_version(conn)?;
+            bump_serving_epoch(conn)
         }
         ImportSource::StreetMappings { file, url } => {
             let outcome = (|| -> Result<crate::mappings::LoadStats> {
@@ -174,7 +177,8 @@ pub fn run(
                 terc_file.as_deref(),
                 &urls.prg,
             )?;
-            stamp_row_hash_version(conn)
+            stamp_row_hash_version(conn)?;
+            bump_serving_epoch(conn)
         }
     }
 }
@@ -224,4 +228,17 @@ fn load_building_type_file(
 /// expression changed underneath them". OSM is exempt — it has no `_row_hash`.
 fn stamp_row_hash_version(conn: &Connection) -> Result<()> {
     crate::dataset::stamp_row_hash_version(conn)
+}
+
+/// Bump the serving epoch after an import rebuilds a dataset table.
+///
+/// `/tiles` reads bdot10k/egib/prg through the `*_unmatched` serving tables
+/// (per-cell versioned, see `serving_version`) but also reads the raw
+/// `bdot10k_buildings`/`egib_buildings`/`prg_addresses` tables directly for
+/// the `*_all` legend layers and the adjacency CTEs — neither of which any
+/// per-cell version can cover. An `import` rewrites those raw tables
+/// wholesale, so it must bump. OSM is exempt — `/tiles` reads no `osm_*`
+/// table (see `serving_version`'s module doc, "Must NOT bump").
+fn bump_serving_epoch(conn: &Connection) -> Result<()> {
+    crate::serving_version::bump_serving_epoch(conn)
 }

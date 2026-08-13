@@ -87,6 +87,7 @@ pub struct Config {
     pub jobs: JobsConfig,
     pub package: PackageConfig,
     pub updates: UpdatesConfig,
+    pub cache: CacheConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -197,6 +198,52 @@ impl Default for UpdatesConfig {
         Self {
             default_minutes: 60,
             max_minutes: 1440,
+        }
+    }
+}
+
+/// `Cache-Control` policy for every response the `run` HTTP server sends --
+/// see `server::http_cache` for the one place these values turn into actual
+/// header bytes and the full per-endpoint policy table.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// z14 `/tiles` response max-age. z14 is the finest zoom -- the one
+    /// `match_refresh` keeps freshest -- so it gets the shortest TTL of the
+    /// two tile tiers.
+    pub tile_max_age_seconds: u64,
+    /// z5..=z13 (aggregated bins and unbinned points) `/tiles` response
+    /// max-age. Coarser zooms move less per individual edit, so they tolerate
+    /// a longer TTL than z14.
+    pub agg_tile_max_age_seconds: u64,
+    /// `/updates` response max-age. Matches the endpoint's pre-Phase-2
+    /// hardcoded value (60s) -- see `server::updates`.
+    pub updates_max_age_seconds: u64,
+    /// max-age for static frontend assets under `web_dir/vendor/` (e.g. the
+    /// MapLibre GL JS bundle) -- versioned by path but not content-hashed, so
+    /// it gets a cautious week rather than the `immutable` treatment fonts get.
+    pub static_max_age_seconds: u64,
+    /// max-age for `web_dir/fonts/**`. Glyph PBFs are named by a fixed byte
+    /// range per font and never change in place, so they're safe to mark
+    /// `immutable` and cache for a year.
+    pub font_max_age_seconds: u64,
+    /// Maximum size in bytes of the in-process z14 `/tiles` response cache
+    /// (`server::tile_cache::TileCache`) -- see that module's doc for the
+    /// two-generation eviction design. Setting this to `0` disables the
+    /// cache entirely: `TileCache::new(0)` is a genuine no-op (every lookup
+    /// misses, every insert drops), not a placeholder that still allocates.
+    pub tile_cache_max_bytes: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            tile_max_age_seconds: 60,
+            agg_tile_max_age_seconds: 300,
+            updates_max_age_seconds: 60,
+            static_max_age_seconds: 604_800,
+            font_max_age_seconds: 31_536_000,
+            tile_cache_max_bytes: 268_435_456,
         }
     }
 }
@@ -319,6 +366,7 @@ impl Default for Config {
             jobs: JobsConfig::default(),
             package: PackageConfig::default(),
             updates: UpdatesConfig::default(),
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -806,6 +854,39 @@ street_mappings = "https://example.test/m.csv"
             cfg.download_urls.street_mappings,
             "https://example.test/m.csv"
         );
+    }
+
+    #[test]
+    fn test_cache_config_defaults() {
+        let config = load_config(None).unwrap();
+        assert_eq!(config.cache.tile_max_age_seconds, 60);
+        assert_eq!(config.cache.agg_tile_max_age_seconds, 300);
+        assert_eq!(config.cache.updates_max_age_seconds, 60);
+        assert_eq!(config.cache.static_max_age_seconds, 604_800);
+        assert_eq!(config.cache.font_max_age_seconds, 31_536_000);
+        assert_eq!(config.cache.tile_cache_max_bytes, 268_435_456);
+    }
+
+    #[test]
+    fn test_cache_config_partial_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[cache]
+tile_max_age_seconds = 30
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert_eq!(config.cache.tile_max_age_seconds, 30);
+        // Unset fields still fall back to their defaults.
+        assert_eq!(config.cache.agg_tile_max_age_seconds, 300);
+        assert_eq!(config.cache.updates_max_age_seconds, 60);
+        assert_eq!(config.cache.static_max_age_seconds, 604_800);
+        assert_eq!(config.cache.font_max_age_seconds, 31_536_000);
+        assert_eq!(config.cache.tile_cache_max_bytes, 268_435_456);
     }
 
     #[test]

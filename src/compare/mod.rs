@@ -31,6 +31,18 @@ pub fn run(conn: &Connection, target: CompareTarget) -> Result<()> {
             buildings::compare_bdot10k(conn)?;
             buildings::compare_egib(conn)?;
             addresses::compare_prg(conn)?;
+            // Pure insurance, not a normal invalidation path: every row this
+            // rewrote already moved that cell's own per-cell version (see
+            // `serving_version`'s module doc), so this bump covers only the
+            // case where `compare full` is run as an offline rebuild (e.g.
+            // restoring the DB from a snapshot) that never went through a
+            // dirty cell at all -- without it, a client's cached ETag for an
+            // unrelated tile could in principle survive such a rebuild.
+            // Deliberately NOT inside `full`'s per-source transactions
+            // (`in_transaction`, above): each source's rebuild is already
+            // independently atomic, and this is a single global stamp for
+            // the whole `Full` run, not per source.
+            crate::serving_version::bump_serving_epoch(conn)?;
         }
         CompareTarget::Reconcile => {
             let enqueued = reconcile::enqueue_all(conn)?;

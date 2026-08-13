@@ -140,11 +140,24 @@ fn validate_and_swap(conn: &Connection, path_str: &str) -> Result<LoadStats> {
 
     conn.execute_batch("BEGIN TRANSACTION")
         .context("Failed to begin mapping swap")?;
-    let swap = conn.execute_batch(&format!(
-        "DELETE FROM {MAPPINGS_TABLE};
+    // `/tiles` and `/package` apply this mapping at serve time with no dirty
+    // cell and no recompute (see CLAUDE.md's street-name gotcha and
+    // `serving_version`'s module doc), so a landed swap is exactly the "no
+    // per-cell version tracks this" case the global epoch exists for.
+    // Chained via `.context().and_then(...)` (converting the duckdb::Error
+    // into anyhow::Error first, so the two calls' error types line up) so
+    // the bump is folded into the same fallible value the swap already is
+    // and lands or rolls back with it below -- this is the one home for the
+    // load (both call sites go through here), so bumping anywhere else would
+    // risk a second, divergent copy.
+    let swap = conn
+        .execute_batch(&format!(
+            "DELETE FROM {MAPPINGS_TABLE};
          INSERT INTO {MAPPINGS_TABLE} (teryt_simc_code, prg_street_name, osm_street_name)
          SELECT teryt_simc_code, prg_street_name, osm_street_name FROM {STAGING_TABLE};"
-    ));
+        ))
+        .context("Failed to apply mapping swap")
+        .and_then(|()| crate::serving_version::bump_serving_epoch(conn));
     match swap {
         Ok(()) => conn
             .execute_batch("COMMIT")
@@ -298,5 +311,37 @@ mod tests {
         let stats = load_from_path(&conn, f.path()).unwrap();
         assert_eq!(stats.rows_loaded, 1);
         assert_eq!(stats.rows_absent_from_prg, 0);
+    }
+
+    /// This mapping changes what `/tiles` renders (`addr:street`) with no
+    /// dirty cell and no recompute, so a landed load must bump the global
+    /// serving epoch -- see `serving_version`'s module doc.
+    #[test]
+    fn successful_load_bumps_the_serving_epoch() {
+        let conn = setup_db();
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            0
+        );
+        let f = write_csv(",gen. Kruka,Generała Kruka\n");
+        load_from_path(&conn, f.path()).unwrap();
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            1
+        );
+    }
+
+    /// Mirror of `duplicate_key_rejects_the_load_and_leaves_the_table_untouched`:
+    /// a rejected load must not claim the serving state moved when nothing
+    /// was actually swapped in.
+    #[test]
+    fn failed_load_does_not_bump_the_serving_epoch() {
+        let conn = setup_db();
+        let bad = write_csv(",B,Bbb\n,b,Bbb2\n");
+        load_from_path(&conn, bad.path()).unwrap_err();
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            0
+        );
     }
 }

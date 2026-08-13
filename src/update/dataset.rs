@@ -170,6 +170,15 @@ pub fn refresh(
                 crate::dataset::stamp_row_hash_version(conn)?;
             }
 
+            // Unlike the stamp above, this fires on EVERY landed refresh, even a
+            // 0/0/0 diff — a refresh can rewrite raw columns `/tiles` reads
+            // (`centroid`, `rodzaj_kod`) that sit outside the diffed row set, so
+            // "the delta was empty" does not mean "nothing /tiles reads changed".
+            // Inside the transaction, so an aborted refresh (see the `?` above,
+            // which returns before reaching here) cannot claim a bump that never
+            // landed — see `serving_version`'s module doc.
+            crate::serving_version::bump_serving_epoch(conn)?;
+
             conn.execute(
                 "INSERT INTO dataset_refreshes
                  (snapshot_id, source, started_at, finished_at, source_etag,
@@ -242,24 +251,29 @@ pub fn refresh(
     outcome.map(|(counts, _)| counts)
 }
 
-/// Human-readable message for the `job_run_log` row.
+/// Human-readable message for the `job_run_log` row. Uses
+/// `dataset::format_skip_clause` for both skip reasons -- see
+/// `dataset::LoadStats` for why a loader can drop rows for either
+/// invalid or oversized geometry.
 fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> String {
     let mut msg = format!(
         "added {} modified {} removed {}",
         counts.added, counts.modified, counts.removed
     );
     if stats.skipped_invalid_geometry > 0 {
-        let shown = stats.skipped_example_ids.join(", ");
-        let more = (stats.skipped_invalid_geometry as usize)
-            .saturating_sub(stats.skipped_example_ids.len());
-        let more_suffix = if more > 0 {
-            format!(", +{more} more")
-        } else {
-            String::new()
-        };
-        msg.push_str(&format!(
-            "; skipped {} invalid-geometry rows (ids: {shown}{more_suffix})",
-            stats.skipped_invalid_geometry
+        msg.push_str("; ");
+        msg.push_str(&crate::dataset::format_skip_clause(
+            "invalid-geometry",
+            stats.skipped_invalid_geometry,
+            &stats.skipped_example_ids,
+        ));
+    }
+    if stats.skipped_oversized_geometry > 0 {
+        msg.push_str("; ");
+        msg.push_str(&crate::dataset::format_skip_clause(
+            "oversized-geometry",
+            stats.skipped_oversized_geometry,
+            &stats.skipped_oversized_example_ids,
         ));
     }
     msg
@@ -393,6 +407,7 @@ mod tests {
                 crate::dataset::LoadStats {
                     skipped_invalid_geometry: 2,
                     skipped_example_ids: vec!["bad1".to_string(), "bad2".to_string()],
+                    ..Default::default()
                 },
             ),
             None,
@@ -410,6 +425,53 @@ mod tests {
             "got: {msg}"
         );
         assert!(msg.contains("bad1") && msg.contains("bad2"), "got: {msg}");
+    }
+
+    /// Mirror of the test above for the other skip reason: an update refresh
+    /// stages via `load_into`, which now also runs
+    /// `dataset::filter_oversized_geometry` on the staging table, so its
+    /// count and example ids must reach `update:<source>`'s job_run_log
+    /// message the same way the invalid-geometry ones do.
+    #[test]
+    fn refresh_records_oversized_geometry_skips_in_job_run_log() {
+        let conn = conn_with_live(LIVE_ROWS);
+        let loader_with_stats = |rows: &'static str, stats: crate::dataset::LoadStats| {
+            move |conn: &Connection, target: &str| -> Result<crate::dataset::LoadStats> {
+                let inner = format!("SELECT id, a, ST_Point(lon, lat) AS geom FROM ({rows})");
+                conn.execute_batch(&format!(
+                    "CREATE TABLE {target} AS {};",
+                    crate::dataset::hashed_select(&inner)
+                ))?;
+                Ok(stats)
+            }
+        };
+
+        refresh(
+            &conn,
+            &TEST_SPEC,
+            loader_with_stats(
+                NEW_ROWS,
+                crate::dataset::LoadStats {
+                    skipped_oversized_geometry: 1,
+                    skipped_oversized_example_ids: vec!["glued".to_string()],
+                    ..Default::default()
+                },
+            ),
+            None,
+        )
+        .unwrap();
+
+        let log = crate::job_log::read_all(&conn).unwrap();
+        let entry = log
+            .get("update:test")
+            .expect("job_run_log entry must exist");
+        assert_eq!(entry.outcome, "Success");
+        let msg = entry.message.as_deref().unwrap();
+        assert!(
+            msg.contains("skipped 1 oversized-geometry rows"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("glued"), "got: {msg}");
     }
 
     #[test]
@@ -937,6 +999,63 @@ mod tests {
             check_row_hash_version(&conn).unwrap(),
             RowHashVersion::Stale("999".to_string()),
             "an aborted refresh must not claim the rewrite happened"
+        );
+    }
+
+    // --- serving_version bump -------------------------------------------
+    //
+    // Mirrors the `stamp_row_hash_version` twins above, but for
+    // `serving_version::bump_serving_epoch`: unlike the stamp, the bump is
+    // unconditional on every LANDED refresh (see the comment beside its call
+    // site in `refresh`, above) -- these three tests pin "landed" (bumps),
+    // "aborted" (does not) and "never attempted" (does not) as the three
+    // cases that matter.
+
+    /// The 0/0/0-diff case (`LIVE_ROWS` staged against itself, so nothing
+    /// changed) still counts as a landed refresh and must still bump --
+    /// raw columns `/tiles` reads (`centroid`, `rodzaj_kod`) can move even
+    /// when the diffed row set didn't.
+    #[test]
+    fn successful_refresh_bumps_the_serving_epoch() {
+        let conn = conn_with_live(LIVE_ROWS);
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            0
+        );
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            1
+        );
+    }
+
+    /// Pins the in-transaction placement: an aborted refresh applied nothing,
+    /// so it must not claim the serving state moved either.
+    #[test]
+    fn aborted_refresh_does_not_bump_the_serving_epoch() {
+        let conn = conn_with_live(LIVE_ROWS);
+        let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
+        refresh(&conn, &TEST_SPEC, loader(empty), None).unwrap_err();
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            0
+        );
+    }
+
+    /// `update::record_noop_refresh` (the ETag-unchanged skip; see
+    /// `serving_version`'s module-doc "Must NOT bump" list) never calls
+    /// `refresh` at all, so it must not move the epoch either -- otherwise a
+    /// daily poll against an unchanged government source would flush every
+    /// cached tile in the country for a change that never happened.
+    /// `record_noop_refresh` is private to `update`, but reachable here
+    /// since `update::dataset` is a descendant module of `update`.
+    #[test]
+    fn noop_refresh_does_not_bump_the_serving_epoch() {
+        let conn = bare_conn();
+        crate::update::record_noop_refresh(&conn, "test", Some("etag-1")).unwrap();
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            0
         );
     }
 

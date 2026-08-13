@@ -367,12 +367,22 @@ fn validate_and_swap(
 
     conn.execute_batch("BEGIN TRANSACTION")
         .context("Failed to begin building-type mapping swap")?;
-    let swap = conn.execute_batch(&format!(
-        "DELETE FROM {dest};
+    // Same funnel, same reasoning as `street_names::load_from_path`: this
+    // mapping is applied at serve time with no dirty cell and no recompute,
+    // so a landed swap needs the global epoch to reach `/tiles` at all.
+    // `.context()` bridges `duckdb::Error` to `anyhow::Error` so the swap and
+    // the bump chain through the same `Result` type, folding the bump into
+    // the swap's own fallible value so it commits or rolls back atomically
+    // with it below.
+    let swap = conn
+        .execute_batch(&format!(
+            "DELETE FROM {dest};
          INSERT INTO {dest} (tier, key, min_levels, max_levels, max_neighbours, tags)
          SELECT tier, key, min_levels, max_levels, max_neighbours, tags FROM {clean};",
-        dest = source.mapping_table
-    ));
+            dest = source.mapping_table
+        ))
+        .context("Failed to apply building-type mapping swap")
+        .and_then(|()| crate::serving_version::bump_serving_epoch(conn));
     match swap {
         Ok(()) => conn
             .execute_batch("COMMIT")
@@ -658,5 +668,37 @@ mod tests {
         load_from_path(&conn, &BDOT10K, f.path()).unwrap();
         let rows = mapping_rows(&conn, "bdot10k_building_types");
         assert_eq!(rows[0].1, "budynek gospodarczy");
+    }
+
+    /// This mapping changes what `/tiles` renders (the building `tags`
+    /// attribute) with no dirty cell and no recompute, so a landed load must
+    /// bump the global serving epoch -- see `serving_version`'s module doc.
+    #[test]
+    fn successful_load_bumps_the_serving_epoch() {
+        let conn = setup_db();
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            0
+        );
+        let f = write_csv(BDOT_HEADER, "1,a,,,,building=yes\n");
+        load_from_path(&conn, &BDOT10K, f.path()).unwrap();
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            1
+        );
+    }
+
+    /// Mirror of `a_bad_load_leaves_the_previous_table_untouched`: a rejected
+    /// load must not claim the serving state moved when nothing was
+    /// actually swapped in.
+    #[test]
+    fn failed_load_does_not_bump_the_serving_epoch() {
+        let conn = setup_db();
+        let bad = write_csv(BDOT_HEADER, "1,a,,,,man_made=silo\n");
+        load_from_path(&conn, &BDOT10K, bad.path()).unwrap_err();
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            0
+        );
     }
 }

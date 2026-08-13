@@ -138,16 +138,19 @@ pub fn hashed_select(inner_select: &str) -> String {
     format!("SELECT *, hash(s) AS _row_hash FROM ({inner_select}) s")
 }
 
-/// Cap on how many skipped-row ids `filter_invalid_geometry` collects as
-/// examples -- enough to point an operator at the actual bad records
-/// upstream, without holding an unbounded list for a source with many
-/// invalid rows. The returned count is always the true total regardless of
-/// this cap.
+/// Cap on how many skipped-row ids `filter_invalid_geometry` and
+/// `filter_oversized_geometry` each collect as examples -- enough to point
+/// an operator at the actual bad records upstream, without holding an
+/// unbounded list for a source with many bad rows. The returned count is
+/// always the true total regardless of this cap.
 pub const MAX_EXAMPLE_IDS: usize = 20;
 
-/// Rows a dataset loader dropped rather than staging, because their geometry
-/// failed `ST_IsValid`. `ST_AsMVTGeom` cannot tolerate invalid geometry (see
-/// docs/invalid_geometry_tile_500s.md) -- we drop rather than repair.
+/// Rows a dataset loader dropped rather than staging, for one of two
+/// reasons: geometry that failed `ST_IsValid` (`ST_AsMVTGeom` cannot
+/// tolerate invalid geometry, see docs/invalid_geometry_tile_500s.md), or
+/// geometry whose bbox spans at least one full z14 cell in either axis (see
+/// `filter_oversized_geometry` -- a corrupted merge of two unrelated
+/// features, not a real building). Both reasons drop rather than repair.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadStats {
     pub skipped_invalid_geometry: i64,
@@ -155,6 +158,40 @@ pub struct LoadStats {
     /// SELECT below finds them -- not exhaustive, just enough to point an
     /// operator at the actual bad records upstream.
     pub skipped_example_ids: Vec<String>,
+    pub skipped_oversized_geometry: i64,
+    /// Same cap and ordering caveat as `skipped_example_ids`, for the
+    /// oversized-geometry reason.
+    pub skipped_oversized_example_ids: Vec<String>,
+}
+
+impl LoadStats {
+    /// Fold in the oversized-geometry counts from a second filter pass, the
+    /// way `import::bdot10k::load_into` / `import::egib::load_into` combine
+    /// `filter_invalid_geometry`'s result (`self`) with
+    /// `filter_oversized_geometry`'s (`oversized`) into the one `LoadStats`
+    /// a loader returns. `oversized`'s own invalid-geometry fields are
+    /// ignored -- `filter_oversized_geometry` never sets them.
+    pub fn merge_oversized(mut self, oversized: LoadStats) -> Self {
+        self.skipped_oversized_geometry = oversized.skipped_oversized_geometry;
+        self.skipped_oversized_example_ids = oversized.skipped_oversized_example_ids;
+        self
+    }
+}
+
+/// Render one skip-reason clause for a `job_run_log` summary message, shared
+/// by every source's `summarize` (`import::bdot10k`, `import::egib`) and by
+/// `update::dataset::summarize_refresh`, so the "N rows, ids: ..., +M more"
+/// wording is written once rather than once per reason per source.
+/// `reason` reads naturally before "rows", e.g. `"invalid-geometry"` or
+/// `"oversized-geometry"`.
+pub fn format_skip_clause(reason: &str, count: i64, ids: &[String]) -> String {
+    let shown = ids.join(", ");
+    let more = (count as usize).saturating_sub(ids.len());
+    if more > 0 {
+        format!("skipped {count} {reason} rows (ids: {shown}, +{more} more)")
+    } else {
+        format!("skipped {count} {reason} rows (ids: {shown})")
+    }
 }
 
 /// Delete invalid-geometry rows from a just-loaded table, capturing example
@@ -195,6 +232,100 @@ pub fn filter_invalid_geometry(
     Ok(LoadStats {
         skipped_invalid_geometry,
         skipped_example_ids,
+        ..Default::default()
+    })
+}
+
+/// Delete rows whose bbox spans at least one full z14 cell in either axis --
+/// too wide to be a single real building, and in practice a corrupted merge
+/// of two unrelated features. Discovered via EGIB row
+/// `260208_5.0009.315.1_BUD`: a 2-part MULTIPOLYGON, 10 points total, area
+/// ~4,700 m^2, whose envelope spans longitude 19.886->20.507 -- two separate
+/// real buildings ~44 km apart glued into one record. `ST_IsValid` returns
+/// true for it, so `filter_invalid_geometry` above never catches it; it
+/// smears across the map, pollutes any `/package` area it clips, and its
+/// centroid (what the match rule compares against OSM, see
+/// `DatasetSpec::with_centroid_select`) lands in open countryside between
+/// the two buildings, matching neither.
+///
+/// Measured over the full source tables (BDOT10k 16,351,815 rows, EGIB
+/// 17,773,961 rows): this drops 0 BDOT10k rows (the longest genuine BDOT10k
+/// building measures 0.696 cells, ~1 km -- ~50% headroom under the
+/// threshold) and 85 EGIB rows.
+///
+/// Threshold is in CELL UNITS, not degrees or metres, because the latitude
+/// threshold is not constant in degrees under the Web-Mercator Y projection
+/// (0.0135 deg at 52N vs 0.0126 deg at 55N) -- cell units keep it one
+/// constant tied to `tile_math::CHANGE_CELL_ZOOM`.
+///
+/// This is an EXTENT test (bbox width in fractional cell units), not a
+/// "reach from the row's own cell" test, deliberately:
+///  - it's position-independent -- a bbox's extent doesn't change depending
+///    on whether it happens to straddle a cell boundary, where a reach
+///    test's answer would (see `tile_math`'s
+///    `cell_frac_is_unfloored_across_a_cell_boundary`, which is the reason
+///    the SQL below reads `ST_XMin`/`ST_XMax` through
+///    `tile_math::cell_x_frac_sql` and never through `cell_x_sql`);
+///  - it drops the strictly larger, more obviously-corrupt set (a
+///    centroid-relative reach test at >= 2 cells caught only 42 of these 85
+///    rows -- the multipolygon ones -- and 0 BDOT10k rows either way);
+///  - it yields a statable invariant a later phase depends on: a bbox
+///    strictly narrower than one cell straddles at most one cell boundary
+///    per axis, so it touches at most 2x2 cells, one of which is the
+///    centroid's own cell -- so the row's reach from its own cell is <= 1.
+///    A later phase's tile-version query uses a 3x3 cell ring whose radius
+///    is exactly that invariant.
+///
+/// The Y comparison (`YMin - YMax`, not `YMax - YMin`) looks inverted, but
+/// isn't: cell-Y grows southward, so `ST_YMin` (the geographically
+/// southernmost point of the bbox) has the LARGER fractional cell-Y. Read
+/// both terms the same way: "fractional cell coordinate of the bbox's far
+/// edge minus that of its near edge >= 1".
+pub fn filter_oversized_geometry(
+    conn: &duckdb::Connection,
+    table: &str,
+    id_col: &str,
+) -> anyhow::Result<LoadStats> {
+    use crate::tile_math::{cell_x_frac_sql, cell_y_frac_sql};
+    use anyhow::Context;
+
+    let x_extent = format!(
+        "(({}) - ({}))",
+        cell_x_frac_sql("ST_XMax(geom)"),
+        cell_x_frac_sql("ST_XMin(geom)")
+    );
+    let y_extent = format!(
+        "(({}) - ({}))",
+        cell_y_frac_sql("ST_YMin(geom)"),
+        cell_y_frac_sql("ST_YMax(geom)")
+    );
+    let predicate = format!("{x_extent} >= 1 OR {y_extent} >= 1");
+
+    let mut skipped_oversized_example_ids = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {id_col} FROM {table} WHERE {predicate} LIMIT {MAX_EXAMPLE_IDS}"
+            ))
+            .with_context(|| format!("Failed to prepare oversized-geometry scan on {table}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .with_context(|| format!("Failed to scan oversized-geometry rows in {table}"))?;
+        for row in rows {
+            skipped_oversized_example_ids
+                .push(row.context("Failed to read oversized-geometry id")?);
+        }
+    }
+
+    let skipped_oversized_geometry = conn
+        .execute(&format!("DELETE FROM {table} WHERE {predicate}"), [])
+        .with_context(|| format!("Failed to delete oversized-geometry rows from {table}"))?
+        as i64;
+
+    Ok(LoadStats {
+        skipped_oversized_geometry,
+        skipped_oversized_example_ids,
+        ..Default::default()
     })
 }
 
@@ -416,5 +547,204 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// The motivating case: EGIB row `260208_5.0009.315.1_BUD` in miniature --
+    /// two small squares ~42 km apart (19.875 and 20.5 degrees longitude,
+    /// well past the real row's 19.886->20.507), glued into one valid
+    /// MULTIPOLYGON. `ST_IsValid` accepts it (each part is a simple,
+    /// non-self-intersecting square), so only the extent filter catches it.
+    #[test]
+    fn filter_oversized_geometry_drops_a_widely_separated_multipolygon() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id VARCHAR, geom GEOMETRY);
+             INSERT INTO t VALUES
+                 ('glued', ST_GeomFromText(
+                     'MULTIPOLYGON(
+                          ((19.875 52.0, 19.876 52.0, 19.876 52.001, 19.875 52.001, 19.875 52.0)),
+                          ((20.5 52.0, 20.501 52.0, 20.501 52.001, 20.5 52.001, 20.5 52.0))
+                      )'
+                 ));",
+        )
+        .unwrap();
+
+        let stats = filter_oversized_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(stats.skipped_oversized_geometry, 1);
+        assert_eq!(
+            stats.skipped_oversized_example_ids,
+            vec!["glued".to_string()]
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// The other side of the same measurement: BDOT10k's real longest
+    /// building is 0.696 cells (~1 km) wide -- ~50% headroom under the
+    /// threshold. A single-part building of comparable width (here ~0.68
+    /// cells, 0.015 degrees longitude at 52N) must survive.
+    #[test]
+    fn filter_oversized_geometry_keeps_a_near_one_km_building() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id VARCHAR, geom GEOMETRY);
+             INSERT INTO t VALUES
+                 ('big_but_real', ST_GeomFromText(
+                     'POLYGON((21.0 52.0, 21.015 52.0, 21.015 52.005, 21.0 52.005, 21.0 52.0))'
+                 ));",
+        )
+        .unwrap();
+
+        let stats = filter_oversized_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(
+            stats,
+            LoadStats::default(),
+            "must not drop a real-sized building"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Pins "extent, not reach": a tiny (~27 m wide) building whose bbox
+    /// happens to straddle a real z14 cell boundary must be kept. The
+    /// boundary and the coordinates are the same ones pinned in
+    /// `tile_math::tests::cell_frac_is_unfloored_across_a_cell_boundary`,
+    /// which shows the two edges floor to DIFFERENT cell indices even
+    /// though they are ~27 m apart. If this filter were built from
+    /// `tile_math::cell_x_sql`/`cell_y_sql` (floored indices) instead of
+    /// `cell_x_frac_sql`/`cell_y_frac_sql`, `ST_XMax`'s cell index minus
+    /// `ST_XMin`'s would read as 1 -- "spans a full cell" -- and this test
+    /// would fail with the row deleted.
+    #[test]
+    fn filter_oversized_geometry_keeps_small_building_straddling_cell_boundary() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id VARCHAR, geom GEOMETRY);
+             INSERT INTO t VALUES
+                 ('shed', ST_GeomFromText(
+                     'POLYGON((20.9837646484375 52.0, 20.9840087890625 52.0,
+                                20.9840087890625 52.0001, 20.9837646484375 52.0001,
+                                20.9837646484375 52.0))'
+                 ));",
+        )
+        .unwrap();
+
+        let stats = filter_oversized_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(
+            stats,
+            LoadStats::default(),
+            "a boundary-straddling shed must not be dropped just for its position"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn filter_oversized_geometry_caps_example_ids_but_counts_all() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch("CREATE TABLE t (id VARCHAR, geom GEOMETRY);")
+            .unwrap();
+        for i in 0..25 {
+            conn.execute(
+                "INSERT INTO t VALUES (?, ST_GeomFromText(
+                     'MULTIPOLYGON(
+                          ((19.875 52.0, 19.876 52.0, 19.876 52.001, 19.875 52.001, 19.875 52.0)),
+                          ((20.5 52.0, 20.501 52.0, 20.501 52.001, 20.5 52.001, 20.5 52.0))
+                      )'
+                 ))",
+                duckdb::params![format!("bad{i}")],
+            )
+            .unwrap();
+        }
+
+        let stats = filter_oversized_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(stats.skipped_oversized_geometry, 25);
+        assert_eq!(stats.skipped_oversized_example_ids.len(), MAX_EXAMPLE_IDS);
+    }
+
+    /// Like `with_centroid_select_does_not_change_the_row_hash`: dropping
+    /// oversized rows runs strictly after `hashed_select` built the table,
+    /// so a surviving row's `_row_hash` must be bit-for-bit identical to
+    /// what it was before the filter ran -- no `ROW_HASH_VERSION` bump
+    /// needed. Computed via `hashed_select` directly (not `load_into`) so
+    /// this is independent of the BDOT10k/EGIB parquet shape.
+    #[test]
+    fn filter_oversized_geometry_does_not_change_surviving_row_hashes() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE src (id VARCHAR, geom GEOMETRY);
+             INSERT INTO src VALUES
+                 ('keep', ST_GeomFromText(
+                     'POLYGON((21.0 52.0, 21.001 52.0, 21.001 52.001, 21.0 52.001, 21.0 52.0))'
+                 )),
+                 ('drop', ST_GeomFromText(
+                     'MULTIPOLYGON(
+                          ((19.875 52.0, 19.876 52.0, 19.876 52.001, 19.875 52.001, 19.875 52.0)),
+                          ((20.5 52.0, 20.501 52.0, 20.501 52.001, 20.5 52.001, 20.5 52.0))
+                      )'
+                 ));",
+        )
+        .unwrap();
+
+        let inner = "SELECT id, geom FROM src";
+        conn.execute_batch(&format!("CREATE TABLE t AS {}", hashed_select(inner)))
+            .unwrap();
+        // `_row_hash` is UBIGINT and can exceed i64::MAX, so snapshot it into
+        // a second table and compare with SQL (like
+        // `with_centroid_select_does_not_change_the_row_hash` does) instead
+        // of round-tripping the value through Rust.
+        conn.execute_batch("CREATE TABLE hash_before AS SELECT id, _row_hash FROM t")
+            .unwrap();
+
+        let stats = filter_oversized_geometry(&conn, "t", "id").unwrap();
+        assert_eq!(stats.skipped_oversized_geometry, 1);
+
+        let disagreements: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hash_before h JOIN t USING (id)
+                 WHERE h._row_hash IS DISTINCT FROM t._row_hash",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            disagreements, 0,
+            "filtering must not change a surviving row's _row_hash"
+        );
+
+        let survivors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(survivors, 1, "'keep' must still be the only surviving row");
     }
 }

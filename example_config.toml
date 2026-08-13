@@ -249,3 +249,34 @@ max_area_sq_deg = 0.04
 default_minutes = 60
 # Largest ?minutes= value accepted; larger requests get a 400.
 max_minutes = 1440
+
+# Cache-Control policy for every response the `run` HTTP server sends -- see
+# server::http_cache for the one place these turn into actual header bytes
+# and the full per-endpoint policy table.
+#
+# /health, /status, both /package verbs, and every error path (axum's own
+# 404/405 rejections included) always get "no-store" regardless of this
+# section -- /package in particular for a correctness reason, not just
+# freshness: a cached response never reaches the export log, so /updates
+# would silently under-report real exports. Nothing here can loosen that.
+[cache]
+# max-age for z14 /tiles responses -- the finest zoom, kept freshest by the
+# match_refresh drain job, so it gets the shorter of the two tile TTLs.
+tile_max_age_seconds = 60
+# max-age for z5..=z13 /tiles responses (aggregated bins and unbinned
+# points). Coarser zooms move less per individual edit, so they tolerate a
+# longer TTL than z14.
+agg_tile_max_age_seconds = 300
+# max-age for GET /updates.
+updates_max_age_seconds = 60
+# max-age for static frontend assets under web_dir/vendor/ (e.g. the
+# MapLibre GL JS bundle) -- versioned by path but not content-hashed, so it
+# gets a cautious week rather than the immutable treatment fonts get below.
+static_max_age_seconds = 604800
+# max-age for web_dir/fonts/**, served with the immutable directive. Glyph
+# PBFs are named by a fixed byte range per font and never change in place,
+# so a year-long cache is safe.
+font_max_age_seconds = 31536000
+# Maximum size in bytes of the in-process z14 /tiles response cache. Set to 0
+# to disable the cache entirely (a genuine no-op, not just a tiny budget).
+tile_cache_max_bytes = 268435456

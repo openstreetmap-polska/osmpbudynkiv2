@@ -151,6 +151,69 @@ fn test_update_bdot10k_unchanged_snapshot_is_a_noop() {
     assert_eq!(cells, 0);
 }
 
+/// A landed refresh rewrites raw columns (`centroid`) `/tiles`' adjacency
+/// CTE reads outside the diffed row set, so `update::dataset::refresh` must
+/// bump `metadata.serving_epoch` on every landed refresh, not just a
+/// non-empty diff -- see `serving_version`'s module doc. `import` itself
+/// also bumps (pinned by `cli_import_bdot10k`'s twin test), so this asserts
+/// the epoch moved again on top of that, i.e. `update` bumps too rather than
+/// relying on the import's earlier bump.
+#[test]
+fn test_update_bdot10k_bumps_serving_epoch() {
+    let (cfg, _dir, db_path) = file_config();
+
+    cmd()
+        .args([
+            "--config",
+            cfg.path().to_str().unwrap(),
+            "import",
+            "bdot10k",
+            "--file",
+            "fixtures/bdot10k.parquet",
+        ])
+        .assert()
+        .success();
+
+    let epoch_after_import: String = {
+        let conn = duckdb::Connection::open(&db_path).unwrap();
+        conn.execute_batch("INSTALL spatial; LOAD spatial;")
+            .unwrap();
+        conn.query_row(
+            "SELECT value FROM metadata WHERE key = 'serving_epoch'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("import must bump metadata.serving_epoch")
+    };
+
+    cmd()
+        .args([
+            "--config",
+            cfg.path().to_str().unwrap(),
+            "update",
+            "bdot10k",
+            "--file",
+            "fixtures/bdot10k_v2.parquet",
+        ])
+        .assert()
+        .success();
+
+    let conn = duckdb::Connection::open(&db_path).unwrap();
+    conn.execute_batch("INSTALL spatial; LOAD spatial;")
+        .unwrap();
+    let epoch_after_update: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'serving_epoch'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("update must also bump metadata.serving_epoch");
+    assert_ne!(
+        epoch_after_import, epoch_after_update,
+        "update must move the epoch again on top of import's own bump"
+    );
+}
+
 #[test]
 fn test_update_bdot10k_missing_file_fails() {
     let (cfg, _dir, _db) = file_config();

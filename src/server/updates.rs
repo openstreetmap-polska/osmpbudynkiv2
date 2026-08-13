@@ -1,5 +1,6 @@
 //! GET /updates: recent /package export activity as a GeoJSON FeatureCollection,
-//! browser-cacheable for 60 seconds.
+//! browser-cacheable for `[cache].updates_max_age_seconds` (default 60s) --
+//! see `server::http_cache` for where that becomes a `Cache-Control` header.
 //!
 //! See docs/superpowers/specs/2026-07-20-export-log-updates-endpoint-design.md
 //! and docs/duckdb_connection_visibility_investigation.md. Reads run via the
@@ -108,6 +109,7 @@ pub async fn get_updates(
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
 
+    let cache_header = state.cache_headers.updates.clone();
     let result = tokio::task::spawn_blocking(move || build_updates(&state, minutes)).await;
     match result {
         Ok(Ok(body)) => {
@@ -116,10 +118,8 @@ pub async fn get_updates(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/geo+json"),
             );
-            resp.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=60"),
-            );
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, cache_header);
             resp
         }
         Ok(Err(e)) => {
@@ -301,17 +301,14 @@ mod tests {
 
     fn make_state_with_write(conn: duckdb::Connection) -> AppState {
         let pool = crate::server::build_pool(conn, 2).unwrap();
-        AppState {
-            pool,
-            registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
-            config: std::sync::Arc::new(crate::config::Config::default()),
-        }
+        AppState::for_tests(pool)
     }
 
+    /// Mounts the real shipping router (`server::build_router`) rather than a
+    /// `/updates`-only stand-in, so these tests exercise the router as it is
+    /// actually assembled in production.
     fn updates_app(state: AppState) -> Router {
-        Router::new()
-            .route("/updates", axum::routing::get(get_updates))
-            .with_state(state)
+        crate::server::build_router(state)
     }
 
     #[tokio::test]
@@ -429,8 +426,6 @@ mod tests {
         assert_eq!(json["features"].as_array().unwrap().len(), 0);
     }
 
-    use crate::server::package::{get_package, post_package};
-
     /// Seeds an in-memory connection with the precomputed serving tables
     /// `/package` reads (one unmatched PRG address, no buildings) plus
     /// `package_exports` and the icu extension `/updates`' interval query
@@ -493,21 +488,14 @@ mod tests {
         .unwrap();
 
         let pool = crate::server::build_pool(conn, 4).unwrap();
-        AppState {
-            pool,
-            registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
-            config: std::sync::Arc::new(crate::config::Config::default()),
-        }
+        AppState::for_tests(pool)
     }
 
+    /// Mounts the real shipping router (`server::build_router`) rather than a
+    /// `/package` + `/updates`-only stand-in, so this exercises the actual
+    /// `/package` -> `/updates` path a client would hit.
     fn combined_app(state: AppState) -> Router {
-        Router::new()
-            .route(
-                "/package",
-                axum::routing::get(get_package).post(post_package),
-            )
-            .route("/updates", axum::routing::get(get_updates))
-            .with_state(state)
+        crate::server::build_router(state)
     }
 
     #[tokio::test]

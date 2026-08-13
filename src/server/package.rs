@@ -1618,20 +1618,14 @@ mod tests {
         )
         .unwrap();
         let pool = crate::server::build_pool(conn, 2).unwrap();
-        AppState {
-            pool,
-            registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
-            config: std::sync::Arc::new(crate::config::Config::default()),
-        }
+        AppState::for_tests(pool)
     }
 
+    /// Mounts the real shipping router (`server::build_router`) rather than a
+    /// `/package`-only stand-in, so these tests exercise the router as it is
+    /// actually assembled in production.
     fn package_app(state: AppState) -> Router {
-        Router::new()
-            .route(
-                "/package",
-                axum::routing::get(get_package).post(post_package),
-            )
-            .with_state(state)
+        crate::server::build_router(state)
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -2121,11 +2115,7 @@ mod tests {
             .connection_timeout(std::time::Duration::from_millis(10))
             .build(crate::server::ClonedConnectionManager::new(conn))
             .unwrap();
-        let state = AppState {
-            pool: pool.clone(),
-            registry: std::sync::Arc::new(crate::server::jobs::JobRegistry::new_for_tests(vec![])),
-            config: std::sync::Arc::new(crate::config::Config::default()),
-        };
+        let state = AppState::for_tests(pool.clone());
 
         // Hold the pool's only connection so log_export's own pool.get() call
         // has nothing available and times out.

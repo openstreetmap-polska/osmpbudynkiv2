@@ -164,10 +164,19 @@ pub struct StatusResponse {
     pub match_staleness: MatchStaleness,
     pub job_run_log: BTreeMap<String, JobRunLogEntry>,
     pub osm_replication: OsmReplicationState,
+    /// Cumulative `tile_cache::TileCache` hit/miss counts since process
+    /// start -- purely diagnostic ("is the z14 tile cache doing anything"),
+    /// no per-tile or per-generation breakdown. Reading `AtomicU64`s is
+    /// cheap enough not to need the `spawn_blocking` the other fields below
+    /// go through for their DB reads.
+    pub tile_cache_hits: u64,
+    pub tile_cache_misses: u64,
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let jobs = state.registry.snapshot();
+    let tile_cache_hits = state.tile_cache.hits();
+    let tile_cache_misses = state.tile_cache.misses();
     let (match_staleness, job_run_log, osm_replication) = tokio::task::spawn_blocking(move || {
         (
             match_staleness_or_default(&state),
@@ -182,6 +191,8 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         match_staleness,
         job_run_log,
         osm_replication,
+        tile_cache_hits,
+        tile_cache_misses,
     })
 }
 
@@ -213,8 +224,6 @@ mod tests {
     #[test]
     fn job_run_log_or_default_reads_recorded_entries() {
         use crate::db::init_db;
-        use crate::server::jobs::JobRegistry;
-        use std::sync::Arc;
 
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
@@ -227,11 +236,7 @@ mod tests {
         .unwrap();
 
         let pool = crate::server::build_pool(conn, 2).unwrap();
-        let state = AppState {
-            pool,
-            registry: Arc::new(JobRegistry::new_for_tests(vec![])),
-            config: Arc::new(crate::config::Config::default()),
-        };
+        let state = AppState::for_tests(pool);
 
         let log = job_run_log_or_default(&state);
         let entry = log.get("import:bdot10k").expect("entry must be present");
@@ -241,9 +246,6 @@ mod tests {
 
     #[test]
     fn osm_replication_state_or_default_reads_metadata() {
-        use crate::server::jobs::JobRegistry;
-        use std::sync::Arc;
-
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         conn.execute_batch(
@@ -254,11 +256,7 @@ mod tests {
         .unwrap();
 
         let pool = crate::server::build_pool(conn, 2).unwrap();
-        let state = AppState {
-            pool,
-            registry: Arc::new(JobRegistry::new_for_tests(vec![])),
-            config: Arc::new(crate::config::Config::default()),
-        };
+        let state = AppState::for_tests(pool);
 
         let s = osm_replication_state_or_default(&state);
         assert_eq!(s.sequence_number, Some(6543210));
@@ -267,18 +265,11 @@ mod tests {
 
     #[test]
     fn osm_replication_state_or_default_falls_back_when_unset() {
-        use crate::server::jobs::JobRegistry;
-        use std::sync::Arc;
-
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
 
         let pool = crate::server::build_pool(conn, 2).unwrap();
-        let state = AppState {
-            pool,
-            registry: Arc::new(JobRegistry::new_for_tests(vec![])),
-            config: Arc::new(crate::config::Config::default()),
-        };
+        let state = AppState::for_tests(pool);
 
         let s = osm_replication_state_or_default(&state);
         assert_eq!(s.sequence_number, None);

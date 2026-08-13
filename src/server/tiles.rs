@@ -1,11 +1,14 @@
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use anyhow::Context;
 
 use super::AppState;
+use super::http_cache;
 use super::package::{ADJACENCY_READ_BUFFER_DEG, BDOT10K_ADJACENCY_KEY, EGIB_ADJACENCY_KEY};
+use crate::serving_version;
 use crate::tile_math::tile_to_bbox;
 
 // ST_AsMVTGeom's bounds argument is BOX_2D, not GEOMETRY -- ST_MakeEnvelope
@@ -463,9 +466,33 @@ const POINTS_MVT_SQL: &str = "
     WHERE t.geom IS NOT NULL
 ";
 
+/// Outcome of the z14 blocking task: either the client's `If-None-Match`
+/// already covers this version and there is nothing further to do (the pool
+/// connection has already been dropped by the time this variant is built --
+/// see `serve_tile`'s comment on why that happens inside the blocking task),
+/// or the tile bytes plus whatever `ETag` the version computed to. `etag` is
+/// `None` only when `serving_version::z14_tile_version` itself failed --
+/// see the comment at that call site for why that degrades instead of 500s.
+///
+/// `Body` covers both a freshly queried tile and a `tile_cache::TileCache`
+/// hit, deliberately as one variant rather than two: a hit must be
+/// indistinguishable from a miss in the response it produces, and giving the
+/// two their own variants would mean two response-shaping paths that could
+/// drift apart on a header, a status code, or the empty-tile 204 (see
+/// `z14_tile_response`). `Bytes` either way, so a cache hit is a refcount
+/// bump rather than a copy of a several-hundred-KB tile.
+enum Z14TaskOutcome {
+    NotModified(HeaderValue),
+    Body {
+        bytes: Bytes,
+        etag: Option<HeaderValue>,
+    },
+}
+
 pub async fn serve_tile(
     State(state): State<AppState>,
     Path((z, x, y)): Path<(u32, u32, u32)>,
+    headers: HeaderMap,
 ) -> Response {
     // Tiers A/B (z5..=z13) are dispatched before the z14 guard below, which
     // is otherwise left byte-for-byte as it was -- see the module-level
@@ -477,9 +504,23 @@ pub async fn serve_tile(
         return serve_tile_points(state, z, x, y).await;
     }
     if z != 14 {
-        return StatusCode::NO_CONTENT.into_response();
+        // A property of the binary's zoom dispatch table, not of the data --
+        // see http_cache::OUT_OF_RANGE_ZOOM_MAX_AGE_SECONDS's doc comment.
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            state.cache_headers.out_of_range_zoom.clone(),
+        );
+        return resp;
     }
 
+    let cache_header = state.cache_headers.tile.clone();
+    // Only z14 gets an ETag. z5..=z13 have no version faithful to their
+    // aggregated/point content -- serving_version's per-cell coverage is
+    // z14-cell-shaped, and falling back to the epoch-only global signal
+    // alone would pin those tiers stale until the next epoch bump, which is
+    // strictly worse than the plain TTL they already get from cache_header.
+    let if_none_match = headers.get(header::IF_NONE_MATCH).cloned();
     let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
     let (buf_min_lon, buf_min_lat, buf_max_lon, buf_max_lat) = (
         min_lon - ADJACENCY_READ_BUFFER_DEG,
@@ -488,11 +529,65 @@ pub async fn serve_tile(
         max_lat + ADJACENCY_READ_BUFFER_DEG,
     );
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Z14TaskOutcome> {
         let conn = state
             .pool
             .get()
             .context("Failed to acquire pool connection")?;
+
+        // Computed and checked against If-None-Match before any MVT SQL
+        // runs, and inside this blocking task rather than around it -- that
+        // is what lets a match `drop(conn)` and return right here, instead
+        // of holding a pool slot through the tile queries below. A 16-tile
+        // viewport refresh then releases 16 pool slots in ~2ms total instead
+        // of the ~250ms the full queries would take.
+        //
+        // `cache_key_version` is kept around (not just folded into `etag`
+        // immediately) because `tile_cache::TileCache` is keyed on the same
+        // raw version string that `etag` wraps -- see the cache lookup right
+        // below. It stays `None` exactly when `etag` does: a version
+        // computation failure means there is no version to key a cache
+        // entry on, so both the lookup and the eventual insert are skipped
+        // together (an entry with no version could never be invalidated
+        // correctly).
+        let (etag, cache_key_version) = match serving_version::z14_tile_version(&conn, x, y) {
+            Ok(version) => {
+                if http_cache::if_none_match_matches(if_none_match.as_ref(), &version) {
+                    let etag = http_cache::weak_etag(&version);
+                    drop(conn);
+                    return Ok(Z14TaskOutcome::NotModified(etag));
+                }
+                let etag = http_cache::weak_etag(&version);
+                (Some(etag), Some(version))
+            }
+            Err(e) => {
+                // A version hiccup should not take down tiles -- fall
+                // through and serve the tile without an ETag rather than
+                // failing the whole request over a metadata read, matching
+                // z14_tile_version's own "degrade, don't fail" choices for
+                // the pieces of its computation that can go individually
+                // stale (see its doc comment).
+                tracing::warn!(
+                    error = %e, x, y,
+                    "failed to compute z14 tile version; serving without an ETag"
+                );
+                (None, None)
+            }
+        };
+
+        // Cache lookup, only reached once we know this isn't a 304 (that
+        // returned above already). A hit drops the pool connection and
+        // returns without running any MVT SQL, same reasoning as the 304
+        // early-release right above: a 16-tile viewport refresh that's
+        // already fully cached costs no pool slots at all beyond this
+        // version read.
+        if let Some(version) = cache_key_version.as_deref()
+            && let Some(bytes) = state.tile_cache.get((z, x, y), version)
+        {
+            drop(conn);
+            return Ok(Z14TaskOutcome::Body { bytes, etag });
+        }
+
         // The bbox is repeated once per `?` group: the `bbox` CTE, then one
         // ST_MakeEnvelope per filtered table. Each group must stay in
         // min_lon, min_lat, max_lon, max_lat order.
@@ -549,29 +644,65 @@ pub async fn serve_tile(
                 min_lon, min_lat, max_lon, max_lat, // egib_buildings filter
             ],
         )?;
-        Ok::<Vec<u8>, anyhow::Error>([addresses, buildings, addresses_all, buildings_all].concat())
+        // Into `Bytes` once, not once per consumer: the cache stores `Bytes`
+        // and the response is built from `Bytes`, so going through `Vec<u8>`
+        // for either would memcpy a tile that runs to several hundred KB.
+        let bytes = Bytes::from([addresses, buildings, addresses_all, buildings_all].concat());
+
+        // Only cache when the version computed successfully -- see this
+        // function's comment on `cache_key_version` above for why an
+        // entry with no version must never be written.
+        if let Some(version) = cache_key_version {
+            state.tile_cache.insert((z, x, y), version, bytes.clone());
+        }
+
+        Ok(Z14TaskOutcome::Body { bytes, etag })
     })
     .await;
 
     match result {
-        Ok(Ok(bytes)) if bytes.is_empty() => StatusCode::NO_CONTENT.into_response(),
-        Ok(Ok(bytes)) => {
-            let mut resp = bytes.into_response();
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/vnd.mapbox-vector-tile"),
-            );
-            resp
+        Ok(Ok(Z14TaskOutcome::NotModified(etag))) => http_cache::not_modified(etag, cache_header),
+        Ok(Ok(Z14TaskOutcome::Body { bytes, etag })) => {
+            z14_tile_response(bytes, cache_header, etag)
         }
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, z, x, y, "tile query failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-        Err(e) => {
-            tracing::error!(error = %e, z, x, y, "tile task panicked");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Ok(Err(e)) => finish_tile_response(Ok(Err(e)), z, x, y, cache_header, None),
+        Err(e) => finish_tile_response(Err(e), z, x, y, cache_header, None),
     }
+}
+
+/// Response shaping for every successful z14 tile -- freshly queried or
+/// served from `tile_cache::TileCache`, which is the point: one path, so a
+/// hit cannot differ from a miss on a header, a status code, or the
+/// empty-tile 204. (A z14 tile covering open country renders no features at
+/// all, so an empty body is the *common* case over most of Poland, not an
+/// edge case.)
+///
+/// Deliberately not routed through `finish_tile_response` below, which the
+/// z5..=z13 tiers still use: its `bytes: Vec<u8>` parameter would force a
+/// copy out of the cache's `Bytes` on every hit, defeating the entire point
+/// of storing `Bytes` there (see `tile_cache`'s module doc). The two are
+/// otherwise the same shaping, and the success branches must stay in step.
+fn z14_tile_response(
+    bytes: Bytes,
+    cache_header: HeaderValue,
+    etag: Option<HeaderValue>,
+) -> Response {
+    let mut resp = if bytes.is_empty() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        let mut resp = bytes.into_response();
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.mapbox-vector-tile"),
+        );
+        resp
+    };
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, cache_header);
+    if let Some(etag) = etag {
+        resp.headers_mut().insert(header::ETAG, etag);
+    }
+    resp
 }
 
 fn query_mvt_layer(
@@ -593,6 +724,7 @@ fn query_mvt_layer(
 /// Tier A dispatch (z5..=z11): two layers (`agg_cells`/`agg_points`), one
 /// shared aggregate. See `agg_bin_ctes` above for the design rationale.
 async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
+    let cache_header = state.cache_headers.agg_tile.clone();
     let bz = (z + 5).min(14);
     let shift = 14 - bz;
     let n: u32 = 1u32 << bz;
@@ -643,12 +775,14 @@ async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
     })
     .await;
 
-    finish_tile_response(result, z, x, y)
+    // z5..=z13 never carry an ETag -- see serve_tile's comment on why.
+    finish_tile_response(result, z, x, y, cache_header, None)
 }
 
 /// Tier B dispatch (z12..=z13): one `points` layer, one feature per
 /// unmatched object (not binned).
 async fn serve_tile_points(state: AppState, z: u32, x: u32, y: u32) -> Response {
+    let cache_header = state.cache_headers.agg_tile.clone();
     let cell_shift = 14 - z;
     let lo_x = (x << cell_shift) as i32;
     let hi_x = (((x + 1) << cell_shift) - 1) as i32;
@@ -676,26 +810,56 @@ async fn serve_tile_points(state: AppState, z: u32, x: u32, y: u32) -> Response 
     })
     .await;
 
-    finish_tile_response(result, z, x, y)
+    // z5..=z13 never carry an ETag -- see serve_tile's comment on why.
+    finish_tile_response(result, z, x, y, cache_header, None)
 }
 
-/// Response shaping shared by the two new tiers. Deliberately duplicated
-/// rather than factored into the z14 path above, which the task keeps
-/// byte-for-byte unchanged (see the comment on `serve_tile`).
+/// Response shaping shared by all three tiers (z5..=z11, z12..=z13, and --
+/// as of Phase 2's cache-header work -- z14 too, via `serve_tile`'s tail).
+/// `cache_header` is set only on a genuine tile response (200 with bytes, or
+/// 204 for a query that legitimately found nothing) -- deliberately *not* on
+/// the error branches below, so a query failure or panic stays header-less
+/// and falls through to the API-default `no-store` the outer
+/// `SetResponseHeaderLayer` in `build_router` stamps on anything without its
+/// own `Cache-Control`. Caching a 500 would turn a transient DB hiccup into
+/// an outage that outlives the hiccup itself.
+///
+/// `etag`, likewise, is only ever applied on the 200/204 branches, never on
+/// a 500 -- an `ETag` on an error response would tell a client "this failure
+/// is a representation of the resource, cache it and compare against it
+/// later", which is exactly as wrong as caching the 500 itself. z5..=z13
+/// callers always pass `None` (see `serve_tile`'s comment on why those
+/// tiers get no `ETag` at all); z14 passes `Some` unless
+/// `serving_version::z14_tile_version` itself failed.
 fn finish_tile_response(
     result: Result<anyhow::Result<Vec<u8>>, tokio::task::JoinError>,
     z: u32,
     x: u32,
     y: u32,
+    cache_header: HeaderValue,
+    etag: Option<HeaderValue>,
 ) -> Response {
     match result {
-        Ok(Ok(bytes)) if bytes.is_empty() => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(bytes)) if bytes.is_empty() => {
+            let mut resp = StatusCode::NO_CONTENT.into_response();
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, cache_header);
+            if let Some(etag) = etag {
+                resp.headers_mut().insert(header::ETAG, etag);
+            }
+            resp
+        }
         Ok(Ok(bytes)) => {
             let mut resp = bytes.into_response();
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/vnd.mapbox-vector-tile"),
             );
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, cache_header);
+            if let Some(etag) = etag {
+                resp.headers_mut().insert(header::ETAG, etag);
+            }
             resp
         }
         Ok(Err(e)) => {
@@ -712,7 +876,6 @@ fn finish_tile_response(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::Arc;
 
     use axum::Router;
     use axum::body::{Body, to_bytes};
@@ -720,7 +883,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::server::{build_pool, jobs::JobRegistry};
+    use crate::server::build_pool;
 
     /// The whole point of phrasing the filter as `ST_Intersects(geom,
     /// ST_MakeEnvelope(?, ?, ?, ?))` instead of `geom && bbox.geom`: only the
@@ -910,27 +1073,35 @@ mod tests {
             conn.execute_batch(seed_sql).unwrap();
         }
         let pool = build_pool(conn, 2).unwrap();
-        AppState {
-            pool,
-            registry: Arc::new(JobRegistry::new_for_tests(vec![])),
-            config: Arc::new(crate::config::Config::default()),
-        }
+        AppState::for_tests(pool)
     }
 
+    /// Mounts the real shipping router (`server::build_router`) rather than a
+    /// `/tiles`-only stand-in, so these tests exercise the router as it is
+    /// actually assembled in production.
     fn tiles_app(state: AppState) -> Router {
-        Router::new()
-            .route("/tiles/{z}/{x}/{y}", axum::routing::get(serve_tile))
-            .with_state(state)
+        crate::server::build_router(state)
     }
 
     async fn request_tile(state: AppState, z: u32, x: u32, y: u32) -> Response {
+        request_tile_with_if_none_match(state, z, x, y, None).await
+    }
+
+    /// Same as `request_tile`, plus an optional `If-None-Match` request
+    /// header -- used by the ETag/304 tests below.
+    async fn request_tile_with_if_none_match(
+        state: AppState,
+        z: u32,
+        x: u32,
+        y: u32,
+        if_none_match: Option<&str>,
+    ) -> Response {
+        let mut builder = Request::builder().uri(format!("/tiles/{z}/{x}/{y}"));
+        if let Some(value) = if_none_match {
+            builder = builder.header(header::IF_NONE_MATCH, value);
+        }
         tiles_app(state)
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/tiles/{z}/{x}/{y}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::empty()).unwrap())
             .await
             .unwrap()
     }
@@ -944,6 +1115,18 @@ mod tests {
         let state = make_state("");
         let response = request_tile(state, 3, 1, 1).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// The out-of-range-zoom 204 is a property of the binary's dispatch
+    /// table, not of the data underneath it, so it gets a long, fixed
+    /// max-age (`http_cache::OUT_OF_RANGE_ZOOM_MAX_AGE_SECONDS`) independent
+    /// of the configured tile/aggregate TTLs.
+    #[tokio::test]
+    async fn out_of_range_zoom_caches_for_a_day() {
+        let state = make_state("");
+        let response = request_tile(state, 3, 1, 1).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.headers()["cache-control"], "public, max-age=86400");
     }
 
     /// z10 sits inside Tier A (aggregated bins) and used to return 204 before
@@ -1109,6 +1292,54 @@ mod tests {
         assert!(
             !bytes.is_empty(),
             "ST_AsMVT emits a layer header even with zero features"
+        );
+    }
+
+    /// z14 is the finest zoom -- the one `match_refresh` keeps freshest -- so
+    /// it gets `tile_max_age_seconds`, the shorter of the two configured TTLs.
+    #[tokio::test]
+    async fn z14_tile_carries_the_configured_tile_cache_control() {
+        let state = make_state("");
+        let response = request_tile(state, 14, 8000, 4900).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "public, max-age=60");
+    }
+
+    /// z5..=z13 (both the aggregated-bin tier and the unbinned-points tier)
+    /// share `agg_tile_max_age_seconds` -- checked at one representative zoom
+    /// from each tier so a regression in either dispatch branch is caught.
+    #[tokio::test]
+    async fn agg_and_points_tiles_carry_the_configured_aggregate_cache_control() {
+        let state = make_state("");
+        let response = request_tile(state, 6, 31, 19).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "public, max-age=300");
+
+        let state = make_state("");
+        let response = request_tile(state, 12, 2000, 1225).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "public, max-age=300");
+    }
+
+    /// A failed tile query must come back header-less from `finish_tile_response`
+    /// so the API-default `SetResponseHeaderLayer` in `build_router` stamps
+    /// `no-store` on it -- caching a 500 would turn a transient DB hiccup into
+    /// an outage that outlives the hiccup. `DROP`s a table `BUILDINGS_MVT_SQL`
+    /// reads so the z14 query fails at execution time.
+    #[tokio::test]
+    async fn failed_tile_query_is_not_cached() {
+        let state = make_state("DROP TABLE bdot10k_buildings;");
+        let response = request_tile(state, 14, 8000, 4900).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        // `z14_tile_version` itself would have succeeded here (it never
+        // reads `bdot10k_buildings`) -- the point of this assertion is that
+        // `finish_tile_response`'s error branch discards the etag it was
+        // handed rather than stamping one on a 500, same reasoning as
+        // `no-store` above.
+        assert!(
+            response.headers().get(header::ETAG).is_none(),
+            "a failed tile query must not carry an ETag"
         );
     }
 
@@ -1321,6 +1552,385 @@ mod tests {
         assert!(
             !body.contains("Global Kwiatowa"),
             "the global row must not be used when a settlement-scoped row matches"
+        );
+    }
+
+    // --- z14 ETag / conditional 304 -----------------------------------------
+
+    #[tokio::test]
+    async fn z14_tile_carries_a_weak_etag_alongside_cache_control() {
+        let state = make_state("");
+        let response = request_tile(state, 14, 8000, 4900).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "public, max-age=60");
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .expect("z14 must carry an ETag")
+            .to_str()
+            .unwrap();
+        assert!(
+            etag.starts_with("W/\""),
+            "z14's ETag must be weak, got {etag}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_if_none_match_returns_304_with_no_body_or_content_headers() {
+        let state = make_state("");
+        let first = request_tile(state.clone(), 14, 8000, 4900).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first
+            .headers()
+            .get(header::ETAG)
+            .expect("z14 must carry an ETag")
+            .clone();
+
+        let second =
+            request_tile_with_if_none_match(state, 14, 8000, 4900, Some(etag.to_str().unwrap()))
+                .await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            second.headers().get(header::ETAG),
+            Some(&etag),
+            "the 304 must echo back the same ETag"
+        );
+        assert_eq!(second.headers()["cache-control"], "public, max-age=60");
+        assert!(
+            second.headers().get(header::CONTENT_TYPE).is_none(),
+            "RFC 9110 SS15.4.5: a 304 must not carry Content-Type"
+        );
+        // Not asserted absent: `http_cache::not_modified` itself never sets
+        // Content-Length (pinned directly in `http_cache`'s own unit test,
+        // which builds the Response without going through a Router), but
+        // axum 0.8's `Route`/`RouteFuture` unconditionally stamps
+        // `Content-Length` on any top-level response whose body reports an
+        // exact size via `size_hint()` -- verified by reading
+        // axum-0.8.9/src/routing/route.rs's `set_content_length`, and by
+        // confirming `/health`'s 200 (an unrelated, pre-existing route)
+        // carries the same "0" here. RFC 9110 SS15.4.5 only forbids actual
+        // *content* on a 304, not this header, so a "0" is informational and
+        // harmless, not a spec violation -- there is no way to suppress it
+        // through axum's public routing API short of nesting every route
+        // (which would also strip it from genuine 200 tile bodies).
+        assert_eq!(second.headers()["content-length"], "0");
+        let bytes = to_bytes(second.into_body(), 1024).await.unwrap();
+        assert!(bytes.is_empty(), "a 304 must have an empty body");
+    }
+
+    #[tokio::test]
+    async fn stale_if_none_match_returns_200_with_the_full_tile() {
+        let state = make_state("");
+        let response = request_tile_with_if_none_match(
+            state,
+            14,
+            8000,
+            4900,
+            Some("W/\"not-the-real-version\""),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::ETAG).is_some());
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            !bytes.is_empty(),
+            "ST_AsMVT emits a layer header even with zero features"
+        );
+    }
+
+    /// Pins the ETag's three sources of movement end to end through HTTP --
+    /// serving_version's own unit tests already pin each source against
+    /// `z14_tile_version` directly; this test is what proves `serve_tile`
+    /// actually wires that primitive into a response header a client would
+    /// see change.
+    #[tokio::test]
+    async fn etag_moves_after_a_cell_recompute_an_epoch_bump_and_a_neighbouring_cell_recompute() {
+        let state = make_state("");
+        let etag_a = request_tile(state.clone(), 14, 8000, 4900)
+            .await
+            .headers()
+            .get(header::ETAG)
+            .expect("z14 must carry an ETag")
+            .clone();
+
+        // 1. A recompute of the tile's own cell (8000, 4900).
+        {
+            let conn = state.pool.get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at) VALUES
+                     ('b1', ST_Point(21.0, 52.0), 8000, 4900, now());",
+            )
+            .unwrap();
+        }
+        let etag_b = request_tile(state.clone(), 14, 8000, 4900)
+            .await
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .clone();
+        assert_ne!(etag_a, etag_b, "a cell recompute must move the tile's ETag");
+
+        // 2. An epoch bump -- covers the sources with no per-cell signal at
+        // all (street/building-type mapping reloads, a `compare full`
+        // rebuild; see serving_version's module doc) -- with the cell itself
+        // left untouched.
+        {
+            let conn = state.pool.get().unwrap();
+            serving_version::bump_serving_epoch(&conn).unwrap();
+        }
+        let etag_c = request_tile(state.clone(), 14, 8000, 4900)
+            .await
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .clone();
+        assert_ne!(etag_b, etag_c, "an epoch bump must move the tile's ETag");
+
+        // 3. A recompute of a NEIGHBOURING cell, one z14 cell away -- still
+        // inside the 3x3 ring `z14_tile_version` reads (see its doc comment)
+        // -- must move it too.
+        {
+            let conn = state.pool.get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at) VALUES
+                     ('b2', ST_Point(21.0, 52.0), 8001, 4901, now());",
+            )
+            .unwrap();
+        }
+        let etag_d = request_tile(state, 14, 8000, 4900)
+            .await
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .clone();
+        assert_ne!(
+            etag_c, etag_d,
+            "a neighbouring cell's recompute must move the tile's ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn agg_and_points_tiles_carry_no_etag() {
+        for (z, x, y) in [(6, 31, 19), (12, 2000, 1225)] {
+            let state = make_state("");
+            let response = request_tile(state, z, x, y).await;
+            assert_eq!(response.status(), StatusCode::OK, "z{z}");
+            assert!(
+                response.headers().get(header::ETAG).is_none(),
+                "z{z} must not carry an ETag -- see serve_tile's comment on why"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_range_zoom_carries_no_etag() {
+        let state = make_state("");
+        let response = request_tile(state, 3, 1, 1).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response.headers().get(header::ETAG).is_none());
+    }
+
+    // --- Phase 5: z14 tile_cache wiring -------------------------------------
+
+    /// The basic payoff: a second request for the exact same tile, with
+    /// nothing having changed in between, is served from `tile_cache`
+    /// instead of running the four MVT queries again. Asserted on the
+    /// cache's own hit/miss counters, not on timing -- timing would be racy
+    /// and wouldn't actually prove which code path served the response.
+    /// A cache hit and a cache miss must be indistinguishable in the response
+    /// they produce, and the empty-tile case is where that is easiest to get
+    /// wrong: `finish_tile_response` answers 204 for empty bytes, so
+    /// `z14_tile_response` (the path a cache hit takes, and the only z14 path
+    /// since the two were unified) has to as well. An earlier draft returned
+    /// a bare 200 with an empty body here, which would have made a z14 tile
+    /// over open country -- the common case across most of Poland -- flip
+    /// between 204 and 200 depending purely on whether it happened to be
+    /// resident in the cache.
+    #[test]
+    fn z14_response_shaping_is_identical_for_empty_and_cached_empty_tiles() {
+        let cache_header = HeaderValue::from_static("public, max-age=60");
+        let etag = HeaderValue::from_static("W/\"1-0-0.0-0.0-0.0\"");
+
+        let fresh = finish_tile_response(
+            Ok(Ok(Vec::new())),
+            14,
+            8000,
+            4900,
+            cache_header.clone(),
+            Some(etag.clone()),
+        );
+        let cached = z14_tile_response(Bytes::new(), cache_header.clone(), Some(etag.clone()));
+
+        assert_eq!(fresh.status(), StatusCode::NO_CONTENT);
+        assert_eq!(cached.status(), fresh.status());
+        assert_eq!(cached.headers().get(header::ETAG), Some(&etag));
+        assert_eq!(
+            cached.headers().get(header::CACHE_CONTROL),
+            Some(&cache_header)
+        );
+        assert_eq!(
+            cached.headers().get(header::CONTENT_TYPE),
+            None,
+            "a 204 must not claim a body's content type"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_request_for_the_same_tile_is_served_from_the_cache() {
+        let state = make_state("");
+
+        let first = request_tile(state.clone(), 14, 8000, 4900).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            state.tile_cache.misses(),
+            1,
+            "first request must miss and populate the cache"
+        );
+        assert_eq!(state.tile_cache.hits(), 0);
+
+        let second = request_tile(state.clone(), 14, 8000, 4900).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            state.tile_cache.hits(),
+            1,
+            "repeat request must be served from the cache"
+        );
+        assert_eq!(
+            state.tile_cache.misses(),
+            1,
+            "no additional miss on the repeat request"
+        );
+    }
+
+    /// A recompute moves `z14_tile_version`'s output (pinned end-to-end
+    /// already by `etag_moves_after_a_cell_recompute_...` above), which must
+    /// also mean the cache entry keyed on the OLD version is bypassed: the
+    /// request after a recompute must miss the cache and return the fresh
+    /// bytes, not the stale cached ones.
+    #[tokio::test]
+    async fn cache_is_bypassed_after_a_version_move() {
+        let state = make_state("");
+
+        let first = request_tile(state.clone(), 14, 8000, 4900).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(state.tile_cache.misses(), 1);
+
+        // Inserted at the tile's own midpoint (not an arbitrary coordinate)
+        // so the row is actually selected by BUILDINGS_MVT_SQL's spatial
+        // `ST_Intersects` filter, not just tagged with the matching
+        // cell_x/cell_y -- matching the pattern every other content-bearing
+        // seed in this file already uses.
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+        {
+            let conn = state.pool.get().unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at) VALUES
+                     ('b1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());"
+            ))
+            .unwrap();
+        }
+
+        let second = request_tile(state.clone(), 14, 8000, 4900).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            state.tile_cache.misses(),
+            2,
+            "a version move must miss the cache rather than serve the stale entry"
+        );
+        assert_eq!(
+            state.tile_cache.hits(),
+            0,
+            "the recompute must never have been served from the cache"
+        );
+
+        let bytes = to_bytes(second.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("bdot10k"),
+            "the recomputed row must appear in the fresh (uncached) tile"
+        );
+    }
+
+    /// A `304` short-circuits before the cache is even consulted (see
+    /// `serve_tile`'s early return on an `If-None-Match` match) -- it must
+    /// move neither counter, not just "not register a miss".
+    #[tokio::test]
+    async fn a_304_registers_neither_a_cache_hit_nor_a_miss() {
+        let state = make_state("");
+
+        let first = request_tile(state.clone(), 14, 8000, 4900).await;
+        let etag = first
+            .headers()
+            .get(header::ETAG)
+            .expect("z14 must carry an ETag")
+            .clone();
+        let hits_after_first = state.tile_cache.hits();
+        let misses_after_first = state.tile_cache.misses();
+
+        let second = request_tile_with_if_none_match(
+            state.clone(),
+            14,
+            8000,
+            4900,
+            Some(etag.to_str().unwrap()),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            state.tile_cache.hits(),
+            hits_after_first,
+            "a 304 must not count as a cache hit"
+        );
+        assert_eq!(
+            state.tile_cache.misses(),
+            misses_after_first,
+            "a 304 must not count as a cache miss either -- it returns before \
+             the cache is ever consulted"
+        );
+    }
+
+    /// z5..=z13 and out-of-range zooms never touch `tile_cache` at all --
+    /// it's a z14-only cache (see the module doc on `tile_cache`).
+    #[tokio::test]
+    async fn cache_is_never_consulted_below_z14() {
+        let state = make_state("");
+        for (z, x, y) in [(3, 1, 1), (6, 31, 19), (12, 2000, 1225)] {
+            let response = request_tile(state.clone(), z, x, y).await;
+            assert!(
+                response.status() == StatusCode::OK || response.status() == StatusCode::NO_CONTENT,
+                "z{z}: unexpected status {}",
+                response.status()
+            );
+            assert_eq!(state.tile_cache.hits(), 0, "z{z} must never hit tile_cache");
+            assert_eq!(
+                state.tile_cache.misses(),
+                0,
+                "z{z} must never miss tile_cache either -- it must not be consulted at all"
+            );
+        }
+    }
+
+    /// A cache hit must be indistinguishable from a fresh response on the
+    /// headers a client actually keys revalidation off of.
+    #[tokio::test]
+    async fn cached_response_carries_the_same_etag_and_cache_control_as_a_fresh_one() {
+        let state = make_state("");
+
+        let first = request_tile(state.clone(), 14, 8000, 4900).await;
+        let first_etag = first.headers().get(header::ETAG).cloned();
+        let first_cache_control = first.headers().get(header::CACHE_CONTROL).cloned();
+
+        let second = request_tile(state.clone(), 14, 8000, 4900).await;
+        assert_eq!(
+            state.tile_cache.hits(),
+            1,
+            "this test must actually exercise the cache-hit path"
+        );
+        assert_eq!(second.headers().get(header::ETAG).cloned(), first_etag);
+        assert_eq!(
+            second.headers().get(header::CACHE_CONTROL).cloned(),
+            first_cache_control
         );
     }
 }

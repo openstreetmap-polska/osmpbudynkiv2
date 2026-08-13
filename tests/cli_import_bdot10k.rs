@@ -110,3 +110,50 @@ fn test_import_bdot10k_writes_row_hash() {
     // against the binary, so the constant isn't importable. Bump both together.
     assert_eq!(stamp, "2");
 }
+
+/// An import rewrites `bdot10k_buildings` wholesale, including the
+/// `centroid` column `/tiles`' adjacency CTE reads with no per-cell version
+/// covering it -- see `serving_version`'s module doc. The import dispatch
+/// must bump `metadata.serving_epoch` alongside `row_hash_version`. Uses a
+/// file-backed database (like `test_import_bdot10k_writes_row_hash` above,
+/// not `memory_config()`) so the state can be read back after the CLI
+/// process exits.
+#[test]
+fn test_import_bdot10k_bumps_serving_epoch() {
+    let db = tempfile::TempDir::new().unwrap();
+    let rocksdb_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db.path().join("test.duckdb");
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    use std::io::Write;
+    write!(
+        tmp,
+        "db_path = \"{}\"\nrocksdb_path = \"{}\"\n",
+        db_path.display(),
+        rocksdb_dir.path().display()
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "--config",
+            tmp.path().to_str().unwrap(),
+            "import",
+            "bdot10k",
+            "--file",
+            "fixtures/bdot10k.parquet",
+        ])
+        .assert()
+        .success();
+
+    let conn = duckdb::Connection::open(&db_path).unwrap();
+    conn.execute_batch("INSTALL spatial; LOAD spatial;")
+        .unwrap();
+    let epoch: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'serving_epoch'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("import must bump metadata.serving_epoch");
+    assert_eq!(epoch, "1", "first bump on a fresh database must land at 1");
+}
