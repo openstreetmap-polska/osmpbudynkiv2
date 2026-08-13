@@ -9,7 +9,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tracing::info;
 
 use crate::config::Config;
-use crate::download::download_file_quiet;
+use crate::download::{download_file_as_quiet, download_file_quiet};
 use crate::osm::kvstore::RocksDB;
 use crate::osm::lifecycle;
 use crate::osm::replication::{
@@ -136,9 +136,17 @@ fn apply_sequence(
     let path = sequence_to_path(seq);
     let url = format!("{replication_base_url}/{path}");
 
-    let osc_gz_path = download_file_quiet(&url, download_dir)?;
-    let osc_xml = decompress_gz(&osc_gz_path)?;
-    let _ = std::fs::remove_file(&osc_gz_path);
+    // `sequence_to_path` is only used to build the URL. The local filename
+    // must be derived from `seq` directly, not (as `download_file_quiet`
+    // would do) from the URL's last path segment: `sequence_to_path` nests
+    // three directory levels of the zero-padded sequence number
+    // (`007/237/736.osc.gz`), so its *last segment alone* repeats every
+    // 1000 sequences -- sequence 7237736 and sequence 7236736 both end in
+    // `736.osc.gz`. Reusing that segment as the on-disk filename would let
+    // `download_file_as_impl`'s exists-check silently hand back a different
+    // sequence's stale file without downloading anything.
+    let osc_gz_path = download_file_as_quiet(&url, download_dir, &osc_local_file_name(seq))?;
+    let osc_xml = decompress_and_remove(&osc_gz_path)?;
 
     let changes = parse_osc(&osc_xml)?;
 
@@ -170,6 +178,39 @@ fn apply_sequence(
             Err(e)
         }
     }
+}
+
+/// On-disk filename for a downloaded replication diff. Deliberately built
+/// from `seq` directly rather than reusing `sequence_to_path(seq)`'s last
+/// path segment as a filename -- see the comment at its call site in
+/// `apply_sequence` for why that collides across sequences 1000 apart.
+fn osc_local_file_name(seq: u64) -> String {
+    format!("{seq}.osc.gz")
+}
+
+/// Decompress a downloaded `.osc.gz` and delete it, **whether or not**
+/// decompression succeeded.
+///
+/// The cleanup must not be skipped on failure. Since the local filename is
+/// now stable per sequence (see [`osc_local_file_name`]), a corrupt leftover
+/// would otherwise be handed straight back by `download_file_as_impl`'s
+/// exists-check on every subsequent attempt, and that sequence could never
+/// make progress again — the update job would wedge permanently on one bad
+/// download.
+///
+/// This exists as its own function rather than three lines inline in
+/// `apply_sequence` so the regression test can pin the *production* ordering.
+/// A test that merely re-executed the same three statements would still pass
+/// if `apply_sequence` were reverted to `decompress_gz(&path)?` followed by
+/// the removal, which is exactly the bug.
+///
+/// Note the removal here is unconditional and is *not* gated on
+/// `config.cleanup_downloaded_files` — that setting governs only the
+/// dataset/PBF paths, never replication diffs.
+fn decompress_and_remove(path: &Path) -> Result<String> {
+    let decompressed = decompress_gz(path);
+    let _ = std::fs::remove_file(path);
+    decompressed
 }
 
 fn decompress_gz(path: &Path) -> Result<String> {
@@ -1617,5 +1658,83 @@ mod tests {
         assert!(kvstore::get_way(&kv, 160)?.is_none());
 
         Ok(())
+    }
+
+    #[test]
+    fn osc_local_file_name_is_unique_per_sequence() {
+        // Direct regression for the on-disk filename collision bug:
+        // `sequence_to_path` nests the zero-padded sequence in three
+        // directory levels (`007/237/736.osc.gz`), so its *last path
+        // segment alone* repeats every 1000 sequences -- these two
+        // sequences 1000 apart really do share it -- while
+        // `osc_local_file_name` (used for the on-disk filename instead)
+        // must not.
+        let a = sequence_to_path(7_237_736);
+        let b = sequence_to_path(7_236_736);
+        assert_eq!(
+            a.rsplit('/').next(),
+            b.rsplit('/').next(),
+            "sanity check: sequence_to_path's last segment really does collide for these two"
+        );
+
+        assert_ne!(
+            osc_local_file_name(7_237_736),
+            osc_local_file_name(7_236_736)
+        );
+    }
+
+    #[test]
+    fn corrupt_download_is_removed_after_decompress_failure() {
+        // Direct regression for the cleanup-skipped-on-failure bug: the old
+        // code was `let osc_xml = decompress_gz(&osc_gz_path)?; let _ =
+        // std::fs::remove_file(&osc_gz_path);`, so the `?` short-circuited
+        // past cleanup whenever decompression failed.
+        //
+        // This calls `decompress_and_remove` -- the function `apply_sequence`
+        // actually uses -- rather than re-executing a copy of its statements
+        // here. That distinction is the whole point: a test that inlined the
+        // same three lines would still pass after `apply_sequence` was
+        // reverted to `decompress_gz(&path)?`, i.e. it could not fail on the
+        // bug it names.
+        //
+        // It still does not call `apply_sequence` itself -- that needs a full
+        // DuckDB `Connection` + `RocksDB` fixture -- so it does not cover the
+        // DB transaction/rollback path, nor that a retried sequence
+        // re-downloads cleanly afterwards. It does download a real corrupt
+        // file over HTTP exactly the way `apply_sequence` does (via
+        // `download_file_as_quiet` with `osc_local_file_name`).
+        let garbage: &'static [u8] = b"this is not a valid gzip stream, just garbage bytes";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    garbage.len()
+                );
+                let _ = stream.write_all(headers.as_bytes());
+                let _ = stream.write_all(garbage);
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("http://{addr}/007/237/736.osc.gz");
+        let seq = 7_237_736u64;
+        let osc_gz_path =
+            download_file_as_quiet(&url, tmp.path(), &osc_local_file_name(seq)).unwrap();
+        assert!(osc_gz_path.exists());
+
+        let osc_xml = decompress_and_remove(&osc_gz_path);
+        assert!(
+            osc_xml.is_err(),
+            "garbage bytes must fail gzip decompression, or this test isn't exercising the failure path"
+        );
+        assert!(
+            !osc_gz_path.exists(),
+            "corrupt download must be cleaned up even though decompression failed"
+        );
     }
 }

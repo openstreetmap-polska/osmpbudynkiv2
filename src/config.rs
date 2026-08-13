@@ -153,21 +153,29 @@ impl Default for MatchRefreshConfig {
 /// Periodic `enqueue_all` sweep — the design's safety net against a dropped
 /// enqueue (design ~line 282).
 ///
-/// **Disabled by default, deliberately.** Two measured reasons, both of which
-/// go away once the per-cell recompute stops full-scanning the government table
-/// (see `docs/per_cell_recompute_full_scan.md`):
+/// **Disabled by default, deliberately.** Two measured reasons. The first has
+/// largely gone away; the second has not, which is why the default has not
+/// moved.
 ///
-/// 1. A sweep enqueues ~339,000 cells. At the drain's measured ~0.9 s/cell that
-///    is ~85 h of work, so any interval under ~4 days would pile sweeps on top
-///    of each other.
-/// 2. Worse, the drain is deliberately oldest-enqueued-first (so no source
-///    starves). A bulk sweep therefore sits *in front of* every subsequent OSM
-///    edit: a building edited a minute after the sweep started would not reach
-///    the serving tables until the whole sweep drained. The safety net would
-///    cost hours of freshness on the thing it is protecting.
+/// 1. *Mostly resolved.* A sweep enqueues ~339,000 cells. At the drain's
+///    then-measured ~0.9 s/cell that was ~85 h of work, so any interval under
+///    ~4 days would pile sweeps on top of each other. Restoring the centroid
+///    RTREE on the per-cell recompute cut that to ~0.02–0.05 s/cell (see
+///    `docs/per_cell_recompute_cell_guard_scan.md`, sequel to
+///    `per_cell_recompute_full_scan.md`), i.e. roughly **2–5 h** — which does
+///    fit inside the 24 h default interval.
+/// 2. *Still true, and now the sole blocker.* The drain is deliberately
+///    oldest-enqueued-first (so no source starves). A bulk sweep therefore
+///    sits *in front of* every subsequent OSM edit: a building edited a minute
+///    after the sweep started would not reach the serving tables until the
+///    whole sweep drained. Even at 2–5 h that is hours of lost freshness on
+///    the thing the safety net exists to protect.
 ///
-/// Turn it on once a cell recompute is cheap enough that a sweep completes in
-/// well under the interval.
+/// So the remaining work is not "make the cell cheaper" — it is to stop a
+/// sweep from head-of-line-blocking live edits (e.g. drain reconcile-sourced
+/// cells at a lower priority than OSM-sourced ones, which would need a
+/// provenance column on `match_dirty_cells`). Until then, leave this off and
+/// rely on `compare reconcile` being run by hand.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct MatchReconcileConfig {
