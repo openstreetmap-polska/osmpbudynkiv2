@@ -1,12 +1,15 @@
 use std::collections::HashSet;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use duckdb::{Connection, OptionalExt};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::config::Config;
 use crate::download::{download_file_as_quiet, download_file_quiet};
@@ -28,16 +31,22 @@ use crate::update::dirty_cells::{DirtyCells, Layer};
 /// redraws would otherwise pollute its log output. Individual sequence
 /// downloads never get their own bar either way; see `download_file_quiet`.
 ///
-/// `is_cancelled` is polled between sequences, never mid-sequence -- mirrors
+/// `is_cancelled` is polled between batches, never mid-batch -- mirrors
 /// `compare::drain::drain_batch`'s "never mid-transaction" rule, since a
-/// sequence's DuckDB transaction (`apply_sequence`) is already its own atomic
-/// unit. On cancellation this returns `Ok(())` early: the remaining
-/// sequences are simply resumed on the next call, from the `metadata` stamp
-/// the last committed sequence left behind. The background job
-/// (`server::jobs::osm_update`) passes `&|| ctx.is_cancelled()` so the
-/// supervisor's timeout actually shortens a run instead of only being
+/// batch's DuckDB transaction (`apply_batch`) is already its own atomic unit
+/// (this used to be one sequence per transaction; see `apply_batch`'s doc
+/// comment for the batching added on top). On cancellation this returns
+/// `Ok(())` early: the remaining sequences are simply resumed on the next
+/// call, from the `metadata` stamp the last committed batch left behind. The
+/// background job (`server::jobs::osm_update`) passes `&|| ctx.is_cancelled()`
+/// so the supervisor's timeout actually shortens a run instead of only being
 /// recorded after the fact; the CLI path (`update::run`'s `Osm` arm) passes
 /// `&|| false` since it has no supervisor and should run to completion.
+///
+/// Downloads are prefetched ahead of the sequence currently being applied
+/// (see [`spawn_prefetcher`]) and, during catch-up, several sequences share
+/// one DuckDB transaction (see [`apply_batch`]). Both are read from
+/// `config.jobs.osm_update`.
 pub fn update(
     conn: &Connection,
     kv: &RocksDB,
@@ -62,6 +71,13 @@ pub fn update(
     let pending = latest_seq - current_seq;
     info!(pending, "Sequences to apply");
 
+    let osm_update_cfg = &config.jobs.osm_update;
+    let chunk_size = catch_up_chunk_size(
+        pending,
+        osm_update_cfg.batch_commit_threshold,
+        osm_update_cfg.batch_size,
+    );
+
     let pb = if show_progress {
         let pb = ProgressBar::new(pending);
         pb.set_style(
@@ -77,51 +93,229 @@ pub fn update(
         None
     };
 
-    for seq in (current_seq + 1)..=latest_seq {
-        if crate::shutdown::is_requested() {
-            info!("Shutdown requested, stopping update");
-            if let Some(pb) = &pb {
-                pb.abandon_with_message("Shutdown requested");
-            }
-            return Ok(());
-        }
+    // `last_applied` starts at `current_seq` (nothing past it is applied
+    // yet) and is advanced by `apply_batch` as it works through each batch,
+    // one sequence at a time -- see that function's doc comment for why it
+    // moves mid-batch rather than only on commit. The prefetch thread reads
+    // it to stay within `prefetch_ahead` of real progress; `stop` is how the
+    // main thread tells the prefetcher to give up promptly on any exit path
+    // below, so `update()` never blocks its `join()` on a full backoff wait.
+    let last_applied = Arc::new(AtomicU64::new(current_seq));
+    let stop = Arc::new(AtomicBool::new(false));
+    // `prefetch_ahead == 0` disables prefetching outright (no thread spawned
+    // at all), the same "0 means off, via config alone" idiom as
+    // `TileCache::new(0)`.
+    let prefetch_handle = (osm_update_cfg.prefetch_ahead > 0).then(|| {
+        spawn_prefetcher(
+            replication_base_url.to_string(),
+            download_dir.clone(),
+            current_seq,
+            latest_seq,
+            osm_update_cfg.prefetch_ahead,
+            Arc::clone(&last_applied),
+            Arc::clone(&stop),
+        )
+    });
 
-        // Polled between sequences only -- see the doc comment above for why
-        // mid-sequence cancellation would be wrong (the transaction inside
-        // apply_sequence is the atomic unit).
-        if is_cancelled() {
-            info!("Cancellation requested, stopping update");
-            if let Some(pb) = &pb {
-                pb.abandon_with_message("Cancellation requested");
-            }
-            return Ok(());
-        }
+    // The whole catch-up loop lives in this closure so that, however it
+    // exits (falls through to completion, an early `return Ok(())` on
+    // shutdown/cancellation, or an `Err` via `?`), the `stop.store` + `join`
+    // below always runs exactly once on the way out. A `Drop` guard would
+    // work too, but would need to reach back into `pb`/`stop` from a
+    // separate type; a closure keeps everything in this function's scope.
+    let result = (|| -> Result<()> {
+        let mut seq = current_seq + 1;
+        let mut applied_so_far: u64 = 0;
+        let mut last_logged_bucket: u64 = 0;
 
-        apply_sequence(
-            conn,
-            kv,
-            seq,
-            replication_base_url,
-            &download_dir,
-            &latest_timestamp,
-        )?;
+        while seq <= latest_seq {
+            if crate::shutdown::is_requested() {
+                info!("Shutdown requested, stopping update");
+                if let Some(pb) = &pb {
+                    pb.abandon_with_message("Shutdown requested");
+                }
+                return Ok(());
+            }
+
+            // Polled between batches only -- see the doc comment above for
+            // why mid-batch cancellation would be wrong (the transaction
+            // inside apply_batch is the atomic unit).
+            if is_cancelled() {
+                info!("Cancellation requested, stopping update");
+                if let Some(pb) = &pb {
+                    pb.abandon_with_message("Cancellation requested");
+                }
+                return Ok(());
+            }
+
+            let batch_end = (seq + chunk_size as u64 - 1).min(latest_seq);
+
+            // Fetch and parse the whole batch BEFORE opening the DuckDB
+            // transaction in apply_batch -- see apply_batch's doc comment for
+            // why that bound matters.
+            let mut batch = Vec::with_capacity((batch_end - seq + 1) as usize);
+            for s in seq..=batch_end {
+                batch.push(fetch_and_parse_sequence(
+                    s,
+                    replication_base_url,
+                    &download_dir,
+                )?);
+            }
+
+            apply_batch(conn, kv, &batch, &latest_timestamp, &last_applied)?;
+
+            let applied_count = batch.len() as u64;
+            applied_so_far += applied_count;
+            if let Some(pb) = &pb {
+                pb.inc(applied_count);
+            } else {
+                // Log once per PROGRESS_LOG_INTERVAL sequences *crossed*, not
+                // when the running total happens to land exactly on a
+                // multiple of it. Before batching, `applied_so_far` advanced
+                // one at a time and hit every multiple, so an equality test
+                // was equivalent; with a batch of `chunk_size` it steps over
+                // them, and any `batch_size` that doesn't divide the interval
+                // (7, 30, 40, ...) would silently produce NO progress logs at
+                // all for the whole run -- exactly the multi-hour catch-up
+                // this batching exists for, and the one place the operator
+                // has no progress bar to fall back on (`show_progress` is
+                // false for the background job).
+                let bucket = applied_so_far / PROGRESS_LOG_INTERVAL;
+                if bucket > last_logged_bucket {
+                    last_logged_bucket = bucket;
+                    info!(
+                        seq = batch_end,
+                        progress = format!("{applied_so_far}/{pending}"),
+                        "Progress"
+                    );
+                }
+            }
+
+            seq = batch_end + 1;
+        }
 
         if let Some(pb) = &pb {
-            pb.inc(1);
-        } else if (seq - current_seq) % 100 == 0 {
-            info!(
-                seq,
-                progress = format!("{}/{}", seq - current_seq, pending),
-                "Progress"
-            );
+            pb.finish_with_message("OSM update complete");
         }
+        info!(final_seq = latest_seq, "OSM update complete");
+        Ok(())
+    })();
+
+    stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = prefetch_handle {
+        // Best-effort: a panicked prefetch thread must not mask the real
+        // result of the catch-up loop above.
+        let _ = handle.join();
     }
 
-    if let Some(pb) = &pb {
-        pb.finish_with_message("OSM update complete");
+    result
+}
+
+/// Batch size for one DuckDB transaction during catch-up.
+///
+/// Batching only engages when `pending` (computed once, at the start of
+/// `update()`, from the sequence range the whole run needs to cover) exceeds
+/// `batch_commit_threshold` -- otherwise `chunk_size` is `1`, which must
+/// stay byte-for-byte today's one-sequence-per-transaction path. Steady
+/// state (one pending sequence per tick, the overwhelmingly common case
+/// outside a cold-start catch-up) never crosses the threshold, so it is
+/// untouched by this change.
+///
+/// `pending` is deliberately not recomputed per batch: the threshold decides
+/// the *mode* for the whole run, not each chunk, so a catch-up that starts
+/// just over the threshold stays batched all the way to its last few
+/// sequences rather than dropping back to `chunk_size = 1` right at the end.
+///
+/// `.max(1)` guards a misconfigured `batch_size = 0`, which would otherwise
+/// make the `while seq <= latest_seq` loop in `update()` build a batch of
+/// zero sequences per iteration and never advance `seq`.
+fn catch_up_chunk_size(pending: u64, batch_commit_threshold: u64, batch_size: usize) -> usize {
+    if pending > batch_commit_threshold {
+        batch_size.max(1)
+    } else {
+        1
     }
-    info!(final_seq = latest_seq, "OSM update complete");
-    Ok(())
+}
+
+/// How often the prefetch thread rechecks `stop` while waiting for its
+/// window to reopen (see [`spawn_prefetcher`]). Deliberately short and fixed
+/// rather than growing like `download_with_retry`'s backoff: there is no
+/// "increasing cost" to justify growth here, since the window reopens the
+/// moment `last_applied` advances -- a short fixed poll just bounds how long
+/// `update()`'s `join()` can be kept waiting once it sets `stop`.
+const PREFETCH_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How many applied sequences between "Progress" log lines when there is no
+/// progress bar (i.e. the background job). See the call site in `update()`
+/// for why this is compared as a bucket rather than by exact divisibility.
+const PROGRESS_LOG_INTERVAL: u64 = 100;
+
+/// Spawn the bounded-window prefetch thread for sequences
+/// `current_seq+1..=latest_seq`.
+///
+/// Deliberately minimal: no channel plumbing, no change to apply ordering.
+/// It downloads into the same `download_dir`, under the same
+/// `osc_local_file_name(seq)` filenames the apply loop's own
+/// `fetch_and_parse_sequence` uses, so that call's `download_file_as_quiet`
+/// simply finds the file already there and returns immediately --
+/// `download::tests::existing_file_skips_download_entirely` pins that
+/// "already exists, skip" branch. This function does no DB access at all;
+/// the apply loop remains the sole source of truth for what actually lands
+/// in the database.
+///
+/// Bounded by `last_applied` so it never runs more than `prefetch_ahead`
+/// sequences ahead of real progress (memory/disk for `prefetch_ahead`
+/// buffered `.osc.gz` files, not the whole backlog), and by `latest_seq` so
+/// it never prefetches a sequence that doesn't exist yet.
+///
+/// A download failure here is non-fatal and is logged at `debug!` rather
+/// than retried: `download_file_as_quiet` (via `download_with_retry`)
+/// already gave the sequence three attempts with exponential backoff, and
+/// retrying again on top of that would let the prefetcher fall behind its
+/// window chasing one stubborn sequence for no benefit -- the apply loop's
+/// own download call is the authority regardless, and just downloads the
+/// sequence itself if the prefetch never landed.
+fn spawn_prefetcher(
+    replication_base_url: String,
+    download_dir: PathBuf,
+    current_seq: u64,
+    latest_seq: u64,
+    prefetch_ahead: usize,
+    last_applied: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut next = current_seq + 1;
+
+        while next <= latest_seq {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+
+            let window_ceiling = last_applied.load(Ordering::SeqCst) + prefetch_ahead as u64;
+            if next > window_ceiling {
+                // Window full: wait for the apply loop to advance, checking
+                // `stop` between short sleeps rather than one long one, so a
+                // cancelled or failed update() doesn't block its join() for
+                // the whole wait.
+                std::thread::sleep(PREFETCH_WINDOW_POLL_INTERVAL);
+                continue;
+            }
+
+            let path = sequence_to_path(next);
+            let url = format!("{replication_base_url}/{path}");
+            if let Err(e) = download_file_as_quiet(&url, &download_dir, &osc_local_file_name(next))
+            {
+                debug!(
+                    seq = next,
+                    error = %e,
+                    "prefetch download failed; the apply loop will download it synchronously instead"
+                );
+            }
+
+            next += 1;
+        }
+    })
 }
 
 fn get_current_sequence(conn: &Connection) -> Result<u64> {
@@ -147,15 +341,25 @@ fn fetch_latest_sequence(replication_base_url: &str, download_dir: &Path) -> Res
     parse_state_txt(&text)
 }
 
-fn apply_sequence(
-    conn: &Connection,
-    kv: &RocksDB,
+/// One downloaded, decompressed, and parsed replication sequence, ready to
+/// apply. Produced by [`fetch_and_parse_sequence`] and consumed by
+/// [`apply_batch`] -- kept as its own type (rather than, say, a tuple) so a
+/// batch's `Vec<FetchedSequence>` reads clearly as "everything needed to
+/// apply N sequences", already fetched, with no DB handle in sight.
+struct FetchedSequence {
+    seq: u64,
+    changes: OsmChange,
+}
+
+/// Download and parse one replication sequence. No DB access -- this is the
+/// network+parsing half of what used to be `apply_sequence` in one function;
+/// see [`apply_batch`] for why the two are now split and what the split
+/// buys.
+fn fetch_and_parse_sequence(
     seq: u64,
     replication_base_url: &str,
     download_dir: &Path,
-    timestamp: &str,
-) -> Result<()> {
-    // Download and parse everything before starting any writes.
+) -> Result<FetchedSequence> {
     let path = sequence_to_path(seq);
     let url = format!("{replication_base_url}/{path}");
 
@@ -170,21 +374,112 @@ fn apply_sequence(
     // sequence's stale file without downloading anything.
     let osc_gz_path = download_file_as_quiet(&url, download_dir, &osc_local_file_name(seq))?;
     let osc_xml = decompress_and_remove(&osc_gz_path)?;
-
     let changes = parse_osc(&osc_xml)?;
 
-    // Apply within a DuckDB transaction for atomicity.
-    // RocksDB writes happen immediately but are idempotent: if we fail and retry
-    // the same sequence (metadata not yet committed), re-applying produces the
-    // same KV state.
+    Ok(FetchedSequence { seq, changes })
+}
+
+/// Apply a batch of already-fetched sequences inside a single DuckDB
+/// transaction, stamping `metadata` once with the batch's *last* sequence.
+///
+/// `batch` must be non-empty and sorted ascending by `seq` -- `update()`'s
+/// caller loop guarantees both. Steady state and any catch-up small enough
+/// to stay under `batch_commit_threshold` always call this with a
+/// single-element batch (`catch_up_chunk_size` returns `1`), which is
+/// exactly the pre-batching `apply_sequence` behaviour: one BEGIN, one
+/// `apply_changes`, one metadata stamp, one COMMIT.
+///
+/// **Why fetching happens before `BEGIN`.** `update()`'s caller loop fetches
+/// and parses the whole batch (network + gzip + XML) *before* calling this
+/// function, so nothing in here ever blocks on the network while the
+/// transaction is open. That bound is the direct mitigation for the
+/// concurrency risk below: the longer this transaction is held, the more it
+/// overlaps the `match_refresh` drain, so keeping network/parsing strictly
+/// outside it is what keeps that overlap bounded by DB work alone. Do not
+/// "simplify" this by having `apply_batch` itself download each sequence
+/// inside the loop below.
+///
+/// **Resume correctness needs no new bookkeeping.** The metadata stamp is
+/// written and committed together with every other write in this
+/// transaction, so a crash (or any error) partway through leaves it at
+/// whatever it was before this call -- `get_current_sequence` then resumes
+/// at the batch's *first* sequence on the next `update()` call, replaying
+/// the whole batch from scratch rather than a partial one. There is no
+/// "resume from sequence N of this batch" state to maintain.
+///
+/// **Crash-safety argument, and the one thing it rests on.** Every RocksDB
+/// primitive `apply_changes` calls is either an unconditional upsert/delete
+/// (`put_node`, `delete_way`, ...) or a read-modify-write set toggle
+/// (`add_node_to_ways`/`remove_node_to_ways`, `src/osm/kvstore.rs:260-313`).
+/// All of those are idempotent, so replaying the *entire* batch on top of
+/// whatever prefix a crash left in RocksDB converges to the same state as
+/// applying it once cleanly -- including at every intermediate statement,
+/// which matters because `resolve_way_coords` reads RocksDB live during each
+/// `osm_buildings`/`osm_former_buildings` INSERT. `rebuild_way_geometry`'s
+/// inferred arm reads *DuckDB* instead, which rolled back cleanly with the
+/// rest of this transaction, so it re-derives the same tags on replay.
+///
+/// This is NOT because "there are no merge operators here" or because the
+/// merge functions are dead code -- a merge operator genuinely is registered
+/// for the reverse-index column families (`src/osm/kvstore.rs:81`), and
+/// `batch_merge_node_to_way`/`batch_merge_way_to_relation` are live callers
+/// of it in `src/import/osm.rs` (~lines 303 and 636, the *import* path's
+/// bulk-load). A list-append merge is NOT idempotent -- replaying one would
+/// duplicate ids in the reverse index. The argument above holds only because
+/// `apply_changes` (this *update* path) exclusively uses the get-modify-put
+/// functions and never a merge; `replaying_a_batch_over_a_partially_written_kv_store_converges_to_the_golden_state`
+/// (this file's test module) pins the resulting convergence directly against
+/// `apply_changes`, not a description of it.
+///
+/// **Concurrency risk.** A longer-held write transaction here overlaps the
+/// `match_refresh` drain for longer than the old one-sequence-per-commit
+/// path did. `match_dirty_cells` is the only table both sides write, and
+/// append-vs-delete-of-different-rows is what
+/// `compare::drain_refresh_concurrency` already establishes as safe under
+/// DuckDB's optimistic concurrency control -- but that test exercises a
+/// *government-refresh*-shaped writer, not this batch shape; see this file's
+/// `osm_apply_batch_and_match_refresh_drain_do_not_collide` for the
+/// OSM-shaped analogue. Separately, because `DirtyCells::flush`'s `now()` is
+/// transaction-start-scoped (see the CLAUDE.md gotcha of the same name),
+/// every cell a batch dirties is stamped with the *batch's* start time and
+/// stays invisible to the drain until the whole batch commits -- the same
+/// cosmetic staleness already accepted for government refreshes, just now
+/// also bounded by batch duration for OSM. And a failed batch re-downloads
+/// every sequence in it, since `.osc.gz` files are deleted right after
+/// decompression (`decompress_and_remove`) and there is nothing on disk to
+/// resume from. These three are why the defaults
+/// (`batch_commit_threshold`/`batch_size` = 20) are modest, not e.g. 200.
+fn apply_batch(
+    conn: &Connection,
+    kv: &RocksDB,
+    batch: &[FetchedSequence],
+    timestamp: &str,
+    last_applied: &AtomicU64,
+) -> Result<()> {
+    let last_seq = batch
+        .last()
+        .map(|f| f.seq)
+        .expect("apply_batch must not be called with an empty batch");
+
     conn.execute_batch("BEGIN TRANSACTION")?;
 
     let result = (|| -> Result<()> {
-        apply_changes(conn, kv, &changes)?;
+        for fetched in batch {
+            apply_changes(conn, kv, &fetched.changes)?;
+            // Advance as each sequence is applied, not only once the whole
+            // batch commits -- "currently-being-applied", per this field's
+            // doc comment at its declaration in `update()`. This lets the
+            // prefetcher's window slide forward smoothly during a large
+            // batch instead of stalling until the batch's transaction
+            // commits; if the transaction later rolls back, `update()`
+            // propagates the error and joins the prefetcher immediately, so
+            // an optimistic bump here never has a chance to matter.
+            last_applied.store(fetched.seq, Ordering::SeqCst);
+        }
 
         conn.execute_batch(&format!(
             "DELETE FROM metadata WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp');
-             INSERT INTO metadata VALUES ('osm_replication_sequence', '{seq}');
+             INSERT INTO metadata VALUES ('osm_replication_sequence', '{last_seq}');
              INSERT INTO metadata VALUES ('osm_replication_timestamp', '{timestamp}');"
         ))?;
 
@@ -206,7 +501,10 @@ fn apply_sequence(
 /// On-disk filename for a downloaded replication diff. Deliberately built
 /// from `seq` directly rather than reusing `sequence_to_path(seq)`'s last
 /// path segment as a filename -- see the comment at its call site in
-/// `apply_sequence` for why that collides across sequences 1000 apart.
+/// `fetch_and_parse_sequence` for why that collides across sequences 1000
+/// apart. Also the filename the prefetch thread (`spawn_prefetcher`) uses,
+/// which is exactly what lets the apply loop's own download call find a
+/// prefetched file already there.
 fn osc_local_file_name(seq: u64) -> String {
     format!("{seq}.osc.gz")
 }
@@ -222,10 +520,10 @@ fn osc_local_file_name(seq: u64) -> String {
 /// download.
 ///
 /// This exists as its own function rather than three lines inline in
-/// `apply_sequence` so the regression test can pin the *production* ordering.
-/// A test that merely re-executed the same three statements would still pass
-/// if `apply_sequence` were reverted to `decompress_gz(&path)?` followed by
-/// the removal, which is exactly the bug.
+/// `fetch_and_parse_sequence` so the regression test can pin the *production*
+/// ordering. A test that merely re-executed the same three statements would
+/// still pass if `fetch_and_parse_sequence` were reverted to
+/// `decompress_gz(&path)?` followed by the removal, which is exactly the bug.
 ///
 /// Note the removal here is unconditional and is *not* gated on
 /// `config.cleanup_downloaded_files` — that setting governs only the
@@ -875,24 +1173,29 @@ mod tests {
     use crate::osm::kvstore;
     use crate::osm::replication::{NodeChange, RelationMember};
 
-    fn setup_test_db_and_kv() -> Result<(Connection, Arc<RocksDB>, tempfile::TempDir)> {
-        let tmpdir = tempfile::tempdir()?;
-        let kv = Arc::new(kvstore::open(tmpdir.path(), 8, 4)?);
-        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init_commands, Some(kv.clone()))?;
+    /// The KV half of the shared test fixture: nodes 1-4 forming a square,
+    /// and way 100 (referencing them) with its reverse index. Split out from
+    /// [`setup_test_db_and_kv`] so `replaying_a_batch_over_a_partially_written_kv_store_converges_to_the_golden_state`
+    /// can build a DuckDB connection bound to an ALREADY-seeded KV store
+    /// (one that also carries a "crash" prefix's writes) without re-seeding
+    /// the KV a second time.
+    fn seed_kv(kv: &RocksDB) -> Result<()> {
+        kvstore::put_node(kv, 1, 20.0, 50.0)?;
+        kvstore::put_node(kv, 2, 20.001, 50.0)?;
+        kvstore::put_node(kv, 3, 20.001, 50.001)?;
+        kvstore::put_node(kv, 4, 20.0, 50.001)?;
 
-        // Seed KV store with test data
-        kvstore::put_node(&kv, 1, 20.0, 50.0)?;
-        kvstore::put_node(&kv, 2, 20.001, 50.0)?;
-        kvstore::put_node(&kv, 3, 20.001, 50.001)?;
-        kvstore::put_node(&kv, 4, 20.0, 50.001)?;
-
-        kvstore::put_way(&kv, 100, &[1, 2, 3, 4, 1])?;
+        kvstore::put_way(kv, 100, &[1, 2, 3, 4, 1])?;
         for &nid in &[1i64, 2, 3, 4] {
-            kvstore::add_node_to_ways(&kv, nid, 100)?;
+            kvstore::add_node_to_ways(kv, nid, 100)?;
         }
+        Ok(())
+    }
 
-        // Seed DuckDB with existing building geometry
+    /// The DuckDB half of the shared test fixture: way 100's existing
+    /// building geometry (matching `seed_kv`'s square) and the pre-batch
+    /// `metadata` stamp. Split out for the same reason as `seed_kv`.
+    fn seed_duckdb(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "INSERT INTO osm_buildings VALUES (100, 'way', 'yes', ST_MakePolygon(ST_MakeLine(
                 list_value(ST_Point(20.0, 50.0), ST_Point(20.001, 50.0),
@@ -901,6 +1204,17 @@ mod tests {
             )));
             INSERT INTO metadata VALUES ('osm_replication_sequence', '1000');",
         )?;
+        Ok(())
+    }
+
+    fn setup_test_db_and_kv() -> Result<(Connection, Arc<RocksDB>, tempfile::TempDir)> {
+        let tmpdir = tempfile::tempdir()?;
+        let kv = Arc::new(kvstore::open(tmpdir.path(), 8, 4)?);
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, Some(kv.clone()))?;
+
+        seed_kv(&kv)?;
+        seed_duckdb(&conn)?;
 
         Ok((conn, kv, tmpdir))
     }
@@ -1713,19 +2027,21 @@ mod tests {
         // std::fs::remove_file(&osc_gz_path);`, so the `?` short-circuited
         // past cleanup whenever decompression failed.
         //
-        // This calls `decompress_and_remove` -- the function `apply_sequence`
-        // actually uses -- rather than re-executing a copy of its statements
-        // here. That distinction is the whole point: a test that inlined the
-        // same three lines would still pass after `apply_sequence` was
-        // reverted to `decompress_gz(&path)?`, i.e. it could not fail on the
-        // bug it names.
+        // This calls `decompress_and_remove` -- the function
+        // `fetch_and_parse_sequence` actually uses -- rather than
+        // re-executing a copy of its statements here. That distinction is
+        // the whole point: a test that inlined the same three lines would
+        // still pass after `fetch_and_parse_sequence` was reverted to
+        // `decompress_gz(&path)?`, i.e. it could not fail on the bug it
+        // names.
         //
-        // It still does not call `apply_sequence` itself -- that needs a full
-        // DuckDB `Connection` + `RocksDB` fixture -- so it does not cover the
-        // DB transaction/rollback path, nor that a retried sequence
-        // re-downloads cleanly afterwards. It does download a real corrupt
-        // file over HTTP exactly the way `apply_sequence` does (via
-        // `download_file_as_quiet` with `osc_local_file_name`).
+        // It still does not call `fetch_and_parse_sequence` itself -- that
+        // needs a mock server that also knows the URL shape -- so it does
+        // not cover the DB transaction/rollback path (`apply_batch`), nor
+        // that a retried sequence re-downloads cleanly afterwards. It does
+        // download a real corrupt file over HTTP exactly the way
+        // `fetch_and_parse_sequence` does (via `download_file_as_quiet` with
+        // `osc_local_file_name`).
         let garbage: &'static [u8] = b"this is not a valid gzip stream, just garbage bytes";
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1775,11 +2091,24 @@ mod tests {
     /// this does NOT cover: cancellation discovered partway through a
     /// multi-sequence catch-up (that would need a mock server answering
     /// several distinct sequence URLs, and the check's placement -- before
-    /// `apply_sequence`, at the top of the `for seq in ...` loop -- is a
-    /// one-line diff verifiable by reading `update` itself); nor does it
-    /// cover the real background-job wiring in
+    /// `apply_batch`, at the top of the `while seq <= latest_seq` loop -- is
+    /// a one-line diff verifiable by reading `update` itself, and is also
+    /// covered end-to-end by `update_applies_in_batches_with_prefetch_and_stops_on_cancellation`
+    /// below); nor does it cover the real background-job wiring in
     /// `server::jobs::osm_update::OsmUpdateJob::run`, which passes
     /// `&|| ctx.is_cancelled()` instead of a hardcoded closure.
+    ///
+    /// Prefetching is deliberately disabled (`prefetch_ahead: 0`) here: this
+    /// test predates the prefetcher and pins something orthogonal to it
+    /// (cancellation checked before the *first* sequence). With prefetching
+    /// on, the one-shot mock server below would already have served its
+    /// single request and exited by the time the prefetch thread started, so
+    /// its download attempt would hit connection-refused and burn through
+    /// `download_with_retry`'s several-second backoff before `update()`
+    /// could `join()` it -- turning a near-instant test into a multi-second
+    /// one for no added coverage. `prefetch_ahead: 0` keeps this test at its
+    /// original speed; the prefetcher itself is covered by the batching test
+    /// below instead.
     #[test]
     fn update_stops_before_applying_a_sequence_when_already_cancelled() -> Result<()> {
         let (conn, kv, _kv_dir) = setup_test_db_and_kv()?;
@@ -1806,19 +2135,561 @@ mod tests {
         let base_url = format!("http://{addr}");
 
         let download_dir = tempfile::tempdir().unwrap();
-        let config = Config {
+        let mut config = Config {
             download_dir: Some(download_dir.path().to_string_lossy().into_owned()),
             ..Config::default()
         };
+        config.jobs.osm_update.prefetch_ahead = 0;
 
         update(&conn, &kv, &config, &base_url, false, &|| true)?;
 
-        // Cancellation must have stopped the loop before `apply_sequence`
+        // Cancellation must have stopped the loop before `apply_batch`
         // ever ran, so the metadata stamp is untouched.
         let seq = get_current_sequence(&conn)?;
         assert_eq!(
             seq, 1000,
             "cancellation before the first sequence must leave the stamp unchanged"
+        );
+
+        Ok(())
+    }
+
+    // --- 2d: batched commits ---
+
+    #[test]
+    fn catch_up_chunk_size_batches_only_when_pending_exceeds_threshold() {
+        // Steady state and any catch-up at or below the threshold: today's
+        // one-sequence-per-transaction path, byte-for-byte -- chunk_size
+        // must be exactly 1, not "close to 1".
+        assert_eq!(catch_up_chunk_size(1, 20, 20), 1);
+        assert_eq!(
+            catch_up_chunk_size(20, 20, 20),
+            1,
+            "pending == threshold must NOT batch -- the rule is strictly greater-than"
+        );
+
+        // Once pending exceeds the threshold, batching engages at batch_size.
+        assert_eq!(catch_up_chunk_size(21, 20, 20), 20);
+        assert_eq!(catch_up_chunk_size(1440, 20, 20), 20);
+        assert_eq!(
+            catch_up_chunk_size(21, 20, 7),
+            7,
+            "chunk_size must track batch_size, not the threshold"
+        );
+
+        // A misconfigured batch_size = 0 must not produce a zero-length
+        // chunk (which would spin update()'s while loop forever without
+        // advancing seq).
+        assert_eq!(catch_up_chunk_size(21, 20, 0), 1);
+    }
+
+    /// Crash-safety pin for 2d's batched commits -- see the extended comment
+    /// on `apply_batch` for the full argument this test exercises. Short
+    /// version: `apply_changes` writes to RocksDB immediately, outside any
+    /// DuckDB transaction, but every DuckDB write happens inside the
+    /// caller's transaction. A crash partway through a batch therefore
+    /// leaves RocksDB reflecting a PREFIX of the batch's sequences while
+    /// DuckDB rolls back to the pre-batch state entirely -- and resume
+    /// always replays the WHOLE batch from its first sequence. This is only
+    /// safe because every RocksDB primitive `apply_changes` uses is an
+    /// idempotent upsert/delete or get-modify-put set toggle
+    /// (`add_node_to_ways`/`remove_node_to_ways`), never the list-append
+    /// RocksDB merge operator that's ALSO registered and live elsewhere
+    /// (`import::osm`'s `batch_merge_node_to_way`/`batch_merge_way_to_relation`).
+    ///
+    /// This test simulates exactly that crash shape without needing
+    /// `apply_batch`/a transaction at all, by calling the real
+    /// `apply_changes` (never a copy of its logic) three times over:
+    ///
+    /// 1. **Golden**: apply three sequences, once each, cleanly.
+    /// 2. **"Crash"**: apply the first two sequences to a KV store, through a
+    ///    DuckDB connection that is then simply dropped -- standing in for a
+    ///    rolled-back transaction, since RocksDB writes persist regardless
+    ///    of what happens to DuckDB.
+    /// 3. **Replay**: apply the FULL three sequences again, against a fresh
+    ///    DuckDB connection (matching the golden run's starting point) but
+    ///    the SAME KV store from step 2 (already carrying the first two
+    ///    sequences' writes).
+    ///
+    /// The middle sequence -- a way reusing nodes already shared with the
+    /// fixture's way 100 -- is what would expose a non-idempotent reverse
+    /// index: if node-to-way association used the RocksDB merge operator
+    /// instead of `add_node_to_ways`'s idempotent get-modify-put, replaying
+    /// it would duplicate the way id in the shared nodes' reverse index, and
+    /// the final snapshot would show three entries where the golden run has
+    /// two.
+    #[test]
+    fn replaying_a_batch_over_a_partially_written_kv_store_converges_to_the_golden_state()
+    -> Result<()> {
+        let seq0 = OsmChange {
+            nodes: vec![NodeChange {
+                action: ChangeAction::Create,
+                id: 950,
+                lon: 25.0,
+                lat: 55.0,
+                tags: vec![("addr:housenumber".into(), "3".into())],
+            }],
+            ..Default::default()
+        };
+        let seq1 = OsmChange {
+            ways: vec![WayChange {
+                action: ChangeAction::Create,
+                id: 960,
+                node_refs: vec![1, 2, 3, 4, 1],
+                tags: vec![("building".into(), "yes".into())],
+            }],
+            ..Default::default()
+        };
+        let seq2 = OsmChange {
+            nodes: vec![NodeChange {
+                action: ChangeAction::Modify,
+                id: 2,
+                lon: 20.0015,
+                lat: 50.0002,
+                tags: vec![],
+            }],
+            ..Default::default()
+        };
+        let batch = [seq0, seq1, seq2];
+
+        // --- Golden: apply all three, once each, cleanly.
+        let (golden_conn, golden_kv, _d1) = setup_test_db_and_kv()?;
+        for c in &batch {
+            apply_changes(&golden_conn, &golden_kv, c)?;
+        }
+        let golden = snapshot_state(&golden_conn, &golden_kv)?;
+
+        // --- "Crash": the first two sequences land in RocksDB, but the
+        // DuckDB connection that received them is discarded before anything
+        // reads it further -- standing in for a transaction that never
+        // committed.
+        let (discarded_conn, replay_kv, _d2) = setup_test_db_and_kv()?;
+        apply_changes(&discarded_conn, &replay_kv, &batch[0])?;
+        apply_changes(&discarded_conn, &replay_kv, &batch[1])?;
+        drop(discarded_conn);
+
+        // --- Replay: the WHOLE batch again, against a fresh DuckDB
+        // connection (matching golden's starting point) but the SAME,
+        // already-partially-written KV store from the "crash" above.
+        //
+        // Deliberately built by hand rather than via another
+        // `setup_test_db_and_kv()` call: that would create its OWN fresh KV
+        // store and bind the new connection's `resolve_way_coords` UDF to
+        // THAT kv, not to `replay_kv` -- and the UDF binding is fixed at
+        // connection creation, not reselected per call. A first attempt at
+        // this test did exactly that and passed for the wrong reason at
+        // first glance, then failed once way 960's geometry was checked: its
+        // INSERT silently matched zero rows because `resolve_way_coords`
+        // was resolving way 960 against a KV that had never heard of it.
+        // Binding to `replay_kv` directly is what makes this test faithful
+        // to production, where `conn` and `kv` are always the same pair.
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let replay_conn = init_db(
+            Path::new(":memory:"),
+            &init_commands,
+            Some(replay_kv.clone()),
+        )?;
+        seed_duckdb(&replay_conn)?;
+        for c in &batch {
+            apply_changes(&replay_conn, &replay_kv, c)?;
+        }
+        let replayed = snapshot_state(&replay_conn, &replay_kv)?;
+
+        assert_eq!(
+            golden, replayed,
+            "replaying a full batch over a partially-written KV store must converge \
+             to the same state as applying it once cleanly"
+        );
+
+        Ok(())
+    }
+
+    /// Comparable snapshot of everything the scenario above touches.
+    /// DuckDB side: every `osm_buildings`/`osm_addresses` row, geometry
+    /// included as WKT so a stale-position bug shows up as a text diff.
+    /// RocksDB side: the raw node/way state plus the reverse index for the
+    /// nodes shared between way 100 (from the fixture) and the scenario's
+    /// own way 960 -- the reverse index is exactly what a non-idempotent
+    /// merge would duplicate.
+    fn snapshot_state(conn: &Connection, kv: &RocksDB) -> Result<String> {
+        let table_rows = |table: &str, tag_col: &str| -> Result<Vec<String>> {
+            let sql = format!(
+                "SELECT osm_id || '|' || osm_type || '|' || COALESCE({tag_col}, '') || '|' || ST_AsText(geom)
+                 FROM {table} ORDER BY osm_id, osm_type"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        };
+
+        let buildings = table_rows("osm_buildings", "building")?;
+        let addresses = table_rows("osm_addresses", "housenumber")?;
+
+        let node1 = kvstore::get_node(kv, 1)?;
+        let node2 = kvstore::get_node(kv, 2)?;
+        let way100 = kvstore::get_way(kv, 100)?;
+        let way960 = kvstore::get_way(kv, 960)?;
+        let mut node1_ways = kvstore::get_node_to_ways(kv, 1)?;
+        let mut node2_ways = kvstore::get_node_to_ways(kv, 2)?;
+        node1_ways.sort();
+        node2_ways.sort();
+
+        Ok(format!(
+            "buildings={buildings:?}\naddresses={addresses:?}\n\
+             node1={node1:?} node2={node2:?}\nway100={way100:?} way960={way960:?}\n\
+             node1_ways={node1_ways:?} node2_ways={node2_ways:?}"
+        ))
+    }
+
+    /// OSM-update-side analogue of `compare::drain_refresh_concurrency`
+    /// (`src/compare/mod.rs`). That module's test drives a
+    /// *government-refresh*-shaped writer against a concurrent drain; this
+    /// drives an *OSM-apply*-shaped writer instead, because 2d's batching
+    /// holds `apply_batch`'s write transaction open for several sequences'
+    /// worth of work rather than one, directly widening the window
+    /// `match_dirty_cells` (append from the OSM side, delete-after-recompute
+    /// from the drain side) has to overlap the drain in.
+    ///
+    /// Calls `apply_batch` directly with in-memory `FetchedSequence` values
+    /// -- no HTTP/network involved -- the same way
+    /// `compare::drain_refresh_concurrency`'s writer thread calls `refresh()`
+    /// directly rather than going through a full CLI/network stack.
+    #[test]
+    fn osm_apply_batch_and_match_refresh_drain_do_not_collide() {
+        use crate::compare::drain::drain_batch;
+        use crate::compare::reconcile::enqueue_all;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(kvstore::open(tmpdir.path(), 8, 4).unwrap());
+        let init_commands = vec![
+            "INSTALL spatial".to_string(),
+            "LOAD spatial".to_string(),
+            "INSTALL icu".to_string(),
+            "LOAD icu".to_string(),
+            "SET geometry_always_xy = true".to_string(),
+        ];
+        let conn = init_db(Path::new(":memory:"), &init_commands, Some(kv.clone())).unwrap();
+
+        // `bdot10k_buildings` spread across many z14 cells (0.03 deg stride
+        // -- same rationale as `compare::drain_refresh_concurrency`'s
+        // `rows_sql`: cells are ~0.022 deg wide at this latitude, so 0.03
+        // deg guarantees distinct cells): real, independent work for the
+        // drain thread that has nothing to do with what the OSM-apply
+        // thread writes (that writes OSM buildings around lon 20, these
+        // government buildings sit at lon 30+).
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom)
+             SELECT 'b' || i, ST_MakeEnvelope(30.0 + i * 0.03, 52.0, 30.0 + i * 0.03 + 0.002, 52.002)
+             FROM range(200) t(i);
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 rodzaj_kod VARCHAR, kondygnacje_nadziemne INTEGER,
+                 kondygnacje_podziemne INTEGER, rodzaj VARCHAR);
+             CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);",
+        )
+        .unwrap();
+        enqueue_all(&conn).unwrap();
+
+        let drain_conn = conn.try_clone().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_drain = stop.clone();
+        let drained = Arc::new(AtomicU64::new(0));
+        let drained_thread = drained.clone();
+
+        let handle = std::thread::spawn(move || {
+            let mut errors: Vec<String> = Vec::new();
+            let mut productive_batches: u64 = 0;
+            while !stop_drain.load(Ordering::SeqCst) {
+                match drain_batch(&drain_conn, 16, &|| false) {
+                    Ok(stats) => {
+                        drained_thread.fetch_add(stats.cells, Ordering::SeqCst);
+                        if stats.cells > 0 {
+                            productive_batches += 1;
+                        }
+                        if stats.failed > 0 {
+                            errors.push(format!("{} cells failed to recompute", stats.failed));
+                        }
+                    }
+                    Err(e) => errors.push(format!("drain_batch errored: {e:#}")),
+                }
+            }
+            (errors, productive_batches)
+        });
+
+        // Meanwhile, apply several OSM batches -- each batch a handful of
+        // sequences creating a brand-new building at a distinct location, so
+        // apply_batch does real INSERT + match_dirty_cells work inside a
+        // transaction long enough to genuinely overlap the drain thread.
+        let last_applied = AtomicU64::new(0);
+        let mut apply_errors: Vec<String> = Vec::new();
+        for batch_idx in 0..10u64 {
+            let seqs: Vec<FetchedSequence> = (0..3u64)
+                .map(|i| {
+                    let seq = batch_idx * 3 + i;
+                    synthetic_building_sequence(seq, 20.0 + seq as f64 * 0.01, 40.0)
+                })
+                .collect();
+            if let Err(e) = apply_batch(&conn, &kv, &seqs, "2024-01-01T00:00:00Z", &last_applied) {
+                apply_errors.push(format!("apply_batch({batch_idx}) errored: {e:#}"));
+            }
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        let (drain_errors, productive_batches) = handle.join().unwrap();
+
+        assert!(
+            apply_errors.is_empty(),
+            "OSM apply_batch must not abort against a concurrent drain: {apply_errors:?}"
+        );
+        assert!(
+            drain_errors.is_empty(),
+            "drain must not abort against a concurrent OSM apply_batch: {drain_errors:?}"
+        );
+        assert!(
+            productive_batches >= 2,
+            "drain made {productive_batches} productive batches during the OSM apply run -- \
+             expected steady progress, not serialization behind apply_batch's transactions"
+        );
+        assert!(
+            drained.load(Ordering::SeqCst) > 0,
+            "drain thread never drained a cell -- the test did not exercise the overlap"
+        );
+
+        // Whatever interleaving happened, the queue must still converge.
+        loop {
+            let s = drain_batch(&conn, 1000, &|| false).unwrap();
+            assert_eq!(s.failed, 0, "post-run drain reported failed cells");
+            if s.cells == 0 {
+                break;
+            }
+        }
+        let queued: i64 = conn
+            .query_row("SELECT COUNT(*) FROM match_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0, "queue must drain to empty");
+    }
+
+    /// Build one synthetic replication sequence that creates a small,
+    /// self-contained square building (4 fresh nodes + 1 way, all newly
+    /// created ids derived from `seq` so different sequences never collide)
+    /// at `(lon0, lat0)`. Used only by the concurrency test above, where the
+    /// exact building shape doesn't matter -- only that `apply_batch` does
+    /// real, distinct DuckDB + RocksDB writes per sequence.
+    fn synthetic_building_sequence(seq: u64, lon0: f64, lat0: f64) -> FetchedSequence {
+        let base: i64 = 1_000_000 + seq as i64 * 10;
+        let d = 0.0005;
+        let n = |i: i64| base + i;
+        let nodes = vec![
+            NodeChange {
+                action: ChangeAction::Create,
+                id: n(1),
+                lon: lon0,
+                lat: lat0,
+                tags: vec![],
+            },
+            NodeChange {
+                action: ChangeAction::Create,
+                id: n(2),
+                lon: lon0 + d,
+                lat: lat0,
+                tags: vec![],
+            },
+            NodeChange {
+                action: ChangeAction::Create,
+                id: n(3),
+                lon: lon0 + d,
+                lat: lat0 + d,
+                tags: vec![],
+            },
+            NodeChange {
+                action: ChangeAction::Create,
+                id: n(4),
+                lon: lon0,
+                lat: lat0 + d,
+                tags: vec![],
+            },
+        ];
+        let way = WayChange {
+            action: ChangeAction::Create,
+            id: n(5),
+            node_refs: vec![n(1), n(2), n(3), n(4), n(1)],
+            tags: vec![("building".into(), "yes".into())],
+        };
+        FetchedSequence {
+            seq,
+            changes: OsmChange {
+                nodes,
+                ways: vec![way],
+                relations: vec![],
+            },
+        }
+    }
+
+    // --- 2c + 2d end-to-end, through the real `update()` loop ---
+
+    /// A syntactically valid but empty OsmChange -- no create/modify/delete
+    /// blocks at all. `parse_osc` returns `OsmChange::default()` for it, so
+    /// `apply_changes` does real work (opens/uses the transaction, notes no
+    /// dirty cells) without needing distinct interesting content per
+    /// sequence; the point of the test below is loop mechanics, not content.
+    const EMPTY_OSC_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><osmChange version="0.6" generator="test"></osmChange>"#;
+
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Multi-connection, multi-request blocking mock server (unlike this
+    /// file's other mock servers, which are all one-shot): answers
+    /// `GET /state.txt` with `state_body` and every other GET with
+    /// `osc_gz_body`, forever, on however many connections arrive. Needed
+    /// here because a single `update()` run now makes many requests --
+    /// `state.txt` once, plus one per distinct sequence from whichever of
+    /// the prefetch thread or the apply loop reaches it first, potentially
+    /// both for one sequence if they race.
+    fn spawn_replication_mock_server(
+        state_body: String,
+        osc_gz_body: Vec<u8>,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::Write as _;
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let count_for_thread = request_count.clone();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                count_for_thread.fetch_add(1, Ordering::SeqCst);
+                let state_body = state_body.clone();
+                let osc_gz_body = osc_gz_body.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let is_state = request.starts_with("GET /state.txt");
+
+                    if is_state {
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            state_body.len()
+                        );
+                        let _ = stream.write_all(headers.as_bytes());
+                        let _ = stream.write_all(state_body.as_bytes());
+                    } else {
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                            osc_gz_body.len()
+                        );
+                        let _ = stream.write_all(headers.as_bytes());
+                        let _ = stream.write_all(&osc_gz_body);
+                    }
+                });
+            }
+        });
+
+        (addr, request_count)
+    }
+
+    /// End-to-end coverage of the new `update()` loop: batching (several
+    /// sequences committed together once `pending` exceeds
+    /// `batch_commit_threshold`), prefetching (the bounded-window thread
+    /// downloading ahead of the apply loop, sharing `download_dir` and
+    /// `osc_local_file_name` so the apply loop's own download calls become
+    /// no-ops for whatever the prefetcher already fetched), and cancellation
+    /// checked between batches. `update()` had no test at all before this
+    /// change; `update_stops_before_applying_a_sequence_when_already_cancelled`
+    /// above is the one prior test, extended here to a multi-sequence,
+    /// multi-batch, always-on server.
+    ///
+    /// This does NOT prove prefetching makes anything faster -- there is no
+    /// outbound network in this environment, and even this local mock
+    /// server answers so quickly that any timing difference would be noise,
+    /// not signal. What it does prove: the prefetch thread runs concurrently
+    /// with the apply loop without erroring, deadlocking, or leaking
+    /// (`update()` joins it before returning here), the exists-check dedup
+    /// keeps the total request count close to the number of distinct
+    /// sequences needed rather than every sequence being fetched twice,
+    /// batching groups sequences into one commit at the configured chunk
+    /// size, and cancellation is honored between batches rather than
+    /// mid-batch or only after the whole backlog.
+    #[test]
+    fn update_applies_in_batches_with_prefetch_and_stops_on_cancellation() -> Result<()> {
+        let (conn, kv, _kv_dir) = setup_test_db_and_kv()?; // current_seq = 1000
+
+        const PENDING: u64 = 13;
+        const LATEST_SEQ: u64 = 1000 + PENDING;
+        let osc_gz_body = gzip_bytes(EMPTY_OSC_XML.as_bytes());
+        let state_body =
+            format!("sequenceNumber={LATEST_SEQ}\ntimestamp=2024-01-01T00\\:00\\:00Z\n");
+        let (addr, request_count) = spawn_replication_mock_server(state_body, osc_gz_body);
+        let base_url = format!("http://{addr}");
+
+        let download_dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            download_dir: Some(download_dir.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        config.jobs.osm_update.batch_commit_threshold = 10;
+        config.jobs.osm_update.batch_size = 10;
+        config.jobs.osm_update.prefetch_ahead = 4;
+
+        // Cancel from the SECOND poll of `is_cancelled` onward: the first
+        // poll happens before batch 1 (must proceed), the second before
+        // batch 2 (must stop) -- pinning "checked between batches", not
+        // "checked between sequences" or "checked once up front".
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let is_cancelled = || calls.fetch_add(1, Ordering::SeqCst) >= 1;
+
+        update(&conn, &kv, &config, &base_url, false, &is_cancelled)?;
+
+        // 13 pending > batch_commit_threshold(10), so chunk_size =
+        // batch_size = 10: batch 1 is sequences 1001..=1010 (10 sequences),
+        // batch 2 would be 1011..=1013 (3 sequences). Cancellation must have
+        // stopped the loop before batch 2 committed, so the stamp sits at
+        // 1010 -- not 1000 (which would mean batching broke, or cancellation
+        // fired too early) and not 1013 (which would mean cancellation was
+        // ignored, or checked only after the whole backlog).
+        let seq = get_current_sequence(&conn)?;
+        assert_eq!(
+            seq, 1010,
+            "batch 1 (10 sequences) must have committed as one transaction before \
+             cancellation, checked between batches, stopped the loop before batch 2"
+        );
+
+        // The exists-check dedup must keep the prefetcher and the apply loop
+        // from each downloading every sequence independently: at most 1
+        // (state.txt) + PENDING (every sequence at most once) + a small
+        // slack for a genuine prefetch/apply race landing on the same
+        // sequence at the same time.
+        let requests = request_count.load(Ordering::SeqCst);
+        assert!(
+            requests <= 1 + PENDING as usize + 5,
+            "too many requests ({requests}) for {PENDING} pending sequences -- the \
+             exists-check dedup between the prefetcher and the apply loop looks broken"
+        );
+        // At least the 10 sequences actually applied must have been fetched
+        // by someone (prefetcher or apply loop), plus state.txt (11 total).
+        assert!(
+            requests > 10,
+            "fewer requests ({requests}) than sequences actually applied -- some \
+             applied sequence's content came from nowhere"
         );
 
         Ok(())

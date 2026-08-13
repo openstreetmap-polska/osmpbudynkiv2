@@ -1,6 +1,7 @@
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -210,8 +211,16 @@ async fn download_with_retry(
             Err(e) => {
                 tracing::warn!(attempt, error = %e, "Download failed");
                 last_error = Some(e);
-                // Remove partial file so the next attempt starts clean
-                let _ = std::fs::remove_file(dest_path);
+                // No cleanup needed here, unlike before: `do_download` now
+                // streams each attempt to its own uniquely-named temp file
+                // (see `temp_dest_path`) and removes *that* on failure, never
+                // touching `dest_path` until a successful rename. This must
+                // NOT delete `dest_path` on the way out any more -- with a
+                // prefetcher (`update::osm`'s bounded-window prefetch
+                // thread), the apply loop and the prefetcher can race to
+                // download the same sequence, so by the time one attempt
+                // fails here `dest_path` may already be a *different*
+                // writer's completed download.
                 if attempt < MAX_RETRIES {
                     let delay = std::time::Duration::from_secs(2u64.pow(attempt));
                     tokio::time::sleep(delay).await;
@@ -223,6 +232,28 @@ async fn download_with_retry(
     Err(last_error.unwrap()).context(format!(
         "Failed to download {url} after {MAX_RETRIES} attempts"
     ))
+}
+
+/// Process-wide counter for building a unique temp-file name per download
+/// attempt (see [`temp_dest_path`]).
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A unique temp path in the same directory as `dest_path`, so the rename in
+/// `do_download` that follows a successful download is a same-filesystem
+/// (and therefore atomic, per `std::fs::rename`'s guarantee) move rather than
+/// a cross-filesystem copy.
+///
+/// Includes both the process id and a process-wide atomic counter: the pid
+/// alone would not be enough, because two downloads *within the same
+/// process* can now legitimately target the same `dest_path` at once (see
+/// the doc comment on the call site in `do_download`).
+fn temp_dest_path(dest_path: &Path) -> PathBuf {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = dest_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download");
+    dest_path.with_file_name(format!("{file_name}.{}.{counter}.part", std::process::id()))
 }
 
 async fn do_download(
@@ -269,24 +300,38 @@ async fn do_download(
         ));
     }
 
-    let file = std::fs::File::create(dest_path)
-        .with_context(|| format!("Failed to create {dest_path:?}"))?;
-    let mut writer = BufWriter::new(file);
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Error reading download stream")?;
-        writer
-            .write_all(&chunk)
-            .with_context(|| format!("Failed to write to {dest_path:?}"))?;
-        if let Some(pb) = &pb {
-            pb.inc(chunk.len() as u64);
+    // Stream into a unique temp file rather than straight onto `dest_path`,
+    // then rename onto `dest_path` only after a successful flush. Before a
+    // prefetcher existed, nothing ever targeted the same `dest_path`
+    // concurrently, so writing directly was safe. With one, the apply loop
+    // advancing onto a sequence the prefetcher is still downloading is a
+    // normal occurrence (see `update::osm`'s prefetch thread), and both
+    // would otherwise stream into the same file and could interleave into
+    // garbage. `std::fs::rename` is atomic within one filesystem (guaranteed
+    // same filesystem here, since `temp_dest_path` places the temp file next
+    // to `dest_path`), so the worst case becomes two complete downloads of
+    // identical bytes, one of which simply loses the rename race.
+    //
+    // This also closes a pre-existing hole: writing straight onto
+    // `dest_path` meant a crash mid-download left a partial file sitting
+    // exactly where the exists-check (`download_file_as_impl`) would find it
+    // and hand back as a "complete" download on the next run. Streaming to a
+    // temp name means `dest_path` only ever holds a complete, flushed file.
+    let temp_path = temp_dest_path(dest_path);
+    match write_response_to_file(&temp_path, response, pb.as_ref()).await {
+        Ok(()) => {
+            std::fs::rename(&temp_path, dest_path)
+                .with_context(|| format!("Failed to move {temp_path:?} to {dest_path:?}"))?;
+        }
+        Err(e) => {
+            // Each attempt owns its own temp file (a fresh name every call),
+            // so cleaning up here is enough -- see the comment on
+            // `download_with_retry`'s error arm for why `dest_path` itself
+            // must NOT be touched.
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
         }
     }
-
-    writer
-        .flush()
-        .with_context(|| format!("Failed to flush {dest_path:?}"))?;
 
     if let Some(pb) = &pb {
         pb.finish_with_message(format!(
@@ -299,6 +344,37 @@ async fn do_download(
     } else {
         debug!(path = %dest_path.display(), "Download complete");
     }
+    Ok(())
+}
+
+/// Create `temp_path`, stream `response`'s body into it, and flush. Split out
+/// of `do_download` so the temp-file lifecycle around it (success: rename
+/// onto the real destination; failure: remove the temp file, in
+/// `do_download`) has one clear boundary: this function either leaves a
+/// complete, flushed file at `temp_path`, or leaves nothing there at all.
+async fn write_response_to_file(
+    temp_path: &Path,
+    response: reqwest::Response,
+    pb: Option<&ProgressBar>,
+) -> Result<()> {
+    let file = std::fs::File::create(temp_path)
+        .with_context(|| format!("Failed to create {temp_path:?}"))?;
+    let mut writer = BufWriter::new(file);
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Error reading download stream")?;
+        writer
+            .write_all(&chunk)
+            .with_context(|| format!("Failed to write to {temp_path:?}"))?;
+        if let Some(pb) = pb {
+            pb.inc(chunk.len() as u64);
+        }
+    }
+
+    writer
+        .flush()
+        .with_context(|| format!("Failed to flush {temp_path:?}"))?;
     Ok(())
 }
 
@@ -602,6 +678,108 @@ mod tests {
             request_count.load(Ordering::SeqCst),
             1,
             "second call must not hit the network at all since the file already exists on disk"
+        );
+    }
+
+    /// Every entry in `dir` whose name ends in `.part` -- i.e. any leftover
+    /// temp file from `temp_dest_path`.
+    fn part_files_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".part"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn successful_download_leaves_no_part_file_behind() {
+        // Regression for the temp-file+rename change: `do_download` must
+        // rename its temp file onto `dest_path` on success, not leave both
+        // sitting in the directory.
+        let data = b"a complete, successful download";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.readable().await;
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                data.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, headers.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, data)
+                .await
+                .unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("ok.bin");
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/ok.bin");
+        do_download(&client, &url, &dest, false).await.unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert_eq!(
+            part_files_in(tmp.path()),
+            Vec::<String>::new(),
+            "a successful download must not leave its temp file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_download_does_not_touch_a_preexisting_dest_path() {
+        // The server advertises a Content-Length larger than what it
+        // actually sends, then drops the connection -- reqwest's body
+        // stream surfaces the truncation as a read error partway through,
+        // so this exercises `write_response_to_file`'s failure branch (and
+        // therefore `do_download`'s temp-file cleanup on the way out), not
+        // just an early `error_for_status` bail before any file is touched.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.readable().await;
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let headers = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nContent-Type: application/octet-stream\r\n\r\n";
+            tokio::io::AsyncWriteExt::write_all(&mut stream, headers.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"only a few bytes, not 1000")
+                .await
+                .unwrap();
+            // Drop `stream` here (closing the connection) instead of sending
+            // the rest of the advertised 1000 bytes.
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("existing.bin");
+        let preexisting: &'static [u8] = b"already-downloaded content that must survive";
+        std::fs::write(&dest, preexisting).unwrap();
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/truncated.bin");
+        let result = do_download(&client, &url, &dest, false).await;
+
+        assert!(
+            result.is_err(),
+            "a truncated body must surface as an error, or this test isn't exercising the failure path"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            preexisting,
+            "a failed download must never touch a pre-existing dest_path -- with a \
+             prefetcher, that path can be another writer's already-completed download"
+        );
+        assert_eq!(
+            part_files_in(tmp.path()),
+            Vec::<String>::new(),
+            "a failed download must clean up its own temp file"
         );
     }
 }
