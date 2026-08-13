@@ -26,6 +26,15 @@ pub fn buffer(b: Bounds, deg: f64) -> Bounds {
     (b.0 - deg, b.1 - deg, b.2 + deg, b.3 + deg)
 }
 
+/// SQL for a constant `ST_MakeEnvelope` literal describing `area`. One home for
+/// the format, so a candidate CTE's envelope and the predicate's own envelope
+/// cannot drift apart -- a mis-ordered argument in one but not the other would
+/// silently narrow to the wrong cell.
+pub fn envelope_sql(area: Bounds) -> String {
+    let (x1, y1, x2, y2) = area;
+    format!("ST_MakeEnvelope({x1}, {y1}, {x2}, {y2})")
+}
+
 /// BDOT10k-only pre-filter for `unmatched_buildings_sql`'s `extra_filter`:
 /// only rows still standing count as a government building to compare at
 /// all — excludes `w budowie` (under construction), `nieczynny` (inactive)
@@ -84,14 +93,14 @@ fn buildings_predicate(
     extra_filter: Option<&str>,
     mode: FormerMode,
 ) -> String {
-    let (x1, y1, x2, y2) = area;
+    let envelope = envelope_sql(area);
     let extra = extra_filter
         .map(|f| format!("AND {f}\n           "))
         .unwrap_or_default();
     let former_exists = format!(
         "EXISTS (
                SELECT 1 FROM osm_former_buildings f
-               WHERE ST_Intersects(f.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+               WHERE ST_Intersects(f.geom, {envelope})
                  AND ST_Intersects(f.geom, b.geom)
                  AND ST_Area(ST_Intersection(f.geom, b.geom)) / ST_Area(b.geom) >= {FORMER_BUILDING_MIN_OVERLAP_FRACTION}
            )"
@@ -103,10 +112,10 @@ fn buildings_predicate(
     format!(
         "SELECT {select_list}
          FROM {source_table} b
-         WHERE ST_Intersects(b.centroid, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+         WHERE ST_Intersects(b.centroid, {envelope})
            {extra}AND NOT EXISTS (
                SELECT 1 FROM osm_buildings osm
-               WHERE ST_Intersects(osm.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
+               WHERE ST_Intersects(osm.geom, {envelope})
                  AND ST_Intersects(osm.geom, b.geom)
                  AND ST_Area(ST_Intersection(osm.geom, b.geom)) / ST_Area(b.geom) >= {MIN_OVERLAP_FRACTION}
            )
@@ -196,16 +205,16 @@ pub fn unmatched_addresses_in_cell_sql(
     write: Bounds,
     read: Bounds,
 ) -> String {
-    let (wx1, wy1, wx2, wy2) = write;
-    let (rx1, ry1, rx2, ry2) = read;
+    let write_envelope = envelope_sql(write);
+    let read_envelope = envelope_sql(read);
     let dist = MATCH_DISTANCE_METERS;
     format!(
         "SELECT {select_list}
          FROM {source_table} a
-         WHERE ST_Intersects(a.geom, ST_MakeEnvelope({wx1}, {wy1}, {wx2}, {wy2}))
+         WHERE ST_Intersects(a.geom, {write_envelope})
            AND NOT EXISTS (
                SELECT 1 FROM osm_addresses o
-               WHERE ST_Intersects(o.geom, ST_MakeEnvelope({rx1}, {ry1}, {rx2}, {ry2}))
+               WHERE ST_Intersects(o.geom, {read_envelope})
                  AND UPPER(TRIM(o.housenumber)) = UPPER(TRIM(a.numer_porzadkowy))
                  AND ST_Distance_Sphere(o.geom, a.geom) <= {dist}
            )"

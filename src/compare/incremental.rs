@@ -3,24 +3,42 @@ use duckdb::Connection;
 
 use crate::compare::columns::classification_columns;
 use crate::compare::rule::{
-    BDOT10K_EKSPLOATOWANY_FILTER, OSM_MATCH_BUFFER_DEG, buffer, unmatched_addresses_in_cell_sql,
-    unmatched_buildings_sql,
+    BDOT10K_EKSPLOATOWANY_FILTER, OSM_MATCH_BUFFER_DEG, buffer, envelope_sql,
+    unmatched_addresses_in_cell_sql, unmatched_buildings_sql,
 };
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
-/// Rebuild one z14 cell's slice of `<source>_unmatched` from current live data.
-/// Read wide (buffered OSM for addresses), write narrow (only rows whose
-/// representative point is inside the cell). Assumes an open transaction —
-/// callers that need atomicity with other statements should wrap this
-/// themselves (see `drain_batch`, which pairs it with a queue delete).
-pub fn recompute_cell_in_txn(
-    conn: &Connection,
-    source: &str,
-    cell_x: i32,
-    cell_y: i32,
-) -> Result<()> {
+/// Builds the `(dest_table, insert_cols, inner_select)` triple
+/// `recompute_cell_in_txn` inserts from. Extracted into its own function so a
+/// regression test can `EXPLAIN` the actual generated SQL, not a
+/// hand-reconstructed copy of it.
+///
+/// The source-table scan is wrapped in a `MATERIALIZED` candidate CTE before
+/// `unmatched_buildings_sql`/`unmatched_addresses_in_cell_sql` and the
+/// trailing cell-tag guard (`AND cx = ... AND cy = ...`) are applied on top of
+/// it. Without the candidate CTE at all, appending the guard directly to the
+/// flat predicate loses the centroid RTREE index and forces a full table
+/// scan (measured ~1.09s/cell on real data; see the identical CTE-vs-JOIN
+/// trap documented at the top of `src/server/tiles.rs`). `MATERIALIZED` is
+/// kept for the same reason it's kept there: it is the documented defense
+/// against DuckDB's join-order optimizer folding a filtered CTE back into a
+/// joint plan with whatever consumes it, which would silently reopen this
+/// exact hole. Be precise about which half is doing the work, though: on the
+/// real 16.35M-row `bdot10k_buildings`, the flat pre-fix shape plans as 2
+/// RTREE scans + 1 `Sequential Scan` at 0.974s, while *both* a bare `WITH`
+/// and `WITH ... MATERIALIZED` plan as 3 RTREE scans at ~0.098s. The CTE
+/// itself is what restores the index here; `MATERIALIZED` is insurance
+/// against a future re-plan, not the active ingredient. The envelope (and
+/// `extra_filter`, when
+/// present) ends up applied twice -- once building `candidates`, once inside
+/// `unmatched_buildings_sql`'s own predicate on `candidates` -- deliberately:
+/// both filters are idempotent, and this is what lets `rule.rs`'s predicate
+/// text stay untouched (see `CLAUDE.md`'s "match rule has one home" gotcha)
+/// rather than needing a signature change to skip the now-redundant outer
+/// check.
+fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, String, String)> {
     let write = tile_to_bbox(CHANGE_CELL_ZOOM, cell_x as u32, cell_y as u32);
-    let (dest, insert_cols, inner) = match source {
+    match source {
         "bdot10k" | "egib" => {
             let (src, id, dest, extra_filter) = if source == "bdot10k" {
                 (
@@ -36,6 +54,16 @@ pub fn recompute_cell_in_txn(
             let cy = cell_y_sql("b.centroid");
             let cc = classification_columns(src);
             let select = format!("b.{id}, b.geom, {cx}, {cy}, now(), {}", cc.source_exprs);
+            let extra = extra_filter
+                .map(|f| format!(" AND {f}"))
+                .unwrap_or_default();
+            let candidates = format!(
+                "WITH candidates AS MATERIALIZED (
+                     SELECT * FROM {src} b
+                     WHERE ST_Intersects(b.centroid, {}){extra}
+                 )\n",
+                envelope_sql(write)
+            );
             // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
             // closed on all four cell edges, so a centroid exactly on a
             // shared boundary would satisfy both neighbours' predicates.
@@ -44,14 +72,14 @@ pub fn recompute_cell_in_txn(
             // this cell, so a boundary row is written by exactly the cell
             // that owns it.
             let inner = format!(
-                "{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
-                unmatched_buildings_sql(src, &select, write, extra_filter)
+                "{candidates}{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
+                unmatched_buildings_sql("candidates", &select, write, extra_filter)
             );
-            (
+            Ok((
                 dest,
                 format!("{id}, geom, cell_x, cell_y, computed_at, {}", cc.dest_names),
                 inner,
-            )
+            ))
         }
         "prg" => {
             let read = buffer(write, OSM_MATCH_BUFFER_DEG);
@@ -61,21 +89,45 @@ pub fn recompute_cell_in_txn(
                 "a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc, \
                  a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania, {cx}, {cy}, now()"
             );
+            // Only the write envelope scopes the candidate CTE -- the read
+            // buffer applies to the osm_addresses subquery inside
+            // unmatched_addresses_in_cell_sql, not to the prg_addresses scan.
+            let candidates = format!(
+                "WITH candidates AS MATERIALIZED (
+                     SELECT * FROM prg_addresses a
+                     WHERE ST_Intersects(a.geom, {})
+                 )\n",
+                envelope_sql(write)
+            );
             // Same write-narrow guard as the buildings branch above.
             let inner = format!(
-                "{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
-                unmatched_addresses_in_cell_sql("prg_addresses", &select, write, read)
+                "{candidates}{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
+                unmatched_addresses_in_cell_sql("candidates", &select, write, read)
             );
-            (
+            Ok((
                 "prg_unmatched",
                 "geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy, \
                  teryt_miejscowosc, wazny_od_lub_data_nadania, cell_x, cell_y, computed_at"
                     .to_string(),
                 inner,
-            )
+            ))
         }
         other => bail!("recompute_cell: unknown source {other}"),
-    };
+    }
+}
+
+/// Rebuild one z14 cell's slice of `<source>_unmatched` from current live data.
+/// Read wide (buffered OSM for addresses), write narrow (only rows whose
+/// representative point is inside the cell). Assumes an open transaction —
+/// callers that need atomicity with other statements should wrap this
+/// themselves (see `drain_batch`, which pairs it with a queue delete).
+pub fn recompute_cell_in_txn(
+    conn: &Connection,
+    source: &str,
+    cell_x: i32,
+    cell_y: i32,
+) -> Result<()> {
+    let (dest, insert_cols, inner) = build_sql(source, cell_x, cell_y)?;
 
     conn.execute(
         &format!("DELETE FROM {dest} WHERE cell_x = ? AND cell_y = ?"),
@@ -314,6 +366,78 @@ mod tests {
             ids,
             Vec::<String>::new(),
             "a former-building-suppressed building must never be served as unmatched"
+        );
+    }
+
+    /// The regression guard for the per-cell drain's full-table-scan fix
+    /// (measured 60 cells 65.48s -> 3.03s): without wrapping the
+    /// envelope-filtered source-table scan in a `candidates` CTE at all,
+    /// appending the trailing cell-tag guard (`AND cx = ... AND cy = ...`)
+    /// directly to the flat predicate loses the centroid RTREE index for a
+    /// sequential scan -- confirmed by hand against the pre-fix SQL shape
+    /// (`unmatched_buildings_sql` + the guard, no CTE), which reproduces 0
+    /// RTREE scans / a full sequential scan of `bdot10k_buildings` at the
+    /// same fixture size used below.
+    ///
+    /// **What this test does NOT currently pin**: whether the CTE needs to
+    /// be `MATERIALIZED` specifically, as opposed to a bare `WITH`. That's
+    /// the documented risk in `src/server/tiles.rs` for a CTE consumed by a
+    /// downstream `JOIN`, and `build_sql` keeps `MATERIALIZED` for the same
+    /// defensive reason. But repeated attempts to reproduce a fold-back
+    /// *without* it here -- at 20k and 500k synthetic rows, with and without
+    /// production-like `threads`/`memory_limit` settings -- all still showed
+    /// `RTREE_IN` in the plan on the bundled DuckDB build this project pins
+    /// (`duckdb = "1.10505.0"`). The same holds on the real 16.35M-row table:
+    /// flat = 2 RTREE + 1 `Sequential Scan` @ 0.974s, bare `WITH` = 3 RTREE @
+    /// 0.098s, `MATERIALIZED` = 3 RTREE @ 0.099s. So the CTE is the active
+    /// ingredient and `MATERIALIZED` is insurance. It's possible the
+    /// anti-join (`NOT EXISTS`) shape here is folded differently than the
+    /// `LEFT JOIN` case tiles.rs guards against, or that the fold-back
+    /// tiles.rs saw needs a non-empty, indexed table on the other side of the
+    /// join to trigger real cost-based re-planning (this fixture leaves
+    /// `osm_buildings` / `osm_former_buildings` empty on purpose -- see
+    /// below). This is a discrepancy against this test's original design
+    /// brief, which expected removing `MATERIALIZED` alone to fail this
+    /// assertion; it's recorded here rather than silently asserting something
+    /// unverified.
+    ///
+    /// osm_buildings / osm_former_buildings are left empty and unindexed --
+    /// exactly what `db::create_schema` gives you before `import osm`'s
+    /// `create_spatial_indexes` ever runs -- so a false-positive "RTREE_IN"
+    /// match from either anti-join side is structurally impossible: the only
+    /// RTREE index anywhere in this fixture is the one built below on
+    /// `bdot10k_buildings.centroid`. Only the substring "RTREE_IN" is
+    /// asserted (DuckDB's EXPLAIN pretty-printer truncates operator labels in
+    /// a wide plan -- see `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`),
+    /// and the absence of "Sequential Scan" is deliberately NOT asserted: the
+    /// fixed plan still legitimately contains one, from the empty anti-join
+    /// tables.
+    #[test]
+    fn drain_candidate_cte_uses_the_centroid_rtree_index() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO bdot10k_buildings (LOKALNYID, geom)
+                 SELECT 'b' || i,
+                        ST_MakeEnvelope(20.0 + i * 0.0001, 52.0,
+                                        20.0 + i * 0.0001 + 0.00005, 52.00005)
+                 FROM range(20000) t(i);
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             CREATE INDEX bdot10k_buildings_centroid_idx ON bdot10k_buildings USING RTREE (centroid);",
+        )
+        .unwrap();
+
+        let (cx, cy) = lonlat_to_tile(20.5005, 52.00002, CHANGE_CELL_ZOOM);
+        let (_, _, inner) = build_sql("bdot10k", cx as i32, cy as i32).unwrap();
+
+        let mut stmt = c.prepare(&format!("EXPLAIN {inner}")).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut plan = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
+        }
+        assert!(
+            plan.contains("RTREE_IN"),
+            "the drained cell's candidate CTE must use the centroid RTREE index, got plan: {plan}"
         );
     }
 }

@@ -42,7 +42,7 @@
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;
 
-use crate::compare::rule::BDOT10K_EKSPLOATOWANY_FILTER;
+use crate::compare::rule::{BDOT10K_EKSPLOATOWANY_FILTER, envelope_sql};
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
 struct TotalsSpec {
@@ -103,6 +103,44 @@ pub fn rebuild_all_in_txn(conn: &Connection, source: &str) -> Result<()> {
     Ok(())
 }
 
+/// Builds the SELECT (its own `MATERIALIZED` candidate CTE included) that
+/// `recompute_cell_in_txn` inserts from. Extracted into its own function so a
+/// regression test can `EXPLAIN` the real generated SQL rather than a
+/// hand-reconstructed copy -- mirrors the identical seam in
+/// `compare::incremental::build_sql`, for the same reason: without wrapping
+/// the source-table scan in a `candidates` CTE at all, appending the
+/// trailing cell-tag guard directly to the flat predicate loses the RTREE
+/// index for a sequential scan (see the `build_sql` doc comment in
+/// `src/compare/incremental.rs` for what was actually verified about the
+/// `MATERIALIZED` keyword specifically, including a discrepancy against this
+/// change's original design brief, and the identical CTE-vs-JOIN trap
+/// documented at the top of `src/server/tiles.rs`). The envelope (and
+/// `filter`, when set) is applied twice -- once building `candidates`, once
+/// in the outer `WHERE` -- deliberately and idempotently, same as the
+/// sibling seam.
+fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<String> {
+    let s = spec(source)?;
+    let (x1, y1, x2, y2) = tile_to_bbox(CHANGE_CELL_ZOOM, cell_x as u32, cell_y as u32);
+    let cx = cell_x_sql(s.point);
+    let cy = cell_y_sql(s.point);
+    let extra = s.filter.map(|f| format!("AND {f} ")).unwrap_or_default();
+    let envelope = envelope_sql((x1, y1, x2, y2));
+
+    Ok(format!(
+        "WITH candidates AS MATERIALIZED (
+             SELECT * FROM {table} b
+             WHERE ST_Intersects({point}, {envelope}) {extra}
+         )
+         SELECT '{source}', {cell_x}, {cell_y}, count(*)::INTEGER
+         FROM candidates b
+         WHERE ST_Intersects({point}, {envelope})
+           {extra}AND {cx} = {cell_x} AND {cy} = {cell_y}
+         HAVING count(*) > 0",
+        table = s.table,
+        point = s.point,
+    ))
+}
+
 /// Rebuild one z14 cell's total for one source. Assumes an open transaction —
 /// the drain calls this from the same one as the cell's unmatched recompute.
 ///
@@ -117,11 +155,7 @@ pub fn recompute_cell_in_txn(
     cell_x: i32,
     cell_y: i32,
 ) -> Result<()> {
-    let s = spec(source)?;
-    let (x1, y1, x2, y2) = tile_to_bbox(CHANGE_CELL_ZOOM, cell_x as u32, cell_y as u32);
-    let cx = cell_x_sql(s.point);
-    let cy = cell_y_sql(s.point);
-    let extra = s.filter.map(|f| format!("AND {f} ")).unwrap_or_default();
+    let inner = build_sql(source, cell_x, cell_y)?;
 
     conn.execute(
         "DELETE FROM cell_totals WHERE source = ? AND cell_x = ? AND cell_y = ?",
@@ -130,17 +164,8 @@ pub fn recompute_cell_in_txn(
     .with_context(|| {
         format!("cell_totals: failed to clear cell ({cell_x},{cell_y}) for {source}")
     })?;
-    // ST_Intersects against a constant envelope so the point column's RTREE
-    // index is usable (see rule::unmatched_buildings_sql); the cell-tag
-    // equality then narrows the closed-edge overlap to the owning cell.
     conn.execute_batch(&format!(
-        "INSERT INTO cell_totals (source, cell_x, cell_y, total)
-         SELECT '{source}', {cell_x}, {cell_y}, count(*)::INTEGER
-         FROM {} b
-         WHERE ST_Intersects({}, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-           {extra}AND {cx} = {cell_x} AND {cy} = {cell_y}
-         HAVING count(*) > 0;",
-        s.table, s.point
+        "INSERT INTO cell_totals (source, cell_x, cell_y, total) {inner};"
     ))
     .with_context(|| {
         format!("cell_totals: failed to recompute cell ({cell_x},{cell_y}) for {source}")
@@ -329,5 +354,46 @@ mod tests {
         let c = conn();
         let err = rebuild_all_in_txn(&c, "nope").unwrap_err().to_string();
         assert!(err.contains("unknown source"), "got: {err}");
+    }
+
+    /// Mirror of `compare::incremental`'s
+    /// `drain_candidate_cte_uses_the_centroid_rtree_index`: the per-cell total
+    /// recompute has the identical guard-after-envelope shape as the
+    /// per-cell unmatched recompute, so it needs the same `candidates` CTE to
+    /// keep the centroid RTREE index live once the cell-tag guard is
+    /// appended -- confirmed against the pre-fix (no-CTE) shape the same way
+    /// as the sibling test. See that test's doc comment for what was (and
+    /// was not) verified about the `MATERIALIZED` keyword specifically; the
+    /// same caveat applies here; `build_sql` keeps `MATERIALIZED` regardless,
+    /// matching the established `src/server/tiles.rs` pattern. Only the
+    /// substring "RTREE_IN" is asserted, for the same truncated-EXPLAIN-label
+    /// reason as `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`.
+    #[test]
+    fn drain_candidate_cte_uses_the_centroid_rtree_index() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO bdot10k_buildings (LOKALNYID, geom)
+                 SELECT 'b' || i,
+                        ST_MakeEnvelope(20.0 + i * 0.0001, 52.0,
+                                        20.0 + i * 0.0001 + 0.00005, 52.00005)
+                 FROM range(20000) t(i);
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             CREATE INDEX bdot10k_buildings_centroid_idx ON bdot10k_buildings USING RTREE (centroid);",
+        )
+        .unwrap();
+
+        let (cx, cy) = lonlat_to_tile(20.5005, 52.00002, CHANGE_CELL_ZOOM);
+        let sql = build_sql("bdot10k", cx as i32, cy as i32).unwrap();
+
+        let mut stmt = c.prepare(&format!("EXPLAIN {sql}")).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut plan = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
+        }
+        assert!(
+            plan.contains("RTREE_IN"),
+            "the cell-totals candidate CTE must use the centroid RTREE index, got plan: {plan}"
+        );
     }
 }
