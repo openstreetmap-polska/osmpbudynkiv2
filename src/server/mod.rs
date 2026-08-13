@@ -137,7 +137,16 @@ pub async fn run(
 
     check_startup_conditions(&pool)?;
 
-    let osm_cfg = jobs::JobConfigResolved::from(&config.jobs.osm_update);
+    // Manual literal, not `JobConfigResolved::from`: `osm_update` is an
+    // `OsmUpdateConfig`, not a generic `JobConfig` (it carries the
+    // prefetch/batch fields a follow-up task will consume), so the blanket
+    // `From<&JobConfig>` impl doesn't apply. Mirrors the `match_refresh`
+    // literal below, which has the same shape for the same reason.
+    let osm_cfg = jobs::JobConfigResolved {
+        enabled: config.jobs.osm_update.enabled,
+        interval: std::time::Duration::from_secs(config.jobs.osm_update.interval_seconds),
+        timeout: std::time::Duration::from_secs(config.jobs.osm_update.timeout_seconds),
+    };
     let export_prune_cfg = jobs::JobConfigResolved {
         enabled: config.jobs.export_log_prune.enabled,
         interval: std::time::Duration::from_secs(config.jobs.export_log_prune.interval_seconds),

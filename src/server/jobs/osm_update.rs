@@ -4,11 +4,13 @@ use crate::server::jobs::{Job, JobContext};
 
 /// Background job that applies OSM minutely replication diffs.
 ///
-/// Delegates to [`crate::update::osm::update`]. That function already
-/// polls the global shutdown flag between sequences, so a SIGINT during
-/// a long run exits gracefully without needing the per-job cancel flag.
-/// Per-job timeouts may still expire mid-sequence; the supervisor records
-/// `TimedOut` and the inner update returns at its next natural exit point.
+/// Delegates to [`crate::update::osm::update`]. That function polls both the
+/// global shutdown flag AND `ctx.is_cancelled()` between sequences (never
+/// mid-sequence -- a sequence's DuckDB transaction is the atomic unit), so a
+/// SIGINT exits gracefully and a supervisor timeout on a long catch-up run
+/// (e.g. importing a day-old PBF and replaying ~1440 minutely sequences)
+/// actually shortens the run instead of only being recorded after the fact
+/// once the whole backlog has drained.
 pub struct OsmUpdateJob;
 
 impl Job for OsmUpdateJob {
@@ -27,6 +29,7 @@ impl Job for OsmUpdateJob {
             &ctx.config,
             &ctx.config.download_urls.osm_replication,
             false,
+            &|| ctx.is_cancelled(),
         )
     }
 }

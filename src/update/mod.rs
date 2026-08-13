@@ -34,7 +34,17 @@ pub fn run(
     show_progress: bool,
 ) -> Result<()> {
     match source {
-        UpdateSource::Osm => osm::update(conn, kv, config, &urls.osm_replication, show_progress),
+        // `&|| false`: the CLI path has no job supervisor, so it is never
+        // cooperatively cancelled -- only the background job
+        // (`server::jobs::osm_update`) passes a real cancel poll.
+        UpdateSource::Osm => osm::update(
+            conn,
+            kv,
+            config,
+            &urls.osm_replication,
+            show_progress,
+            &|| false,
+        ),
         UpdateSource::Bdot10k { file } => {
             let mut etag = None;
             if file.is_none() {

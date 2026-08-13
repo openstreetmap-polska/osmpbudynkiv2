@@ -35,9 +35,11 @@ use crate::server::DbPool;
 ///
 /// `cancel` is set by the supervisor on timeout or shutdown. Jobs SHOULD poll
 /// it (via [`JobContext::is_cancelled`]) periodically and return early when
-/// it is true. The bundled OSM update job relies on the global shutdown flag
-/// instead, so `cancel` and `is_cancelled` are part of the public contract for
-/// future jobs that want cooperative cancellation.
+/// it is true -- the bundled OSM update job does this too (see
+/// `server::jobs::osm_update`), polling it between replication sequences
+/// alongside the global shutdown flag, so `cancel` and `is_cancelled` are
+/// part of the public contract for any job that wants cooperative
+/// cancellation, not just future ones.
 #[derive(Clone)]
 pub struct JobContext {
     pub pool: DbPool,

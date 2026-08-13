@@ -108,6 +108,48 @@ impl Default for JobConfig {
     }
 }
 
+/// Config for the `osm_update` background job (OSM minutely replication
+/// catch-up). Same three fields and defaults as the generic [`JobConfig`] it
+/// replaces (`enabled = true`, `interval_seconds = 60`, `timeout_seconds =
+/// 600`), plus three fields consumed by a follow-up task (prefetching diff
+/// downloads ahead of the sequence being applied, and batching commits during
+/// catch-up) -- this change only adds the config plumbing, not the behaviour,
+/// so the three new fields are read by nothing yet.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct OsmUpdateConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    /// How many replication diffs to download ahead of the sequence
+    /// currently being applied, during catch-up.
+    pub prefetch_ahead: usize,
+    /// Batching only engages once the number of pending sequences exceeds
+    /// this threshold, so steady state (one pending sequence per tick) stays
+    /// on today's one-sequence-per-transaction path byte-for-byte. Applies
+    /// only during catch-up.
+    pub batch_commit_threshold: u64,
+    /// Sequences per DuckDB transaction while catching up. A failed batch
+    /// re-downloads every sequence in it (downloaded `.osc.gz` files are
+    /// deleted right after decompression, so there is nothing on disk to
+    /// resume from), which is a reason to keep this modest. Applies only
+    /// during catch-up.
+    pub batch_size: usize,
+}
+
+impl Default for OsmUpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 60,
+            timeout_seconds: 600,
+            prefetch_ahead: 8,
+            batch_commit_threshold: 20,
+            batch_size: 20,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct ExportLogPruneConfig {
@@ -259,7 +301,7 @@ impl Default for CacheConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct JobsConfig {
-    pub osm_update: JobConfig,
+    pub osm_update: OsmUpdateConfig,
     pub export_log_prune: ExportLogPruneConfig,
     pub bdot10k_update: JobConfig,
     pub egib_update: JobConfig,
@@ -280,7 +322,7 @@ impl Default for JobsConfig {
             timeout_seconds,
         };
         Self {
-            osm_update: JobConfig::default(),
+            osm_update: OsmUpdateConfig::default(),
             export_log_prune: ExportLogPruneConfig::default(),
             bdot10k_update: daily(3600),
             egib_update: daily(3600),
@@ -613,6 +655,9 @@ file_path = "/data/TERC.zip"
         assert!(config.jobs.osm_update.enabled);
         assert_eq!(config.jobs.osm_update.interval_seconds, 60);
         assert_eq!(config.jobs.osm_update.timeout_seconds, 600);
+        assert_eq!(config.jobs.osm_update.prefetch_ahead, 8);
+        assert_eq!(config.jobs.osm_update.batch_commit_threshold, 20);
+        assert_eq!(config.jobs.osm_update.batch_size, 20);
         assert!(config.jobs.match_refresh.enabled);
         assert_eq!(config.jobs.match_refresh.interval_seconds, 30);
         assert_eq!(config.jobs.match_refresh.timeout_seconds, 300);
@@ -680,6 +725,35 @@ interval_seconds = 120
         // defaults preserved
         assert!(config.jobs.osm_update.enabled);
         assert_eq!(config.jobs.osm_update.timeout_seconds, 600);
+        // the three new prefetch/batch fields also fall back to defaults
+        // when the TOML doesn't mention them
+        assert_eq!(config.jobs.osm_update.prefetch_ahead, 8);
+        assert_eq!(config.jobs.osm_update.batch_commit_threshold, 20);
+        assert_eq!(config.jobs.osm_update.batch_size, 20);
+    }
+
+    /// The three fields added for the prefetch/batched-commit follow-up
+    /// (unread by any code yet -- this pins only that they parse and
+    /// default correctly) round-trip through TOML, and omitting one of them
+    /// still falls back to its own default rather than to zero.
+    #[test]
+    fn osm_update_config_prefetch_and_batch_fields_parse_from_toml() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[jobs.osm_update]
+prefetch_ahead = 16
+batch_commit_threshold = 50
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert_eq!(config.jobs.osm_update.prefetch_ahead, 16);
+        assert_eq!(config.jobs.osm_update.batch_commit_threshold, 50);
+        // omitted -- falls back to its own default, not zero
+        assert_eq!(config.jobs.osm_update.batch_size, 20);
     }
 
     #[test]

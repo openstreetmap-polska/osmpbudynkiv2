@@ -133,9 +133,26 @@ enabled = false
 # for the previous run to complete.
 interval_seconds = 60
 # Maximum wall-clock time for a single run. On timeout the run is
-# recorded as TimedOut and the cancel flag is set; the blocking task
-# is allowed to drain to keep DuckDB writes ordered.
+# recorded as TimedOut and the cancel flag is set; the run now polls
+# that flag between replication sequences and stops there, so a
+# catch-up run (e.g. after importing a day-old PBF) actually shortens
+# instead of running to completion regardless.
 timeout_seconds = 600
+# How many replication diffs to download ahead of the sequence
+# currently being applied, during catch-up. (Not yet consumed -- config
+# plumbing for a follow-up prefetching task.)
+# prefetch_ahead = 8
+# Batching only engages once the number of pending sequences exceeds
+# this threshold, so steady state (one pending sequence per tick) is
+# unaffected. Applies only during catch-up. (Not yet consumed -- config
+# plumbing for a follow-up batched-commit task.)
+# batch_commit_threshold = 20
+# Sequences per DuckDB transaction while catching up. A failed batch
+# re-downloads every sequence in it (downloaded files are deleted right
+# after decompression), which is a reason to keep this modest. Applies
+# only during catch-up. (Not yet consumed -- config plumbing for a
+# follow-up batched-commit task.)
+# batch_size = 20
 
 # Prunes old rows from the /package export log (see [updates] and the
 # GET /updates endpoint below).

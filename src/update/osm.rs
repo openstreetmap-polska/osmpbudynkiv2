@@ -27,12 +27,24 @@ use crate::update::dirty_cells::{DirtyCells, Layer};
 /// background job renders no terminal, and a progress bar's carriage-return
 /// redraws would otherwise pollute its log output. Individual sequence
 /// downloads never get their own bar either way; see `download_file_quiet`.
+///
+/// `is_cancelled` is polled between sequences, never mid-sequence -- mirrors
+/// `compare::drain::drain_batch`'s "never mid-transaction" rule, since a
+/// sequence's DuckDB transaction (`apply_sequence`) is already its own atomic
+/// unit. On cancellation this returns `Ok(())` early: the remaining
+/// sequences are simply resumed on the next call, from the `metadata` stamp
+/// the last committed sequence left behind. The background job
+/// (`server::jobs::osm_update`) passes `&|| ctx.is_cancelled()` so the
+/// supervisor's timeout actually shortens a run instead of only being
+/// recorded after the fact; the CLI path (`update::run`'s `Osm` arm) passes
+/// `&|| false` since it has no supervisor and should run to completion.
 pub fn update(
     conn: &Connection,
     kv: &RocksDB,
     config: &Config,
     replication_base_url: &str,
     show_progress: bool,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     let download_dir = config.download_dir();
     let current_seq = get_current_sequence(conn)?;
@@ -70,6 +82,17 @@ pub fn update(
             info!("Shutdown requested, stopping update");
             if let Some(pb) = &pb {
                 pb.abandon_with_message("Shutdown requested");
+            }
+            return Ok(());
+        }
+
+        // Polled between sequences only -- see the doc comment above for why
+        // mid-sequence cancellation would be wrong (the transaction inside
+        // apply_sequence is the atomic unit).
+        if is_cancelled() {
+            info!("Cancellation requested, stopping update");
+            if let Some(pb) = &pb {
+                pb.abandon_with_message("Cancellation requested");
             }
             return Ok(());
         }
@@ -1736,5 +1759,68 @@ mod tests {
             !osc_gz_path.exists(),
             "corrupt download must be cleaned up even though decompression failed"
         );
+    }
+
+    /// `update()` must stop before applying any sequence when `is_cancelled`
+    /// already reports true, rather than grinding through the whole backlog
+    /// first and only recording the cancellation afterwards.
+    ///
+    /// This pins the "stops before starting the next sequence" half of the
+    /// contract: the mock `state.txt` server advertises exactly one pending
+    /// sequence (1001, one past the metadata stamp of 1000 set up by
+    /// `setup_test_db_and_kv`), and there is deliberately no mock server for
+    /// that sequence's `.osc.gz` -- if `update` tried to download it despite
+    /// `is_cancelled` returning true, the download would fail and this test
+    /// would error out rather than merely pass for the wrong reason. What
+    /// this does NOT cover: cancellation discovered partway through a
+    /// multi-sequence catch-up (that would need a mock server answering
+    /// several distinct sequence URLs, and the check's placement -- before
+    /// `apply_sequence`, at the top of the `for seq in ...` loop -- is a
+    /// one-line diff verifiable by reading `update` itself); nor does it
+    /// cover the real background-job wiring in
+    /// `server::jobs::osm_update::OsmUpdateJob::run`, which passes
+    /// `&|| ctx.is_cancelled()` instead of a hardcoded closure.
+    #[test]
+    fn update_stops_before_applying_a_sequence_when_already_cancelled() -> Result<()> {
+        let (conn, kv, _kv_dir) = setup_test_db_and_kv()?;
+
+        // One-shot HTTP server standing in for `<replication_base_url>/state.txt`,
+        // same raw-TcpListener style as `corrupt_download_is_removed_after_decompress_failure`
+        // above and `update::mod`'s `serve_head_once`/`serve_body_once` test helpers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "sequenceNumber=1001\ntimestamp=2024-01-01T00\\:00\\:00Z\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let base_url = format!("http://{addr}");
+
+        let download_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            download_dir: Some(download_dir.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+
+        update(&conn, &kv, &config, &base_url, false, &|| true)?;
+
+        // Cancellation must have stopped the loop before `apply_sequence`
+        // ever ran, so the metadata stamp is untouched.
+        let seq = get_current_sequence(&conn)?;
+        assert_eq!(
+            seq, 1000,
+            "cancellation before the first sequence must leave the stamp unchanged"
+        );
+
+        Ok(())
     }
 }
