@@ -238,6 +238,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
         -- Dirty-cell queue drained by the match_refresh job. Duplicates allowed
         -- (deduped on drain). source is 'bdot10k'|'egib'|'prg'; an OSM building
         -- edit enqueues bdot10k+egib, an OSM address edit enqueues prg.
+        -- The cells a producer enqueues are the exact reach of the match
+        -- rule's OSM read, not a neighbourhood margin: an edited object's
+        -- bbox cells, widened by update::dirty_cells::layer_buffer_deg (0 for
+        -- buildings, OSM_MATCH_BUFFER_DEG for addresses). See that function
+        -- for why, and note it must widen if either rule's OSM read ever does.
         -- cell_z is informational only: every producer writes CHANGE_CELL_ZOOM
         -- and the drain neither selects nor filters on it (recompute_cell_in_txn
         -- hardcodes CHANGE_CELL_ZOOM). If CHANGE_CELL_ZOOM ever changes, queue
