@@ -19,6 +19,14 @@ pub fn enqueue_all(conn: &Connection) -> Result<i64> {
     // harmless: the drain is idempotent per (source, cell), and a later
     // `compare reconcile` re-covers whatever this run missed.
     for (source, table, point) in specs {
+        // Checked once per source, same granularity as `compare::run`'s
+        // between-sub-compares check. This loop has no transaction at all
+        // (see the comment above), so bailing here doesn't undo anything --
+        // it just stops enqueueing the sources that haven't run yet, which
+        // is the same partial-sweep outcome the loop already tolerates on a
+        // real INSERT failure (an `Err` propagated via `?` below). A later
+        // `compare reconcile` re-covers whatever a cancelled sweep missed.
+        crate::shutdown::check_requested()?;
         let cx = cell_x_sql(point);
         let cy = cell_y_sql(point);
         // `execute` (not `execute_batch`) so its return value is the number

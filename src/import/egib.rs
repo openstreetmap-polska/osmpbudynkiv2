@@ -57,6 +57,16 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
             "Step done: load table"
         );
 
+        // `load_into` itself is one `CREATE TABLE AS SELECT` statement (plus
+        // the two single-statement geometry filters and the rodzaj_kod
+        // cascade it calls) -- no Rust-side loop to check inside. This is
+        // the one Rust-level step boundary `import` actually has: between
+        // the table load above and the (also lengthy, on the real 17M-row
+        // table) RTREE index build below. Bails with an Err, matching
+        // `import::osm::import`'s `check_shutdown` convention -- a table
+        // loaded but not yet indexed is not a usable import.
+        crate::shutdown::check_requested()?;
+
         let t = std::time::Instant::now();
         conn.execute_batch(
             "CREATE INDEX egib_buildings_geom_idx ON egib_buildings USING RTREE (geom);

@@ -222,6 +222,17 @@ async fn download_with_retry(
                 // fails here `dest_path` may already be a *different*
                 // writer's completed download.
                 if attempt < MAX_RETRIES {
+                    // Checked BEFORE the backoff sleep, not after: a
+                    // government snapshot download is multi-GB, so a failed
+                    // attempt can itself have taken a long time, and by then
+                    // a shutdown may already be pending. Without this check
+                    // here, Ctrl+C during that window would still sit
+                    // through up to 2^attempt seconds of backoff before even
+                    // starting the next (doomed) attempt. Bails with an Err,
+                    // matching `import::osm::import`'s `check_shutdown`
+                    // convention -- a download abandoned mid-retry is a
+                    // failed download, not a silently-accepted partial one.
+                    crate::shutdown::check_requested()?;
                     let delay = std::time::Duration::from_secs(2u64.pow(attempt));
                     tokio::time::sleep(delay).await;
                 }
@@ -363,6 +374,17 @@ async fn write_response_to_file(
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
+        // A government snapshot is multi-GB; without this, Ctrl+C during the
+        // transfer would do nothing until the whole thing finished. Bails
+        // with an Err rather than returning as if the download had
+        // succeeded -- the caller (`do_download`) treats that exactly like
+        // any other failed attempt: the temp file this function has been
+        // writing into is removed on the way out, `dest_path` is left
+        // untouched (see the comment on `download_with_retry`'s error arm
+        // for why that matters with a concurrent prefetcher), and the
+        // caller sees a genuine error instead of silently keeping a
+        // truncated "successful" download.
+        crate::shutdown::check_requested()?;
         let chunk = chunk.context("Error reading download stream")?;
         writer
             .write_all(&chunk)

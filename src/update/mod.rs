@@ -25,6 +25,15 @@ use crate::osm::kvstore::RocksDB;
 /// *background* job bypasses `run` entirely and calls `osm::update` directly
 /// (see `server::jobs::osm_update`), so this only ever reaches the `Osm` arm
 /// from the CLI; the other three arms are reachable from both paths.
+///
+/// `is_cancelled` is forwarded unchanged into whichever update function the
+/// matched arm calls (`osm::update`, `dataset::refresh` for `Bdot10k`/`Egib`,
+/// `import::prg::update_prg` for `Prg`) -- `run` has no opinion of its own on
+/// cancellation, it only routes the caller's signal through. What concrete
+/// closure a given call passes depends on the caller: `main.rs`'s
+/// `Command::Update` arm passes `&|| false` (the CLI has no job supervisor to
+/// cancel it), `server::jobs::dataset_update::DatasetUpdateJob` passes
+/// `&|| ctx.is_cancelled()`.
 pub fn run(
     conn: &Connection,
     kv: &RocksDB,
@@ -32,18 +41,16 @@ pub fn run(
     config: &Config,
     urls: &DownloadUrls,
     show_progress: bool,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     match source {
-        // `&|| false`: the CLI path has no job supervisor, so it is never
-        // cooperatively cancelled -- only the background job
-        // (`server::jobs::osm_update`) passes a real cancel poll.
         UpdateSource::Osm => osm::update(
             conn,
             kv,
             config,
             &urls.osm_replication,
             show_progress,
-            &|| false,
+            is_cancelled,
         ),
         UpdateSource::Bdot10k { file } => {
             let mut etag = None;
@@ -68,6 +75,7 @@ pub fn run(
                 &spec::BDOT10K,
                 |c, target| crate::import::bdot10k::load_into(c, target, &p),
                 etag.as_deref(),
+                is_cancelled,
             );
             cleanup_if_downloaded(&path, was_downloaded && config.cleanup_downloaded_files);
             result.map(|_| ())
@@ -94,6 +102,7 @@ pub fn run(
                 &spec::EGIB,
                 |c, target| crate::import::egib::load_into(c, target, &p),
                 etag.as_deref(),
+                is_cancelled,
             );
             cleanup_if_downloaded(&path, was_downloaded && config.cleanup_downloaded_files);
             result.map(|_| ())
@@ -120,6 +129,7 @@ pub fn run(
                 &urls.prg,
                 etag.as_deref(),
                 show_progress,
+                is_cancelled,
             )
         }
     }

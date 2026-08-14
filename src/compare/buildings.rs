@@ -44,6 +44,32 @@ fn compare_buildings(
     dest: &str,
     extra_filter: Option<&str>,
 ) -> Result<()> {
+    compare_buildings_with_cancel(
+        conn,
+        label,
+        source_table,
+        id_col,
+        dest,
+        extra_filter,
+        &crate::shutdown::is_requested,
+    )
+}
+
+/// Does the actual work of `compare_buildings`, with the shutdown check
+/// factored out behind `is_cancelled` so a test can inject a closure that
+/// returns `true` on a chosen call rather than flipping the process-global
+/// `shutdown::is_requested` flag (which would leak into every other test
+/// running in the same process). The production entry point above always
+/// passes `&crate::shutdown::is_requested`.
+fn compare_buildings_with_cancel(
+    conn: &Connection,
+    label: &str,
+    source_table: &str,
+    id_col: &str,
+    dest: &str,
+    extra_filter: Option<&str>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
     info!(source = label, "Comparing buildings against OSM");
     let t = std::time::Instant::now();
 
@@ -71,6 +97,36 @@ fn compare_buildings(
         while y < max_y {
             let mut x = min_x;
             while x < max_x {
+                // The DELETE above already ran inside this same transaction
+                // (see `in_transaction`'s doc comment: a full compare is a
+                // clear-then-repopulate), so the only safe way to stop this
+                // loop early is to fail the closure and let `in_transaction`
+                // roll the DELETE back too -- leaving the previous `dest`
+                // contents in place. `bail!` here, not `return Ok(())`.
+                //
+                // That is the opposite of how `update::osm::update` handles
+                // the same flag, and deliberately so: that loop commits one
+                // replication batch at a time and resumes from a metadata
+                // stamp, so an early `Ok` there just means "less caught up,
+                // pick up again next run." This grid loop has no such
+                // checkpoint partway through -- an early `Ok` here would let
+                // `in_transaction` COMMIT a `dest` missing every cell after
+                // this one, which is exactly the silent-outage failure mode
+                // (`/tiles`/`/package` answering with zero features) that
+                // transaction exists to prevent. Don't "make this consistent"
+                // with the OSM update path; the two loops resume differently,
+                // so they must fail differently too.
+                //
+                // The message comes from `shutdown::SHUTDOWN_BAIL_MESSAGE`
+                // rather than being retyped, so a cancellation noticed here
+                // is indistinguishable from one noticed by
+                // `shutdown::check_requested()` at any other seam. This
+                // cannot call `check_requested()` itself: it must consult the
+                // injected `is_cancelled`, not the process-global flag
+                // directly, so that the test below can drive it.
+                if is_cancelled() {
+                    anyhow::bail!(crate::shutdown::SHUTDOWN_BAIL_MESSAGE);
+                }
                 let (x_hi, y_hi) = (x + GRID_STEP, y + GRID_STEP);
                 let area = (x, y, x_hi, y_hi);
                 let inner = unmatched_buildings_sql(source_table, &select, area, extra_filter);
@@ -499,6 +555,82 @@ mod tests {
         assert_eq!(
             total, 1,
             "a suppressed building must still count towards its cell's denominator"
+        );
+    }
+
+    /// A compare cancelled partway through the grid must roll back the
+    /// DELETE too, leaving `dest` exactly as a previous run left it -- not
+    /// emptied, and not partially repopulated. This is the failure mode
+    /// `compare::in_transaction`'s doc comment calls out by name (an
+    /// in-progress compare silently serving zero features), just triggered
+    /// by a shutdown request instead of a query error.
+    ///
+    /// `crate::shutdown::is_requested()` reads a process-global static, which
+    /// a test cannot flip without leaking `true` into every other test in
+    /// this binary (they all share one process). So this drives
+    /// `compare_buildings_with_cancel` directly with an injected closure
+    /// that goes true partway through the grid scan, the same shape
+    /// `compare::drain::drain_batch` already uses for its own
+    /// `is_cancelled: &dyn Fn() -> bool` parameter.
+    #[test]
+    fn cancelled_compare_leaves_the_previous_contents_intact() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let conn = setup();
+        conn.execute_batch(
+            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
+                 KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
+                 NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
+             -- Two buildings several degrees apart so source_grid_extent
+             -- spans many 0.5-degree cells -- the cancellation below fires
+             -- partway through that scan, not on the only cell there is.
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
+                 ('lonely_a', ST_MakeEnvelope(14.05,49.05,14.06,49.06)),
+                 ('lonely_b', ST_MakeEnvelope(20.0,52.0,20.001,52.001));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             -- Simulates a previous, already-committed comparison run --
+             -- the row a cancelled compare must NOT discard.
+             INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at)
+             VALUES ('previous_run', ST_Point(21.0, 52.0), 9147, 5411, now());",
+        )
+        .unwrap();
+
+        // False for the first three grid cells scanned, true from then on --
+        // exercises a mid-grid cancellation rather than an immediate one.
+        let calls = AtomicUsize::new(0);
+        let is_cancelled = || calls.fetch_add(1, Ordering::SeqCst) >= 3;
+
+        let err = compare_buildings_with_cancel(
+            &conn,
+            "bdot10k",
+            "bdot10k_buildings",
+            "LOKALNYID",
+            "bdot10k_unmatched",
+            Some(BDOT10K_EKSPLOATOWANY_FILTER),
+            &is_cancelled,
+        )
+        .expect_err("a cancelled compare must return Err, not Ok(())");
+        assert!(
+            format!("{err:#}").contains(crate::shutdown::SHUTDOWN_BAIL_MESSAGE),
+            "got: {err:#}"
+        );
+
+        let rows: Vec<String> = {
+            let mut s = conn
+                .prepare("SELECT LOKALNYID FROM bdot10k_unmatched")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            rows,
+            vec!["previous_run".to_string()],
+            "a cancelled compare must roll back its DELETE, not leave the \
+             serving table empty or partially repopulated"
         );
     }
 }

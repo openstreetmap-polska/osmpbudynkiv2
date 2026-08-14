@@ -46,11 +46,17 @@ impl Drop for ScratchGuard<'_> {
 ///
 /// `load` must create the staging table named by `spec.staging_table()`,
 /// including a `_row_hash` column (use `crate::dataset::hashed_select`).
+///
+/// `is_cancelled` is polled at three points via [`check_cancelled`], all
+/// outside the apply transaction -- see that helper's doc comment for both
+/// why the checks stop there and why a cancelled `refresh` returns `Err`
+/// rather than `Ok(())`.
 pub fn refresh(
     conn: &Connection,
     spec: &DatasetSpec,
     load: impl FnOnce(&Connection, &str) -> Result<crate::dataset::LoadStats>,
     source_etag: Option<&str>,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<DiffCounts> {
     let total = std::time::Instant::now();
     let staging = spec.staging_table();
@@ -66,6 +72,7 @@ pub fn refresh(
     let job_name = format!("update:{}", spec.name);
     let outcome = (|| -> Result<(DiffCounts, crate::dataset::LoadStats)> {
         // --- stage ---
+        check_cancelled(spec.name, "staging", is_cancelled)?;
         let t = std::time::Instant::now();
         let load_stats = load(conn, &staging)
             .with_context(|| format!("Failed to stage {} snapshot", spec.name))?;
@@ -94,6 +101,7 @@ pub fn refresh(
         let hash_version = check_row_hash_version(conn)?;
 
         // --- diff ---
+        check_cancelled(spec.name, "diff", is_cancelled)?;
         let t = std::time::Instant::now();
         let counts = diff::compute(conn, spec)?;
         info!(
@@ -123,6 +131,10 @@ pub fn refresh(
         }
 
         // --- apply ---
+        // Last check before anything lands: everything from here on runs
+        // inside the apply transaction, and check_cancelled must never be
+        // called there (see its doc comment for why).
+        check_cancelled(spec.name, "apply", is_cancelled)?;
         let t = std::time::Instant::now();
         let id = spec.id_column;
         let live = spec.table;
@@ -279,6 +291,45 @@ fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> 
     msg
 }
 
+/// Both cancellation signals `refresh` polls, mirroring the loop in
+/// `update::osm::update` (`src/update/osm.rs:131-149`): the process-global
+/// `crate::shutdown::is_requested()` (SIGINT/SIGTERM on the CLI path) and the
+/// caller-injected `is_cancelled` (supervisor timeout or scheduler shutdown
+/// on the server path). One function so `refresh`'s three call sites check
+/// both signals identically.
+///
+/// Every call site in `refresh` sits OUTSIDE the apply transaction, and that
+/// is deliberate: `readers_never_observe_a_partial_apply` and the
+/// `insert_change_areas`-ordering test both depend on that transaction being
+/// an atomic unit that either fully lands or fully doesn't. A check inside it
+/// would buy nothing over checking before `BEGIN` -- the transaction would
+/// just roll back either way -- while adding a rollback path that has to be
+/// reasoned about for no benefit. Do not add a fourth call site inside it.
+///
+/// Returns `Err`, deliberately the opposite of `osm::update`'s `Ok(())` on
+/// cancellation. `osm::update` commits one replication batch at a time and
+/// resumes from a `metadata` stamp, so stopping early is real, durable
+/// partial progress -- "less caught up, resume next run". `refresh` has no
+/// such checkpoint: until the apply transaction commits, nothing has landed
+/// -- no `dataset_refreshes` row, no delta, no dirty cells, no serving-epoch
+/// bump. `Ok(())` here would make the `job_log::record` call at the bottom of
+/// `refresh` write a `Success` row, and the job registry report a successful
+/// run, for a refresh that did nothing at all.
+fn check_cancelled(source: &str, stage: &str, is_cancelled: &dyn Fn() -> bool) -> Result<()> {
+    let reason = if crate::shutdown::is_requested() {
+        "shutdown requested"
+    } else if is_cancelled() {
+        "job cancelled"
+    } else {
+        return Ok(());
+    };
+    info!(
+        source,
+        stage, reason, "Dataset refresh cancelled before landing"
+    );
+    bail!("Cancelled before {stage} ({reason})")
+}
+
 /// What `metadata.row_hash_version` says about the live table's `_row_hash`
 /// values, relative to the expression this build would produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +462,7 @@ mod tests {
                 },
             ),
             None,
+            &|| false,
         )
         .unwrap();
 
@@ -458,6 +510,7 @@ mod tests {
                 },
             ),
             None,
+            &|| false,
         )
         .unwrap();
 
@@ -479,7 +532,7 @@ mod tests {
         let conn = conn_with_live(LIVE_ROWS);
         let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
 
-        let _ = refresh(&conn, &TEST_SPEC, loader(empty), None);
+        let _ = refresh(&conn, &TEST_SPEC, loader(empty), None, &|| false);
 
         let log = crate::job_log::read_all(&conn).unwrap();
         let entry = log
@@ -492,7 +545,7 @@ mod tests {
     #[test]
     fn applies_delta_to_live_table() {
         let conn = conn_with_live(LIVE_ROWS);
-        let counts = refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+        let counts = refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
         assert_eq!(
             counts,
             DiffCounts {
@@ -521,7 +574,10 @@ mod tests {
     #[test]
     fn writes_refresh_row_and_change_areas() {
         let conn = conn_with_live(LIVE_ROWS);
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), Some("etag-1")).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), Some("etag-1"), &|| {
+            false
+        })
+        .unwrap();
 
         let (snapshot_id, source, etag, added, modified, removed): (
             i64,
@@ -587,7 +643,7 @@ mod tests {
             ('m1','CHANGED',21.0,52.0), ('m2','CHANGED',21.0,52.0), ('a1','v1',21.0,52.0)
           ) t(id,a,lon,lat)";
 
-        let counts = refresh(&conn, &TEST_SPEC, loader(NEW), None).unwrap();
+        let counts = refresh(&conn, &TEST_SPEC, loader(NEW), None, &|| false).unwrap();
         assert_eq!(
             counts,
             DiffCounts {
@@ -611,8 +667,8 @@ mod tests {
     #[test]
     fn snapshot_ids_increment() {
         let conn = conn_with_live(LIVE_ROWS);
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
 
         let ids: Vec<i64> = {
             let mut stmt = conn
@@ -630,7 +686,7 @@ mod tests {
     fn empty_staging_aborts_and_leaves_live_untouched() {
         let conn = conn_with_live(LIVE_ROWS);
         let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
-        let err = refresh(&conn, &TEST_SPEC, loader(empty), None).unwrap_err();
+        let err = refresh(&conn, &TEST_SPEC, loader(empty), None, &|| false).unwrap_err();
         assert!(
             format!("{err:#}").contains("0 rows"),
             "error should name the empty staging table, got: {err:#}"
@@ -650,11 +706,11 @@ mod tests {
     #[test]
     fn staging_table_is_always_cleaned_up() {
         let conn = conn_with_live(LIVE_ROWS);
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
         assert!(!staging_exists(&conn), "staging left behind after success");
 
         let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
-        let _ = refresh(&conn, &TEST_SPEC, loader(empty), None);
+        let _ = refresh(&conn, &TEST_SPEC, loader(empty), None, &|| false);
         assert!(!staging_exists(&conn), "staging left behind after failure");
     }
 
@@ -664,7 +720,7 @@ mod tests {
     #[test]
     fn diff_temp_tables_do_not_outlive_the_refresh() {
         let conn = conn_with_live(LIVE_ROWS);
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
 
         for t in [
             "diff_live_hashes",
@@ -698,7 +754,7 @@ mod tests {
     #[test]
     fn unchanged_snapshot_records_a_noop_refresh() {
         let conn = conn_with_live(LIVE_ROWS);
-        let counts = refresh(&conn, &TEST_SPEC, loader(LIVE_ROWS), None).unwrap();
+        let counts = refresh(&conn, &TEST_SPEC, loader(LIVE_ROWS), None, &|| false).unwrap();
         assert_eq!(
             counts,
             DiffCounts {
@@ -730,7 +786,7 @@ mod tests {
         const ALL_NEW: &str = "SELECT * FROM (VALUES ('a','X',21.0,52.0), ('b','X',21.0,52.0))
                                t(id,a,lon,lat)";
 
-        let counts = refresh(&conn, &TEST_SPEC, loader(ALL_NEW), None).unwrap();
+        let counts = refresh(&conn, &TEST_SPEC, loader(ALL_NEW), None, &|| false).unwrap();
         assert_eq!(
             counts,
             DiffCounts {
@@ -767,7 +823,7 @@ mod tests {
           ) t(id,a,lon,lat)";
 
         let conn = conn_with_live(BEFORE);
-        refresh(&conn, &TEST_SPEC, loader(AFTER), None).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(AFTER), None, &|| false).unwrap();
 
         let (origin_x, origin_y) = lonlat_to_tile(21.0, 52.0, CHANGE_CELL_ZOOM);
         let (dest_x, dest_y) = lonlat_to_tile(19.0, 50.0, CHANGE_CELL_ZOOM);
@@ -838,7 +894,7 @@ mod tests {
             seen
         });
 
-        refresh(&conn, &TEST_SPEC, loader(AFTER), None).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(AFTER), None, &|| false).unwrap();
         stop.store(true, Ordering::SeqCst);
         let seen = handle.join().unwrap();
 
@@ -951,7 +1007,7 @@ mod tests {
         )
         .unwrap();
 
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
 
         assert_eq!(
             check_row_hash_version(&conn).unwrap(),
@@ -971,7 +1027,7 @@ mod tests {
     #[test]
     fn unstamped_database_is_stamped_after_a_successful_refresh() {
         let conn = conn_with_live(LIVE_ROWS);
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
 
         assert_eq!(
             check_row_hash_version(&conn).unwrap(),
@@ -993,7 +1049,7 @@ mod tests {
         .unwrap();
 
         let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
-        refresh(&conn, &TEST_SPEC, loader(empty), None).unwrap_err();
+        refresh(&conn, &TEST_SPEC, loader(empty), None, &|| false).unwrap_err();
 
         assert_eq!(
             check_row_hash_version(&conn).unwrap(),
@@ -1022,7 +1078,7 @@ mod tests {
             crate::serving_version::read_serving_epoch(&conn).unwrap(),
             0
         );
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None).unwrap();
+        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
         assert_eq!(
             crate::serving_version::read_serving_epoch(&conn).unwrap(),
             1
@@ -1035,7 +1091,7 @@ mod tests {
     fn aborted_refresh_does_not_bump_the_serving_epoch() {
         let conn = conn_with_live(LIVE_ROWS);
         let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
-        refresh(&conn, &TEST_SPEC, loader(empty), None).unwrap_err();
+        refresh(&conn, &TEST_SPEC, loader(empty), None, &|| false).unwrap_err();
         assert_eq!(
             crate::serving_version::read_serving_epoch(&conn).unwrap(),
             0
@@ -1072,6 +1128,128 @@ mod tests {
         assert!(
             format!("{err:#}").contains("row hash version"),
             "error should mention row hash version, got: {err:#}"
+        );
+    }
+
+    // --- cancellation ------------------------------------------------------
+    //
+    // `check_cancelled` is polled at three points, all before the apply
+    // transaction begins (see its doc comment for why). These tests drive it
+    // with an injected closure over an `AtomicUsize` -- the same shape
+    // `compare::drain::drain_batch`'s `cancellation_stops_the_batch_between_
+    // cells` test and `compare::buildings`'s `cancelled_compare_leaves_the_
+    // previous_contents_intact` test use -- and never by flipping the
+    // process-global `crate::shutdown` flag, which has no public setter for
+    // exactly this reason: a test cannot flip it without leaking `true` into
+    // every other test sharing this binary's process.
+
+    /// Cancelled at the very first check point, before `load` ever runs:
+    /// nothing has happened at all, so this pins the cleanest possible bail.
+    #[test]
+    fn cancelled_before_staging_leaves_everything_untouched() {
+        let conn = conn_with_live(LIVE_ROWS);
+        let err = refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Cancelled before staging"),
+            "got: {err:#}"
+        );
+
+        let live_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live_rows, 3, "live table must be untouched");
+        let refreshes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dataset_refreshes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refreshes, 0, "a cancelled refresh must not be recorded");
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            0
+        );
+        assert!(
+            !staging_exists(&conn),
+            "ScratchGuard must clean up the staging table even though load() never ran"
+        );
+    }
+
+    /// Cancelled AFTER staging has already landed a full snapshot, but
+    /// before the apply transaction begins. This is the case that actually
+    /// proves a staged-but-not-applied refresh discards cleanly: a bug that
+    /// only shows up once something has genuinely been staged (staging left
+    /// behind past `ScratchGuard`, or dirty cells enqueued before `BEGIN`)
+    /// would not be caught by the "before staging" test above.
+    #[test]
+    fn cancelled_after_staging_discards_the_staged_snapshot_cleanly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let conn = conn_with_live(LIVE_ROWS);
+        let calls = AtomicUsize::new(0);
+        // false on the first poll (the "staging" check, letting `load` run
+        // and create the staging table), true from the second call onward --
+        // so this bails at the "diff" check point, after staging succeeded.
+        let cancel = || calls.fetch_add(1, Ordering::SeqCst) >= 1;
+
+        let err = refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &cancel).unwrap_err();
+        // Assert the exact stage, not just "Cancelled before": reaching the
+        // "diff" check point is the only proof this test staged anything at
+        // all. A substring match on "Cancelled before" would also accept a
+        // bail at "staging", which is the *previous* test's case -- so a
+        // future refactor that moved or lost the post-staging check point
+        // would leave this test passing while it stopped covering the thing
+        // its name and doc comment promise.
+        assert!(
+            format!("{err:#}").contains("Cancelled before diff"),
+            "got: {err:#}"
+        );
+
+        let live_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live_rows, 3, "live table must be untouched");
+        let refreshes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dataset_refreshes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refreshes, 0, "a cancelled refresh must not be recorded");
+        assert_eq!(
+            crate::serving_version::read_serving_epoch(&conn).unwrap(),
+            0
+        );
+        assert!(
+            !staging_exists(&conn),
+            "staging left behind after a cancelled refresh"
+        );
+        let dirty: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dirty, 0,
+            "dirty cells are only enqueued inside the apply transaction, \
+             which a cancelled-before-apply refresh never reaches"
+        );
+    }
+
+    /// A cancelled refresh is a real failure, not a quiet no-op: it must
+    /// land in `job_run_log` as `Error`, the same as any other aborted
+    /// refresh, so an operator (or `/status`) can tell "cancelled" apart
+    /// from "never ran".
+    #[test]
+    fn cancellation_is_recorded_in_job_run_log_as_an_error() {
+        let conn = conn_with_live(LIVE_ROWS);
+        let _ = refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| true);
+
+        let log = crate::job_log::read_all(&conn).unwrap();
+        let entry = log
+            .get("update:test")
+            .expect("job_run_log entry must exist even for a cancelled refresh");
+        assert_eq!(entry.outcome, "Error");
+        assert!(
+            entry.message.as_deref().unwrap().contains("Cancelled"),
+            "got: {:?}",
+            entry.message
         );
     }
 }

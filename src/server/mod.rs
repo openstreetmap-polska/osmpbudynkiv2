@@ -250,7 +250,14 @@ pub async fn run(
     let listener = TcpListener::bind(&config.http_listen_addr).await?;
     info!(addr = %config.http_listen_addr, "HTTP server listening");
 
-    axum::serve(listener, app)
+    // Bind the result instead of `?`-ing it away: a serve error is exactly
+    // the moment the scheduler most needs to be told to stop. `?` here would
+    // return before `scheduler.shutdown()` ever ran, leaving every
+    // supervisor's stop/cancel flags unset -- the runtime drop in
+    // `main.rs`'s `Command::Run` arm would then block waiting on
+    // `spawn_blocking` jobs that were never asked to exit (see the log line
+    // below for what that wait looks like from the outside).
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -260,11 +267,27 @@ pub async fn run(
                 }
             }
         })
-        .await?;
+        .await;
 
     scheduler
         .shutdown(tokio::time::Duration::from_secs(30))
         .await;
+
+    // The runtime that hosts this future is dropped by the caller --
+    // `main.rs`'s `Command::Run` arm drops the `Runtime` it built once `run`
+    // returns -- and tokio's documented `Runtime::drop` behavior is to block
+    // waiting for any still-running `spawn_blocking` task, which cannot be
+    // aborted (see `Scheduler::shutdown`'s doc comment). If a job outlived
+    // the shutdown grace, this is the last log line an operator sees before
+    // the process appears to hang; without it, "grace exceeded" followed by
+    // silence looks like a freeze rather than an expected (if undesirably
+    // long) wait on a specific job finishing.
+    info!(
+        "server::run returning; process exit may now block on in-flight background jobs \
+         until they finish (only applies if one is still running)"
+    );
+
+    serve_result.context("HTTP server error")?;
 
     Ok(())
 }

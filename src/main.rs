@@ -47,13 +47,38 @@ fn main() -> Result<()> {
         &config.duckdb_init_commands,
         Some(kv.clone()),
     )?;
+    // Lets the first Ctrl+C abort a statement already in flight, not just one
+    // that hasn't started yet -- see `shutdown::INTERRUPT_HANDLES`'s doc
+    // comment. This covers the CLI's single connection (import/update/
+    // compare, all below); it does not cover `run`'s HTTP server, whose
+    // `ClonedConnectionManager` hands out independent `try_clone()`s each
+    // with their own handle -- the server relies on its graceful-shutdown
+    // path and per-job cancel flags instead. Registering this base
+    // connection's handle is harmless for that path too: `run` only ever
+    // clones it, never queries it directly.
+    shutdown::register_interrupt_handle(conn.interrupt_handle());
 
     match cli.command {
         Command::Import { source } => {
             import::run(&conn, &kv, source, &config, &config.download_urls)?
         }
         Command::Update { source } => {
-            update::run(&conn, &kv, source, &config, &config.download_urls, true)?
+            // The CLI has no job supervisor to cancel it, unlike the
+            // scheduled background path (`server::jobs::dataset_update`
+            // passes `&|| ctx.is_cancelled()`). Ctrl+C still reaches the
+            // refresh, though: `crate::shutdown::is_requested()` is polled
+            // inside `dataset::refresh`/`osm::update` regardless of what
+            // this closure returns, and the DuckDB interrupt handle
+            // registered above aborts a statement already in flight.
+            update::run(
+                &conn,
+                &kv,
+                source,
+                &config,
+                &config.download_urls,
+                true,
+                &|| false,
+            )?
         }
         Command::Compare { target } => compare::run(&conn, target)?,
         Command::Run => {

@@ -276,6 +276,28 @@ pub(crate) async fn supervise(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
+        // Register as a `Notify` waiter BEFORE checking `stop`, not after.
+        // `Notify::notify_waiters` (called by `Scheduler::shutdown`) only
+        // wakes waiters already registered at the moment it runs -- it is
+        // not a latch. If we checked `stop` first and only constructed
+        // `notified()` afterward (as the old code did, inline in the
+        // `select!`), a supervisor that read `stop == false` a moment before
+        // `shutdown()` set it and called `notify_waiters()` would register
+        // too late to see that notification, and would then sleep until its
+        // next tick -- up to `interval_seconds`, which is 86400 for the
+        // dataset jobs -- turning shutdown's 30s grace into a de facto
+        // 24h one. `enable()` makes `notified` a registered waiter
+        // immediately (polling it once, per its own doc example), so any
+        // `notify_waiters()` from this point on is captured by the `select!`
+        // below even though we haven't started awaiting it yet. Moving the
+        // `notified()`/`enable()` pair back inside the `select!` (i.e.
+        // constructing the future at the same place it's awaited) silently
+        // reintroduces this race -- keep them here, ahead of the `stop`
+        // check.
+        let notified = shutdown_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -284,7 +306,7 @@ pub(crate) async fn supervise(
         // and re-check `stop` at the top.
         tokio::select! {
             biased;
-            _ = shutdown_notify.notified() => continue,
+            _ = &mut notified => continue,
             _ = ticker.tick() => {}
         }
 
@@ -755,6 +777,34 @@ mod tests {
         let res = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(res.is_ok(), "supervisor did not exit within 2s of shutdown");
     }
+
+    // NOTE: no deterministic test for the register-before-`stop`-check fix
+    // above (`notified`/`enable()` in `supervise`). The natural approach --
+    // `#[tokio::test(start_paused = true)]` with a long interval, so
+    // "woken by notify" and "notify missed, waiting out the next tick" are
+    // unmistakably different outcomes -- needs tokio's `test-util` feature
+    // (it gates `time::pause`/the virtual clock entirely; without it
+    // `start_paused` doesn't compile), which `Cargo.toml` does not currently
+    // enable. Adding it is outside this change's file ownership.
+    //
+    // Even with that feature available, a genuine attempt talked through
+    // beforehand suggests it would not have discriminated anyway: the race
+    // this fix closes is between literal CPU instructions on two OS threads
+    // of a *multi-threaded* runtime (the supervisor's `stop.load()` versus
+    // its waiter registration a few lines later, racing a concurrent
+    // `notify_waiters()` call from another thread) -- but `start_paused`
+    // requires a `current_thread` runtime, where tasks are cooperatively
+    // scheduled and only switch at `.await` points. There is no `.await`
+    // between the `stop` check and entering `select!` in either ordering, so
+    // on a `current_thread` runtime the supervisor always finishes
+    // registering as a waiter in one uninterrupted synchronous burst before
+    // it can next yield -- the same burst regardless of which fix is
+    // applied, since no other task can run in between to land in the gap.
+    // `supervisor_honors_shutdown_during_idle` above already exercises the
+    // externally-visible behavior (idle supervisor wakes on shutdown, not
+    // just eventually) on a real multi-threaded runtime; it doesn't pin this
+    // ordering specifically because its `sleep(200ms)` gives the supervisor
+    // ample real time to register well before `notify_waiters()` runs.
 
     // Silence "field is never read" if any test struct goes unused.
     #[allow(dead_code)]

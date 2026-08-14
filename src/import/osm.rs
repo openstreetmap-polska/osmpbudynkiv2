@@ -94,132 +94,180 @@ pub fn import(
     file: Option<&Path>,
     url: &str,
 ) -> Result<()> {
-    let (pbf_path, was_downloaded) = match file {
-        Some(path) => (PathBuf::from(path), false),
-        None => (download_file(url, &config.download_dir())?, true),
-    };
+    // The whole import lives in this closure so that every exit path --
+    // success, any `?` propagated from a step, and a `check_shutdown()` bail
+    // in particular -- funnels through the single `job_run_log` self-report
+    // below. Self-reported here rather than at import/mod.rs's call sites
+    // because `ImportSource::Full` also calls this function, and
+    // self-reporting keeps "record import:osm's outcome" a single site
+    // regardless of which CLI arm got here (mirrors bdot10k::import,
+    // egib::import and update::dataset::refresh's outcome/match shape).
+    let outcome = (|| -> Result<String> {
+        let (pbf_path, was_downloaded) = match file {
+            Some(path) => (PathBuf::from(path), false),
+            None => (download_file(url, &config.download_dir())?, true),
+        };
 
-    let pbf_str = pbf_path.to_str().context("PBF path is not valid UTF-8")?;
+        let pbf_str = pbf_path.to_str().context("PBF path is not valid UTF-8")?;
 
-    if let Some((seq, timestamp)) = read_replication_info(&pbf_path)? {
-        conn.execute_batch(&format!(
-            "DELETE FROM metadata WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp');
-             INSERT INTO metadata VALUES ('osm_replication_sequence', '{seq}');
-             INSERT INTO metadata VALUES ('osm_replication_timestamp', '{timestamp}');"
-        ))
-        .context("Failed to store replication metadata")?;
-        info!(
-            sequence = seq,
-            timestamp, "OSM replication metadata from PBF header"
-        );
-    } else {
-        tracing::warn!("PBF header has no replication metadata — update start point unknown");
-    }
-
-    reset_osm_tables(conn, kv)?;
-
-    info!(path = pbf_str, "Starting OSM import");
-
-    let total = std::time::Instant::now();
-
-    let check_shutdown = || -> Result<()> {
-        if crate::shutdown::is_requested() {
-            anyhow::bail!("Shutdown requested");
+        // Read the header now -- an unreadable or malformed PBF should fail
+        // fast, before hours of work -- but hold the parsed value rather than
+        // writing it to `metadata` yet. It gets written only after every
+        // data-loading step below has succeeded; see the comment beside that
+        // write for why the split is load-bearing.
+        let replication_info = read_replication_info(&pbf_path)?;
+        if replication_info.is_none() {
+            tracing::warn!("PBF header has no replication metadata — update start point unknown");
         }
-        Ok(())
-    };
 
-    let t = std::time::Instant::now();
-    stream_nodes_to_rocksdb(conn, kv, pbf_str)?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: stream nodes to RocksDB"
-    );
-    check_shutdown()?;
+        reset_osm_tables(conn, kv)?;
 
-    let t = std::time::Instant::now();
-    import_address_nodes(conn, pbf_str)?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: import address nodes"
-    );
-    check_shutdown()?;
+        info!(path = pbf_str, "Starting OSM import");
 
-    let t = std::time::Instant::now();
-    stream_ways_to_rocksdb(conn, kv, pbf_str)?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: stream ways to RocksDB"
-    );
-    check_shutdown()?;
+        let total = std::time::Instant::now();
 
-    let t = std::time::Instant::now();
-    import_way_buildings_and_addresses(conn, pbf_str)?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: import way buildings and addresses"
-    );
-    check_shutdown()?;
+        let check_shutdown = || -> Result<()> {
+            crate::shutdown::check_requested()?;
+            Ok(())
+        };
 
-    let t = std::time::Instant::now();
-    import_way_former_buildings(conn, pbf_str)?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: import way former buildings"
-    );
-    check_shutdown()?;
+        let t = std::time::Instant::now();
+        stream_nodes_to_rocksdb(conn, kv, pbf_str)?;
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: stream nodes to RocksDB"
+        );
+        check_shutdown()?;
 
-    let t = std::time::Instant::now();
-    stream_relations_to_rocksdb(conn, kv, pbf_str)?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: stream relations to RocksDB"
-    );
-    check_shutdown()?;
+        let t = std::time::Instant::now();
+        import_address_nodes(conn, pbf_str)?;
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: import address nodes"
+        );
+        check_shutdown()?;
 
-    let t = std::time::Instant::now();
-    import_relation_buildings_and_addresses(conn, pbf_str)?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: import relation buildings and addresses"
-    );
-    check_shutdown()?;
+        let t = std::time::Instant::now();
+        stream_ways_to_rocksdb(conn, kv, pbf_str)?;
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: stream ways to RocksDB"
+        );
+        check_shutdown()?;
 
-    let t = std::time::Instant::now();
-    import_relation_former_buildings(conn, pbf_str)?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: import relation former buildings"
-    );
-    check_shutdown()?;
+        let t = std::time::Instant::now();
+        import_way_buildings_and_addresses(conn, pbf_str)?;
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: import way buildings and addresses"
+        );
+        check_shutdown()?;
 
-    let t = std::time::Instant::now();
-    kvstore::compact_reverse_indexes(kv);
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: compact reverse indexes"
-    );
-    check_shutdown()?;
+        let t = std::time::Instant::now();
+        import_way_former_buildings(conn, pbf_str)?;
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: import way former buildings"
+        );
+        check_shutdown()?;
 
-    let t = std::time::Instant::now();
-    create_spatial_indexes(conn)?;
-    info!(
-        elapsed = %format_duration(t.elapsed()),
-        "Step done: create spatial indexes"
-    );
+        let t = std::time::Instant::now();
+        stream_relations_to_rocksdb(conn, kv, pbf_str)?;
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: stream relations to RocksDB"
+        );
+        check_shutdown()?;
 
-    log_import_stats(conn)?;
+        let t = std::time::Instant::now();
+        import_relation_buildings_and_addresses(conn, pbf_str)?;
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: import relation buildings and addresses"
+        );
+        check_shutdown()?;
 
-    if was_downloaded && config.cleanup_downloaded_files {
-        info!(path = %pbf_path.display(), "Cleaning up downloaded file");
-        let _ = std::fs::remove_file(&pbf_path);
+        let t = std::time::Instant::now();
+        import_relation_former_buildings(conn, pbf_str)?;
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: import relation former buildings"
+        );
+        check_shutdown()?;
+
+        let t = std::time::Instant::now();
+        kvstore::compact_reverse_indexes(kv);
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: compact reverse indexes"
+        );
+        check_shutdown()?;
+
+        let t = std::time::Instant::now();
+        create_spatial_indexes(conn)?;
+        info!(
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: create spatial indexes"
+        );
+
+        // Stamp the replication metadata LAST -- only now that every
+        // data-loading step above has actually landed. `update osm`'s
+        // catch-up loop resumes from this stamp, so it must never be visible
+        // for an import that did not finish. Stamping it up front (the
+        // previous behaviour) meant a Ctrl+C at, say, step 3 left the
+        // sequence recorded while `osm_addresses` was half full,
+        // `osm_buildings` was empty and RocksDB was partial -- and a later
+        // `update osm` or `run` would proceed against that state with no
+        // indication the import never completed. A PBF with no replication
+        // metadata in its header (warned about above, at the top) writes
+        // nothing here either way.
+        if let Some((seq, timestamp)) = replication_info {
+            conn.execute_batch(&format!(
+                "DELETE FROM metadata WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp');
+                 INSERT INTO metadata VALUES ('osm_replication_sequence', '{seq}');
+                 INSERT INTO metadata VALUES ('osm_replication_timestamp', '{timestamp}');"
+            ))
+            .context("Failed to store replication metadata")?;
+            info!(
+                sequence = seq,
+                timestamp, "OSM replication metadata from PBF header"
+            );
+        }
+
+        let (buildings, addresses, former_buildings) = log_import_stats(conn)?;
+
+        if was_downloaded && config.cleanup_downloaded_files {
+            info!(path = %pbf_path.display(), "Cleaning up downloaded file");
+            let _ = std::fs::remove_file(&pbf_path);
+        }
+
+        let elapsed = total.elapsed();
+        info!(
+            elapsed = %format_duration(elapsed),
+            "OSM import complete"
+        );
+
+        Ok(format!(
+            "buildings={buildings} addresses={addresses} former_buildings={former_buildings} \
+             elapsed={}",
+            format_duration(elapsed)
+        ))
+    })();
+
+    // bdot10k/egib/prg all self-report via job_run_log (see their `import`
+    // functions and `update::dataset::refresh`); OSM previously did not, so
+    // `/status` showed nothing for it either way an import went. A failure to
+    // write the log must never fail the job itself -- see
+    // `job_log::record`'s own doc comment, which is why this is `let _ =`.
+    match &outcome {
+        Ok(msg) => {
+            let _ = crate::job_log::record(conn, "import:osm", "Success", Some(msg));
+        }
+        Err(e) => {
+            let _ = crate::job_log::record(conn, "import:osm", "Error", Some(&format!("{e:#}")));
+        }
     }
-
-    info!(
-        elapsed = %format_duration(total.elapsed()),
-        "OSM import complete"
-    );
-    Ok(())
+    outcome.map(|_| ())
 }
 
 fn import_address_nodes(conn: &Connection, pbf_path: &str) -> Result<()> {
@@ -665,7 +713,7 @@ fn create_spatial_indexes(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn log_import_stats(conn: &Connection) -> Result<()> {
+fn log_import_stats(conn: &Connection) -> Result<(i64, i64, i64)> {
     let buildings: i64 =
         conn.query_row("SELECT COUNT(*) FROM osm_buildings", [], |row| row.get(0))?;
     let addresses: i64 =
@@ -675,7 +723,7 @@ fn log_import_stats(conn: &Connection) -> Result<()> {
             row.get(0)
         })?;
     info!(buildings, addresses, former_buildings, "OSM import totals");
-    Ok(())
+    Ok((buildings, addresses, former_buildings))
 }
 
 #[cfg(test)]
@@ -886,5 +934,122 @@ mod tests {
         assert!((lat - 52.206263).abs() < 1e-4);
 
         Ok(())
+    }
+
+    /// A completed import must both stamp the replication metadata (the
+    /// fixture PBF's header has genuine replication info -- see
+    /// `pbf_header::tests::test_read_replication_info_from_fixture`) and
+    /// record a `job_run_log` success row, which OSM did not do before this
+    /// change.
+    #[test]
+    fn successful_import_stamps_replication_metadata_and_records_job_log_success() -> Result<()> {
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
+        run_import_with_fixture(&conn, Path::new("fixtures/osm.pbf"))?;
+
+        let stamped: String = conn.query_row(
+            "SELECT value FROM metadata WHERE key = 'osm_replication_sequence'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            !stamped.is_empty(),
+            "a completed import must stamp the replication sequence"
+        );
+
+        let log = crate::job_log::read_all(&conn)?;
+        let entry = log.get("import:osm").expect("entry must be present");
+        assert_eq!(entry.outcome, "Success");
+        let msg = entry.message.as_deref().unwrap();
+        assert!(msg.contains("buildings=2"), "got: {msg}");
+        assert!(msg.contains("addresses=3"), "got: {msg}");
+        assert!(msg.contains("former_buildings=1"), "got: {msg}");
+
+        Ok(())
+    }
+
+    /// The load-bearing ordering change: the replication stamp must not
+    /// exist for an import that failed partway through, even though the PBF
+    /// header itself was read successfully and has valid replication info.
+    /// This is the Gap 3 hazard -- stamping up front used to leave a
+    /// half-imported database indistinguishable from a complete one to a
+    /// later `update osm` or `run`.
+    ///
+    /// There is no way to reach into the process-wide shutdown flag from a
+    /// unit test (it has no public setter, by design -- see
+    /// `shutdown::is_requested`), so this simulates "fails after the header
+    /// read but before the import finishes" a different way: it pre-creates
+    /// an index with the exact name `create_spatial_indexes` (the last
+    /// data-loading step, immediately before the metadata write) will try to
+    /// create, so that step -- and therefore the whole import -- fails.
+    /// `check_shutdown()`'s bail is just one of many ways a late step can
+    /// fail; this test exercises the ordering guarantee itself, which
+    /// protects against all of them alike.
+    #[test]
+    fn failed_import_does_not_stamp_replication_metadata() -> Result<()> {
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
+        conn.execute_batch(
+            "CREATE TABLE zzz_scratch (geom GEOMETRY);
+             CREATE INDEX osm_buildings_geom_idx ON zzz_scratch USING RTREE (geom);",
+        )?;
+
+        let result = run_import_with_fixture(&conn, Path::new("fixtures/osm.pbf"));
+        assert!(
+            result.is_err(),
+            "expected the forced index-name collision to fail the import"
+        );
+
+        use duckdb::OptionalExt;
+        let stamped: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'osm_replication_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        assert_eq!(
+            stamped, None,
+            "a failed import must not stamp replication metadata, even though \
+             the header itself was read successfully"
+        );
+
+        let log = crate::job_log::read_all(&conn)?;
+        let entry = log
+            .get("import:osm")
+            .expect("entry must exist even on failure");
+        assert_eq!(entry.outcome, "Error");
+        assert!(entry.message.is_some());
+
+        Ok(())
+    }
+
+    /// Mirrors `bdot10k`/`egib`'s `import_records_error_in_job_run_log_on_failure`:
+    /// even a failure before any table is touched at all (here, the PBF file
+    /// doesn't exist, so `read_replication_info` errors immediately) must
+    /// still leave an `import:osm` row in `job_run_log`.
+    #[test]
+    fn import_records_error_in_job_run_log_on_missing_file() {
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, None).unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(kvstore::open(tmp_dir.path(), 512, 64).unwrap());
+        let config = Config::default();
+
+        let result = import(
+            &conn,
+            &kv,
+            &config,
+            Some(Path::new("nonexistent.pbf")),
+            "unused",
+        );
+        assert!(result.is_err());
+
+        let log = crate::job_log::read_all(&conn).unwrap();
+        let entry = log
+            .get("import:osm")
+            .expect("entry must exist even on failure");
+        assert_eq!(entry.outcome, "Error");
+        assert!(entry.message.is_some());
     }
 }

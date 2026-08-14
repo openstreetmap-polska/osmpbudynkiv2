@@ -13,11 +13,24 @@ use tracing::info;
 
 use crate::cli::{AddressesSource, BuildingsSource, CompareTarget};
 
+/// `shutdown::check_requested()` is called between sub-compares below, never
+/// mid-compare: each of `compare_bdot10k`/`compare_egib`/`compare_prg` is
+/// already independently atomic (`in_transaction`), so bailing between them
+/// only ever skips a sub-compare that hasn't started -- it can never discard
+/// one that already committed. Mid-compare cancellation is a separate seam
+/// with a different rationale, inside `compare_buildings`'s grid loop.
+///
+/// It bails with `Err` rather than swallowing the cancellation as `Ok(())`,
+/// for the same reason that grid-loop check does (see its comment): `compare`
+/// is invoked by hand, and a non-zero exit after "Shutdown requested" on
+/// stderr is the correct signal -- not a silent partial run that looks
+/// identical to a completed one.
 pub fn run(conn: &Connection, target: CompareTarget) -> Result<()> {
     match target {
         CompareTarget::Buildings { source } => match source {
             None | Some(BuildingsSource::All) => {
                 buildings::compare_bdot10k(conn)?;
+                crate::shutdown::check_requested()?;
                 buildings::compare_egib(conn)?;
             }
             Some(BuildingsSource::Bdot10k) => buildings::compare_bdot10k(conn)?,
@@ -29,7 +42,9 @@ pub fn run(conn: &Connection, target: CompareTarget) -> Result<()> {
         },
         CompareTarget::Full => {
             buildings::compare_bdot10k(conn)?;
+            crate::shutdown::check_requested()?;
             buildings::compare_egib(conn)?;
+            crate::shutdown::check_requested()?;
             addresses::compare_prg(conn)?;
             // Pure insurance, not a normal invalidation path: every row this
             // rewrote already moved that cell's own per-cell version (see
@@ -469,6 +484,7 @@ mod drain_refresh_concurrency {
                     Ok(crate::dataset::LoadStats::default())
                 },
                 None,
+                &|| false,
             );
             if let Err(e) = res {
                 refresh_errors.push(format!("refresh({tag}) errored: {e:#}"));

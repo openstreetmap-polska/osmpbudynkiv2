@@ -18,6 +18,16 @@ fn refresh_lock() -> &'static Mutex<()> {
 }
 
 /// Background job that refreshes one government dataset from a fresh snapshot.
+///
+/// Delegates to [`crate::update::run`], passing `&|| ctx.is_cancelled()`
+/// through to whichever update function the matched source needs it
+/// (`dataset::refresh` for `Bdot10k`/`Egib`, `import::prg::update_prg` for
+/// `Prg`). Both poll it -- alongside the process-global shutdown flag -- at
+/// well-defined points before their apply transaction begins (see
+/// `update::dataset::refresh`'s doc comment), so a supervisor timeout on a
+/// long-running refresh actually stops it instead of only being recorded
+/// after the fact once the whole staging + diff + apply sequence has already
+/// run to completion on its own.
 pub struct DatasetUpdateJob {
     spec: &'static DatasetSpec,
     name: &'static str,
@@ -62,6 +72,7 @@ impl Job for DatasetUpdateJob {
             &ctx.config,
             &ctx.config.download_urls,
             false,
+            &|| ctx.is_cancelled(),
         )
     }
 }

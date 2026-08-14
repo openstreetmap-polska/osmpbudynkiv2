@@ -82,6 +82,12 @@ pub fn import(
 /// `source_etag` is the validator observed by the caller's HEAD check (see
 /// `update::source_unchanged`), if any; it is threaded through unchanged to
 /// `dataset::refresh` so it lands in `dataset_refreshes.source_etag`.
+///
+/// `is_cancelled` is threaded through unchanged to `dataset::refresh`, which
+/// polls it (alongside `crate::shutdown::is_requested()`) at three points
+/// before its apply transaction begins -- see `dataset::refresh`'s and
+/// `check_cancelled`'s doc comments for why cancellation is checked only
+/// there and not, e.g., mid-stream through `stream_gml_into`.
 #[allow(clippy::too_many_arguments)]
 pub fn update_prg(
     conn: &Connection,
@@ -91,6 +97,7 @@ pub fn update_prg(
     url: &str,
     source_etag: Option<&str>,
     show_progress: bool,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     let (zip_path, was_downloaded, terc) =
         prepare_source(config, file, terc_file, url, show_progress)?;
@@ -106,6 +113,7 @@ pub fn update_prg(
             materialize_into(c, target, &raw).map(|()| crate::dataset::LoadStats::default())
         },
         source_etag,
+        is_cancelled,
     );
     cleanup_if_downloaded(&zip_path, was_downloaded && config.cleanup_downloaded_files);
     result.map(|_| ())
@@ -257,6 +265,19 @@ fn stream_gml_into(
     let mut table_created = false;
     let mut total_rows: usize = 0;
     for (n, &idx) in gml_indices.iter().enumerate() {
+        // Checked once per voivodeship entry as well as once per batch below
+        // -- a full PRG zip has ~16 entries, each itself taking a while to
+        // stream, so this catches a shutdown request sitting between entries
+        // without waiting for the next batch-loop check to happen to fire.
+        // This function is shared by both `import prg` and `update prg`'s
+        // staging load (see `update_prg`'s call above in this file), so a
+        // single check here covers both paths. Bails with an `Err`, matching
+        // `import::osm::import`'s `check_shutdown` convention: a partially
+        // streamed staging table must be reported as a failure, not silently
+        // accepted as if the whole zip had loaded -- `materialize_into`
+        // would otherwise build the final table from a truncated
+        // `raw_table` with no indication anything was cut short.
+        crate::shutdown::check_requested()?;
         info!(
             entry = n + 1,
             of = gml_indices.len(),
@@ -272,6 +293,12 @@ fn stream_gml_into(
         .with_context(|| format!("Failed to build PRG 2021 parser for zip entry {idx}"))?;
 
         for batch in parser {
+            // Same rationale as the entry-loop check above, at finer grain:
+            // a single GML entry (one voivodeship) can itself take a while
+            // to stream through its ~2048-row batches, so this is the seam
+            // that actually bounds how long a shutdown request waits before
+            // being noticed.
+            crate::shutdown::check_requested()?;
             if batch.num_rows() == 0 {
                 continue;
             }

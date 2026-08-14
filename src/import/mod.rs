@@ -168,8 +168,11 @@ pub fn run(
             terc_file,
         } => {
             osm::import(conn, kv, config, osm_file.as_deref(), &urls.osm_pbf)?;
+            crate::shutdown::check_requested()?;
             bdot10k::import(conn, config, bdot10k_file.as_deref(), &urls.bdot10k)?;
+            crate::shutdown::check_requested()?;
             egib::import(conn, config, egib_file.as_deref(), &urls.egib)?;
+            crate::shutdown::check_requested()?;
             prg::import(
                 conn,
                 config,
