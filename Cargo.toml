@@ -34,6 +34,11 @@ predicates = "3"
 tempfile = "3"
 tower = "0.5"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+
 # Release-optimized build with debug symbols kept for profilers (samply, perf).
 # Use via `cargo run --profile profiling -- ...` or `cargo build --profile profiling`.
 [profile.profiling]
