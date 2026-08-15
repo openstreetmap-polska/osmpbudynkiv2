@@ -266,7 +266,12 @@ const PROGRESS_LOG_INTERVAL: u64 = 100;
 /// Bounded by `last_applied` so it never runs more than `prefetch_ahead`
 /// sequences ahead of real progress (memory/disk for `prefetch_ahead`
 /// buffered `.osc.gz` files, not the whole backlog), and by `latest_seq` so
-/// it never prefetches a sequence that doesn't exist yet.
+/// it never prefetches a sequence that doesn't exist yet. Also bounded
+/// *behind*: a `next` still sitting at or below `last_applied` is skipped
+/// straight to `last_applied + 1` rather than downloaded, since the apply
+/// loop has already consumed (and deleted) that sequence's file -- see the
+/// comment at the skip site for why this matters more than it looks like it
+/// should.
 ///
 /// A download failure here is non-fatal and is logged at `debug!` rather
 /// than retried: `download_file_as_quiet` (via `download_with_retry`)
@@ -292,7 +297,27 @@ fn spawn_prefetcher(
                 return;
             }
 
-            let window_ceiling = last_applied.load(Ordering::SeqCst) + prefetch_ahead as u64;
+            let applied = last_applied.load(Ordering::SeqCst);
+            if next <= applied {
+                // Already consumed by the apply loop -- which fetches a
+                // whole batch synchronously before calling `apply_batch`,
+                // then deletes each `.osc.gz` right after decompressing it
+                // (`decompress_and_remove`). If that batch's commit lands
+                // between two of this thread's window checks (very possible:
+                // `apply_batch` can finish well inside
+                // `PREFETCH_WINDOW_POLL_INTERVAL`), `last_applied` can jump
+                // past several `next` values this thread was sitting behind
+                // in one stride. Downloading them now would just be
+                // re-fetching bytes the apply loop already used and threw
+                // away -- nobody reads a prefetched file whose sequence is
+                // behind `last_applied`. Skip straight to the first
+                // not-yet-applied sequence instead of downloading one we
+                // know is stale.
+                next = applied + 1;
+                continue;
+            }
+
+            let window_ceiling = applied + prefetch_ahead as u64;
             if next > window_ceiling {
                 // Window full: wait for the apply loop to advance, checking
                 // `stop` between short sleeps rather than one long one, so a
