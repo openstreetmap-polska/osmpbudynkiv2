@@ -193,6 +193,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
             kod_pocztowy VARCHAR,
             teryt_miejscowosc VARCHAR,
             wazny_od_lub_data_nadania DATE,
+            teryt_gmina VARCHAR,
+            gmina VARCHAR,
             cell_x INTEGER,
             cell_y INTEGER,
             computed_at TIMESTAMP WITH TIME ZONE

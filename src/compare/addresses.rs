@@ -67,7 +67,7 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(
         "INSERT INTO prg_unmatched
          (geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy,
-          teryt_miejscowosc, wazny_od_lub_data_nadania, cell_x, cell_y, computed_at)
+          teryt_miejscowosc, wazny_od_lub_data_nadania, teryt_gmina, gmina, cell_x, cell_y, computed_at)
          WITH
          neighbor_offsets(dx, dy) AS (
              VALUES (-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)
@@ -99,7 +99,8 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
                AND ST_Distance_Sphere(o.geom, s.geom) <= {MATCH_DISTANCE_METERS}
          )
          SELECT s.geom, s.lokalny_id, s.numer_porzadkowy, s.ulica, s.miejscowosc,
-                s.kod_pocztowy, s.teryt_miejscowosc, s.wazny_od_lub_data_nadania, {cx}, {cy}, now()
+                s.kod_pocztowy, s.teryt_miejscowosc, s.wazny_od_lub_data_nadania,
+                s.teryt_gmina, s.gmina, {cx}, {cy}, now()
          FROM prg_addresses s
          WHERE NOT EXISTS (SELECT 1 FROM matched_ids m WHERE m.lokalny_id = s.lokalny_id);"
     ))
@@ -136,6 +137,8 @@ mod tests {
                  kod_pocztowy VARCHAR,
                  teryt_miejscowosc VARCHAR,
                  wazny_od_lub_data_nadania DATE,
+                 teryt_gmina VARCHAR,
+                 gmina VARCHAR,
                  geom GEOMETRY
              );",
         )
@@ -147,7 +150,7 @@ mod tests {
     /// — the other serving columns are irrelevant to the matching logic.
     fn insert_prg(conn: &Connection, id: &str, hn: &str, point_sql: &str) {
         conn.execute_batch(&format!(
-            "INSERT INTO prg_addresses VALUES ('{id}', '{hn}', NULL, NULL, NULL, NULL, NULL, {point_sql});"
+            "INSERT INTO prg_addresses VALUES ('{id}', '{hn}', NULL, NULL, NULL, NULL, NULL, NULL, NULL, {point_sql});"
         ))
         .unwrap();
     }
@@ -237,7 +240,7 @@ mod tests {
     fn null_housenumbers_dont_match() {
         let conn = setup();
         conn.execute_batch(
-            "INSERT INTO prg_addresses VALUES ('p1', NULL, NULL, NULL, NULL, NULL, NULL, ST_Point(21.01, 52.21));
+            "INSERT INTO prg_addresses VALUES ('p1', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ST_Point(21.01, 52.21));
              INSERT INTO osm_addresses VALUES (1, 'node', NULL, NULL, NULL, NULL, ST_Point(21.01, 52.21));",
         )
         .unwrap();

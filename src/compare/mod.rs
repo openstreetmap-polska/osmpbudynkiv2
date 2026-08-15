@@ -204,7 +204,7 @@ mod full_vs_incremental_equivalence {
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
-                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);",
+                 wazny_od_lub_data_nadania DATE, teryt_gmina VARCHAR, gmina VARCHAR, geom GEOMETRY);",
         )
         .unwrap();
         c
@@ -461,7 +461,7 @@ mod drain_refresh_concurrency {
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
-                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);",
+                 wazny_od_lub_data_nadania DATE, teryt_gmina VARCHAR, gmina VARCHAR, geom GEOMETRY);",
             BDOT10K.with_centroid_select(&rows_sql(n, "v1"))
         ))
         .unwrap();
@@ -642,7 +642,7 @@ mod clear_and_repopulate_is_atomic {
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
-                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);",
+                 wazny_od_lub_data_nadania DATE, teryt_gmina VARCHAR, gmina VARCHAR, geom GEOMETRY);",
         )
         .unwrap();
         c

@@ -69,7 +69,8 @@ const ADDRESSES_MVT_SQL: &str = "
     WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
     candidates AS MATERIALIZED (
         SELECT a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc,
-               a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania
+               a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania,
+               a.teryt_gmina, a.gmina
         FROM prg_unmatched a
         WHERE ST_Intersects(a.geom, ST_MakeEnvelope(?, ?, ?, ?))
     ),
@@ -93,6 +94,8 @@ const ADDRESSES_MVT_SQL: &str = "
                resolved.miejscowosc,
                resolved.kod_pocztowy,
                resolved.wazny_od_lub_data_nadania::VARCHAR AS wazny_od_lub_data_nadania,
+               resolved.teryt_gmina,
+               resolved.gmina,
                NULLIF(trim(resolved.numer_porzadkowy), '') AS \"addr:housenumber\",
                resolved.resolved_street AS \"addr:street\",
                CASE WHEN resolved.resolved_street IS NOT NULL THEN NULLIF(trim(resolved.miejscowosc), '') END AS \"addr:city\",
@@ -227,7 +230,9 @@ const ALL_ADDRESSES_MVT_SQL: &str = "
                a.ulica,
                a.miejscowosc,
                a.kod_pocztowy,
-               a.wazny_od_lub_data_nadania::VARCHAR AS wazny_od_lub_data_nadania
+               a.wazny_od_lub_data_nadania::VARCHAR AS wazny_od_lub_data_nadania,
+               a.teryt_gmina,
+               a.gmina
         FROM prg_addresses a, bbox
         WHERE ST_Intersects(a.geom, ST_MakeEnvelope(?, ?, ?, ?))
     ) t
@@ -952,7 +957,8 @@ mod tests {
                  FROM range(20000) t(i);
              CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR, miejscowosc VARCHAR,
-                 kod_pocztowy VARCHAR, wazny_od_lub_data_nadania DATE, geom GEOMETRY);
+                 kod_pocztowy VARCHAR, wazny_od_lub_data_nadania DATE, teryt_gmina VARCHAR,
+                 gmina VARCHAR, geom GEOMETRY);
              CREATE INDEX prg_addresses_geom_idx ON prg_addresses USING RTREE (geom);
              INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, geom)
                  SELECT 'p' || i, '1', ST_Point(20.0 + i*0.0001, 52.0)
@@ -1057,7 +1063,8 @@ mod tests {
             "CREATE TABLE prg_addresses (
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR,
-                 wazny_od_lub_data_nadania DATE, geom GEOMETRY);
+                 wazny_od_lub_data_nadania DATE, teryt_gmina VARCHAR, gmina VARCHAR,
+                 geom GEOMETRY);
              CREATE TABLE bdot10k_buildings (
                  LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR,
@@ -1409,16 +1416,18 @@ mod tests {
         let seed = format!(
             "INSERT INTO prg_unmatched
                  (lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy,
-                  teryt_miejscowosc, wazny_od_lub_data_nadania, geom, cell_x, cell_y, computed_at)
+                  teryt_miejscowosc, wazny_od_lub_data_nadania, teryt_gmina, gmina,
+                  geom, cell_x, cell_y, computed_at)
              VALUES
                  ('a1', '12', 'Marszalkowska', 'Warszawa', '00-590', '0918123',
-                  DATE '2012-04-27', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
+                  DATE '2012-04-27', '146501', 'Warszawa',
+                  ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
              INSERT INTO prg_addresses
                  (lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy,
-                  wazny_od_lub_data_nadania, geom)
+                  wazny_od_lub_data_nadania, teryt_gmina, gmina, geom)
              VALUES
                  ('a1', '12', 'Marszalkowska', 'Warszawa', '00-590', DATE '2012-04-27',
-                  ST_Point({mid_lon}, {mid_lat}));
+                  '146501', 'Warszawa', ST_Point({mid_lon}, {mid_lat}));
              INSERT INTO bdot10k_unmatched
                  (LOKALNYID, geom, cell_x, cell_y, computed_at,
                   funkcja_szczegolowa, funkcja_ogolna, liczba_kondygnacji,
@@ -1465,6 +1474,9 @@ mod tests {
             "kod_pocztowy",
             "wazny_od_lub_data_nadania",
             "2012-04-27",
+            "teryt_gmina",
+            "146501",
+            "gmina",
             "addr:housenumber",
             "addr:street",
             "addr:postcode",

@@ -551,6 +551,8 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     miejscowosc: "Miejscowość",
     kod_pocztowy: "Kod pocztowy",
     wazny_od_lub_data_nadania: "Ważny od / data nadania",
+    teryt_gmina: "TERYT gminy",
+    gmina: "Gmina",
 
     // addresses -- OSM tag preview. Literal tag keys, shown unchanged: this
     // is naming the tag /package would write, not a column, so translating

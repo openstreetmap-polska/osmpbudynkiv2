@@ -87,7 +87,8 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, St
             let cy = cell_y_sql("a.geom");
             let select = format!(
                 "a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc, \
-                 a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania, {cx}, {cy}, now()"
+                 a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania, \
+                 a.teryt_gmina, a.gmina, {cx}, {cy}, now()"
             );
             // Only the write envelope scopes the candidate CTE -- the read
             // buffer applies to the osm_addresses subquery inside
@@ -107,7 +108,8 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, St
             Ok((
                 "prg_unmatched",
                 "geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy, \
-                 teryt_miejscowosc, wazny_od_lub_data_nadania, cell_x, cell_y, computed_at"
+                 teryt_miejscowosc, wazny_od_lub_data_nadania, teryt_gmina, gmina, \
+                 cell_x, cell_y, computed_at"
                     .to_string(),
                 inner,
             ))
