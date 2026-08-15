@@ -77,15 +77,11 @@ fn test_import_prg_from_fixture() {
         .unwrap();
     assert_eq!(bad_geom, 0, "all geoms should be inside Poland's extent");
 
-    // Verify TERC mapping was applied — all 3 addresses are in lubuskie.
-    let woj: String = conn
-        .query_row(
-            "SELECT DISTINCT wojewodztwo FROM prg_addresses",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(woj, "lubuskie");
+    // TERC-mapping coverage (`wojewodztwo` used to be asserted here) moved to
+    // `import::prg::tests::stream_gml_into_applies_the_terc_mapping_before_materialize_projects_it_away`
+    // — `wojewodztwo` is one of the columns `materialize_into` drops (see
+    // `docs/superpowers/plans/2026-08-14-column-trimming.md`), so it no
+    // longer exists in `prg_addresses` to assert on here.
 
     // Verify housenumbers are present.
     let housenumbers: Vec<String> = {

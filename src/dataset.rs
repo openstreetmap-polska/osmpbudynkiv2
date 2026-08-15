@@ -606,6 +606,40 @@ pub fn deduplicate_by_key(
     })
 }
 
+/// Drop `column` from `table` immediately after [`deduplicate_by_key`] has
+/// consumed it as the ranking window's `order_by`. Shared by
+/// `import::egib::load_into` (`czas_pozyskania`) and
+/// `import::prg::materialize_into` (`wersja_id`) -- one mechanism for both
+/// sources, per
+/// `docs/superpowers/plans/2026-08-14-column-trimming.md`'s "the
+/// ordering-column problem".
+///
+/// `deduplicate_by_key`'s `order_by` is interpolated into a window function
+/// running against the table *after* it already exists (`row_number() OVER
+/// (PARTITION BY {keys} ORDER BY {order_by} ...)`), so the ordering column
+/// has to be a real column of the table at dedup time -- it cannot be
+/// projected away by the `CREATE TABLE AS SELECT` that builds the table, the
+/// way e.g. PRG's `dlugosc_geograficzna` is consumed to build `geom` and
+/// simply never appears in the output column list. This runs the moment
+/// after dedup no longer needs it, so nothing downstream (the diff, the
+/// serving tables, `/tiles`) ever sees a column nothing reads.
+///
+/// This is the one place in the codebase that runs `ALTER TABLE` -- but it
+/// is not the migration path several other gotchas explain does not exist:
+/// it runs against a table the caller's own `CREATE TABLE AS SELECT` just
+/// built moments earlier in the same load, never against a pre-existing
+/// live database.
+pub fn drop_ordering_column(
+    conn: &duckdb::Connection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))
+        .with_context(|| format!("Failed to drop ordering column {column} from {table}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,6 +1129,41 @@ mod tests {
             count, 2,
             "same LOKALNYID under two different PRZESTRZENNAZW values must both survive"
         );
+    }
+
+    #[test]
+    fn drop_ordering_column_removes_the_column_and_keeps_the_rest() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id VARCHAR, ordering_col INTEGER, kept VARCHAR);
+             INSERT INTO t VALUES ('a', 1, 'x');",
+        )
+        .unwrap();
+
+        drop_ordering_column(&conn, "t", "ordering_col").unwrap();
+
+        let cols: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT column_name FROM duckdb_columns()
+                     WHERE table_name = 't' ORDER BY column_index",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(cols, vec!["id".to_string(), "kept".to_string()]);
+
+        let kept: String = conn
+            .query_row("SELECT kept FROM t WHERE id = 'a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, "x", "surviving rows and columns must be untouched");
     }
 
     #[test]

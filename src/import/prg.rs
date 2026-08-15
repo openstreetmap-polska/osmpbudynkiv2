@@ -373,6 +373,17 @@ const ULICA_PREFIX_STRIP_SQL: &str = r"CASE
 /// filter, the count query's `IS NULL` complement, and the dedup's
 /// `PARTITION BY`), so they cannot drift.
 ///
+/// Projects an explicit column list rather than `SELECT *`/`SELECT *
+/// REPLACE(...)` -- see
+/// `docs/superpowers/plans/2026-08-14-column-trimming.md` for the audit
+/// behind which of PRG's 24 raw columns are kept (the dropped ones and their
+/// restore cost are catalogued in `docs/prg_dropped_columns.md`).
+/// `teryt_gmina`/`gmina` are kept despite having no current reader, the same
+/// "kept but not compared" shape as `wazny_od_lub_data_nadania` below.
+/// `wersja_id` is a special case: it stays in the projection only long
+/// enough to feed the dedup's `ORDER BY` below, then is removed via
+/// `dataset::drop_ordering_column` -- see that function's doc comment.
+///
 /// Also normalizes `ulica` via [`ULICA_PREFIX_STRIP_SQL`]. This is the one
 /// funnel both `import` and `update`'s staging load pass through, so the
 /// normalization lands on both paths from a single site. It is safe to edit
@@ -397,7 +408,10 @@ pub fn materialize_into(
 ) -> Result<crate::dataset::LoadStats> {
     let non_null = crate::dataset::non_null_key_sql(crate::dataset::PRG.key_columns);
     let inner = format!(
-        "SELECT * REPLACE (({ULICA_PREFIX_STRIP_SQL}) AS ulica), \
+        "SELECT lokalny_id, numer_porzadkowy, \
+                ({ULICA_PREFIX_STRIP_SQL}) AS ulica, \
+                miejscowosc, kod_pocztowy, teryt_miejscowosc, teryt_gmina, gmina, \
+                wazny_od_lub_data_nadania, wersja_id, \
                 ST_Point(dlugosc_geograficzna, szerokosc_geograficzna) AS geom \
          FROM {raw_table} \
          WHERE dlugosc_geograficzna IS NOT NULL \
@@ -452,6 +466,13 @@ pub fn materialize_into(
         "lokalny_id",
     )?;
     unique.skipped_null_key = null_key_rows;
+
+    // `wersja_id` has served its only purpose (ranking the dedup above) --
+    // nothing reads it downstream, so it does not survive into the stored
+    // table. Must run after `deduplicate_by_key`, not before: see
+    // `dataset::drop_ordering_column`'s doc comment.
+    crate::dataset::drop_ordering_column(conn, target_table, "wersja_id")?;
+
     Ok(unique)
 }
 
@@ -489,7 +510,11 @@ mod tests {
     /// Each row gets its own `lokalny_id` (derived from `ord`, so distinct)
     /// and a constant `wersja_id` -- these tests care about `ulica`
     /// stripping, not the key/dedup machinery, so the key columns are just
-    /// populated well enough to stay out of the way.
+    /// populated well enough to stay out of the way. The remaining columns
+    /// (`numer_porzadkowy` through `wazny_od_lub_data_nadania`) exist purely
+    /// because `materialize_into`'s explicit projection now names them --
+    /// see `docs/superpowers/plans/2026-08-14-column-trimming.md` -- and are
+    /// filled with placeholder constants nothing in these tests inspects.
     fn materialized_ulica(inputs: &[Option<&str>]) -> Vec<Option<String>> {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
@@ -500,13 +525,21 @@ mod tests {
                  dlugosc_geograficzna DOUBLE,
                  szerokosc_geograficzna DOUBLE,
                  lokalny_id VARCHAR,
-                 wersja_id INTEGER
+                 wersja_id INTEGER,
+                 numer_porzadkowy VARCHAR,
+                 miejscowosc VARCHAR,
+                 kod_pocztowy VARCHAR,
+                 teryt_miejscowosc VARCHAR,
+                 teryt_gmina VARCHAR,
+                 gmina VARCHAR,
+                 wazny_od_lub_data_nadania DATE
              );",
         )
         .unwrap();
         for (i, value) in inputs.iter().enumerate() {
             conn.execute(
-                "INSERT INTO prg_raw VALUES (?, ?, 21.0, 52.0, ?, 1)",
+                "INSERT INTO prg_raw VALUES
+                     (?, ?, 21.0, 52.0, ?, 1, '1', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL)",
                 duckdb::params![i as i32, value, format!("key-{i}")],
             )
             .unwrap();
@@ -514,8 +547,12 @@ mod tests {
 
         materialize_into(&conn, "prg_out", "prg_raw").unwrap();
 
+        // `ord` is a test-only helper column, not part of `materialize_into`'s
+        // explicit projection (see its doc comment), so it does not survive
+        // into `prg_out`. `lokalny_id` ("key-{i}") sorts the same as `ord`
+        // for the single-digit input counts every caller here uses.
         let mut stmt = conn
-            .prepare("SELECT ulica FROM prg_out ORDER BY ord")
+            .prepare("SELECT ulica FROM prg_out ORDER BY lokalny_id")
             .unwrap();
         let rows: Vec<Option<String>> = stmt
             .query_map([], |r| r.get(0))
@@ -575,9 +612,9 @@ mod tests {
         );
     }
 
-    /// The `* REPLACE` rewrite must not disturb the rest of the projection:
-    /// the geometry column still has to be built from the lon/lat pair, and
-    /// the coordinate-less filter still applies.
+    /// The explicit projection must not disturb the rest of the SELECT: the
+    /// geometry column still has to be built from the lon/lat pair, and the
+    /// coordinate-less filter still applies.
     #[test]
     fn materialize_still_writes_geometry() {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
@@ -588,13 +625,20 @@ mod tests {
                  dlugosc_geograficzna DOUBLE,
                  szerokosc_geograficzna DOUBLE,
                  lokalny_id VARCHAR,
-                 wersja_id INTEGER
+                 wersja_id INTEGER,
+                 numer_porzadkowy VARCHAR,
+                 miejscowosc VARCHAR,
+                 kod_pocztowy VARCHAR,
+                 teryt_miejscowosc VARCHAR,
+                 teryt_gmina VARCHAR,
+                 gmina VARCHAR,
+                 wazny_od_lub_data_nadania DATE
              );
              INSERT INTO prg_raw VALUES
-                 ('ulica Herbaciana', 21.0, 52.0, 'a', 1),
-                 ('Aleja Krakowska', 21.5, 52.5, 'b', 1),
+                 ('ulica Herbaciana', 21.0, 52.0, 'a', 1, '1', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL),
+                 ('Aleja Krakowska', 21.5, 52.5, 'b', 1, '2', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL),
                  -- filtered out: no coordinates
-                 ('ulica Bezdomna', NULL, NULL, 'c', 1);",
+                 ('ulica Bezdomna', NULL, NULL, 'c', 1, '3', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL);",
         )
         .unwrap();
 
@@ -632,12 +676,19 @@ mod tests {
                  wersja_id INTEGER,
                  ulica VARCHAR,
                  dlugosc_geograficzna DOUBLE,
-                 szerokosc_geograficzna DOUBLE
+                 szerokosc_geograficzna DOUBLE,
+                 numer_porzadkowy VARCHAR,
+                 miejscowosc VARCHAR,
+                 kod_pocztowy VARCHAR,
+                 teryt_miejscowosc VARCHAR,
+                 teryt_gmina VARCHAR,
+                 gmina VARCHAR,
+                 wazny_od_lub_data_nadania DATE
              );
              INSERT INTO prg_raw VALUES
-                 ('dup-key', 1, 'stale', 21.0, 52.0),
-                 ('dup-key', 2, 'fresh', 21.0, 52.0),
-                 ('unique-key', 1, 'other', 22.0, 53.0);",
+                 ('dup-key', 1, 'stale', 21.0, 52.0, '1', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL),
+                 ('dup-key', 2, 'fresh', 21.0, 52.0, '1', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL),
+                 ('unique-key', 1, 'other', 22.0, 53.0, '2', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL);",
         )
         .unwrap();
 
@@ -675,11 +726,18 @@ mod tests {
                  wersja_id INTEGER,
                  ulica VARCHAR,
                  dlugosc_geograficzna DOUBLE,
-                 szerokosc_geograficzna DOUBLE
+                 szerokosc_geograficzna DOUBLE,
+                 numer_porzadkowy VARCHAR,
+                 miejscowosc VARCHAR,
+                 kod_pocztowy VARCHAR,
+                 teryt_miejscowosc VARCHAR,
+                 teryt_gmina VARCHAR,
+                 gmina VARCHAR,
+                 wazny_od_lub_data_nadania DATE
              );
              INSERT INTO prg_raw VALUES
-                 ('has-key', 1, 'ok', 21.0, 52.0),
-                 (NULL, 1, 'no-key', 22.0, 53.0);",
+                 ('has-key', 1, 'ok', 21.0, 52.0, '1', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL),
+                 (NULL, 1, 'no-key', 22.0, 53.0, '2', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL);",
         )
         .unwrap();
 
@@ -690,5 +748,99 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM prg_out", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "the NULL-keyed row must not survive");
+    }
+
+    /// Part of `docs/superpowers/plans/2026-08-14-column-trimming.md`'s
+    /// Testing requirement: `wersja_id`'s removal
+    /// (`dataset::drop_ordering_column`, run after the dedup) is a separate
+    /// statement from the projection, so it is exactly the kind of step that
+    /// gets lost in a refactor while every other test still passes. Also
+    /// confirms `teryt_gmina`/`gmina` -- kept despite having no current
+    /// reader, see `materialize_into`'s doc comment -- actually survive.
+    #[test]
+    fn materialize_drops_wersja_id_and_keeps_teryt_gmina_and_gmina() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prg_raw (
+                 lokalny_id VARCHAR,
+                 wersja_id INTEGER,
+                 ulica VARCHAR,
+                 dlugosc_geograficzna DOUBLE,
+                 szerokosc_geograficzna DOUBLE,
+                 numer_porzadkowy VARCHAR,
+                 miejscowosc VARCHAR,
+                 kod_pocztowy VARCHAR,
+                 teryt_miejscowosc VARCHAR,
+                 teryt_gmina VARCHAR,
+                 gmina VARCHAR,
+                 wazny_od_lub_data_nadania DATE
+             );
+             INSERT INTO prg_raw VALUES
+                 ('a', 1, 'Testowa', 21.0, 52.0, '1', 'Test', '00-000', '1465011', '0805011', 'Kolsko', NULL);",
+        )
+        .unwrap();
+
+        materialize_into(&conn, "prg_out", "prg_raw").unwrap();
+
+        let has_wersja_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM duckdb_columns()
+                 WHERE table_name = 'prg_out' AND column_name = 'wersja_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_wersja_id,
+            "wersja_id must not survive into the stored table -- \
+             nothing reads it once the dedup it orders has run"
+        );
+
+        let (teryt_gmina, gmina): (String, String) = conn
+            .query_row(
+                "SELECT teryt_gmina, gmina FROM prg_out WHERE lokalny_id = 'a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (teryt_gmina.as_str(), gmina.as_str()),
+            ("0805011", "Kolsko")
+        );
+    }
+
+    /// Moved here from `tests/cli_import_prg.rs`, which used to assert on
+    /// `SELECT DISTINCT wojewodztwo FROM prg_addresses` to verify the TERC
+    /// mapping was applied. `wojewodztwo` is one of the columns
+    /// `materialize_into` now drops (see
+    /// `docs/superpowers/plans/2026-08-14-column-trimming.md`,
+    /// recommendation (1) under "One real coverage loss to resolve"), so
+    /// that coverage has to move to the raw table `stream_gml_into`
+    /// produces, before `materialize_into` ever runs. TERC is consumed
+    /// inside `prg_convert`'s parser regardless of what this loader stores
+    /// afterward, so `--terc-file` stays required either way -- this test
+    /// pins that the mapping actually landed, not that the flag is merely
+    /// accepted.
+    #[test]
+    fn stream_gml_into_applies_the_terc_mapping_before_materialize_projects_it_away() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        let terc = get_teryt_mapping(
+            false,
+            &None,
+            &None,
+            &Some(PathBuf::from("fixtures/teryt.zip")),
+        )
+        .unwrap();
+        let terc = Arc::new(terc);
+
+        stream_gml_into(&conn, Path::new("fixtures/prg.zip"), &terc, "prg_raw").unwrap();
+
+        let woj: String = conn
+            .query_row("SELECT DISTINCT wojewodztwo FROM prg_raw", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(woj, "lubuskie");
     }
 }

@@ -25,9 +25,16 @@ use crate::utils::format_duration;
 /// `PARTITION BY`), so they cannot drift.
 pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> Result<LoadStats> {
     let non_null = crate::dataset::non_null_key_sql(crate::dataset::EGIB.key_columns);
+    // Explicit column list, not `SELECT * EXCLUDE(...)`: `pozostale_atrybuty`
+    // is dropped outright (never needed), while `czas_pozyskania` stays in
+    // the projection only because `deduplicate_by_key` below orders by it --
+    // it is removed right after via `dataset::drop_ordering_column`, see
+    // that function's doc comment ("the ordering-column problem" in
+    // `docs/superpowers/plans/2026-08-14-column-trimming.md`).
     let inner = format!(
-        "SELECT * EXCLUDE(geometry, geometry_bbox), \
-         ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom \
+        "SELECT id_budynku, rodzaj, kondygnacje_nadziemne, kondygnacje_podziemne, \
+                czas_pozyskania, \
+                ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom \
          FROM '{parquet_path}' WHERE {non_null}"
     );
     let select = crate::dataset::EGIB.with_centroid_select(&inner);
@@ -71,6 +78,13 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
         "id_budynku",
     )?;
     unique.skipped_null_key = null_key_rows;
+
+    // `czas_pozyskania` has served its only purpose (ranking the dedup
+    // above) -- nothing reads it downstream, so it does not survive into the
+    // stored table. Must run after `deduplicate_by_key`, not before: see
+    // `dataset::drop_ordering_column`'s doc comment.
+    crate::dataset::drop_ordering_column(conn, target_table, "czas_pozyskania")?;
+
     Ok(stats.merge_oversized(oversized).merge_unique_key(unique))
 }
 
@@ -328,10 +342,19 @@ mod tests {
     /// Same "must go through `load_into`" rationale as
     /// `load_into_drops_null_keyed_rows` above -- the dedup runs on the table
     /// `load_into` just built, so a fixture with a real duplicate key is the
-    /// only way to exercise it end to end. `egib_v2.parquet`'s duplicate pair
-    /// shares one `id_budynku` key with a strictly OLDER `czas_pozyskania` on
-    /// the extra copy, so the part that actually matters here is confirming
-    /// the *newer* row -- not just *a* row -- is the one that survives.
+    /// only way to exercise it end to end.
+    ///
+    /// This can no longer assert on the *winner* of the `czas_pozyskania
+    /// DESC` tie-break: `czas_pozyskania` is the only column
+    /// `egib_v2.parquet`'s duplicate pair differs on (see
+    /// `fixtures/scripts/prepare_update_fixtures.sh`), and
+    /// `dataset::drop_ordering_column` removes it from the table by the time
+    /// `load_into` returns -- there is nothing left to distinguish which
+    /// copy survived. That tie-break behaviour is pinned generically instead,
+    /// against a synthetic table that keeps its ordering column, by
+    /// `dataset::tests::deduplicate_by_key_keeps_the_newest_version`. This
+    /// test's job is narrower: the duplicate is actually removed and its id
+    /// reported.
     #[test]
     fn load_into_collapses_duplicate_keys() {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
@@ -348,22 +371,34 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM egib_buildings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 74, "duplicate collapses down to one row per key");
+    }
 
-        // `prepare_update_fixtures.sh` set the duplicate's czas_pozyskania to
-        // the lexicographically (== chronologically, for this format) OLDER
-        // '2020-01-01 00:00'; if that older copy had won the tie-break
-        // instead of the pre-existing row, this count would be nonzero.
-        let kept_old_version: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM egib_buildings WHERE czas_pozyskania < '2026-01-01'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            kept_old_version, 0,
-            "the older duplicate must have lost the czas_pozyskania DESC tie-break"
-        );
+    /// Part of `docs/superpowers/plans/2026-08-14-column-trimming.md`'s
+    /// Testing requirement: the ordering column's removal is a separate
+    /// statement from the projection (`dataset::drop_ordering_column`, run
+    /// after the dedup), so it is exactly the kind of step that gets lost in
+    /// a refactor while every other test still passes. `pozostale_atrybuty`
+    /// is checked alongside it since it is EGIB's other dropped column --
+    /// unlike `czas_pozyskania` it is never loaded at all, not merely
+    /// dropped after the fact.
+    #[test]
+    fn load_into_drops_the_ordering_column_after_dedup() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        load_into(&conn, "egib_buildings", "fixtures/egib.parquet").unwrap();
+
+        for dropped in ["czas_pozyskania", "pozostale_atrybuty"] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM duckdb_columns()
+                     WHERE table_name = 'egib_buildings' AND column_name = ?",
+                    duckdb::params![dropped],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!present, "{dropped} must not survive into egib_buildings");
+        }
     }
 
     #[test]

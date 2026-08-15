@@ -47,9 +47,17 @@ use crate::utils::format_duration;
 /// being on.
 pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> Result<LoadStats> {
     let non_null = crate::dataset::non_null_key_sql(crate::dataset::BDOT10K.key_columns);
+    // Explicit column list, not `SELECT * EXCLUDE(GEOM)`: a source that adds
+    // a column should not silently start being stored. This is exactly the
+    // set `docs/superpowers/plans/2026-08-14-column-trimming.md` measured
+    // BDOT10k's churn figures over -- keep it in sync with that plan's
+    // "keep 14" list (12 raw columns here plus `geom` and, via
+    // `with_centroid_select` below, `centroid`).
     let inner = format!(
-        "SELECT * EXCLUDE(GEOM), \
-         ST_Transform(ST_GeomFromWKB(GEOM), 'EPSG:2180', 'EPSG:4326') AS geom \
+        "SELECT PRZESTRZENNAZW, LOKALNYID, WERSJA, KATEGORIAISTNIENIA, \
+                PRZEWAZAJACAFUNKCJABUDYNKU, FUNKCJAOGOLNABUDYNKU, LICZBAKONDYGNACJI, \
+                NAZWA, FSBUD, INFORMACJADODATKOWA, KODKST, ZRODLODANYCHGEOMETRYCZNYCH, \
+                ST_Transform(ST_GeomFromWKB(GEOM), 'EPSG:2180', 'EPSG:4326') AS geom \
          FROM '{parquet_path}' WHERE {non_null}"
     );
     let select = crate::dataset::BDOT10K.with_centroid_select(&inner);
