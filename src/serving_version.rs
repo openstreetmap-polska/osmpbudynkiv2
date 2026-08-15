@@ -33,11 +33,10 @@
 //!   principle -- there is no cell-local signal to attach it to.
 //!
 //! The only writers of those raw tables are `import` and
-//! `update::dataset::refresh` -- both already bump sites for
-//! [`crate::dataset::ROW_HASH_VERSION`] reasons -- which is what makes
-//! epoch-only coverage sound for them: every write that matters for tiles
-//! and isn't covered by a per-cell version goes through one of those two
-//! paths, and both bump the epoch.
+//! `update::dataset::refresh` -- both already bump sites below -- which is
+//! what makes epoch-only coverage sound for them: every write that matters
+//! for tiles and isn't covered by a per-cell version goes through one of
+//! those two paths, and both bump the epoch.
 //!
 //! # Bump sites
 //!
@@ -45,15 +44,15 @@
 //! version tracks is rewritten.**
 //!
 //! - `import` dispatch, the `bdot10k` / `egib` / `prg` / `full` arms
-//!   (`src/import/mod.rs`, beside each existing `stamp_row_hash_version`
-//!   call).
+//!   (`src/import/mod.rs`, immediately after each arm's own
+//!   `<source>::import(...)` call).
 //! - `update::dataset::refresh`'s apply transaction (`src/update/dataset.rs`)
-//!   -- inside the transaction, so a rollback can't leave a bumped epoch,
-//!   and unconditional, unlike the `stamp_row_hash_version` call beside it
-//!   (that one only fires on a version mismatch; every refresh that lands
-//!   changes what `/tiles` reads, even a "zero added/modified/removed"
-//!   diff-of-nothing, because raw tables outside the diffed live table --
-//!   e.g. `centroid`, `rodzaj_kod` -- aren't part of the diff either).
+//!   -- inside the transaction, so a rollback can't leave a bumped epoch
+//!   describing a delta that never landed, and unconditional: every refresh
+//!   that lands changes what `/tiles` reads, even a "zero
+//!   added/modified/removed" diff-of-nothing, because raw tables outside the
+//!   diffed live table -- e.g. `centroid`, `rodzaj_kod` -- aren't part of the
+//!   diff either.
 //! - `mappings::street_names::load_from_path`, inside the loader itself
 //!   (in the same swap transaction as the `DELETE`+`INSERT`), not at its two
 //!   call sites (`src/import/mod.rs`, `src/server/jobs/street_mappings_update.rs`)
@@ -108,23 +107,22 @@ use duckdb::Connection;
 pub const SERVING_EPOCH_KEY: &str = "serving_epoch";
 
 /// Bumped by hand whenever the MVT SQL changes shape -- a new attribute
-/// column, a renamed one, a different geometry simplification. This is the
-/// same discipline as [`crate::dataset::ROW_HASH_VERSION`]: without it, a
-/// deployed binary that changes what a tile *contains* would still produce
-/// the same version string for the same underlying rows (nothing in the
-/// data changed, only how it's rendered), so a client's cached `ETag` would
-/// keep matching and every existing client would serve the stale shape
+/// column, a renamed one, a different geometry simplification. A constant
+/// bumped by hand is the only way to catch a shape change like this: without
+/// it, a deployed binary that changes what a tile *contains* would still
+/// produce the same version string for the same underlying rows (nothing in
+/// the data changed, only how it's rendered), so a client's cached `ETag`
+/// would keep matching and every existing client would serve the stale shape
 /// forever, with no way to self-heal short of a manual cache-buster.
 pub const TILE_FORMAT_VERSION: u32 = 1;
 
 /// Record that the live serving state moved in a way no per-cell version
 /// tracks. A **counter**, not a timestamp -- deliberately, so a backwards
 /// NTP step can't produce a value already seen and hand out a version that
-/// looks unchanged when it isn't. Mirrors
-/// [`crate::dataset::stamp_row_hash_version`]'s delete-then-insert shape:
-/// `metadata` has no primary key (see `src/db.rs`), so replacing the row
-/// this way rather than `UPDATE`-ing it is what keeps it from silently
-/// becoming two rows.
+/// looks unchanged when it isn't. Delete-then-insert, the same convention
+/// `job_log::record` uses: `metadata` has no primary key (see `src/db.rs`),
+/// so replacing the row this way rather than `UPDATE`-ing it is what keeps
+/// it from silently becoming two rows.
 ///
 /// Does not open its own transaction: every call site either already has an
 /// ambient one open (e.g. `update::dataset::refresh`'s apply transaction,

@@ -27,7 +27,7 @@ use crate::tile_math::CHANGE_CELL_ZOOM;
 pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i64) -> Result<i64> {
     let live = spec.table;
     let staging = spec.staging_table();
-    let id = spec.id_column;
+    let keys = spec.key_columns.join(", ");
     let z = CHANGE_CELL_ZOOM;
 
     let point_live = spec.representative_point_sql("l");
@@ -47,19 +47,19 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
                 now()
          FROM (
              SELECT 'added' AS kind, {sx} AS cell_x, {sy} AS cell_y
-             FROM {staging} s JOIN diff_added d ON s.{id} = d.id
+             FROM {staging} s JOIN diff_added d USING ({keys})
              WHERE s.geom IS NOT NULL
              UNION ALL
              SELECT 'removed', {lx}, {ly}
-             FROM {live} l JOIN diff_removed d ON l.{id} = d.id
+             FROM {live} l JOIN diff_removed d USING ({keys})
              WHERE l.geom IS NOT NULL
              UNION ALL
              SELECT 'modified', {sx}, {sy}
-             FROM {staging} s JOIN diff_modified d ON s.{id} = d.id
+             FROM {staging} s JOIN diff_modified d USING ({keys})
              WHERE s.geom IS NOT NULL
              UNION ALL
              SELECT 'modified', {lx}, {ly}
-             FROM {live} l JOIN diff_modified d ON l.{id} = d.id
+             FROM {live} l JOIN diff_modified d USING ({keys})
              WHERE l.geom IS NOT NULL
          )
          GROUP BY cell_x, cell_y",
@@ -83,7 +83,7 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
 pub fn insert_dirty_cells(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
     let live = spec.table;
     let staging = spec.staging_table();
-    let id = spec.id_column;
+    let keys = spec.key_columns.join(", ");
     let z = crate::tile_math::CHANGE_CELL_ZOOM;
     let point_live = spec.representative_point_sql("l");
     let point_stg = spec.representative_point_sql("s");
@@ -97,16 +97,16 @@ pub fn insert_dirty_cells(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
          SELECT DISTINCT '{source}', {z}, cell_x, cell_y, now()
          FROM (
              SELECT {sx} AS cell_x, {sy} AS cell_y
-             FROM {staging} s JOIN diff_added d ON s.{id} = d.id WHERE s.geom IS NOT NULL
+             FROM {staging} s JOIN diff_added d USING ({keys}) WHERE s.geom IS NOT NULL
              UNION
              SELECT {lx}, {ly}
-             FROM {live} l JOIN diff_removed d ON l.{id} = d.id WHERE l.geom IS NOT NULL
+             FROM {live} l JOIN diff_removed d USING ({keys}) WHERE l.geom IS NOT NULL
              UNION
              SELECT {sx}, {sy}
-             FROM {staging} s JOIN diff_modified d ON s.{id} = d.id WHERE s.geom IS NOT NULL
+             FROM {staging} s JOIN diff_modified d USING ({keys}) WHERE s.geom IS NOT NULL
              UNION
              SELECT {lx}, {ly}
-             FROM {live} l JOIN diff_modified d ON l.{id} = d.id WHERE l.geom IS NOT NULL
+             FROM {live} l JOIN diff_modified d USING ({keys}) WHERE l.geom IS NOT NULL
          )",
         source = spec.name,
     );
@@ -125,7 +125,9 @@ mod tests {
     const TEST_SPEC: DatasetSpec = DatasetSpec {
         name: "test",
         table: "live",
-        id_column: "id",
+        key_columns: &["id"],
+        compared_columns: &["a"],
+        compare_geometry: true,
         geom_kind: GeomKind::Point,
     };
 

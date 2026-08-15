@@ -9,23 +9,21 @@ use crate::dataset::LoadStats;
 use crate::download::download_file;
 use crate::utils::format_duration;
 
-/// BDOT10k's record key -- composite, unlike EGIB's. One array feeds all
-/// three sites that have to agree on it (the load select's `IS NOT NULL`
-/// filter, the count query's `IS NULL` complement, and the dedup's
-/// `PARTITION BY`), which matters more here than for a single-column key:
-/// the complement of `a IS NOT NULL AND b IS NOT NULL` is `a IS NULL OR
-/// b IS NULL`, and that asymmetry is easy to get wrong when spelled out by
-/// hand. Plan 2 moves this onto `DatasetSpec::key_columns`.
-const KEY_COLUMNS: &[&str] = &["PRZESTRZENNAZW", "LOKALNYID"];
-
-/// Create `target_table` from a BDOT10k GeoParquet file, including the
-/// `_row_hash` column, then delete any invalid-geometry rows (see
-/// `docs/invalid_geometry_tile_500s.md`), any oversized-geometry rows (see
-/// `dataset::filter_oversized_geometry`), drop any row with a NULL record
-/// key (see `dataset::non_null_key_sql`), and finally collapse duplicate
-/// keys down to one row each (see `dataset::deduplicate_by_key`). Does NOT
-/// create an index -- callers that need one create it themselves, and the
-/// update path deliberately does not.
+/// Create `target_table` from a BDOT10k GeoParquet file, then delete any
+/// invalid-geometry rows (see `docs/invalid_geometry_tile_500s.md`), any
+/// oversized-geometry rows (see `dataset::filter_oversized_geometry`), drop
+/// any row with a NULL record key (see `dataset::non_null_key_sql`), and
+/// finally collapse duplicate keys down to one row each (see
+/// `dataset::deduplicate_by_key`). Does NOT create an index -- callers that
+/// need one create it themselves, and the update path deliberately does not.
+///
+/// BDOT10k's record key -- `crate::dataset::BDOT10K.key_columns` -- is
+/// composite, unlike EGIB's. Its single array feeds all three sites that have
+/// to agree on it below (the load select's `IS NOT NULL` filter, the count
+/// query's `IS NULL` complement, and the dedup's `PARTITION BY`), which
+/// matters more here than for a single-column key: the complement of `a IS
+/// NOT NULL AND b IS NOT NULL` is `a IS NULL OR b IS NULL`, and that
+/// asymmetry is easy to get wrong when spelled out by hand.
 ///
 /// Workaround: DuckDB's automatic GeoParquet conversion and ST_Read (GDAL)
 /// both fail on BDOT10k files because their CRS (EPSG:2180) is stored as a
@@ -48,14 +46,13 @@ const KEY_COLUMNS: &[&str] = &["PRZESTRZENNAZW", "LOKALNYID"];
 /// the same instance — e.g. EGIB's `load_into`, which relies on the default
 /// being on.
 pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> Result<LoadStats> {
-    let non_null = crate::dataset::non_null_key_sql(KEY_COLUMNS);
+    let non_null = crate::dataset::non_null_key_sql(crate::dataset::BDOT10K.key_columns);
     let inner = format!(
         "SELECT * EXCLUDE(GEOM), \
          ST_Transform(ST_GeomFromWKB(GEOM), 'EPSG:2180', 'EPSG:4326') AS geom \
          FROM '{parquet_path}' WHERE {non_null}"
     );
-    let select =
-        crate::dataset::BDOT10K.with_centroid_select(&crate::dataset::hashed_select(&inner));
+    let select = crate::dataset::BDOT10K.with_centroid_select(&inner);
 
     conn.execute_batch("SET enable_geoparquet_conversion = false;")
         .with_context(|| format!("Failed to disable GeoParquet conversion for {target_table}"))?;
@@ -69,7 +66,7 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
             .query_row(
                 &format!(
                     "SELECT count(*) FROM '{parquet_path}' WHERE {}",
-                    crate::dataset::null_key_sql(KEY_COLUMNS)
+                    crate::dataset::null_key_sql(crate::dataset::BDOT10K.key_columns)
                 ),
                 [],
                 |r| r.get(0),
@@ -107,7 +104,7 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
     let mut unique = crate::dataset::deduplicate_by_key(
         conn,
         target_table,
-        KEY_COLUMNS,
+        crate::dataset::BDOT10K.key_columns,
         "WERSJA DESC",
         "LOKALNYID",
     )?;
@@ -277,9 +274,9 @@ mod tests {
 
     /// `load_into` must actually remove invalid rows, not just report them --
     /// exercised directly since real fixtures don't contain one. Loads a tiny
-    /// staged table by hand (mirroring `hashed_select`'s output shape) rather
-    /// than going through `crate::dataset::filter_invalid_geometry` in
-    /// isolation, so this catches a regression in how `load_into` calls it.
+    /// staged table by hand (mirroring the shape `load_into`'s select
+    /// produces) rather than going through `crate::dataset::filter_invalid_geometry`
+    /// in isolation, so this catches a regression in how `load_into` calls it.
     #[test]
     fn load_into_drops_a_deliberately_invalid_row() {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];

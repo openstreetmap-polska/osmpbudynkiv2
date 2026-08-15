@@ -4,9 +4,9 @@
 //! readable by `/status`.
 //!
 //! Deliberately a snapshot, not a history: `record` deletes the previous row
-//! for `job_name` before inserting the new one, matching the same
-//! delete-then-insert convention `dataset::stamp_row_hash_version` already
-//! uses instead of `ON CONFLICT`.
+//! for `job_name` before inserting the new one, rather than `ON CONFLICT` --
+//! the same delete-then-insert shape `serving_version::bump_serving_epoch`
+//! uses for the same reason: the table it targets has no primary key.
 //!
 //! This module must not depend on `crate::server` -- `import`/`update` run
 //! independently of whether the HTTP server is up.

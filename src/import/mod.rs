@@ -22,12 +22,10 @@ pub fn run(
         ImportSource::Osm { file } => osm::import(conn, kv, config, file.as_deref(), &urls.osm_pbf),
         ImportSource::Bdot10k { file } => {
             bdot10k::import(conn, config, file.as_deref(), &urls.bdot10k)?;
-            stamp_row_hash_version(conn)?;
             bump_serving_epoch(conn)
         }
         ImportSource::Egib { file } => {
             egib::import(conn, config, file.as_deref(), &urls.egib)?;
-            stamp_row_hash_version(conn)?;
             bump_serving_epoch(conn)
         }
         ImportSource::Prg { file, terc_file } => {
@@ -38,7 +36,6 @@ pub fn run(
                 terc_file.as_deref(),
                 &urls.prg,
             )?;
-            stamp_row_hash_version(conn)?;
             bump_serving_epoch(conn)
         }
         ImportSource::StreetMappings { file, url } => {
@@ -180,7 +177,6 @@ pub fn run(
                 terc_file.as_deref(),
                 &urls.prg,
             )?;
-            stamp_row_hash_version(conn)?;
             bump_serving_epoch(conn)
         }
     }
@@ -222,15 +218,6 @@ fn load_building_type_file(
         }
     }
     Ok(stats)
-}
-
-/// Stamp the row-hash version after an import rebuilds a dataset table.
-///
-/// An import writes `_row_hash` with the current expression, so the stamp is
-/// what lets a later `update` tell "these hashes are comparable" from "the
-/// expression changed underneath them". OSM is exempt — it has no `_row_hash`.
-fn stamp_row_hash_version(conn: &Connection) -> Result<()> {
-    crate::dataset::stamp_row_hash_version(conn)
 }
 
 /// Bump the serving epoch after an import rebuilds a dataset table.

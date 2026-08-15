@@ -9,30 +9,28 @@ use crate::dataset::LoadStats;
 use crate::download::download_file;
 use crate::utils::format_duration;
 
-/// EGIB's record key. One array feeds all three sites that have to agree on
-/// it -- the load select's `IS NOT NULL` filter, the count query's `IS NULL`
-/// complement, and the dedup's `PARTITION BY` -- so they cannot drift.
-/// Plan 2 moves this onto `DatasetSpec::key_columns`.
-const KEY_COLUMNS: &[&str] = &["id_budynku"];
-
-/// Create `target_table` from an EGIB GeoParquet file, including the
-/// `_row_hash` column, then delete any invalid-geometry rows (see
-/// `docs/invalid_geometry_tile_500s.md`), any oversized-geometry rows (see
-/// `dataset::filter_oversized_geometry`), drop any row with a NULL record
-/// key (see `dataset::non_null_key_sql`), and finally collapse duplicate
-/// keys down to one row each (see `dataset::deduplicate_by_key`). Does NOT
-/// create an index.
+/// Create `target_table` from an EGIB GeoParquet file, then delete any
+/// invalid-geometry rows (see `docs/invalid_geometry_tile_500s.md`), any
+/// oversized-geometry rows (see `dataset::filter_oversized_geometry`), drop
+/// any row with a NULL record key (see `dataset::non_null_key_sql`), and
+/// finally collapse duplicate keys down to one row each (see
+/// `dataset::deduplicate_by_key`). Does NOT create an index.
 ///
 /// Geometry is transformed from EPSG:2180 to EPSG:4326 for uniform spatial
 /// comparisons.
+///
+/// EGIB's record key -- `crate::dataset::EGIB.key_columns` -- feeds all three
+/// sites that have to agree on it below (the load select's `IS NOT NULL`
+/// filter, the count query's `IS NULL` complement, and the dedup's
+/// `PARTITION BY`), so they cannot drift.
 pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> Result<LoadStats> {
-    let non_null = crate::dataset::non_null_key_sql(KEY_COLUMNS);
+    let non_null = crate::dataset::non_null_key_sql(crate::dataset::EGIB.key_columns);
     let inner = format!(
         "SELECT * EXCLUDE(geometry, geometry_bbox), \
          ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom \
          FROM '{parquet_path}' WHERE {non_null}"
     );
-    let select = crate::dataset::EGIB.with_centroid_select(&crate::dataset::hashed_select(&inner));
+    let select = crate::dataset::EGIB.with_centroid_select(&inner);
     let select = crate::mappings::egib::with_rodzaj_kod_select(&select);
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS {target_table};
@@ -48,7 +46,7 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
         .query_row(
             &format!(
                 "SELECT count(*) FROM '{parquet_path}' WHERE {}",
-                crate::dataset::null_key_sql(KEY_COLUMNS)
+                crate::dataset::null_key_sql(crate::dataset::EGIB.key_columns)
             ),
             [],
             |r| r.get(0),
@@ -68,7 +66,7 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
     let mut unique = crate::dataset::deduplicate_by_key(
         conn,
         target_table,
-        KEY_COLUMNS,
+        crate::dataset::EGIB.key_columns,
         "czas_pozyskania DESC",
         "id_budynku",
     )?;

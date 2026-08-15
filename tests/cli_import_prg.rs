@@ -100,47 +100,16 @@ fn test_import_prg_from_fixture() {
     assert_eq!(housenumbers, vec!["1A", "21A", "2A"]);
 }
 
-#[test]
-fn test_import_prg_writes_row_hash() {
-    let db = tempfile::TempDir::new().unwrap();
-    let rocksdb_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db.path().join("test.duckdb");
-    let mut tmp = tempfile::NamedTempFile::new().unwrap();
-    use std::io::Write;
-    write!(
-        tmp,
-        "db_path = \"{}\"\nrocksdb_path = \"{}\"\n",
-        db_path.display(),
-        rocksdb_dir.path().display()
-    )
-    .unwrap();
-
-    cmd()
-        .args([
-            "--config",
-            tmp.path().to_str().unwrap(),
-            "import",
-            "prg",
-            "--file",
-            "fixtures/prg.zip",
-            "--terc-file",
-            "fixtures/teryt.zip",
-        ])
-        .assert()
-        .success();
-
-    let conn = duckdb::Connection::open(&db_path).unwrap();
-    conn.execute_batch("INSTALL spatial; LOAD spatial;")
-        .unwrap();
-    let null_hashes: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FILTER (WHERE _row_hash IS NULL) FROM prg_addresses",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(null_hashes, 0, "every row must carry a hash");
-}
+// `test_import_prg_writes_row_hash` used to live here, asserting a non-NULL
+// `_row_hash` on every row. That column is gone along with the whole-row-hash
+// diff mechanism (see `docs/superpowers/plans/2026-08-14-key-based-diff.md`).
+// It is deleted outright rather than kept as a row-count check: unlike its
+// bdot10k/egib counterparts, its only remaining purpose -- opening the
+// file-backed database directly and asserting `COUNT(*) FROM prg_addresses`
+// -- is already covered, more thoroughly, by `test_import_prg_from_fixture`
+// above (same `count == 3`, plus geometry-bounds and content checks), so a
+// row-count-only survivor here would duplicate that test rather than pin
+// anything new.
 
 #[test]
 fn test_import_prg_missing_file() {

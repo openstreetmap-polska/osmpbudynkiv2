@@ -51,9 +51,16 @@ pub fn import(
     // Materialize the final table with a geometry column built from
     // EPSG:4326 lon/lat (the parser already reprojected from EPSG:2180).
     let t = std::time::Instant::now();
-    materialize_into(conn, crate::dataset::PRG.table, raw_table)?;
+    let stats = materialize_into(conn, crate::dataset::PRG.table, raw_table)?;
+    // `import prg` has no `job_run_log` integration the way `update prg`'s
+    // `refresh` -> `summarize_refresh` does, so this `info!` is the only
+    // operator-visible signal that `materialize_into` silently dropped a row
+    // for having a NULL or duplicate `lokalny_id` -- surface both counts
+    // rather than discarding the returned `LoadStats`.
     info!(
         elapsed = %format_duration(t.elapsed()),
+        skipped_null_key = stats.skipped_null_key,
+        skipped_duplicate_key = stats.skipped_duplicate_key,
         "Step done: build prg_addresses with geom column"
     );
 
@@ -108,9 +115,10 @@ pub fn update_prg(
             let raw = format!("{target}_raw");
             stream_gml_into(c, &zip_path, &terc, &raw)?;
             // PRG does not filter invalid geometry (that's bdot10k/egib-only,
-            // see `crate::dataset::filter_invalid_geometry`), so there is
-            // nothing to report beyond the default (all-zero) stats.
-            materialize_into(c, target, &raw).map(|()| crate::dataset::LoadStats::default())
+            // see `crate::dataset::filter_invalid_geometry`), so
+            // `materialize_into`'s `LoadStats` carries only the null-key and
+            // duplicate-key counts.
+            materialize_into(c, target, &raw)
         },
         source_etag,
         is_cancelled,
@@ -355,33 +363,96 @@ const ULICA_PREFIX_STRIP_SQL: &str = r"CASE
 
 /// Build `target_table` from the streamed `raw_table`, adding a geometry
 /// column built from EPSG:4326 lon/lat (the parser already reprojected from
-/// EPSG:2180) and the `_row_hash` column. Drops `raw_table` afterwards.
+/// EPSG:2180), then drop any row with a NULL record key (see
+/// `dataset::non_null_key_sql`) and collapse duplicate keys down to one row
+/// each (see `dataset::deduplicate_by_key`). Drops `raw_table` afterwards.
 /// Does NOT create an index.
+///
+/// PRG's record key -- `crate::dataset::PRG.key_columns` -- feeds all three
+/// sites below that have to agree on it (the load select's `IS NOT NULL`
+/// filter, the count query's `IS NULL` complement, and the dedup's
+/// `PARTITION BY`), so they cannot drift.
 ///
 /// Also normalizes `ulica` via [`ULICA_PREFIX_STRIP_SQL`]. This is the one
 /// funnel both `import` and `update`'s staging load pass through, so the
-/// normalization lands on both paths from a single site. It sits INSIDE
-/// `hashed_select`'s projection — unlike `DatasetSpec::with_centroid_select`
-/// and `mappings::egib::with_rodzaj_kod_select`, which wrap it from outside —
-/// because it rewrites a stored value rather than deriving an extra column:
-/// hashing the value as stored is what lets `ROW_HASH_VERSION` catch a future
-/// edit to the expression and self-heal on the next refresh. **Editing
-/// `ULICA_PREFIX_STRIP_SQL` therefore requires bumping `ROW_HASH_VERSION`.**
-pub fn materialize_into(conn: &Connection, target_table: &str, raw_table: &str) -> Result<()> {
+/// normalization lands on both paths from a single site. It is safe to edit
+/// freely, unlike the columns discussed next: `ulica` is one of
+/// `PRG.compared_columns`, so a change to this expression surfaces as an
+/// ordinary "modified" record on the next refresh and self-heals per record
+/// with no version bump to remember.
+///
+/// Contrast that with values derived *outside* `compared_columns` --
+/// `centroid` (`DatasetSpec::with_centroid_select`) and EGIB's `rodzaj_kod`
+/// (`mappings::egib::RODZAJ_KOD_CASE_SQL`). Those are recomputed for every
+/// *staged* row on every refresh, so a record that happens to be modified
+/// for some unrelated reason picks up the new expression -- but a record
+/// that stays unmodified keeps its old, stale value forever. Under the old
+/// whole-row-hash diff a version bump forced a full rewrite that fixed such
+/// columns as a side effect; nothing does that any more, so editing one of
+/// those expressions now requires a re-import, not merely a refresh.
+pub fn materialize_into(
+    conn: &Connection,
+    target_table: &str,
+    raw_table: &str,
+) -> Result<crate::dataset::LoadStats> {
+    let non_null = crate::dataset::non_null_key_sql(crate::dataset::PRG.key_columns);
     let inner = format!(
         "SELECT * REPLACE (({ULICA_PREFIX_STRIP_SQL}) AS ulica), \
                 ST_Point(dlugosc_geograficzna, szerokosc_geograficzna) AS geom \
          FROM {raw_table} \
          WHERE dlugosc_geograficzna IS NOT NULL \
-           AND szerokosc_geograficzna IS NOT NULL"
+           AND szerokosc_geograficzna IS NOT NULL \
+           AND {non_null}"
     );
+
+    // A filtered CTAS doesn't report how many rows its WHERE excluded, so
+    // count them with a second, narrow query -- unlike BDOT10k/EGIB, which
+    // count against the source parquet file on disk (and so can run the
+    // count at any point relative to their CREATE TABLE), PRG's source here
+    // is the in-database `raw_table`, and the CREATE TABLE statement below
+    // drops `raw_table` as the last step of its own `execute_batch`. This
+    // count MUST run before that batch executes, or it fails with "table
+    // does not exist".
+    let null_key_rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM {raw_table} WHERE {}",
+                crate::dataset::null_key_sql(crate::dataset::PRG.key_columns)
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("Failed to count NULL-keyed rows in {raw_table}"))?;
+
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS {target_table};
-         CREATE TABLE {target_table} AS {};
-         DROP TABLE {raw_table};",
-        crate::dataset::hashed_select(&inner)
+         CREATE TABLE {target_table} AS {inner};
+         DROP TABLE {raw_table};"
     ))
-    .with_context(|| format!("Failed to materialize {target_table}"))
+    .with_context(|| format!("Failed to materialize {target_table}"))?;
+
+    // Unlike BDOT10k/EGIB, PRG runs no geometry filters at all (there is no
+    // `filter_invalid_geometry`/`filter_oversized_geometry` call for PRG
+    // points), so their "must come after both geometry filters" ordering
+    // constraint on the dedup does not apply here. It still has to come
+    // after the table is built, to match the other two loaders.
+    //
+    // `wersja_id DESC` is deliberate: measured on the real 2026-01-10
+    // snapshot, lokalny_id 49ba6299-04f9-48c1-8c50-56737d64927e appears
+    // twice, differing only in wersja_id and in a field the newer version
+    // corrects (`wazny_od_lub_data_nadania` -- one copy carries the typo
+    // `0200-07-15`, the other the correction `2003-07-15` at a later
+    // wersja_id). Newest wersja_id wins so the correction survives, not the
+    // stale typo.
+    let mut unique = crate::dataset::deduplicate_by_key(
+        conn,
+        target_table,
+        crate::dataset::PRG.key_columns,
+        "wersja_id DESC",
+        "lokalny_id",
+    )?;
+    unique.skipped_null_key = null_key_rows;
+    Ok(unique)
 }
 
 /// Walk the archive once and collect indices of entries whose name ends in
@@ -415,6 +486,10 @@ mod tests {
     /// Materialize `inputs` (raw `ulica` values) through the real
     /// `materialize_into` and read the resulting column back, so the tests
     /// exercise the actual import SQL rather than a copy of the expression.
+    /// Each row gets its own `lokalny_id` (derived from `ord`, so distinct)
+    /// and a constant `wersja_id` -- these tests care about `ulica`
+    /// stripping, not the key/dedup machinery, so the key columns are just
+    /// populated well enough to stay out of the way.
     fn materialized_ulica(inputs: &[Option<&str>]) -> Vec<Option<String>> {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
@@ -423,14 +498,16 @@ mod tests {
                  ord INTEGER,
                  ulica VARCHAR,
                  dlugosc_geograficzna DOUBLE,
-                 szerokosc_geograficzna DOUBLE
+                 szerokosc_geograficzna DOUBLE,
+                 lokalny_id VARCHAR,
+                 wersja_id INTEGER
              );",
         )
         .unwrap();
         for (i, value) in inputs.iter().enumerate() {
             conn.execute(
-                "INSERT INTO prg_raw VALUES (?, ?, 21.0, 52.0)",
-                duckdb::params![i as i32, value],
+                "INSERT INTO prg_raw VALUES (?, ?, 21.0, 52.0, ?, 1)",
+                duckdb::params![i as i32, value, format!("key-{i}")],
             )
             .unwrap();
         }
@@ -499,43 +576,119 @@ mod tests {
     }
 
     /// The `* REPLACE` rewrite must not disturb the rest of the projection:
-    /// every row still needs a hash, and the geometry column still has to be
-    /// built from the lon/lat pair.
+    /// the geometry column still has to be built from the lon/lat pair, and
+    /// the coordinate-less filter still applies.
     #[test]
-    fn materialize_still_writes_row_hash_and_geometry() {
+    fn materialize_still_writes_geometry() {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         conn.execute_batch(
             "CREATE TABLE prg_raw (
                  ulica VARCHAR,
                  dlugosc_geograficzna DOUBLE,
-                 szerokosc_geograficzna DOUBLE
+                 szerokosc_geograficzna DOUBLE,
+                 lokalny_id VARCHAR,
+                 wersja_id INTEGER
              );
              INSERT INTO prg_raw VALUES
-                 ('ulica Herbaciana', 21.0, 52.0),
-                 ('Aleja Krakowska', 21.5, 52.5),
+                 ('ulica Herbaciana', 21.0, 52.0, 'a', 1),
+                 ('Aleja Krakowska', 21.5, 52.5, 'b', 1),
                  -- filtered out: no coordinates
-                 ('ulica Bezdomna', NULL, NULL);",
+                 ('ulica Bezdomna', NULL, NULL, 'c', 1);",
         )
         .unwrap();
 
         materialize_into(&conn, "prg_out", "prg_raw").unwrap();
 
-        let (rows, null_hashes, null_geoms): (i64, i64, i64) = conn
+        let (rows, null_geoms): (i64, i64) = conn
             .query_row(
                 "SELECT COUNT(*),
-                        COUNT(*) FILTER (WHERE _row_hash IS NULL),
                         COUNT(*) FILTER (WHERE geom IS NULL)
                  FROM prg_out",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(
             rows, 2,
             "the coordinate-less row must still be filtered out"
         );
-        assert_eq!(null_hashes, 0, "every row must carry a hash");
         assert_eq!(null_geoms, 0, "every row must carry a geometry");
+    }
+
+    /// A duplicate `lokalny_id` collapses to the row carrying the higher
+    /// `wersja_id` -- the real case measured on the 2026-01-10 snapshot (see
+    /// `materialize_into`'s doc comment): two rows share one `lokalny_id`,
+    /// differing only in `wersja_id` and in a field the newer version
+    /// corrects. Driven through the real `materialize_into`, not a copy of
+    /// its SQL.
+    #[test]
+    fn materialize_collapses_duplicate_lokalny_id_to_the_newer_wersja_id() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prg_raw (
+                 lokalny_id VARCHAR,
+                 wersja_id INTEGER,
+                 ulica VARCHAR,
+                 dlugosc_geograficzna DOUBLE,
+                 szerokosc_geograficzna DOUBLE
+             );
+             INSERT INTO prg_raw VALUES
+                 ('dup-key', 1, 'stale', 21.0, 52.0),
+                 ('dup-key', 2, 'fresh', 21.0, 52.0),
+                 ('unique-key', 1, 'other', 22.0, 53.0);",
+        )
+        .unwrap();
+
+        let stats = materialize_into(&conn, "prg_out", "prg_raw").unwrap();
+
+        assert_eq!(stats.skipped_duplicate_key, 1);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prg_out", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "duplicate collapses down to one row per key");
+
+        let surviving_ulica: String = conn
+            .query_row(
+                "SELECT ulica FROM prg_out WHERE lokalny_id = 'dup-key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            surviving_ulica, "fresh",
+            "the higher wersja_id must win the tie-break, not just any surviving row"
+        );
+    }
+
+    /// A NULL `lokalny_id` row has no usable identity and cannot be diffed
+    /// or deduplicated, so it must not survive into the target table --
+    /// mirroring BDOT10k/EGIB's `load_into_drops_null_keyed_rows`.
+    #[test]
+    fn materialize_drops_null_lokalny_id_rows() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prg_raw (
+                 lokalny_id VARCHAR,
+                 wersja_id INTEGER,
+                 ulica VARCHAR,
+                 dlugosc_geograficzna DOUBLE,
+                 szerokosc_geograficzna DOUBLE
+             );
+             INSERT INTO prg_raw VALUES
+                 ('has-key', 1, 'ok', 21.0, 52.0),
+                 (NULL, 1, 'no-key', 22.0, 53.0);",
+        )
+        .unwrap();
+
+        let stats = materialize_into(&conn, "prg_out", "prg_raw").unwrap();
+
+        assert_eq!(stats.skipped_null_key, 1);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prg_out", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "the NULL-keyed row must not survive");
     }
 }

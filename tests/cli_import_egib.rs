@@ -82,8 +82,16 @@ fn test_import_egib_missing_file() {
         .failure();
 }
 
+/// Reads the live table back through a direct `duckdb::Connection` (rather
+/// than trusting the CLI's own stdout `count=` line, which
+/// `test_import_egib_from_fixture` above already pins) to confirm the
+/// import actually persisted the expected row count to `egib_buildings`.
+/// This used to assert a non-NULL `_row_hash` on every row; that column is
+/// gone along with the whole-row-hash diff mechanism (see
+/// `docs/superpowers/plans/2026-08-14-key-based-diff.md`) and has no
+/// replacement to assert here.
 #[test]
-fn test_import_egib_writes_row_hash() {
+fn test_import_egib_persists_expected_row_count() {
     let db = tempfile::TempDir::new().unwrap();
     let rocksdb_dir = tempfile::TempDir::new().unwrap();
     let db_path = db.path().join("test.duckdb");
@@ -112,12 +120,8 @@ fn test_import_egib_writes_row_hash() {
     let conn = duckdb::Connection::open(&db_path).unwrap();
     conn.execute_batch("INSTALL spatial; LOAD spatial;")
         .unwrap();
-    let null_hashes: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FILTER (WHERE _row_hash IS NULL) FROM egib_buildings",
-            [],
-            |row| row.get(0),
-        )
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM egib_buildings", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(null_hashes, 0, "every row must carry a hash");
+    assert_eq!(total, 74);
 }

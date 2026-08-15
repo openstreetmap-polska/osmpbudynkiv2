@@ -1,55 +1,13 @@
-//! Per-source metadata and the shared row-hash SQL used by both the import
-//! and the update paths.
+//! Per-source metadata ([`DatasetSpec`]) plus the shared load-time helpers
+//! used by both `import` and `update`'s staging load: [`non_null_key_sql`] /
+//! [`null_key_sql`] (record-identity filtering), [`deduplicate_by_key`],
+//! [`filter_invalid_geometry`] and [`filter_oversized_geometry`].
 //!
-//! The row hash is computed by hashing a whole-row reference over a subquery
-//! alias rather than an explicit column list:
-//!
-//! ```sql
-//! SELECT *, hash(s) AS _row_hash FROM (<inner select>) s
-//! ```
-//!
-//! `hash(s)` hashes every column of `s` including `GEOMETRY`, and `s`
-//! deliberately does not contain `_row_hash`, so the hash is never
-//! self-referential. Because there is no column list to maintain, a source
-//! gaining or losing a column cannot silently desynchronize the import and
-//! update expressions.
-
-/// Bumped whenever the hashed row content changes for any source.
-///
-/// That is [`hashed_select`] itself, but also anything feeding *into* it: a
-/// source's inner select is part of the hash input, so a change there moves
-/// the stored hashes just as surely (version 2 is such a case — PRG's import
-/// gained a street-name normalization inside its inner select, see
-/// `import::prg::ULICA_PREFIX_STRIP_SQL`). Transformations deliberately
-/// wrapped *outside* `hashed_select` — [`DatasetSpec::with_centroid_select`],
-/// `mappings::egib::with_rodzaj_kod_select` — do not count.
-///
-/// The value in force when a live table was built is stamped into
-/// `metadata.row_hash_version` by [`stamp_row_hash_version`]. A mismatch
-/// against this constant means the stored `_row_hash` values were produced by
-/// a different expression, so every row will compare as modified; the refresh
-/// warns, rewrites the table wholesale, and re-stamps — so the warning fires
-/// once per bump rather than forever. The stamp is global, so a bump made for
-/// one source also costs the others one full-rewrite refresh apiece.
-pub const ROW_HASH_VERSION: i64 = 2;
-pub const ROW_HASH_VERSION_KEY: &str = "row_hash_version";
-
-/// Record that the live dataset tables were built with the current
-/// [`ROW_HASH_VERSION`].
-///
-/// Called by every path that (re)builds a live table's `_row_hash` column
-/// wholesale: a full `import`, and the full-rewrite refresh that follows a
-/// version bump. Anything that rewrites only a delta must NOT call this — the
-/// untouched rows would still carry the old expression's hashes.
-pub fn stamp_row_hash_version(conn: &duckdb::Connection) -> anyhow::Result<()> {
-    use anyhow::Context;
-    // Both interpolated values are compile-time constants of this crate.
-    conn.execute_batch(&format!(
-        "DELETE FROM metadata WHERE key = '{ROW_HASH_VERSION_KEY}';
-         INSERT INTO metadata VALUES ('{ROW_HASH_VERSION_KEY}', '{ROW_HASH_VERSION}');"
-    ))
-    .context("Failed to record row hash version")
-}
+//! [`DatasetSpec::changed_predicate_sql`] is the single home for the
+//! comparison a refresh uses to decide whether a record is "modified" — see
+//! its doc comment and `docs/superpowers/plans/2026-08-14-key-based-diff.md`
+//! for the measurements behind each source's `compared_columns` /
+//! `compare_geometry` choice.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeomKind {
@@ -65,9 +23,13 @@ pub struct DatasetSpec {
     pub name: &'static str,
     /// The live table this source owns.
     pub table: &'static str,
-    /// Stable per-object identifier. NOT unique — BDOT10k has duplicate IDs,
-    /// so the diff compares an ID's whole row-set, never row to row.
-    pub id_column: &'static str,
+    /// Unique, non-null record identity, guaranteed at load by
+    /// `dataset::non_null_key_sql` + `dataset::deduplicate_by_key`.
+    pub key_columns: &'static [&'static str],
+    /// Columns compared to decide "modified". Never volatile export metadata.
+    pub compared_columns: &'static [&'static str],
+    /// Whether geometry participates in the comparison.
+    pub compare_geometry: bool,
     pub geom_kind: GeomKind,
 }
 
@@ -86,13 +48,23 @@ impl DatasetSpec {
         }
     }
 
-    /// Wrap `select_sql` (the output of [`hashed_select`]) so a `Polygon`
-    /// source also gains a persisted `centroid GEOMETRY` column, computed
-    /// from `geom`. Added OUTSIDE `hashed_select`'s projection deliberately:
-    /// `hash(s)` inside `hashed_select` already ran over the inner columns
-    /// only, so wrapping here cannot change any row's `_row_hash` and needs
-    /// no `ROW_HASH_VERSION` bump. A no-op passthrough for `Point` sources
-    /// (PRG), which have no separate centroid to store.
+    /// Wrap `select_sql` so a `Polygon` source also gains a persisted
+    /// `centroid GEOMETRY` column, computed from `geom`. Safe to add outside
+    /// the diff's view: `centroid` is simply not one of the names in
+    /// `compared_columns`, so it cannot affect what `changed_predicate_sql`
+    /// compares.
+    ///
+    /// That has a consequence, though. Because `centroid` sits outside the
+    /// compared set, its value on an *unmodified* record never self-heals —
+    /// it is recomputed for every row a refresh *stages*, so a record
+    /// rewritten for some other reason (e.g. its `WERSJA` bumped) picks up a
+    /// corrected expression for free, but a record the diff never touches
+    /// keeps whatever `centroid` its last import or full rewrite computed,
+    /// forever. **Editing this expression requires a re-import, not a
+    /// refresh**, to reach every row.
+    ///
+    /// A no-op passthrough for `Point` sources (PRG), which have no separate
+    /// centroid to store.
     pub fn with_centroid_select(&self, select_sql: &str) -> String {
         match self.geom_kind {
             GeomKind::Point => select_sql.to_string(),
@@ -106,37 +78,145 @@ impl DatasetSpec {
     pub fn staging_table(&self) -> String {
         format!("{}__staging", self.table)
     }
+
+    /// SQL predicate that is true when the record under alias `a` differs
+    /// from the record under alias `b` in a way this source cares about.
+    ///
+    /// This is the ONE place the comparison is written; see
+    /// `docs/superpowers/plans/2026-08-14-key-based-diff.md` for the
+    /// measurements behind each source's `compared_columns` /
+    /// `compare_geometry` choice. Shape: a row-wise
+    /// `(a.c1, a.c2, ...) IS DISTINCT FROM (b.c1, b.c2, ...)` over
+    /// `compared_columns`, plus `OR ST_AsWKB(a.geom) IS DISTINCT FROM
+    /// ST_AsWKB(b.geom)` when `compare_geometry` is set. The whole result is
+    /// parenthesized so a caller can safely append ` AND ...` to it.
+    ///
+    /// Row-wise `IS DISTINCT FROM` is used specifically because it is
+    /// NULL-safe in DuckDB (`(NULL, 1) IS DISTINCT FROM (NULL, 1)` is false,
+    /// `(NULL, 1) IS DISTINCT FROM (2, 1)` is true) — EGIB depends on this,
+    /// since 617,207 of its records have all three compared attributes NULL
+    /// and would otherwise compare as permanently "distinct".
+    ///
+    /// Geometry MUST be compared via `ST_AsWKB(...)`, never the bare
+    /// `a.geom IS DISTINCT FROM b.geom` — measured on the real 17.5M-row
+    /// EGIB table: native GEOMETRY comparison took 24.18s against 2.50s for
+    /// `ST_AsWKB`, for the identical answer.
+    pub fn changed_predicate_sql(&self, a: &str, b: &str) -> String {
+        let attrs = if self.compared_columns.is_empty() {
+            None
+        } else {
+            let lhs = self
+                .compared_columns
+                .iter()
+                .map(|c| format!("{a}.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rhs = self
+                .compared_columns
+                .iter()
+                .map(|c| format!("{b}.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("({lhs}) IS DISTINCT FROM ({rhs})"))
+        };
+
+        let geom = if self.compare_geometry {
+            Some(format!(
+                "ST_AsWKB({a}.geom) IS DISTINCT FROM ST_AsWKB({b}.geom)"
+            ))
+        } else {
+            None
+        };
+
+        match (attrs, geom) {
+            (Some(attrs), Some(geom)) => format!("({attrs} OR {geom})"),
+            (Some(attrs), None) => format!("({attrs})"),
+            (None, Some(geom)) => format!("({geom})"),
+            // Nothing is compared, so nothing can ever be modified.
+            (None, None) => "(FALSE)".to_string(),
+        }
+    }
 }
 
 pub const BDOT10K: DatasetSpec = DatasetSpec {
     name: "bdot10k",
     table: "bdot10k_buildings",
-    id_column: "LOKALNYID",
+    key_columns: &["PRZESTRZENNAZW", "LOKALNYID"],
+    // WERSJA plus the retained attributes; geometry deliberately excluded.
+    // BDOT10k periodically re-serializes every geometry wholesale: 0.94% of
+    // rows differed between 03-15 and 04-19, 4.5% between 04-19 and 08-01,
+    // and 100% (16,344,762 of 16,344,762) in the 2026-08-10 export.
+    // Re-serialized bytes are indistinguishable from real movement, so
+    // comparing geometry would mean one refresh per re-serialization event
+    // rewriting the whole table and dirtying every z14 cell in Poland. Cost
+    // of excluding it: a geometry-only edit with no WERSJA bump and no
+    // attribute change is missed, self-healing whenever that record next
+    // changes for another reason.
+    //
+    // The comparison must be IS DISTINCT FROM, never > or >=: attributes
+    // change WITHOUT a WERSJA bump (6,395 records in the 03-15 -> 04-19
+    // pair, including 64 KATEGORIAISTNIENIA transitions, the column
+    // rule::BDOT10K_EKSPLOATOWANY_FILTER gates on), so a > predicate would
+    // miss them outright. A symmetric predicate also means a staged record
+    // whose WERSJA went backwards replaces the live one rather than freezing
+    // it -- upstream's latest export is treated as the truth, not the
+    // highest version number. Measured 2026-08-15: after deduplicate_by_key
+    // (which orders WERSJA DESC), backwards movement is 0 across all three
+    // national pairs, so that second case is theoretical; the first is not.
+    // See docs/superpowers/plans/2026-08-14-key-based-diff.md.
+    compared_columns: &[
+        "WERSJA",
+        "KATEGORIAISTNIENIA",
+        "PRZEWAZAJACAFUNKCJABUDYNKU",
+        "FUNKCJAOGOLNABUDYNKU",
+        "LICZBAKONDYGNACJI",
+        "NAZWA",
+        "FSBUD",
+        "INFORMACJADODATKOWA",
+        "KODKST",
+        "ZRODLODANYCHGEOMETRYCZNYCH",
+    ],
+    compare_geometry: false,
     geom_kind: GeomKind::Polygon,
 };
 
 pub const EGIB: DatasetSpec = DatasetSpec {
     name: "egib",
     table: "egib_buildings",
-    id_column: "id_budynku",
+    key_columns: &["id_budynku"],
+    // `czas_pozyskania` (99.7% churn per export) and `pozostale_atrybuty`
+    // (32.8%, carries a per-export gml_id) are excluded as pure export
+    // noise. Geometry is NOT optional here, unlike BDOT10k: 617,207 records
+    // have all three of these attributes NULL, so geometry is their only
+    // signal of change. See docs/superpowers/plans/2026-08-14-key-based-diff.md.
+    compared_columns: &["rodzaj", "kondygnacje_nadziemne", "kondygnacje_podziemne"],
+    compare_geometry: true,
     geom_kind: GeomKind::Polygon,
 };
 
 pub const PRG: DatasetSpec = DatasetSpec {
     name: "prg",
     table: "prg_addresses",
-    id_column: "lokalny_id",
+    key_columns: &["lokalny_id"],
+    // `wersja_id` and `poczatek_wersji_obiektu` are deliberately absent.
+    // PRG bulk-republishes by gmina: over four consecutive snapshot pairs,
+    // `wersja_id` moved 34-147x more often than any content changed
+    // (149,198 version bumps vs 1,012 content changes in the 4-day pair).
+    // Downstream that is 1,549 z14 dirty cells instead of 182.
+    // `poczatek_wersji_obiektu` moves in exact lockstep with `wersja_id` (0
+    // disagreements in 8.6M records), so it is a second version-metadata
+    // column, not content -- including it would silently reinstate
+    // version-only churn. See docs/superpowers/plans/2026-08-14-key-based-diff.md.
+    compared_columns: &[
+        "numer_porzadkowy",
+        "ulica",
+        "miejscowosc",
+        "kod_pocztowy",
+        "teryt_miejscowosc",
+    ],
+    compare_geometry: true,
     geom_kind: GeomKind::Point,
 };
-
-/// Wrap `inner_select` so its result gains a `_row_hash UBIGINT` column.
-///
-/// This is the ONLY place the hash expression is written. Both the import
-/// and the update path call it; if they ever diverge, every row compares as
-/// modified on every refresh forever.
-pub fn hashed_select(inner_select: &str) -> String {
-    format!("SELECT *, hash(s) AS _row_hash FROM ({inner_select}) s")
-}
 
 /// Cap on how many skipped-row ids `filter_invalid_geometry` and
 /// `filter_oversized_geometry` each collect as examples -- enough to point
@@ -154,12 +234,13 @@ pub const MAX_EXAMPLE_IDS: usize = 20;
 /// inside the load SELECT, that one after the table exists; see the plan's
 /// "Why not do both at insert").
 ///
-/// This filter sits INSIDE `hashed_select`'s input, which [`ROW_HASH_VERSION`]'s
-/// doc flags as bump territory ("a source's inner select is part of the hash
-/// input"). It still needs no bump: that rule is about expressions that
-/// change a row's *value* (`ULICA_PREFIX_STRIP_SQL` is the version-2 case).
-/// A row filter changes which rows exist, never the content of a surviving
-/// row, so every surviving `_row_hash` is bit-identical.
+/// This filter sits INSIDE the load SELECT, alongside expressions that
+/// rewrite a row's *value* (e.g. `import::prg::ULICA_PREFIX_STRIP_SQL`). A
+/// row filter is a different kind of thing from those: it changes which rows
+/// exist, never the content of a surviving row, which is what makes it safe
+/// to sit wherever it does relative to the other load-time steps — none of
+/// them can observe a row this filter already dropped, and this filter
+/// cannot alter what they see from a row it lets through.
 pub fn non_null_key_sql(key_columns: &[&str]) -> String {
     key_columns
         .iter()
@@ -463,9 +544,10 @@ pub fn filter_oversized_geometry(
 /// across a DELETE+INSERT; this one lives and dies inside a single DELETE
 /// statement.
 ///
-/// Runs strictly after the table is built and outside `hashed_select`'s
-/// projection -- the same argument `filter_oversized_geometry` already
-/// relies on -- so no `ROW_HASH_VERSION` bump is needed.
+/// Runs strictly after the table is built. Like [`non_null_key_sql`], this is
+/// a row filter -- it changes which rows exist, never the content of a
+/// surviving row -- so it needs nothing further to stay correct as the
+/// load-time steps around it change.
 ///
 /// **Must run after `filter_invalid_geometry` and
 /// `filter_oversized_geometry`.** A duplicate pair whose newest member has
@@ -529,14 +611,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hashed_select_wraps_inner_query() {
-        assert_eq!(
-            hashed_select("SELECT 1 AS a"),
-            "SELECT *, hash(s) AS _row_hash FROM (SELECT 1 AS a) s"
-        );
-    }
-
-    #[test]
     fn representative_point_reads_the_stored_centroid_for_polygons() {
         assert_eq!(BDOT10K.representative_point_sql("l"), "l.centroid");
         assert_eq!(EGIB.representative_point_sql("s"), "s.centroid");
@@ -548,62 +622,77 @@ mod tests {
     }
 
     #[test]
-    fn with_centroid_select_wraps_polygon_sources_outside_the_hash() {
-        let hashed = hashed_select("SELECT 1 AS a, ST_Point(1, 2) AS geom");
-        let wrapped = BDOT10K.with_centroid_select(&hashed);
+    fn with_centroid_select_wraps_polygon_sources() {
+        let select = "SELECT 1 AS a, ST_Point(1, 2) AS geom";
+        let wrapped = BDOT10K.with_centroid_select(select);
         assert_eq!(
             wrapped,
-            format!("SELECT *, ST_Centroid(geom) AS centroid FROM ({hashed}) t")
+            format!("SELECT *, ST_Centroid(geom) AS centroid FROM ({select}) t")
         );
     }
 
     #[test]
     fn with_centroid_select_is_a_noop_for_points() {
-        let hashed = hashed_select("SELECT 1 AS a, ST_Point(1, 2) AS geom");
-        assert_eq!(PRG.with_centroid_select(&hashed), hashed);
+        let select = "SELECT 1 AS a, ST_Point(1, 2) AS geom";
+        assert_eq!(PRG.with_centroid_select(select), select);
     }
 
-    /// The load-bearing invariant from the module doc: adding `centroid` via
-    /// `with_centroid_select` must not change `_row_hash`, since it wraps
-    /// `hashed_select`'s output rather than feeding into it. If this ever
-    /// regresses, every refresh would compare every row as modified forever
-    /// (see `ROW_HASH_VERSION`) without anyone bumping the constant.
+    /// The load-bearing invariant from `with_centroid_select`'s doc: adding
+    /// `centroid` must not change what `changed_predicate_sql` compares,
+    /// since `centroid` is not one of `compared_columns`. Uses a
+    /// locally-defined `DatasetSpec` with a smaller `compared_columns` than
+    /// `BDOT10K`'s real ten columns -- this pins the general mechanism
+    /// `with_centroid_select` relies on, not BDOT10K's specific column list,
+    /// so the test data stays small. Mirrors
+    /// `mappings::egib::tests::does_not_change_what_the_diff_compares`, the
+    /// equivalent test for `with_rodzaj_kod_select`.
     #[test]
-    fn with_centroid_select_does_not_change_the_row_hash() {
+    fn with_centroid_select_does_not_change_what_the_diff_compares() {
         use crate::db::init_db;
         use std::path::Path;
 
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         conn.execute_batch(
-            "CREATE TABLE src (id VARCHAR, geom GEOMETRY);
+            "CREATE TABLE src (id VARCHAR, a VARCHAR, geom GEOMETRY);
              INSERT INTO src VALUES
-                 ('1', ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
-                 ('2', NULL);",
+                 ('1', 'x', ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
+                 ('2', NULL, NULL);",
         )
         .unwrap();
 
-        let inner = "SELECT id, geom FROM src";
-        let hashed = hashed_select(inner);
-        let with_centroid = BDOT10K.with_centroid_select(&hashed);
+        let spec = DatasetSpec {
+            name: "test",
+            table: "t",
+            key_columns: &["id"],
+            compared_columns: &["a"],
+            compare_geometry: false,
+            geom_kind: GeomKind::Polygon,
+        };
+
+        let inner = "SELECT id, a, geom FROM src";
+        let with_centroid = spec.with_centroid_select(inner);
 
         conn.execute_batch(&format!(
-            "CREATE TABLE plain AS {hashed};
+            "CREATE TABLE plain AS {inner};
              CREATE TABLE with_centroid AS {with_centroid};"
         ))
         .unwrap();
 
-        let disagreements: i64 = conn
+        let differing: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM plain p JOIN with_centroid c USING (id)
-                 WHERE p._row_hash IS DISTINCT FROM c._row_hash",
+                &format!(
+                    "SELECT COUNT(*) FROM plain p JOIN with_centroid c USING (id)
+                     WHERE {}",
+                    spec.changed_predicate_sql("p", "c")
+                ),
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
-            disagreements, 0,
-            "adding centroid outside hashed_select's wrap must not change _row_hash"
+            differing, 0,
+            "adding centroid outside compared_columns must not change what the diff sees"
         );
 
         let has_centroid: bool = conn
@@ -624,49 +713,6 @@ mod tests {
     fn staging_table_is_derived_from_live_table() {
         assert_eq!(BDOT10K.staging_table(), "bdot10k_buildings__staging");
         assert_eq!(PRG.staging_table(), "prg_addresses__staging");
-    }
-
-    /// The hash must actually be computable over a GEOMETRY column and must
-    /// agree between two independent evaluations of the same content. This is
-    /// the invariant the whole feature rests on.
-    #[test]
-    fn hash_agrees_across_independent_evaluations() {
-        use crate::db::init_db;
-        use std::path::Path;
-
-        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE src (id VARCHAR, a VARCHAR, lon DOUBLE, lat DOUBLE);
-             INSERT INTO src VALUES ('1','x',20.0,52.0), ('2','y',NULL,NULL);",
-        )
-        .unwrap();
-
-        let inner = "SELECT id, a, ST_Point(lon, lat) AS geom FROM src";
-        let sql = format!(
-            "CREATE TABLE t1 AS {};
-             CREATE TABLE t2 AS {};",
-            hashed_select(inner),
-            hashed_select(inner)
-        );
-        conn.execute_batch(&sql).unwrap();
-
-        let disagreements: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM t1 JOIN t2 USING (id)
-                 WHERE t1._row_hash IS DISTINCT FROM t2._row_hash",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(disagreements, 0, "same content must hash identically");
-
-        let nulls: i64 = conn
-            .query_row("SELECT COUNT(*) FROM t1 WHERE _row_hash IS NULL", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(nulls, 0, "NULL geometry must still produce a hash");
     }
 
     #[test]
@@ -883,66 +929,6 @@ mod tests {
         assert_eq!(stats.skipped_oversized_example_ids.len(), MAX_EXAMPLE_IDS);
     }
 
-    /// Like `with_centroid_select_does_not_change_the_row_hash`: dropping
-    /// oversized rows runs strictly after `hashed_select` built the table,
-    /// so a surviving row's `_row_hash` must be bit-for-bit identical to
-    /// what it was before the filter ran -- no `ROW_HASH_VERSION` bump
-    /// needed. Computed via `hashed_select` directly (not `load_into`) so
-    /// this is independent of the BDOT10k/EGIB parquet shape.
-    #[test]
-    fn filter_oversized_geometry_does_not_change_surviving_row_hashes() {
-        use crate::db::init_db;
-        use std::path::Path;
-
-        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE src (id VARCHAR, geom GEOMETRY);
-             INSERT INTO src VALUES
-                 ('keep', ST_GeomFromText(
-                     'POLYGON((21.0 52.0, 21.001 52.0, 21.001 52.001, 21.0 52.001, 21.0 52.0))'
-                 )),
-                 ('drop', ST_GeomFromText(
-                     'MULTIPOLYGON(
-                          ((19.875 52.0, 19.876 52.0, 19.876 52.001, 19.875 52.001, 19.875 52.0)),
-                          ((20.5 52.0, 20.501 52.0, 20.501 52.001, 20.5 52.001, 20.5 52.0))
-                      )'
-                 ));",
-        )
-        .unwrap();
-
-        let inner = "SELECT id, geom FROM src";
-        conn.execute_batch(&format!("CREATE TABLE t AS {}", hashed_select(inner)))
-            .unwrap();
-        // `_row_hash` is UBIGINT and can exceed i64::MAX, so snapshot it into
-        // a second table and compare with SQL (like
-        // `with_centroid_select_does_not_change_the_row_hash` does) instead
-        // of round-tripping the value through Rust.
-        conn.execute_batch("CREATE TABLE hash_before AS SELECT id, _row_hash FROM t")
-            .unwrap();
-
-        let stats = filter_oversized_geometry(&conn, "t", "id").unwrap();
-        assert_eq!(stats.skipped_oversized_geometry, 1);
-
-        let disagreements: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM hash_before h JOIN t USING (id)
-                 WHERE h._row_hash IS DISTINCT FROM t._row_hash",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            disagreements, 0,
-            "filtering must not change a surviving row's _row_hash"
-        );
-
-        let survivors: i64 = conn
-            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(survivors, 1, "'keep' must still be the only surviving row");
-    }
-
     #[test]
     fn non_null_key_sql_covers_every_key_column() {
         assert_eq!(
@@ -992,59 +978,6 @@ mod tests {
             4,
             "the two must partition the table exactly"
         );
-    }
-
-    /// Mirrors `with_centroid_select_does_not_change_the_row_hash`: applying
-    /// `non_null_key_sql` as a `WHERE` on the load select must not change the
-    /// `_row_hash` of a row that survives it, even though the filter sits
-    /// INSIDE `hashed_select`'s input (see the doc comment on
-    /// `non_null_key_sql` for why that's still no-bump territory).
-    #[test]
-    fn non_null_key_filter_does_not_change_surviving_row_hashes() {
-        use crate::db::init_db;
-        use std::path::Path;
-
-        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE src (id VARCHAR, key VARCHAR, geom GEOMETRY);
-             INSERT INTO src VALUES
-                 ('1', 'a', ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
-                 ('2', NULL, ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'));",
-        )
-        .unwrap();
-
-        let inner = "SELECT id, key, geom FROM src";
-        let filtered_inner = format!(
-            "SELECT id, key, geom FROM src WHERE {}",
-            non_null_key_sql(&["key"])
-        );
-
-        conn.execute_batch(&format!(
-            "CREATE TABLE plain AS {};
-             CREATE TABLE filtered AS {};",
-            hashed_select(inner),
-            hashed_select(&filtered_inner)
-        ))
-        .unwrap();
-
-        let disagreements: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM plain p JOIN filtered f USING (id)
-                 WHERE p._row_hash IS DISTINCT FROM f._row_hash",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            disagreements, 0,
-            "dropping NULL-keyed rows must not change a surviving row's _row_hash"
-        );
-
-        let filtered_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM filtered", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(filtered_count, 1, "the NULL-keyed row must be gone");
     }
 
     #[test]
@@ -1127,61 +1060,6 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    /// Mirrors `filter_oversized_geometry_does_not_change_surviving_row_hashes`:
-    /// deleting duplicate rows runs strictly after `hashed_select` built the
-    /// table, so a surviving row's `_row_hash` must be bit-for-bit identical
-    /// to what it was before the dedup ran -- no `ROW_HASH_VERSION` bump
-    /// needed.
-    #[test]
-    fn deduplicate_by_key_does_not_change_surviving_row_hashes() {
-        use crate::db::init_db;
-        use std::path::Path;
-
-        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE src (id_budynku VARCHAR, wersja INTEGER, geom GEOMETRY);
-             INSERT INTO src VALUES
-                 ('keep', 1, ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
-                 ('dup', 1, ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))')),
-                 ('dup', 2, ST_GeomFromText('POLYGON((0 0, 3 0, 3 3, 0 3, 0 0))'));",
-        )
-        .unwrap();
-
-        let inner = "SELECT id_budynku, wersja, geom FROM src";
-        conn.execute_batch(&format!("CREATE TABLE t AS {}", hashed_select(inner)))
-            .unwrap();
-        conn.execute_batch(
-            "CREATE TABLE hash_before AS SELECT id_budynku, wersja, _row_hash FROM t",
-        )
-        .unwrap();
-
-        let stats =
-            deduplicate_by_key(&conn, "t", &["id_budynku"], "wersja DESC", "id_budynku").unwrap();
-        assert_eq!(stats.skipped_duplicate_key, 1);
-
-        let disagreements: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM hash_before h JOIN t USING (id_budynku, wersja)
-                 WHERE h._row_hash IS DISTINCT FROM t._row_hash",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            disagreements, 0,
-            "deduplication must not change a surviving row's _row_hash"
-        );
-
-        let survivors: i64 = conn
-            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            survivors, 2,
-            "'keep' and the surviving 'dup' row must remain"
-        );
-    }
-
     /// BDOT10k's two-column key: the same `LOKALNYID` under two different
     /// `PRZESTRZENNAZW` values is not a duplicate and must not be collapsed.
     #[test]
@@ -1224,6 +1102,180 @@ mod tests {
         assert_eq!(
             format_skip_clause("null-key", 210080, &[]),
             "skipped 210080 null-key rows"
+        );
+    }
+
+    #[test]
+    fn changed_predicate_sql_single_column_no_geometry() {
+        let spec = DatasetSpec {
+            name: "test",
+            table: "t",
+            key_columns: &["id"],
+            compared_columns: &["rodzaj"],
+            compare_geometry: false,
+            geom_kind: GeomKind::Point,
+        };
+        assert_eq!(
+            spec.changed_predicate_sql("s", "l"),
+            "((s.rodzaj) IS DISTINCT FROM (l.rodzaj))"
+        );
+    }
+
+    #[test]
+    fn changed_predicate_sql_multi_column_with_geometry() {
+        let spec = DatasetSpec {
+            name: "test",
+            table: "t",
+            key_columns: &["id"],
+            compared_columns: &["rodzaj", "kondygnacje_nadziemne", "kondygnacje_podziemne"],
+            compare_geometry: true,
+            geom_kind: GeomKind::Polygon,
+        };
+        assert_eq!(
+            spec.changed_predicate_sql("s", "l"),
+            "((s.rodzaj, s.kondygnacje_nadziemne, s.kondygnacje_podziemne) IS DISTINCT FROM \
+             (l.rodzaj, l.kondygnacje_nadziemne, l.kondygnacje_podziemne) \
+             OR ST_AsWKB(s.geom) IS DISTINCT FROM ST_AsWKB(l.geom))"
+        );
+    }
+
+    /// Silent-regression territory: BDOT10k's geometry churn (100% in the
+    /// 2026-08-10 export) means comparing geometry would rewrite every
+    /// z14 cell in Poland on that kind of refresh. `compare_geometry: false`
+    /// is what prevents that, so pin that the predicate text never mentions
+    /// `geom` -- a future reader "fixing" `compare_geometry` back to `true`
+    /// on the const should fail this test.
+    #[test]
+    fn bdot10k_predicate_does_not_mention_geometry() {
+        assert!(!BDOT10K.changed_predicate_sql("s", "l").contains("geom"));
+    }
+
+    /// PRG's version columns (`wersja_id`, `poczatek_wersji_obiektu`) are
+    /// pure bulk-republication noise -- see the comment on `PRG` -- and must
+    /// never appear in the comparison. Geometry, unlike BDOT10k, IS compared
+    /// for PRG, so the predicate must mention `ST_AsWKB`.
+    #[test]
+    fn prg_predicate_omits_version_columns_and_uses_st_aswkb() {
+        let sql = PRG.changed_predicate_sql("s", "l");
+        assert!(!sql.contains("wersja_id"));
+        assert!(!sql.contains("poczatek_wersji_obiektu"));
+        assert!(sql.contains("ST_AsWKB"));
+    }
+
+    /// `IS DISTINCT FROM` must be NULL-safe on the row-wise tuple form, since
+    /// EGIB depends on it (617,207 records with all three compared
+    /// attributes NULL). Driven through `changed_predicate_sql` on a local
+    /// spec rather than hand-written SQL, so this pins the actual generated
+    /// predicate, not just DuckDB's general behaviour.
+    #[test]
+    fn changed_predicate_sql_is_null_safe() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        let spec = DatasetSpec {
+            name: "test",
+            table: "t",
+            key_columns: &["id"],
+            compared_columns: &["a", "b"],
+            compare_geometry: false,
+            geom_kind: GeomKind::Point,
+        };
+
+        conn.execute_batch(
+            "CREATE TABLE s (id VARCHAR, a INTEGER, b INTEGER);
+             CREATE TABLE l (id VARCHAR, a INTEGER, b INTEGER);
+             INSERT INTO s VALUES ('same', NULL, 1), ('diff', NULL, 1);
+             INSERT INTO l VALUES ('same', NULL, 1), ('diff', 2, 1);",
+        )
+        .unwrap();
+
+        let predicate = spec.changed_predicate_sql("s", "l");
+        let changed: Vec<String> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT s.id FROM s JOIN l USING (id) WHERE {predicate} ORDER BY s.id"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+
+        assert_eq!(
+            changed,
+            vec!["diff".to_string()],
+            "(NULL, 1) vs (NULL, 1) must be NOT distinct, (NULL, 1) vs (2, 1) must be distinct"
+        );
+    }
+
+    /// Geometry participation must be driven by `compare_geometry`,
+    /// exercised through real SQL rather than just string-inspecting the
+    /// predicate: two rows with equal attributes and different geometry
+    /// compare as changed when `compare_geometry: true`, and unchanged when
+    /// `compare_geometry: false`.
+    #[test]
+    fn changed_predicate_sql_geometry_participation_follows_compare_geometry() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        conn.execute_batch(
+            "CREATE TABLE s (id VARCHAR, a INTEGER, geom GEOMETRY);
+             CREATE TABLE l (id VARCHAR, a INTEGER, geom GEOMETRY);
+             INSERT INTO s VALUES
+                 ('moved', 1, ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))'));
+             INSERT INTO l VALUES
+                 ('moved', 1, ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'));",
+        )
+        .unwrap();
+
+        let with_geom = DatasetSpec {
+            name: "test",
+            table: "t",
+            key_columns: &["id"],
+            compared_columns: &["a"],
+            compare_geometry: true,
+            geom_kind: GeomKind::Polygon,
+        };
+        let without_geom = DatasetSpec {
+            compare_geometry: false,
+            ..with_geom
+        };
+
+        let changed_with: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM s JOIN l USING (id) WHERE {}",
+                    with_geom.changed_predicate_sql("s", "l")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            changed_with, 1,
+            "geometry-only change must count as modified when compare_geometry is true"
+        );
+
+        let changed_without: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM s JOIN l USING (id) WHERE {}",
+                    without_geom.changed_predicate_sql("s", "l")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            changed_without, 0,
+            "geometry-only change must be invisible when compare_geometry is false"
         );
     }
 }

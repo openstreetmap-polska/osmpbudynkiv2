@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use duckdb::Connection;
 use tracing::{info, warn};
 
-use crate::dataset::{DatasetSpec, ROW_HASH_VERSION, ROW_HASH_VERSION_KEY};
+use crate::dataset::DatasetSpec;
 use crate::update::changeset::insert_change_areas;
 use crate::update::diff::{self, DiffCounts};
 use crate::utils::format_duration;
@@ -13,12 +13,12 @@ use crate::utils::format_duration;
 const IMPLAUSIBLE_CHURN_FRACTION: f64 = 0.5;
 
 /// Drops every scratch table a refresh creates — the staging table and the
-/// five `diff_*` temp tables — on every exit path, including early returns
+/// three `diff_*` temp tables — on every exit path, including early returns
 /// and errors. DuckDB has no temp-table-per-transaction semantics here, so
 /// this is the only thing standing between a failed refresh and a stale
 /// staging table blocking the next one, and between a *successful* refresh
-/// and its per-ID hash tables (~16M rows for PRG) sitting on the pooled
-/// connection until the next refresh happens to drop them.
+/// and its diff tables sitting on the pooled connection until the next
+/// refresh happens to drop them.
 struct ScratchGuard<'a> {
     conn: &'a Connection,
     staging: String,
@@ -28,8 +28,6 @@ impl Drop for ScratchGuard<'_> {
     fn drop(&mut self) {
         let sql = format!(
             "DROP TABLE IF EXISTS {};
-             DROP TABLE IF EXISTS diff_live_hashes;
-             DROP TABLE IF EXISTS diff_new_hashes;
              DROP TABLE IF EXISTS diff_added;
              DROP TABLE IF EXISTS diff_removed;
              DROP TABLE IF EXISTS diff_modified;",
@@ -45,7 +43,9 @@ impl Drop for ScratchGuard<'_> {
 /// in a single transaction together with the changeset.
 ///
 /// `load` must create the staging table named by `spec.staging_table()`,
-/// including a `_row_hash` column (use `crate::dataset::hashed_select`).
+/// with the SAME column set, IN THE SAME ORDER, as the live table (see
+/// [`check_column_shapes_match`], called below before the diff runs) — the
+/// apply's `INSERT INTO {live} SELECT s.* ...` is positional and arity-strict.
 ///
 /// `is_cancelled` is polled at three points via [`check_cancelled`], all
 /// outside the apply transaction -- see that helper's doc comment for both
@@ -98,7 +98,14 @@ pub fn refresh(
             );
         }
 
-        let hash_version = check_row_hash_version(conn)?;
+        // Replaces the automatic "shape changed, recompare everything"
+        // self-heal that ROW_HASH_VERSION used to provide. Without it, a
+        // loader whose output shape silently changed (a column added,
+        // dropped, or reordered) would fail deep inside the apply's
+        // `INSERT INTO {live} SELECT s.* ...` with an opaque arity/type
+        // error instead of a named one — or, worse, would appear to work if
+        // the accidental new shape happened to still typecheck positionally.
+        check_column_shapes_match(conn, spec)?;
 
         // --- diff ---
         check_cancelled(spec.name, "diff", is_cancelled)?;
@@ -136,8 +143,14 @@ pub fn refresh(
         // called there (see its doc comment for why).
         check_cancelled(spec.name, "apply", is_cancelled)?;
         let t = std::time::Instant::now();
-        let id = spec.id_column;
         let live = spec.table;
+        let keys = spec.key_columns;
+        let key_equalities = keys
+            .iter()
+            .map(|k| format!("{live}.{k} = d.{k}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let keys_using = keys.join(", ");
 
         conn.execute_batch("BEGIN TRANSACTION")
             .context("Failed to begin apply transaction")?;
@@ -165,30 +178,23 @@ pub fn refresh(
             crate::update::changeset::insert_dirty_cells(conn, spec)?;
 
             conn.execute_batch(&format!(
-                "DELETE FROM {live} WHERE {id} IN (
-                     SELECT id FROM diff_removed UNION ALL SELECT id FROM diff_modified);
-                 INSERT INTO {live} SELECT * FROM {staging} WHERE {id} IN (
-                     SELECT id FROM diff_added UNION ALL SELECT id FROM diff_modified);"
+                "DELETE FROM {live} WHERE EXISTS (
+                     SELECT 1 FROM (SELECT * FROM diff_removed UNION ALL SELECT * FROM diff_modified) d
+                     WHERE {key_equalities});
+                 INSERT INTO {live} SELECT s.* FROM {staging} s SEMI JOIN (
+                     SELECT * FROM diff_added UNION ALL SELECT * FROM diff_modified) d
+                     USING ({keys_using});"
             ))
             .with_context(|| format!("Failed to apply delta to {live}"))?;
 
-            // A stale stamp means every ID compared as modified, so the DELETE +
-            // INSERT above just replaced the whole table with staging rows — whose
-            // hashes come from the current expression. Re-stamping here is what
-            // makes the mismatch warning fire once per bump instead of forever.
-            // An unstamped database gets its first stamp the same way. Inside the
-            // transaction, so a refresh that rolls back leaves the stamp alone.
-            if hash_version != RowHashVersion::Current {
-                crate::dataset::stamp_row_hash_version(conn)?;
-            }
-
-            // Unlike the stamp above, this fires on EVERY landed refresh, even a
-            // 0/0/0 diff — a refresh can rewrite raw columns `/tiles` reads
-            // (`centroid`, `rodzaj_kod`) that sit outside the diffed row set, so
-            // "the delta was empty" does not mean "nothing /tiles reads changed".
-            // Inside the transaction, so an aborted refresh (see the `?` above,
-            // which returns before reaching here) cannot claim a bump that never
-            // landed — see `serving_version`'s module doc.
+            // Fires on EVERY landed refresh, even a 0/0/0 diff (no added,
+            // modified or removed keys at all): a refresh can rewrite raw
+            // columns `/tiles` reads (`centroid`, `rodzaj_kod`) that sit
+            // outside `compared_columns`, so "the delta was empty" does not
+            // mean "nothing /tiles reads changed". Inside the transaction, so
+            // an aborted refresh (see the `?` above, which returns before
+            // reaching here) cannot claim a bump that never landed — see
+            // `serving_version`'s module doc.
             crate::serving_version::bump_serving_epoch(conn)?;
 
             conn.execute(
@@ -347,58 +353,61 @@ fn check_cancelled(source: &str, stage: &str, is_cancelled: &dyn Fn() -> bool) -
     bail!("Cancelled before {stage} ({reason})")
 }
 
-/// What `metadata.row_hash_version` says about the live table's `_row_hash`
-/// values, relative to the expression this build would produce.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RowHashVersion {
-    /// Stamped, and the stamp matches. Nothing to do.
-    Current,
-    /// Stamped with a different version: `hashed_select` changed since this
-    /// table was built, so every row will compare as modified.
-    Stale(String),
-    /// No stamp at all — a database imported before stamping existed.
-    Unstamped,
+/// Column names of `table`, in `column_index` order (i.e. declaration
+/// order), via `duckdb_columns()`.
+///
+/// Ordered deliberately, not a set: the apply's `INSERT INTO {live} SELECT
+/// s.* ...` (see [`refresh`]) is positional, so two tables with the same
+/// columns in a different order are just as fatal to it as two tables with
+/// genuinely different columns — see [`check_column_shapes_match`].
+fn ordered_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT column_name FROM duckdb_columns()
+             WHERE table_name = ? ORDER BY column_index",
+        )
+        .with_context(|| format!("Failed to prepare column listing for {table}"))?;
+    let rows = stmt
+        .query_map(duckdb::params![table], |r| r.get::<_, String>(0))
+        .with_context(|| format!("Failed to list columns for {table}"))?;
+    let mut names = Vec::new();
+    for row in rows {
+        names.push(row.with_context(|| format!("Failed to read column name for {table}"))?);
+    }
+    Ok(names)
 }
 
-/// Read the stamp and warn if it is stale. Pure read: re-stamping happens in
-/// the apply transaction (see [`refresh`]), so a refresh that never lands
-/// cannot leave a stamp claiming a rewrite that did not happen.
+/// Bail loudly if `spec.table` (live) and `spec.staging_table()` (staging)
+/// don't have the exact same columns in the exact same order.
 ///
-/// Deliberately narrow scope: [`ROW_HASH_VERSION`] is a constant we bump by
-/// hand when we edit [`crate::dataset::hashed_select`]. It is not derived
-/// from the DuckDB version, so an upgrade that silently changed `hash()`
-/// output would NOT be caught here. That costs no correctness — the refresh
-/// would simply be a full rewrite — only the explanatory warning.
-fn check_row_hash_version(conn: &Connection) -> Result<RowHashVersion> {
-    // `.optional()` turns `QueryReturnedNoRows` (nothing stored yet) into
-    // `Ok(None)` while still propagating any genuine query error (e.g. the
-    // `metadata` table itself is missing) — `.ok()` would have silently
-    // swallowed both cases alike.
-    use duckdb::OptionalExt;
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = ?",
-            duckdb::params![ROW_HASH_VERSION_KEY],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("Failed to read row hash version from metadata")?;
-
-    Ok(match stored {
-        Some(v) if v == ROW_HASH_VERSION.to_string() => RowHashVersion::Current,
-        Some(v) => {
-            warn!(
-                stored = %v,
-                expected = ROW_HASH_VERSION,
-                "row hash version mismatch — the row-hash expression changed since this \
-                 table was built, so every row compares as modified and this refresh is \
-                 effectively a full rewrite. It re-stamps the version on success, so this \
-                 warning should not appear again."
-            );
-            RowHashVersion::Stale(v)
-        }
-        None => RowHashVersion::Unstamped,
-    })
+/// This is what replaces the automatic "shape changed, recompare everything"
+/// self-heal `ROW_HASH_VERSION` used to provide. There is no row-hash
+/// expression left to version, so a loader whose output shape silently
+/// changed (a column added, dropped, renamed, or reordered) previously would
+/// either be papered over — the old version-mismatch path forced a full
+/// rewrite that happened to fix the shape mismatch too, as a side effect —
+/// or, with that gone, fail deep inside the apply's `INSERT INTO {live}
+/// SELECT s.* ...` with an opaque arity/type error that does not name the
+/// actual cause. This check turns that into one loud, named failure instead,
+/// strictly better than either of the old outcomes.
+///
+/// Called once, early in [`refresh`], after the staging table exists and the
+/// empty-snapshot guard has passed, but before the diff runs — there is no
+/// point diffing two tables whose shapes have already diverged.
+fn check_column_shapes_match(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
+    let live_cols = ordered_column_names(conn, spec.table)?;
+    let staging_cols = ordered_column_names(conn, &spec.staging_table())?;
+    if live_cols != staging_cols {
+        bail!(
+            "{}: staging and live column sets differ (live: [{}], staging: [{}]) — \
+             the loader's output shape changed. Re-run `import {}` to rebuild the live table.",
+            spec.name,
+            live_cols.join(", "),
+            staging_cols.join(", "),
+            spec.name,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -411,7 +420,9 @@ mod tests {
     const TEST_SPEC: DatasetSpec = DatasetSpec {
         name: "test",
         table: "live",
-        id_column: "id",
+        key_columns: &["id"],
+        compared_columns: &["a"],
+        compare_geometry: true,
         geom_kind: GeomKind::Point,
     };
 
@@ -424,11 +435,8 @@ mod tests {
         ];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         let inner = format!("SELECT id, a, ST_Point(lon, lat) AS geom FROM ({rows})");
-        conn.execute_batch(&format!(
-            "CREATE TABLE live AS {};",
-            crate::dataset::hashed_select(&inner)
-        ))
-        .unwrap();
+        conn.execute_batch(&format!("CREATE TABLE live AS {inner};"))
+            .unwrap();
         conn
     }
 
@@ -438,10 +446,7 @@ mod tests {
     ) -> impl FnOnce(&Connection, &str) -> Result<crate::dataset::LoadStats> {
         move |conn: &Connection, target: &str| {
             let inner = format!("SELECT id, a, ST_Point(lon, lat) AS geom FROM ({rows})");
-            conn.execute_batch(&format!(
-                "CREATE TABLE {target} AS {};",
-                crate::dataset::hashed_select(&inner)
-            ))?;
+            conn.execute_batch(&format!("CREATE TABLE {target} AS {inner};"))?;
             Ok(crate::dataset::LoadStats::default())
         }
     }
@@ -459,10 +464,7 @@ mod tests {
         let loader_with_stats = |rows: &'static str, stats: crate::dataset::LoadStats| {
             move |conn: &Connection, target: &str| -> Result<crate::dataset::LoadStats> {
                 let inner = format!("SELECT id, a, ST_Point(lon, lat) AS geom FROM ({rows})");
-                conn.execute_batch(&format!(
-                    "CREATE TABLE {target} AS {};",
-                    crate::dataset::hashed_select(&inner)
-                ))?;
+                conn.execute_batch(&format!("CREATE TABLE {target} AS {inner};"))?;
                 Ok(stats)
             }
         };
@@ -507,10 +509,7 @@ mod tests {
         let loader_with_stats = |rows: &'static str, stats: crate::dataset::LoadStats| {
             move |conn: &Connection, target: &str| -> Result<crate::dataset::LoadStats> {
                 let inner = format!("SELECT id, a, ST_Point(lon, lat) AS geom FROM ({rows})");
-                conn.execute_batch(&format!(
-                    "CREATE TABLE {target} AS {};",
-                    crate::dataset::hashed_select(&inner)
-                ))?;
+                conn.execute_batch(&format!("CREATE TABLE {target} AS {inner};"))?;
                 Ok(stats)
             }
         };
@@ -731,21 +730,14 @@ mod tests {
         assert!(!staging_exists(&conn), "staging left behind after failure");
     }
 
-    /// The per-ID hash tables are the largest thing a refresh materializes
-    /// (one row per ID, ~16M for PRG). They must not outlive the refresh on
-    /// the pooled connection, waiting for the *next* refresh to drop them.
+    /// The diff temp tables must not outlive the refresh on the pooled
+    /// connection, waiting for the *next* refresh to drop them.
     #[test]
     fn diff_temp_tables_do_not_outlive_the_refresh() {
         let conn = conn_with_live(LIVE_ROWS);
         refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
 
-        for t in [
-            "diff_live_hashes",
-            "diff_new_hashes",
-            "diff_added",
-            "diff_removed",
-            "diff_modified",
-        ] {
+        for t in ["diff_added", "diff_removed", "diff_modified"] {
             assert!(!table_exists(&conn, t), "{t} left behind after success");
         }
     }
@@ -926,163 +918,133 @@ mod tests {
     }
 
     /// A bare connection with the schema (including `metadata`) but no
-    /// `live`/`staging` tables — enough for `check_row_hash_version` alone.
+    /// `live`/`staging` tables.
     fn bare_conn() -> Connection {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         init_db(Path::new(":memory:"), &init, None).unwrap()
     }
 
-    #[test]
-    fn check_row_hash_version_matches_is_a_noop() {
-        let conn = bare_conn();
-        conn.execute(
-            "INSERT INTO metadata VALUES (?, ?)",
-            duckdb::params![ROW_HASH_VERSION_KEY, ROW_HASH_VERSION.to_string()],
-        )
-        .unwrap();
-
-        assert_eq!(
-            check_row_hash_version(&conn).unwrap(),
-            RowHashVersion::Current
-        );
-
-        let value: String = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key = ?",
-                duckdb::params![ROW_HASH_VERSION_KEY],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(value, ROW_HASH_VERSION.to_string());
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM metadata", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 1, "must not insert a duplicate row");
-    }
-
-    /// A version mismatch must warn, not error, and must not re-stamp on its
-    /// own — the stamp is only earned by an apply that actually lands.
-    #[test]
-    fn check_row_hash_version_mismatch_warns_but_does_not_block() {
-        let conn = bare_conn();
-        conn.execute(
-            "INSERT INTO metadata VALUES (?, ?)",
-            duckdb::params![ROW_HASH_VERSION_KEY, "999"],
-        )
-        .unwrap();
-
-        assert_eq!(
-            check_row_hash_version(&conn).unwrap(),
-            RowHashVersion::Stale("999".to_string())
-        );
-
-        let value: String = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key = ?",
-                duckdb::params![ROW_HASH_VERSION_KEY],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            value, "999",
-            "the check itself must not overwrite the stored version"
-        );
-    }
+    // --- column-shape guard ----------------------------------------------
+    //
+    // Replaces the ROW_HASH_VERSION self-heal: with no row-hash expression
+    // left to version, a loader whose output shape silently changed would
+    // otherwise fail deep inside the apply's `INSERT INTO {live} SELECT
+    // s.* ...` with an opaque arity/type error. These pin the loud, named
+    // failure instead.
 
     #[test]
-    fn check_row_hash_version_reports_unstamped_without_writing() {
-        let conn = bare_conn();
-
-        assert_eq!(
-            check_row_hash_version(&conn).unwrap(),
-            RowHashVersion::Unstamped
-        );
-
-        let rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM metadata WHERE key = ?",
-                duckdb::params![ROW_HASH_VERSION_KEY],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            rows, 0,
-            "the check must not stamp; only a landed apply does"
-        );
-    }
-
-    /// The self-heal: a stale stamp means the refresh rewrote every row with
-    /// the current expression, so it must re-stamp. Otherwise the warning
-    /// fires forever and the advice it prints ("re-run the import") cannot
-    /// clear it either.
-    #[test]
-    fn stale_version_is_restamped_after_a_successful_refresh() {
+    fn matching_column_shapes_proceed() {
         let conn = conn_with_live(LIVE_ROWS);
-        conn.execute(
-            "INSERT INTO metadata VALUES (?, ?)",
-            duckdb::params![ROW_HASH_VERSION_KEY, "999"],
-        )
-        .unwrap();
-
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
-
+        let counts = refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
         assert_eq!(
-            check_row_hash_version(&conn).unwrap(),
-            RowHashVersion::Current,
-            "a second refresh must not warn again"
+            counts,
+            DiffCounts {
+                added: 1,
+                modified: 1,
+                removed: 1
+            }
         );
-        let rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM metadata WHERE key = ?",
-                duckdb::params![ROW_HASH_VERSION_KEY],
-                |r| r.get(0),
-            )
+    }
+
+    /// Staging with an extra column (beyond what `live` has) must bail
+    /// rather than silently succeed or fail with an opaque arity error deep
+    /// inside the apply's positional `INSERT ... SELECT s.*`.
+    #[test]
+    fn extra_staging_column_bails_with_a_named_error() {
+        let conn = conn_with_live(LIVE_ROWS);
+        let bad_loader = |conn: &Connection, target: &str| -> Result<crate::dataset::LoadStats> {
+            conn.execute_batch(&format!(
+                "CREATE TABLE {target} AS
+                 SELECT id, a, ST_Point(lon, lat) AS geom, 'extra' AS surprise
+                 FROM (VALUES ('keep','v1',21.0,52.0)) t(id,a,lon,lat)"
+            ))?;
+            Ok(crate::dataset::LoadStats::default())
+        };
+
+        let err = refresh(&conn, &TEST_SPEC, bad_loader, None, &|| false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("test"), "error should name the source: {msg}");
+        assert!(
+            msg.contains("column"),
+            "error should mention the column mismatch: {msg}"
+        );
+
+        let live_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM live", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(rows, 1, "re-stamping must replace, not duplicate");
+        assert_eq!(live_rows, 3, "live table must be untouched");
     }
 
+    /// Same columns, different order — the apply is positional
+    /// (`INSERT INTO {live} SELECT s.* ...`), so a reorder is just as fatal
+    /// as an added/removed column and must bail the same way.
     #[test]
-    fn unstamped_database_is_stamped_after_a_successful_refresh() {
+    fn reordered_staging_columns_bail_with_a_named_error() {
         let conn = conn_with_live(LIVE_ROWS);
-        refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
+        // `live`'s column order is (id, a, geom); this staging table has the
+        // same three columns, reordered to (a, id, geom).
+        let bad_loader = |conn: &Connection, target: &str| -> Result<crate::dataset::LoadStats> {
+            conn.execute_batch(&format!(
+                "CREATE TABLE {target} AS
+                 SELECT a, id, ST_Point(lon, lat) AS geom
+                 FROM (VALUES ('keep','v1',21.0,52.0)) t(id,a,lon,lat)"
+            ))?;
+            Ok(crate::dataset::LoadStats::default())
+        };
 
-        assert_eq!(
-            check_row_hash_version(&conn).unwrap(),
-            RowHashVersion::Current
-        );
+        let err = refresh(&conn, &TEST_SPEC, bad_loader, None, &|| false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("test"), "error should name the source: {msg}");
+
+        let live_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live_rows, 3, "live table must be untouched");
     }
 
-    /// The stamp claims "the live table was rebuilt with this expression". A
-    /// refresh that aborts rebuilds nothing, so it must leave the old stamp
-    /// in place — otherwise the next run would silently skip the warning for
-    /// a table whose hashes are still stale.
+    /// Empirical check for the apply's `INSERT INTO {live} SELECT s.* FROM
+    /// {staging} s SEMI JOIN (...) d USING ({keys})`: a `SEMI JOIN ...
+    /// USING (...)` must still project every column of `s`, including the
+    /// key columns themselves, not just the non-key columns -- confirmed by
+    /// asserting both the row count AND every column's content, not merely
+    /// that the query runs.
     #[test]
-    fn aborted_refresh_does_not_restamp() {
-        let conn = conn_with_live(LIVE_ROWS);
-        conn.execute(
-            "INSERT INTO metadata VALUES (?, ?)",
-            duckdb::params![ROW_HASH_VERSION_KEY, "999"],
+    fn select_star_semi_join_using_projects_every_staging_column() {
+        let conn = bare_conn();
+        conn.execute_batch(
+            "CREATE TABLE s (k1 VARCHAR, k2 VARCHAR, val VARCHAR);
+             INSERT INTO s VALUES ('a','x','v1'), ('b','y','v2'), ('c','z','v3');
+             CREATE TEMP TABLE d AS SELECT * FROM (VALUES ('a','x'), ('c','z')) t(k1,k2);",
         )
         .unwrap();
 
-        let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
-        refresh(&conn, &TEST_SPEC, loader(empty), None, &|| false).unwrap_err();
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT s.* FROM s SEMI JOIN d USING (k1, k2) ORDER BY k1")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
 
         assert_eq!(
-            check_row_hash_version(&conn).unwrap(),
-            RowHashVersion::Stale("999".to_string()),
-            "an aborted refresh must not claim the rewrite happened"
+            rows,
+            vec![
+                ("a".to_string(), "x".to_string(), "v1".to_string()),
+                ("c".to_string(), "z".to_string(), "v3".to_string()),
+            ],
+            "SEMI JOIN ... USING must project the key columns AND every other \
+             staging column, not merge or drop any of them"
         );
     }
 
     // --- serving_version bump -------------------------------------------
     //
-    // Mirrors the `stamp_row_hash_version` twins above, but for
-    // `serving_version::bump_serving_epoch`: unlike the stamp, the bump is
-    // unconditional on every LANDED refresh (see the comment beside its call
-    // site in `refresh`, above) -- these three tests pin "landed" (bumps),
-    // "aborted" (does not) and "never attempted" (does not) as the three
-    // cases that matter.
+    // The bump is unconditional on every LANDED refresh (see the comment
+    // beside its call site in `refresh`, above) -- these three tests pin
+    // "landed" (bumps), "aborted" (does not) and "never attempted" (does
+    // not) as the three cases that matter.
 
     /// The 0/0/0-diff case (`LIVE_ROWS` staged against itself, so nothing
     /// changed) still counts as a landed refresh and must still bump --
@@ -1129,22 +1091,6 @@ mod tests {
         assert_eq!(
             crate::serving_version::read_serving_epoch(&conn).unwrap(),
             0
-        );
-    }
-
-    /// `.ok()` would have silently swallowed a genuine query failure (not
-    /// just "no row yet") as if the version had never been recorded. Drop
-    /// `metadata` entirely so the query fails for a real reason, and confirm
-    /// the error propagates instead of being treated as first-run.
-    #[test]
-    fn check_row_hash_version_propagates_genuine_query_errors() {
-        let conn = bare_conn();
-        conn.execute_batch("DROP TABLE metadata").unwrap();
-
-        let err = check_row_hash_version(&conn).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("row hash version"),
-            "error should mention row hash version, got: {err:#}"
         );
     }
 

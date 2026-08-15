@@ -9,7 +9,8 @@
 //! `docs/superpowers/specs/2026-08-03-building-type-mappings-design.md`,
 //! "One new source-table column"). Living here rather than inline in
 //! `import::egib` keeps the cascade in exactly one place, the way
-//! `dataset::hashed_select` is the one place the row-hash expression lives.
+//! `DatasetSpec::changed_predicate_sql` is the one place the comparison
+//! lives.
 
 /// SQL `CASE` expression resolving `rodzaj` to a single KŚT letter, or NULL
 /// when unresolved (an expected outcome for this source -- the cascade is
@@ -50,8 +51,22 @@ END";
 /// Wrap `select_sql` (typically the output of
 /// `DatasetSpec::with_centroid_select`) so it also gains a `rodzaj_kod
 /// VARCHAR` column. Added OUTSIDE `hashed_select`'s projection, the same way
-/// `centroid` is (see `DatasetSpec::with_centroid_select`), so it never
-/// affects `_row_hash` and needs no `ROW_HASH_VERSION` bump.
+/// `centroid` is (see `DatasetSpec::with_centroid_select`) -- but the reason
+/// it's safe to do so has changed. It's not that the column sits outside a
+/// hash expression; it's that `rodzaj_kod` is simply not one of the names in
+/// `EGIB.compared_columns`, so it cannot affect what `changed_predicate_sql`
+/// sees.
+///
+/// That has a consequence the old row-hash story didn't: because it's
+/// outside the compared set, `rodzaj_kod` on an *unmodified* record never
+/// self-heals. It is recomputed fresh for every row a refresh *stages*, so a
+/// record that gets rewritten for some other reason (its `WERSJA` bumped, an
+/// attribute changed) picks up a corrected expression for free -- but a
+/// record the diff never touches keeps whatever `rodzaj_kod` its last import
+/// or full rewrite gave it, forever. `ROW_HASH_VERSION` used to force a
+/// full-table rewrite on every bump, which fixed this as a side effect;
+/// nothing does that any more. Editing `RODZAJ_KOD_CASE_SQL` therefore
+/// requires a re-import (`import egib`), not a refresh, to reach every row.
 pub fn with_rodzaj_kod_select(select_sql: &str) -> String {
     format!("SELECT *, ({RODZAJ_KOD_CASE_SQL}) AS rodzaj_kod FROM ({select_sql}) t")
 }
@@ -124,33 +139,50 @@ mod tests {
         }
     }
 
-    /// `with_rodzaj_kod_select` must not disturb the row hash: it wraps
-    /// `hashed_select`'s output rather than feeding into it, the same
-    /// invariant `dataset::with_centroid_select` carries -- see
-    /// `dataset::tests::with_centroid_select_does_not_change_the_row_hash`.
+    /// `with_rodzaj_kod_select` must not disturb what the diff compares: it
+    /// adds a derived `rodzaj_kod` column that sits outside
+    /// `EGIB.compared_columns`, so joining a wrapped and an unwrapped table
+    /// on the key and running `EGIB.changed_predicate_sql` over them must
+    /// report zero differing rows -- the same invariant
+    /// `dataset::with_centroid_select` carries for `centroid`, now pinned
+    /// against the diff predicate instead of a `_row_hash` column that no
+    /// longer exists.
     #[test]
-    fn does_not_change_the_row_hash() {
+    fn does_not_change_what_the_diff_compares() {
         let c = conn();
-        c.execute_batch("CREATE TABLE src (id VARCHAR, rodzaj VARCHAR); INSERT INTO src VALUES ('1','m'), ('2', NULL);")
-            .unwrap();
-        let inner = "SELECT id, rodzaj FROM src";
-        let hashed = crate::dataset::hashed_select(inner);
-        let with_rodzaj = with_rodzaj_kod_select(&hashed);
+        c.execute_batch(
+            "CREATE TABLE src (
+                 id_budynku VARCHAR,
+                 rodzaj VARCHAR,
+                 kondygnacje_nadziemne INTEGER,
+                 kondygnacje_podziemne INTEGER,
+                 geom GEOMETRY
+             );
+             INSERT INTO src VALUES
+                 ('1', 'm', 2, 1, ST_Point(19.0, 50.0)),
+                 ('2', NULL, NULL, NULL, ST_Point(19.1, 50.1));",
+        )
+        .unwrap();
+        let inner = "SELECT id_budynku, rodzaj, kondygnacje_nadziemne, kondygnacje_podziemne, geom FROM src";
+        let with_rodzaj = with_rodzaj_kod_select(inner);
 
         c.execute_batch(&format!(
-            "CREATE TABLE plain AS {hashed};
+            "CREATE TABLE plain AS {inner};
              CREATE TABLE with_rodzaj AS {with_rodzaj};"
         ))
         .unwrap();
 
-        let disagreements: i64 = c
+        let differing: i64 = c
             .query_row(
-                "SELECT COUNT(*) FROM plain p JOIN with_rodzaj w USING (id)
-                 WHERE p._row_hash IS DISTINCT FROM w._row_hash",
+                &format!(
+                    "SELECT COUNT(*) FROM plain p JOIN with_rodzaj w USING (id_budynku)
+                     WHERE {}",
+                    crate::dataset::EGIB.changed_predicate_sql("p", "w")
+                ),
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(disagreements, 0);
+        assert_eq!(differing, 0);
     }
 }

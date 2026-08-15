@@ -360,17 +360,29 @@ mod drain_refresh_concurrency {
 
     use crate::compare::drain::drain_batch;
     use crate::compare::reconcile::enqueue_all;
-    use crate::dataset::{BDOT10K, hashed_select};
+    use crate::dataset::BDOT10K;
     use crate::db::init_db;
     use crate::update::dataset::refresh;
 
     /// `n` buildings, one per z14 cell (cells are ~0.022 deg wide at this
-    /// latitude, so a 0.03 deg stride guarantees distinct cells), with `tag`
-    /// woven into the id-independent column so a re-stage produces a
-    /// whole-row-hash change on every row.
+    /// latitude, so a 0.03 deg stride guarantees distinct cells).
+    ///
+    /// `tag` is woven into `wersja`, not chosen arbitrarily: `WERSJA` is one
+    /// of `BDOT10K.compared_columns`, and DuckDB identifiers are
+    /// case-insensitive, so this lowercase fixture column matches that
+    /// uppercase entry. That is what makes a re-stage with a different `tag`
+    /// produce a real change under `changed_predicate_sql` on every row --
+    /// it works for this specific reason, not incidentally, so renaming this
+    /// column would silently turn these tests into no-ops.
+    ///
+    /// `PRZESTRZENNAZW` is part of BDOT10k's composite key
+    /// (`(PRZESTRZENNAZW, LOKALNYID)`) but held constant across all rows,
+    /// mirroring production -- the real column has only 16 distinct values
+    /// nationally. `LOKALNYID` stays the per-row-varying half of the key.
     fn rows_sql(n: i64, tag: &str) -> String {
         format!(
-            "SELECT 'b' || i AS LOKALNYID,
+            "SELECT '04' AS PRZESTRZENNAZW,
+                    'b' || i AS LOKALNYID,
                     '{tag}' AS wersja,
                     ST_MakeEnvelope(20.0 + i * 0.03, 52.0,
                                     20.0 + i * 0.03 + 0.002, 52.002) AS geom,
@@ -414,7 +426,7 @@ mod drain_refresh_concurrency {
                  lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
                  miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
                  wazny_od_lub_data_nadania DATE, geom GEOMETRY);",
-            BDOT10K.with_centroid_select(&hashed_select(&rows_sql(n, "v1")))
+            BDOT10K.with_centroid_select(&rows_sql(n, "v1"))
         ))
         .unwrap();
         // Match roughly every third building, so the serving table is neither
@@ -479,7 +491,7 @@ mod drain_refresh_concurrency {
                 move |c: &Connection, target: &str| {
                     c.execute_batch(&format!(
                         "CREATE TABLE {target} AS {}",
-                        BDOT10K.with_centroid_select(&hashed_select(&rows))
+                        BDOT10K.with_centroid_select(&rows)
                     ))?;
                     Ok(crate::dataset::LoadStats::default())
                 },

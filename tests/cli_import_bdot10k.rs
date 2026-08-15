@@ -82,8 +82,19 @@ fn test_import_bdot10k_missing_file() {
         .failure();
 }
 
+/// Reads the live table back through a direct `duckdb::Connection` (rather
+/// than trusting the CLI's own stdout `count=` line, which
+/// `test_import_bdot10k_from_fixture` above already pins) to confirm the
+/// import actually persisted the expected row count to
+/// `bdot10k_buildings`. This used to also assert a non-NULL `_row_hash` on
+/// every row and a `metadata.row_hash_version` stamp; both are gone along
+/// with the whole-row-hash diff mechanism (see
+/// `docs/superpowers/plans/2026-08-14-key-based-diff.md`) and have no
+/// replacement to assert here — the file-backed-database setup is kept
+/// because `test_import_bdot10k_bumps_serving_epoch` below relies on the
+/// same technique and refers back to this test by name.
 #[test]
-fn test_import_bdot10k_writes_row_hash() {
+fn test_import_bdot10k_persists_expected_row_count() {
     let db = tempfile::TempDir::new().unwrap();
     let rocksdb_dir = tempfile::TempDir::new().unwrap();
     let db_path = db.path().join("test.duckdb");
@@ -112,38 +123,21 @@ fn test_import_bdot10k_writes_row_hash() {
     let conn = duckdb::Connection::open(&db_path).unwrap();
     conn.execute_batch("INSTALL spatial; LOAD spatial;")
         .unwrap();
-    let (total, null_hashes): (i64, i64) = conn
-        .query_row(
-            "SELECT COUNT(*), COUNT(*) FILTER (WHERE _row_hash IS NULL) FROM bdot10k_buildings",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM bdot10k_buildings", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(total, 74);
-    assert_eq!(null_hashes, 0, "every row must carry a hash");
-
-    // The import must also stamp the version those hashes were built with.
-    // Without it, a later `update` cannot tell "these hashes are comparable"
-    // from "the expression changed underneath them".
-    let stamp: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'row_hash_version'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("import must stamp row_hash_version");
-    // Tracks `dataset::ROW_HASH_VERSION` by hand — this is an integration test
-    // against the binary, so the constant isn't importable. Bump both together.
-    assert_eq!(stamp, "2");
 }
 
 /// An import rewrites `bdot10k_buildings` wholesale, including the
 /// `centroid` column `/tiles`' adjacency CTE reads with no per-cell version
 /// covering it -- see `serving_version`'s module doc. The import dispatch
-/// must bump `metadata.serving_epoch` alongside `row_hash_version`. Uses a
-/// file-backed database (like `test_import_bdot10k_writes_row_hash` above,
-/// not `memory_config()`) so the state can be read back after the CLI
-/// process exits.
+/// must bump `metadata.serving_epoch`. Uses a file-backed database (like
+/// `test_import_bdot10k_persists_expected_row_count` above, not
+/// `memory_config()`) so the state can be read back after the CLI process
+/// exits.
 #[test]
 fn test_import_bdot10k_bumps_serving_epoch() {
     let db = tempfile::TempDir::new().unwrap();
