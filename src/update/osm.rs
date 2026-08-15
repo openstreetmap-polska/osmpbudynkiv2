@@ -23,6 +23,13 @@ use crate::osm::replication::{
 use crate::osm::{encoding, kvstore};
 use crate::update::dirty_cells::{DirtyCells, Layer};
 
+/// `job_run_log` key this function reports under (see `Job::log_keys` on
+/// `server::jobs::osm_update::OsmUpdateJob`). Self-reported here rather than
+/// by the job wrapper, same as `import::osm::import` reports "import:osm"
+/// itself -- this function is also reachable straight from the CLI
+/// (`update::run`'s `Osm` arm), not just through the background job.
+pub const OSM_UPDATE_JOB_LOG_KEY: &str = "update:osm";
+
 /// Apply pending OSM replication sequences.
 ///
 /// `show_progress` gates a single overall progress bar covering the whole
@@ -66,6 +73,12 @@ pub fn update(
 
     if current_seq >= latest_seq {
         info!("Database is up to date");
+        let _ = crate::job_log::record(
+            conn,
+            OSM_UPDATE_JOB_LOG_KEY,
+            "Success",
+            Some(&format!("already up to date at sequence {current_seq}")),
+        );
         return Ok(());
     }
 
@@ -124,7 +137,7 @@ pub fn update(
     // below always runs exactly once on the way out. A `Drop` guard would
     // work too, but would need to reach back into `pb`/`stop` from a
     // separate type; a closure keeps everything in this function's scope.
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<u64> {
         let mut seq = current_seq + 1;
         let mut applied_so_far: u64 = 0;
         let mut last_logged_bucket: u64 = 0;
@@ -135,7 +148,7 @@ pub fn update(
                 if let Some(pb) = &pb {
                     pb.abandon_with_message("Shutdown requested");
                 }
-                return Ok(());
+                return Ok(applied_so_far);
             }
 
             // Polled between batches only -- see the doc comment above for
@@ -146,7 +159,7 @@ pub fn update(
                 if let Some(pb) = &pb {
                     pb.abandon_with_message("Cancellation requested");
                 }
-                return Ok(());
+                return Ok(applied_so_far);
             }
 
             let batch_end = (seq + chunk_size as u64 - 1).min(latest_seq);
@@ -199,7 +212,7 @@ pub fn update(
             pb.finish_with_message("OSM update complete");
         }
         info!(final_seq = latest_seq, "OSM update complete");
-        Ok(())
+        Ok(applied_so_far)
     })();
 
     stop.store(true, Ordering::SeqCst);
@@ -209,7 +222,35 @@ pub fn update(
         let _ = handle.join();
     }
 
-    result
+    match &result {
+        Ok(applied) => {
+            // `applied < pending` means a shutdown/cancellation `return`
+            // above cut the loop short -- still "Success" (see this
+            // function's doc comment on why that return is `Ok`, not
+            // `Err`: the metadata stamp only advances per committed batch,
+            // so this is real, resumable progress), but the message says so
+            // rather than implying every pending sequence landed.
+            let msg = if *applied < pending {
+                format!(
+                    "applied {applied} of {pending} pending sequences (stopped early), now at sequence {}",
+                    current_seq + applied
+                )
+            } else {
+                format!("applied {applied} sequences, now at sequence {latest_seq}")
+            };
+            let _ = crate::job_log::record(conn, OSM_UPDATE_JOB_LOG_KEY, "Success", Some(&msg));
+        }
+        Err(e) => {
+            let _ = crate::job_log::record(
+                conn,
+                OSM_UPDATE_JOB_LOG_KEY,
+                "Error",
+                Some(&format!("{e:#}")),
+            );
+        }
+    }
+
+    result.map(|_| ())
 }
 
 /// Batch size for one DuckDB transaction during catch-up.
@@ -2580,6 +2621,64 @@ mod tests {
         assert_eq!(
             seq, 1000,
             "cancellation before the first sequence must leave the stamp unchanged"
+        );
+
+        // Still a Success row, with a message distinguishing "stopped early"
+        // from "actually caught up" -- see `OSM_UPDATE_JOB_LOG_KEY`'s doc
+        // comment for why this is Success rather than Error.
+        let log = crate::job_log::read_all(&conn).unwrap();
+        let entry = &log[OSM_UPDATE_JOB_LOG_KEY];
+        assert_eq!(entry.outcome, "Success");
+        assert_eq!(
+            entry.message.as_deref(),
+            Some("applied 0 of 1 pending sequences (stopped early), now at sequence 1000")
+        );
+
+        Ok(())
+    }
+
+    /// When the local stamp already matches (or exceeds) the remote's latest
+    /// sequence, `update()` returns before the catch-up loop even builds --
+    /// this pins that the early return still writes a job_run_log row rather
+    /// than leaving `/status` showing whatever the previous run left behind.
+    #[test]
+    fn update_logs_already_up_to_date() -> Result<()> {
+        let (conn, kv, _kv_dir) = setup_test_db_and_kv()?;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                // Same stamp `setup_test_db_and_kv` leaves in `metadata`
+                // (see the sibling cancellation test above) -- current == latest.
+                let body = "sequenceNumber=1000\ntimestamp=2024-01-01T00\\:00\\:00Z\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let base_url = format!("http://{addr}");
+
+        let download_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            download_dir: Some(download_dir.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+
+        update(&conn, &kv, &config, &base_url, false, &|| false)?;
+
+        let log = crate::job_log::read_all(&conn).unwrap();
+        let entry = &log[OSM_UPDATE_JOB_LOG_KEY];
+        assert_eq!(entry.outcome, "Success");
+        assert_eq!(
+            entry.message.as_deref(),
+            Some("already up to date at sequence 1000")
         );
 
         Ok(())

@@ -5,11 +5,18 @@ use anyhow::{Context, Result};
 
 use crate::server::jobs::{Job, JobContext};
 
+/// `job_run_log` key this job reports under (see `Job::log_keys`).
+const JOB_LOG_KEY: &str = "export_log_prune";
+
 pub struct ExportLogPruneJob;
 
 impl Job for ExportLogPruneJob {
     fn name(&self) -> &'static str {
         "export_log_prune"
+    }
+
+    fn log_keys(&self) -> &'static [&'static str] {
+        &[JOB_LOG_KEY]
     }
 
     fn run(&self, ctx: &JobContext) -> Result<()> {
@@ -18,13 +25,31 @@ impl Job for ExportLogPruneJob {
             .get()
             .context("failed to acquire pool connection")?;
         let days = ctx.config.jobs.export_log_prune.retention_days;
-        conn.execute(
+        let outcome = conn.execute(
             &format!(
                 "DELETE FROM package_exports WHERE exported_at < (now() - INTERVAL '{days} days')"
             ),
             [],
-        )?;
-        Ok(())
+        );
+
+        match &outcome {
+            Ok(deleted) => {
+                let _ = crate::job_log::record(
+                    &conn,
+                    JOB_LOG_KEY,
+                    "Success",
+                    Some(&format!("pruned {deleted} rows older than {days} days")),
+                );
+            }
+            Err(e) => {
+                let _ =
+                    crate::job_log::record(&conn, JOB_LOG_KEY, "Error", Some(&format!("{e:#}")));
+            }
+        }
+
+        outcome
+            .map(|_| ())
+            .context("Failed to prune package_exports")
     }
 }
 
@@ -90,6 +115,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining_count, 2, "the 10-day-old row must survive");
+
+        let log = crate::job_log::read_all(&conn).unwrap();
+        assert_eq!(log[JOB_LOG_KEY].outcome, "Success");
+        assert_eq!(
+            log[JOB_LOG_KEY].message.as_deref(),
+            Some("pruned 1 rows older than 365 days")
+        );
     }
 
     #[test]
@@ -112,5 +144,14 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM package_exports", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+
+        // A no-op run still writes a job_run_log row -- 0 pruned is a fact
+        // worth showing in /status, not silence indistinguishable from "this
+        // job never ran".
+        let log = crate::job_log::read_all(&conn).unwrap();
+        assert_eq!(
+            log[JOB_LOG_KEY].message.as_deref(),
+            Some("pruned 0 rows older than 365 days")
+        );
     }
 }

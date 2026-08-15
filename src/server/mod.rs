@@ -513,6 +513,7 @@ mod tests {
             last_outcome: Some(JobOutcome::Success),
             next_run_at: Some("2026-05-28T12:01:03Z".to_string()),
             run_count: 7,
+            log_keys: Vec::new(),
         };
         let dir = tempfile::tempdir().unwrap();
         let app = build_router(make_test_state(vec![preset], dir.path()));

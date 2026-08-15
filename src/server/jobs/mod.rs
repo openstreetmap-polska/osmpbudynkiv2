@@ -62,6 +62,19 @@ pub trait Job: Send + Sync + 'static {
     /// The actual work. Runs inside `spawn_blocking`. Must be sync. Should
     /// honor `ctx.is_cancelled()` periodically when reasonable.
     fn run(&self, ctx: &JobContext) -> Result<()>;
+
+    /// `job_run_log` keys this job's runs are recorded under (see
+    /// `crate::job_log`), for `/status` to join `jobs[]` against
+    /// `job_run_log` and show the last recorded message alongside the
+    /// registry's own state. Empty for jobs that never call
+    /// `job_log::record` (e.g. `match_refresh`) -- their `JobOutcome`
+    /// already carries an error message when relevant, and there is no
+    /// richer summary to join in. A job can report under more than one key
+    /// (`building_types_update` refreshes bdot10k and egib independently,
+    /// each with its own `job_run_log` row).
+    fn log_keys(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -93,6 +106,9 @@ pub struct JobStatus {
     pub last_outcome: Option<JobOutcome>,
     pub next_run_at: Option<String>,
     pub run_count: u64,
+    /// See `Job::log_keys`. Copied in at registration time since it's fixed
+    /// per job, not per run.
+    pub log_keys: Vec<&'static str>,
 }
 
 /// In-memory registry shared between supervisors and the `/status` handler.
@@ -191,6 +207,7 @@ impl Scheduler {
                 last_outcome: None,
                 next_run_at: None,
                 run_count: 0,
+                log_keys: job.log_keys().to_vec(),
             });
         }
         let registry = Arc::new(registry);
@@ -470,6 +487,7 @@ mod tests {
                 last_outcome: None,
                 next_run_at: None,
                 run_count: 0,
+                log_keys: Vec::new(),
             });
         }
         let snap = r.snapshot();
@@ -557,6 +575,7 @@ mod tests {
             last_outcome: None,
             next_run_at: None,
             run_count: 0,
+            log_keys: Vec::new(),
         });
         Arc::new(r)
     }

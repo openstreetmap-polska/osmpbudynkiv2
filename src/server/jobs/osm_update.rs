@@ -18,6 +18,13 @@ impl Job for OsmUpdateJob {
         "osm_update"
     }
 
+    /// See `update::osm::OSM_UPDATE_JOB_LOG_KEY` -- `update::osm::update`
+    /// self-reports under this key rather than the wrapper doing it, since
+    /// that function is also reachable straight from the CLI.
+    fn log_keys(&self) -> &'static [&'static str] {
+        &[crate::update::osm::OSM_UPDATE_JOB_LOG_KEY]
+    }
+
     fn run(&self, ctx: &JobContext) -> Result<()> {
         let conn = ctx
             .pool

@@ -75,6 +75,20 @@ impl Job for DatasetUpdateJob {
             &|| ctx.is_cancelled(),
         )
     }
+
+    /// One key, matching what `update::dataset::refresh` (via
+    /// `refresh_job_log_name`) reports under for this source. Not derived
+    /// dynamically into a `&'static str` -- the three sources are fixed, so
+    /// a match on `spec.name` is exhaustive and the parity test below pins
+    /// it against the shared helper directly.
+    fn log_keys(&self) -> &'static [&'static str] {
+        match self.spec.name {
+            "bdot10k" => &["update:bdot10k"],
+            "egib" => &["update:egib"],
+            "prg" => &["update:prg"],
+            other => unreachable!("unknown dataset spec {other}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +118,19 @@ mod tests {
                 terc_file: None
             }
         ));
+    }
+
+    #[test]
+    fn log_keys_agree_with_the_shared_refresh_job_log_name_helper() {
+        for (spec, registry_name) in [
+            (&BDOT10K, "bdot10k_update"),
+            (&EGIB, "egib_update"),
+            (&PRG, "prg_update"),
+        ] {
+            let job = DatasetUpdateJob::new(spec, registry_name);
+            let expected = crate::update::dataset::refresh_job_log_name(spec.name);
+            assert_eq!(job.log_keys().to_vec(), vec![expected.as_str()]);
+        }
     }
 
     /// The lock is a single process-wide `'static` instance shared across

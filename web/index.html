@@ -148,21 +148,32 @@
       Status <span id="status-dot" class="status-dot" aria-hidden="true"></span>
     </button>
     <div id="status-body" class="panel-body" hidden>
-      <table id="status-table">
-        <thead>
-          <tr>
-            <th scope="col">Zadanie</th>
-            <th scope="col">Stan</th>
-            <th scope="col">Ostatnie uruchomienie</th>
-            <th scope="col">Następne uruchomienie</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+      <div class="status-table-scroll">
+        <table id="status-table">
+          <thead>
+            <tr>
+              <th scope="col">Zadanie</th>
+              <th scope="col">Stan</th>
+              <th scope="col">Ostatnie uruch.</th>
+              <th scope="col">Czas</th>
+              <th scope="col">Nast. uruch.</th>
+              <th scope="col"><span class="visually-hidden">Szczegóły</span></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
       <p class="hint" id="staleness-hint"></p>
       <p class="hint" id="osm-replication-hint"></p>
     </div>
   </section>
+
+  <dialog id="job-details-modal" class="feedback-modal job-details-modal">
+    <h2 id="job-details-title"></h2>
+    <dl class="feedback-modal-details" id="job-details-summary"></dl>
+    <div id="job-details-logs"></div>
+    <button id="job-details-close" type="button" class="feedback-modal-close">Zamknij</button>
+  </dialog>
 
   <script type="module" src="app.js"></script>
 </body>

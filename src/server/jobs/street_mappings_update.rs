@@ -13,6 +13,7 @@ use crate::mappings::LoadStats;
 use crate::server::jobs::{Job, JobContext};
 
 const ETAG_KEY: &str = "street_mappings_etag";
+const JOB_LOG_KEY: &str = "update:street-mappings";
 
 pub struct StreetMappingsUpdateJob;
 
@@ -31,6 +32,10 @@ impl Default for StreetMappingsUpdateJob {
 impl Job for StreetMappingsUpdateJob {
     fn name(&self) -> &'static str {
         "street_mappings_update"
+    }
+
+    fn log_keys(&self) -> &'static [&'static str] {
+        &[JOB_LOG_KEY]
     }
 
     fn run(&self, ctx: &JobContext) -> Result<()> {
@@ -97,16 +102,11 @@ impl Job for StreetMappingsUpdateJob {
                     "loaded {} mapping rows ({} not present in current PRG data)",
                     stats.rows_loaded, stats.rows_absent_from_prg
                 );
-                let _ =
-                    crate::job_log::record(&conn, "update:street-mappings", "Success", Some(&msg));
+                let _ = crate::job_log::record(&conn, JOB_LOG_KEY, "Success", Some(&msg));
             }
             Err(e) => {
-                let _ = crate::job_log::record(
-                    &conn,
-                    "update:street-mappings",
-                    "Error",
-                    Some(&format!("{e:#}")),
-                );
+                let _ =
+                    crate::job_log::record(&conn, JOB_LOG_KEY, "Error", Some(&format!("{e:#}")));
             }
         }
 

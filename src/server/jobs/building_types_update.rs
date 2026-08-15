@@ -15,6 +15,9 @@ use tracing::{info, warn};
 use crate::mappings::building_types::{BDOT10K, BuildingTypeSource, BuildingTypeStats, EGIB};
 use crate::server::jobs::{Job, JobContext};
 
+const BDOT10K_JOB_LOG_KEY: &str = "update:bdot10k-building-types";
+const EGIB_JOB_LOG_KEY: &str = "update:egib-building-types";
+
 pub struct BuildingTypesUpdateJob;
 
 impl BuildingTypesUpdateJob {
@@ -34,6 +37,10 @@ impl Job for BuildingTypesUpdateJob {
         "building_types_update"
     }
 
+    fn log_keys(&self) -> &'static [&'static str] {
+        &[BDOT10K_JOB_LOG_KEY, EGIB_JOB_LOG_KEY]
+    }
+
     fn run(&self, ctx: &JobContext) -> Result<()> {
         let conn = ctx
             .pool
@@ -47,7 +54,7 @@ impl Job for BuildingTypesUpdateJob {
             &ctx.config.download_urls.bdot10k_building_types,
             "bdot10k_building_types_etag",
             "bdot10k_building_types.csv",
-            "update:bdot10k-building-types",
+            BDOT10K_JOB_LOG_KEY,
         );
         let egib = refresh_one(
             &conn,
@@ -56,7 +63,7 @@ impl Job for BuildingTypesUpdateJob {
             &ctx.config.download_urls.egib_building_types,
             "egib_building_types_etag",
             "egib_building_types.csv",
-            "update:egib-building-types",
+            EGIB_JOB_LOG_KEY,
         );
 
         // Run both regardless of which failed (already done above); surface

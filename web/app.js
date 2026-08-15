@@ -1040,6 +1040,11 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const statusTableBody = document.querySelector("#status-table tbody");
   const stalenessHint = document.getElementById("staleness-hint");
   const osmReplicationHint = document.getElementById("osm-replication-hint");
+  const jobDetailsModal = document.getElementById("job-details-modal");
+  const jobDetailsTitle = document.getElementById("job-details-title");
+  const jobDetailsSummary = document.getElementById("job-details-summary");
+  const jobDetailsLogs = document.getElementById("job-details-logs");
+  const jobDetailsClose = document.getElementById("job-details-close");
 
   const JOB_STATE_LABELS = {
     idle: "bezczynne",
@@ -1047,11 +1052,22 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     disabled: "wyłączone",
   };
 
-  const STATUS_DOT_TITLES = {
-    error: "Błąd",
-    running: "W trakcie",
-    idle: "Bezczynne",
-    "": "Wyłączone",
+  // The header dot answers one question only -- "can this page currently
+  // reach the server" -- so it has just two states, set from `pollStatus`'s
+  // own try/catch rather than derived from job data. Per-job dots answer a
+  // different question ("what is THIS job doing / what did it last do") and
+  // get their own state->title mapping below (`jobDotTitle`); the two must
+  // not be merged into one shared table again, or the header silently goes
+  // back to meaning "any job errored" instead of "server reachable".
+  const SERVER_DOT_TITLES = {
+    idle: "Serwer działa",
+    error: "Błąd połączenia z serwerem",
+  };
+
+  const OUTCOME_LABELS = {
+    Success: "sukces",
+    Error: "błąd",
+    TimedOut: "przekroczono limit czasu",
   };
 
   statusToggle.addEventListener("click", () => {
@@ -1060,37 +1076,139 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     statusBody.hidden = expanded;
   });
 
-  function fmtTimestamp(iso) {
-    if (!iso) return "—";
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toISOString().replace("T", " ").slice(0, 19) + "Z";
+  // /status carries timestamps in two shapes: the in-memory job registry
+  // emits plain RFC3339 UTC ("...Z"), while job_run_log's ran_at and
+  // match_dirty_cells' enqueued_at come back from a DuckDB
+  // `TIMESTAMP WITH TIME ZONE`::VARCHAR cast -- "YYYY-MM-DD HH:MM:SS.ffffff+HH",
+  // a space instead of "T" and a bare hour offset some engines refuse to
+  // parse. Normalizing both to a shape every `Date` parser accepts (rather
+  // than trusting `new Date(raw)` directly) is what lets every timestamp
+  // in this panel render in the browser's own timezone instead of quietly
+  // keeping whichever timezone the server happened to format it in.
+  function parseTimestamp(raw) {
+    if (!raw) return null;
+    let s = raw.trim().replace(" ", "T");
+    s = s.replace(/([+-]\d{2})$/, "$1:00");
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? null : d;
   }
+
+  const TIMESTAMP_FORMATTER = new Intl.DateTimeFormat("pl-PL", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+
+  // No explicit `timeZone` option -- Intl defaults to the browser's own,
+  // which is the point: the same raw value now renders differently for a
+  // viewer in a different timezone than the server, instead of always UTC.
+  function fmtTimestamp(raw) {
+    const d = parseTimestamp(raw);
+    return d ? TIMESTAMP_FORMATTER.format(d) : "—";
+  }
+
+  function fmtDuration(ms) {
+    if (ms == null) return "—";
+    if (ms < 1000) return `${ms} ms`;
+    const totalSeconds = ms / 1000;
+    if (totalSeconds < 60) return `${totalSeconds.toFixed(1)} s`;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = Math.round(totalSeconds % 60);
+    return `${minutes} min ${seconds} s`;
+  }
+
+  function fmtIntervalSeconds(sec) {
+    if (sec == null) return "—";
+    if (sec < 60) return `${sec} s`;
+    if (sec < 3600) return `${Math.round(sec / 60)} min`;
+    if (sec < 86400) {
+      const hours = sec / 3600;
+      return `${Number.isInteger(hours) ? hours : hours.toFixed(1)} h`;
+    }
+    const days = sec / 86400;
+    return `${Number.isInteger(days) ? days : days.toFixed(1)} d`;
+  }
+
+  function fmtOutcome(outcome) {
+    if (!outcome) return { label: "—", detail: "" };
+    return { label: OUTCOME_LABELS[outcome.kind] || outcome.kind, detail: outcome.message || "" };
+  }
+
+  // A job's dot has exactly one job: show what it's doing right now, or --
+  // once it's idle -- what its last run actually resulted in. "idle" no
+  // longer means "green because nothing's happening"; it means "green
+  // because the last run succeeded" (and red if it didn't), so the color
+  // itself carries the last-execution-result signal the row's text alone
+  // doesn't.
+  function jobDotState(job) {
+    if (job.state === "running") return "running";
+    if (job.state === "disabled") return "";
+    if (job.last_outcome && job.last_outcome.kind !== "Success") return "error";
+    return "idle";
+  }
+
+  function jobDotTitle(job, dotState) {
+    if (dotState === "running") return "W trakcie";
+    if (dotState === "") return "Wyłączone";
+    if (!job.last_outcome) return "Bezczynne — brak danych o poprzednim uruchomieniu";
+    const outcome = fmtOutcome(job.last_outcome);
+    return outcome.detail
+      ? `Bezczynne — ${outcome.label}: ${outcome.detail}`
+      : `Bezczynne — ${outcome.label}`;
+  }
+
+  function detailRow(term, valueHtml) {
+    return `<div><dt>${escapeHtml(term)}</dt><dd>${valueHtml}</dd></div>`;
+  }
+
+  // Keyed by job_run_log's own keys (e.g. "update:bdot10k"), not the job
+  // registry's names -- see `Job::log_keys` on the server, which each
+  // job's row in `jobs[]` echoes back as `log_keys` so this panel can join
+  // the two without hardcoding the mapping itself.
+  let latestJobRunLog = {};
 
   function renderStatus(data) {
     const jobs = data.jobs || [];
-    const anyError = jobs.some((j) => j.last_outcome && j.last_outcome.kind === "Error");
-    const anyRunning = jobs.some((j) => j.state === "running");
-    const overallState = anyError ? "error" : anyRunning ? "running" : "idle";
-    statusDot.dataset.state = overallState;
-    statusDot.title = STATUS_DOT_TITLES[overallState] || overallState;
+    latestJobRunLog = data.job_run_log || {};
 
     statusTableBody.innerHTML = "";
     for (const job of jobs) {
       const row = document.createElement("tr");
       const stateLabel = JOB_STATE_LABELS[job.state] || job.state;
-      const dotState = job.state === "running" ? "running" : job.enabled ? "idle" : "";
-      const dotTitle = STATUS_DOT_TITLES[dotState] || dotState;
+      const dotState = jobDotState(job);
+      const dotTitle = jobDotTitle(job, dotState);
       const stateCell = document.createElement("td");
       stateCell.innerHTML = `<span class="job-state"><span class="status-dot" data-state="${dotState}" title="${dotTitle}"></span>${stateLabel}</span>`;
       row.innerHTML = `<td>${job.name}</td>`;
       row.appendChild(stateCell);
+
       const lastRun = document.createElement("td");
       lastRun.textContent = fmtTimestamp(job.last_finished_at);
       row.appendChild(lastRun);
+
+      const duration = document.createElement("td");
+      duration.textContent = fmtDuration(job.last_duration_ms);
+      row.appendChild(duration);
+
       const nextRun = document.createElement("td");
       nextRun.textContent = fmtTimestamp(job.next_run_at);
       row.appendChild(nextRun);
+
+      const detailsCell = document.createElement("td");
+      const detailsBtn = document.createElement("button");
+      detailsBtn.type = "button";
+      detailsBtn.className = "job-details-btn";
+      detailsBtn.textContent = "i";
+      detailsBtn.title = "Szczegóły";
+      detailsBtn.setAttribute("aria-label", `Szczegóły: ${job.name}`);
+      detailsBtn.addEventListener("click", () => openJobDetails(job));
+      detailsCell.appendChild(detailsBtn);
+      row.appendChild(detailsCell);
+
       statusTableBody.appendChild(row);
     }
 
@@ -1111,13 +1229,73 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     }
   }
 
+  function openJobDetails(job) {
+    jobDetailsTitle.textContent = job.name;
+
+    const outcome = fmtOutcome(job.last_outcome);
+    jobDetailsSummary.innerHTML = [
+      detailRow("Włączone", job.enabled ? "tak" : "nie"),
+      detailRow("Interwał", fmtIntervalSeconds(job.interval_seconds)),
+      detailRow("Limit czasu", fmtIntervalSeconds(job.timeout_seconds)),
+      detailRow("Stan", escapeHtml(JOB_STATE_LABELS[job.state] || job.state)),
+      detailRow("Ostatnie uruchomienie", fmtTimestamp(job.last_started_at)),
+      detailRow("Ostatnie zakończenie", fmtTimestamp(job.last_finished_at)),
+      detailRow("Czas trwania", fmtDuration(job.last_duration_ms)),
+      detailRow("Następne uruchomienie", fmtTimestamp(job.next_run_at)),
+      detailRow("Liczba uruchomień", String(job.run_count)),
+      detailRow(
+        "Ostatni wynik",
+        outcome.detail
+          ? `${escapeHtml(outcome.label)}: ${escapeHtml(outcome.detail)}`
+          : escapeHtml(outcome.label)
+      ),
+    ].join("");
+
+    const logKeys = job.log_keys || [];
+    if (logKeys.length === 0) {
+      jobDetailsLogs.innerHTML = `<p class="hint">Brak dodatkowego logu dla tego zadania.</p>`;
+    } else {
+      jobDetailsLogs.innerHTML = logKeys
+        .map((key) => {
+          const entry = latestJobRunLog[key];
+          if (!entry) {
+            return (
+              `<div class="job-log-entry"><h3>${escapeHtml(key)}</h3>` +
+              `<p class="hint">Brak zapisanego przebiegu.</p></div>`
+            );
+          }
+          return (
+            `<div class="job-log-entry"><h3>${escapeHtml(key)}</h3>` +
+            `<dl class="feedback-modal-details">` +
+            detailRow("Czas", fmtTimestamp(entry.ran_at)) +
+            detailRow("Wynik", escapeHtml(entry.outcome)) +
+            detailRow("Wiadomość", entry.message ? escapeHtml(entry.message) : "—") +
+            `</dl></div>`
+          );
+        })
+        .join("");
+    }
+
+    if (!jobDetailsModal.open) jobDetailsModal.showModal();
+  }
+
+  jobDetailsClose.addEventListener("click", () => jobDetailsModal.close());
+  // Same backdrop-click-to-dismiss handling as #download-feedback below.
+  jobDetailsModal.addEventListener("click", (e) => {
+    if (e.target === jobDetailsModal) jobDetailsModal.close();
+  });
+
   async function pollStatus() {
     try {
       const res = await fetch("/status");
       if (!res.ok) throw new Error(`status ${res.status}`);
-      renderStatus(await res.json());
+      const data = await res.json();
+      statusDot.dataset.state = "idle";
+      statusDot.title = SERVER_DOT_TITLES.idle;
+      renderStatus(data);
     } catch (err) {
       statusDot.dataset.state = "error";
+      statusDot.title = SERVER_DOT_TITLES.error;
       console.error("failed to load /status", err);
     }
   }

@@ -592,6 +592,10 @@ button {
   border-top: 1px solid var(--line);
 }
 
+.status-table-scroll {
+  overflow-x: auto;
+}
+
 #status-table {
   width: 100%;
   border-collapse: collapse;
@@ -625,6 +629,70 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+}
+
+.job-details-btn {
+  display: block;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  font-family: var(--font-data);
+  font-size: 10px;
+  font-style: italic;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}
+.job-details-btn:hover {
+  background: var(--paper);
+  border-color: var(--accent);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.job-details-modal {
+  max-width: min(90vw, 460px);
+}
+
+.job-details-modal #job-details-title {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 700;
+  font-family: var(--font-data);
+  color: var(--ink);
+}
+
+.job-log-entry {
+  padding: 10px 0 0;
+}
+.job-log-entry + .job-log-entry {
+  margin-top: 4px;
+  border-top: 1px solid var(--line);
+}
+.job-log-entry h3 {
+  margin: 6px 0 6px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+}
+.job-log-entry dd {
+  overflow-wrap: break-word;
 }
 
 @media (prefers-reduced-motion: reduce) {

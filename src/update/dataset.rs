@@ -12,6 +12,14 @@ use crate::utils::format_duration;
 /// fires on an upstream restructuring. It is a diagnostic, NOT a stop.
 const IMPLAUSIBLE_CHURN_FRACTION: f64 = 0.5;
 
+/// The one home for the `job_run_log` key a dataset refresh reports under.
+/// `refresh` itself and `server::jobs::dataset_update::DatasetUpdateJob::log_keys`
+/// (which lets `/status` join `jobs[]` against `job_run_log`) both call this
+/// rather than restating the `"update:{name}"` shape.
+pub fn refresh_job_log_name(source_name: &str) -> String {
+    format!("update:{source_name}")
+}
+
 /// Drops every scratch table a refresh creates — the staging table and the
 /// three `diff_*` temp tables — on every exit path, including early returns
 /// and errors. DuckDB has no temp-table-per-transaction semantics here, so
@@ -69,7 +77,7 @@ pub fn refresh(
         staging: staging.clone(),
     };
 
-    let job_name = format!("update:{}", spec.name);
+    let job_name = refresh_job_log_name(spec.name);
     let outcome = (|| -> Result<(DiffCounts, crate::dataset::LoadStats)> {
         // --- stage ---
         check_cancelled(spec.name, "staging", is_cancelled)?;
