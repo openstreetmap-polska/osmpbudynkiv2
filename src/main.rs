@@ -81,6 +81,7 @@ fn main() -> Result<()> {
             )?
         }
         Command::Compare { target } => compare::run(&conn, target)?,
+        Command::Queue { action } => compare::run_queue(&conn, action)?,
         Command::Run => {
             let rt = tokio::runtime::Runtime::new()?;
             let config = Arc::new(config);

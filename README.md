@@ -19,7 +19,7 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] `update osm` — incremental updates from the minutely OSM replication feed
 - [x] `update prg` / `update bdot10k` / `update egib` — re-download a government dataset and apply only the delta, skipping the refresh entirely when the source ETag is unchanged
 - [x] `compare buildings` (BDOT10k, EGIB) / `compare addresses` (PRG) — spatial matching of government objects against OSM, writing precomputed `*_unmatched` serving tables (`bdot10k_unmatched`, `egib_unmatched`, `prg_unmatched`) that `/tiles` and `/package` read directly
-- [x] Incremental freshness for `*_unmatched` between full compares — government refreshes and OSM updates enqueue the z14 cells they touched into `match_dirty_cells`; the `match_refresh` background job drains that queue by recomputing just those cells; `compare reconcile` re-enqueues every live cell as a safety net or offline rebuild path; `/status` reports queue staleness
+- [x] Incremental freshness for `*_unmatched` between full compares — government refreshes and OSM updates enqueue the z14 cells they touched into `match_dirty_cells`; the `match_refresh` background job drains that queue by recomputing just those cells; `queue reconcile` re-enqueues every live cell as a safety net or offline rebuild path; `/status` reports queue staleness
 - [x] `run` HTTP server basics: `/health`, `/status` (background job status + match-queue staleness), startup checks, graceful shutdown, read-only connection pool + single writer
 - [x] Background job scheduler (no overlapping runs, timeout handling) with periodic OSM refresh, government-dataset refresh, `match_refresh`/`match_reconcile`, mapping-file refresh and export-log pruning jobs
 - [x] Per-tile change tracking — every refresh records which z14 cells changed (`dataset_change_areas`) alongside a refresh log (`dataset_refreshes`)
@@ -123,7 +123,7 @@ the mapping CSVs). They are all `enabled = false` in
 [`example_config.toml`](example_config.toml), so a config copied from it
 updates nothing until you turn them on. The equivalent offline commands are
 `update osm` / `update bdot10k` / `update egib` / `update prg` followed by
-`compare full` (or `compare reconcile`).
+`compare full` (or `queue reconcile`).
 
 Editing a mapping CSV needs only its `import` command re-run — both mappings
 are applied when a response is built, so they never change *which* objects are
@@ -282,11 +282,6 @@ cargo run -- compare buildings egib
 # Compare addresses
 cargo run -- compare addresses
 cargo run -- compare addresses prg
-
-# Re-enqueue every cell containing a government object, so the drain rebuilds
-# them (safety net for a dropped enqueue; also usable as an offline rebuild
-# path or a daily job)
-cargo run -- compare reconcile
 ```
 
 `compare` recomputes the `*_unmatched` serving tables (`bdot10k_unmatched`,
@@ -295,9 +290,29 @@ cargo run -- compare reconcile
 updates keep them current incrementally: each producer enqueues the z14 cells
 it touched into `match_dirty_cells`, and the `match_refresh` background job
 (see `run` below) drains that queue by recomputing just those cells.
-`compare reconcile` re-enqueues every live cell instead of comparing directly,
-for when the queue can't be trusted or a full serving rebuild is wanted
-without redoing the whole comparison.
+
+### queue — operate on the match_dirty_cells queue by hand
+
+```bash
+# Re-enqueue every cell containing a government object, so the next drain
+# rebuilds it (safety net for a dropped enqueue, an offline rebuild path, or
+# a scheduled sweep)
+cargo run -- queue reconcile
+
+# Drain the queue: recompute *_unmatched for every dirty cell, oldest first,
+# until none remain
+cargo run -- queue drain
+cargo run -- queue drain --batch-size 1000
+```
+
+Both actions require exclusive access to the database (like any CLI command)
+— do not run them against a database a `run` server also has open; the
+server drains the same queue itself via its `match_refresh`/`match_reconcile`
+background jobs. `queue reconcile` re-enqueues every live cell instead of
+comparing directly, for when the queue can't be trusted or a full serving
+rebuild is wanted without redoing the whole comparison. `queue drain` is the
+manual, one-shot equivalent of what `match_refresh` does on a schedule inside
+`run`.
 
 ### run — HTTP service
 
@@ -326,7 +341,7 @@ are created with `CREATE TABLE IF NOT EXISTS`, so starting the server against
 an older database that predates them leaves all three empty — `/tiles` and
 `/package` will start up cleanly but serve zero features (a startup warning
 names each empty table). Run an offline `compare full` before restarting the
-server against that database. `compare reconcile` is **not** an equivalent
+server against that database. `queue reconcile` is **not** an equivalent
 fast path here: it only re-enqueues every live cell for the incremental
 drain, so populating a fully empty database through it means draining the
 entire country cell-by-cell, which is orders of magnitude slower than a

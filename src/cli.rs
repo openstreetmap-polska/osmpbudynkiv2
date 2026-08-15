@@ -33,6 +33,12 @@ pub enum Command {
         #[command(subcommand)]
         target: CompareTarget,
     },
+    /// Operate on the match_dirty_cells queue that keeps the `*_unmatched`
+    /// serving tables incrementally fresh between full compares
+    Queue {
+        #[command(subcommand)]
+        action: QueueAction,
+    },
     /// Run HTTP service with background data updates
     Run,
 }
@@ -51,10 +57,23 @@ pub enum CompareTarget {
     },
     /// Run all available comparisons
     Full,
-    /// Enqueue every cell containing a government object, so the drain
-    /// rebuilds them (safety net for a dropped enqueue; also usable as an
-    /// offline rebuild path or a daily job).
+}
+
+#[derive(Subcommand)]
+pub enum QueueAction {
+    /// Enqueue every cell containing a government object, so the next
+    /// drain rebuilds it. A safety net for a dropped enqueue, an offline
+    /// rebuild path, or a scheduled sweep.
     Reconcile,
+    /// Drain the queue: recompute the `*_unmatched` serving tables for every
+    /// dirty cell, oldest first, until none remain or the run is
+    /// interrupted. Requires exclusive access to the database — do not run
+    /// this against a database a `run` server also has open.
+    Drain {
+        /// Cells recomputed per transaction
+        #[arg(long, default_value_t = 512)]
+        batch_size: usize,
+    },
 }
 
 #[derive(Subcommand)]

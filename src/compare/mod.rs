@@ -11,7 +11,7 @@ use anyhow::Result;
 use duckdb::Connection;
 use tracing::info;
 
-use crate::cli::{AddressesSource, BuildingsSource, CompareTarget};
+use crate::cli::{AddressesSource, BuildingsSource, CompareTarget, QueueAction};
 
 /// `shutdown::check_requested()` is called between sub-compares below, never
 /// mid-compare: each of `compare_bdot10k`/`compare_egib`/`compare_prg` is
@@ -59,9 +59,45 @@ pub fn run(conn: &Connection, target: CompareTarget) -> Result<()> {
             // the whole `Full` run, not per source.
             crate::serving_version::bump_serving_epoch(conn)?;
         }
-        CompareTarget::Reconcile => {
+    }
+    Ok(())
+}
+
+/// Handles the `queue` CLI command: `reconcile` re-enqueues, `drain` runs
+/// `drain::drain_batch` in a loop until the queue is empty (a batch that
+/// drains zero cells means either nothing is left, or everything left is
+/// failing and re-selecting it won't help -- either way, further looping
+/// can't make progress) or the run is interrupted. Checked between batches
+/// rather than passed only into `drain_batch`'s per-cell `is_cancelled`, so a
+/// Ctrl+C between batches bails loudly with `Err` instead of quietly
+/// stopping and reporting success, matching `run` above.
+pub fn run_queue(conn: &Connection, action: QueueAction) -> Result<()> {
+    match action {
+        QueueAction::Reconcile => {
             let enqueued = reconcile::enqueue_all(conn)?;
             info!(enqueued, "reconcile sweep complete");
+        }
+        QueueAction::Drain { batch_size } => {
+            let mut total_drained = 0u64;
+            let mut total_failed = 0u64;
+            loop {
+                crate::shutdown::check_requested()?;
+                let stats = drain::drain_batch(conn, batch_size, &crate::shutdown::is_requested)?;
+                total_drained += stats.cells;
+                total_failed += stats.failed;
+                if stats.cells == 0 {
+                    break;
+                }
+            }
+            if total_failed > 0 {
+                tracing::warn!(
+                    drained = total_drained,
+                    failed = total_failed,
+                    "drain complete with some cells left queued for retry"
+                );
+            } else {
+                info!(drained = total_drained, "drain complete, queue empty");
+            }
         }
     }
     Ok(())

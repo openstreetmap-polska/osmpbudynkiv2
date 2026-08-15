@@ -83,7 +83,7 @@
 //!   inside the loader (not at the call sites) gets this right for free --
 //!   verified by reading both jobs: each does `if previous == current {
 //!   return Ok(()); }` strictly above its call into the loader.
-//! - `compare reconcile`. It only re-enqueues dirty cells for the drain to
+//! - `queue reconcile`. It only re-enqueues dirty cells for the drain to
 //!   pick up later; the drain's own per-cell recompute is what actually
 //!   changes `computed_at`, and that's already covered per-cell.
 //! - `import osm` / `update osm`. `/tiles` reads no `osm_*` table directly --

@@ -4,7 +4,7 @@
 //! This is the safety net the design relies on (design ~line 282): the only
 //! real failure mode of the incremental path is a *dropped* enqueue, and it is
 //! self-repairing only if something re-enqueues everything on a schedule. Until
-//! this job existed the sweep was CLI-only (`compare reconcile`), which cannot
+//! this job existed the sweep was CLI-only (`queue reconcile`), which cannot
 //! run while the server holds the DB — DuckDB is single-writer — so the safety
 //! net required stopping the service.
 //!

@@ -197,7 +197,7 @@ pub async fn run(
         // The safety net for a dropped enqueue. Off by default -- see
         // MatchReconcileConfig for the measured reasons. It only appends to
         // match_dirty_cells and lets the per-cell drain rebuild, so unlike
-        // `compare reconcile` on the CLI it is safe against a live server.
+        // `queue reconcile` on the CLI it is safe against a live server.
         (
             Arc::new(jobs::match_reconcile::MatchReconcileJob) as Arc<dyn jobs::Job>,
             jobs::JobConfigResolved {

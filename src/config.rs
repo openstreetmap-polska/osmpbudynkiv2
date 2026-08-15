@@ -220,7 +220,7 @@ impl Default for MatchRefreshConfig {
 /// sweep from head-of-line-blocking live edits (e.g. drain reconcile-sourced
 /// cells at a lower priority than OSM-sourced ones, which would need a
 /// provenance column on `match_dirty_cells`). Until then, leave this off and
-/// rely on `compare reconcile` being run by hand.
+/// rely on `queue reconcile` being run by hand.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct MatchReconcileConfig {

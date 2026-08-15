@@ -247,7 +247,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
         -- and the drain neither selects nor filters on it (recompute_cell_in_txn
         -- hardcodes CHANGE_CELL_ZOOM). If CHANGE_CELL_ZOOM ever changes, queue
         -- rows written at the old zoom are silently reinterpreted at the new
-        -- one — drain the queue before changing it, then `compare reconcile`.
+        -- one — drain the queue before changing it, then `queue reconcile`.
         CREATE TABLE IF NOT EXISTS match_dirty_cells (
             source VARCHAR,
             cell_z INTEGER,

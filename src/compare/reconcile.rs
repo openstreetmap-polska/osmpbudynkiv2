@@ -17,7 +17,7 @@ pub fn enqueue_all(conn: &Connection) -> Result<i64> {
     // transaction wraps this loop), so a mid-sweep failure leaves a partial
     // enqueue for whichever sources ran before the failing one. That's
     // harmless: the drain is idempotent per (source, cell), and a later
-    // `compare reconcile` re-covers whatever this run missed.
+    // `queue reconcile` re-covers whatever this run missed.
     for (source, table, point) in specs {
         // Checked once per source, same granularity as `compare::run`'s
         // between-sub-compares check. This loop has no transaction at all
@@ -25,7 +25,7 @@ pub fn enqueue_all(conn: &Connection) -> Result<i64> {
         // it just stops enqueueing the sources that haven't run yet, which
         // is the same partial-sweep outcome the loop already tolerates on a
         // real INSERT failure (an `Err` propagated via `?` below). A later
-        // `compare reconcile` re-covers whatever a cancelled sweep missed.
+        // `queue reconcile` re-covers whatever a cancelled sweep missed.
         crate::shutdown::check_requested()?;
         let cx = cell_x_sql(point);
         let cy = cell_y_sql(point);
@@ -33,7 +33,7 @@ pub fn enqueue_all(conn: &Connection) -> Result<i64> {
         // of rows this INSERT actually added -- a COUNT(*) query afterwards
         // would include any dirty cells for this source enqueued by another
         // producer before this sweep ran, inflating the "enqueued" total
-        // `compare reconcile` logs.
+        // `queue reconcile` logs.
         let n = conn
             .execute(
                 &format!(
@@ -162,7 +162,7 @@ mod tests {
     /// The returned total must be the number of rows *this sweep* inserted,
     /// not the queue's overall depth for that source -- a pre-existing dirty
     /// cell (e.g. left over from an OSM update moments earlier) must not
-    /// inflate the "enqueued" count `compare reconcile` logs.
+    /// inflate the "enqueued" count `queue reconcile` logs.
     #[test]
     fn enqueue_all_returns_only_newly_inserted_rows() {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
