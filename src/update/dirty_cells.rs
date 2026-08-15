@@ -37,7 +37,7 @@ pub enum Layer {
 /// what a recompute reads, the same "read wide, write narrow" trap
 /// `OSM_MATCH_BUFFER_DEG`'s own doc comment (`compare::rule`) warns about for
 /// `MATCH_DISTANCE_METERS`. The blast radius of getting this wrong is
-/// bounded, not silent forever, though: `compare reconcile` (the daily
+/// bounded, not silent forever, though: `queue reconcile` (the daily
 /// `match_reconcile` job) re-enqueues every live cell regardless, so a
 /// subtly-too-narrow reach degrades to "stale until the next sweep", not
 /// "wrong forever".
@@ -47,6 +47,32 @@ fn layer_buffer_deg(layer: Layer) -> f64 {
         Layer::Addresses => OSM_MATCH_BUFFER_DEG,
     }
 }
+
+/// Ceiling on how many z14 cells one OSM row may enqueue in
+/// [`DirtyCells::note_existing`]. A row whose bbox demands more is skipped
+/// with a warning rather than expanded.
+///
+/// The reach itself is exact and must stay that way (see `note_existing`'s
+/// doc and the CLAUDE.md gotcha on the 5.6x amplification the old fixed 3x3
+/// caused), so this is not a tuning knob for normal data -- it is a guard
+/// against one input class that government exports do not have and OSM does:
+/// a node dragged to (0, 0). Measured over the 2026-08 Poland extract, the
+/// widest real `osm_buildings` row spans 0.7306 z14 cells, so every genuine
+/// building touches at most 2x2 = 4 cells; a Polish building way with one
+/// Null Island node spans lon 21deg->0 and lat 52deg->0, which is 955 x 2781
+/// = **2,659,592** cells inserted into the HashSet and then into
+/// `match_dirty_cells`, inside the update transaction. At the ~0.098 s per
+/// z14 recompute measured in docs/per_cell_recompute_cell_guard_scan.md that
+/// is days of drain backlog produced by a single way edit.
+///
+/// 1024 (a 32x32 cell block, roughly 48 km square at Polish latitudes) sits
+/// 256x above the widest real row and far below the corrupt case, so no
+/// plausible building is affected either way. Skipping rather than clamping
+/// is safe because `queue reconcile` re-enqueues every live cell on its
+/// daily sweep: a skipped row degrades to "stale until the next sweep", the
+/// same failure bound `layer_buffer_deg`'s doc describes for a too-narrow
+/// reach -- whereas enqueueing the millions would take the drain out for days.
+const MAX_ENQUEUE_CELLS_PER_ROW: i64 = 1024;
 
 #[derive(Default)]
 pub struct DirtyCells {
@@ -68,6 +94,12 @@ impl DirtyCells {
 
     /// Record every cell touched by the point's neighbourhood, buffered per
     /// [`layer_buffer_deg`] (node fast path -- no query).
+    ///
+    /// Needs no [`MAX_ENQUEUE_CELLS_PER_ROW`] guard, unlike
+    /// [`Self::note_existing`]: the range here spans a fixed buffer around a
+    /// single point rather than an arbitrary bbox, so it is at most 2x2 cells
+    /// whatever the coordinates are. A node dragged to (0, 0) enqueues that
+    /// one wrong cell, not a rectangle stretching back to Poland.
     pub fn note_point(&mut self, layer: Layer, lon: f64, lat: f64) {
         if lon.is_finite() && lat.is_finite() {
             let buf = layer_buffer_deg(layer);
@@ -131,6 +163,22 @@ impl DirtyCells {
         })?;
         for row in rows {
             let (x_lo, x_hi, y_lo, y_hi) = row?;
+            // Widths as i64 before multiplying: the corrupt case this guards
+            // against reaches ~2.7M cells, and a row spanning the whole world
+            // would overflow an i32 product.
+            let cells = (x_hi as i64 - x_lo as i64 + 1) * (y_hi as i64 - y_lo as i64 + 1);
+            if cells > MAX_ENQUEUE_CELLS_PER_ROW {
+                tracing::warn!(
+                    table,
+                    osm_id,
+                    osm_type,
+                    cells,
+                    max = MAX_ENQUEUE_CELLS_PER_ROW,
+                    "Skipping dirty-cell enqueue for an implausibly large OSM row \
+                     (likely a node at 0,0) — reconcile will pick these cells up"
+                );
+                continue;
+            }
             for x in x_lo..=x_hi {
                 for y in y_lo..=y_hi {
                     self.set(layer).insert((x, y));
@@ -241,6 +289,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prg, 0);
+    }
+
+    /// The Null Island case, at full scale: a Polish building way with one
+    /// node dragged to (0, 0). Without the cap this enqueues 955 x 2781 =
+    /// 2,659,592 cells from a single edit; with it, nothing is enqueued and
+    /// the daily reconcile sweep is what picks the real cells up.
+    #[test]
+    fn note_existing_skips_a_row_whose_bbox_spans_an_implausible_number_of_cells() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO osm_buildings VALUES (9,'way',NULL, ST_MakeEnvelope(0.0,0.0,21.0,52.0));",
+        )
+        .unwrap();
+        let mut d = DirtyCells::default();
+        d.note_existing(&c, Layer::Buildings, "osm_buildings", 9, "way")
+            .unwrap();
+        d.flush(&c).unwrap();
+
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM match_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "an implausibly large row must enqueue nothing");
+    }
+
+    /// The other side of the same guard: a row right at the cap's scale still
+    /// enqueues normally, so the cap cannot quietly swallow ordinary edits.
+    /// 0.02 degrees of longitude is a little under one z14 cell at this
+    /// latitude, i.e. far larger than any real building and still nowhere
+    /// near 1024 cells.
+    #[test]
+    fn note_existing_still_enqueues_a_merely_large_row() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO osm_buildings VALUES (10,'way',NULL, ST_MakeEnvelope(21.0,52.0,21.02,52.02));",
+        )
+        .unwrap();
+        let mut d = DirtyCells::default();
+        d.note_existing(&c, Layer::Buildings, "osm_buildings", 10, "way")
+            .unwrap();
+        d.flush(&c).unwrap();
+
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source='bdot10k'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            n > 1 && n <= MAX_ENQUEUE_CELLS_PER_ROW,
+            "a large-but-plausible row must still enqueue its cells, got {n}"
+        );
     }
 
     #[test]

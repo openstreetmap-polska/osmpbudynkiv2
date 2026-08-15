@@ -69,57 +69,39 @@ pub const MIN_OVERLAP_FRACTION: f64 = 0.10;
 /// corrected); a missed veto costs a wrong import.
 pub const FORMER_BUILDING_MIN_OVERLAP_FRACTION: f64 = 0.10;
 
-/// Which side of the former-building veto `buildings_predicate` builds:
-/// `Veto` excludes a suppressed building (what `unmatched_buildings_sql`
-/// serves), `Only` selects exactly the rows `Veto` excludes on top of the
-/// `osm_buildings` anti-join (what `suppressed_buildings_sql` serves), so
-/// `matched + unmatched + suppressed = total` holds by construction.
-enum FormerMode {
-    Veto,
-    Only,
+/// The `osm_buildings` half of the building rule: does a live OSM building
+/// polygon cover at least `MIN_OVERLAP_FRACTION` of `b`'s own footprint?
+///
+/// `unmatched_buildings_sql` and `suppressed_buildings_sql` both *negate*
+/// this — a suppressed row is "unmatched but for the veto" — so the clause
+/// text lives here once instead of being spelled out in each. Correlates on
+/// `b`, so a caller must alias its government-source relation `b`.
+fn osm_building_covers_sql(envelope: &str) -> String {
+    format!(
+        "EXISTS (
+               SELECT 1 FROM osm_buildings osm
+               WHERE ST_Intersects(osm.geom, {envelope})
+                 AND ST_Intersects(osm.geom, b.geom)
+                 AND ST_Area(ST_Intersection(osm.geom, b.geom)) / ST_Area(b.geom) >= {MIN_OVERLAP_FRACTION}
+           )"
+    )
 }
 
-/// Shared builder behind `unmatched_buildings_sql` and
-/// `suppressed_buildings_sql`: both read the same `osm_buildings` anti-join
-/// and the same `osm_former_buildings` overlap clause, differing only in
-/// whether the former-building clause is a `NOT EXISTS` (excluding a
-/// suppressed row) or an `EXISTS` (selecting only a suppressed row). Keeping
-/// both polarities behind one function is what keeps the veto text itself in
-/// one place.
-fn buildings_predicate(
-    source_table: &str,
-    select_list: &str,
-    area: Bounds,
-    extra_filter: Option<&str>,
-    mode: FormerMode,
-) -> String {
-    let envelope = envelope_sql(area);
-    let extra = extra_filter
-        .map(|f| format!("AND {f}\n           "))
-        .unwrap_or_default();
-    let former_exists = format!(
+/// The `osm_former_buildings` half — the suppression veto itself.
+///
+/// Same one-home reasoning as `osm_building_covers_sql`, and the reason the
+/// two polarities can never drift: `unmatched_buildings_sql` negates this,
+/// `suppressed_buildings_sql` requires it, and both read this one text.
+/// That is what makes `matched + unmatched + suppressed = total` exact
+/// rather than merely intended. Correlates on `b`, same as above.
+fn former_building_covers_sql(envelope: &str) -> String {
+    format!(
         "EXISTS (
                SELECT 1 FROM osm_former_buildings f
                WHERE ST_Intersects(f.geom, {envelope})
                  AND ST_Intersects(f.geom, b.geom)
                  AND ST_Area(ST_Intersection(f.geom, b.geom)) / ST_Area(b.geom) >= {FORMER_BUILDING_MIN_OVERLAP_FRACTION}
            )"
-    );
-    let former_clause = match mode {
-        FormerMode::Veto => format!("AND NOT {former_exists}"),
-        FormerMode::Only => format!("AND {former_exists}"),
-    };
-    format!(
-        "SELECT {select_list}
-         FROM {source_table} b
-         WHERE ST_Intersects(b.centroid, {envelope})
-           {extra}AND NOT EXISTS (
-               SELECT 1 FROM osm_buildings osm
-               WHERE ST_Intersects(osm.geom, {envelope})
-                 AND ST_Intersects(osm.geom, b.geom)
-                 AND ST_Area(ST_Intersection(osm.geom, b.geom)) / ST_Area(b.geom) >= {MIN_OVERLAP_FRACTION}
-           )
-           {former_clause}"
     )
 }
 
@@ -165,12 +147,18 @@ pub fn unmatched_buildings_sql(
     area: Bounds,
     extra_filter: Option<&str>,
 ) -> String {
-    buildings_predicate(
-        source_table,
-        select_list,
-        area,
-        extra_filter,
-        FormerMode::Veto,
+    let envelope = envelope_sql(area);
+    let extra = extra_filter
+        .map(|f| format!("AND {f}\n           "))
+        .unwrap_or_default();
+    format!(
+        "SELECT {select_list}
+         FROM {source_table} b
+         WHERE ST_Intersects(b.centroid, {envelope})
+           {extra}AND NOT {osm_covers}
+           AND NOT {former_covers}",
+        osm_covers = osm_building_covers_sql(&envelope),
+        former_covers = former_building_covers_sql(&envelope),
     )
 }
 
@@ -181,18 +169,71 @@ pub fn unmatched_buildings_sql(
 /// `matched + unmatched + suppressed = total` is exact: a plain "overlaps a
 /// former polygon" count would double-count rows also covered by a live OSM
 /// building and could push `matched` negative.
+///
+/// **The clause order here is load-bearing, and it is why this doesn't just
+/// call the same flat predicate `unmatched_buildings_sql` uses.** Its one
+/// caller (`compare::buildings::compare_buildings`) runs this *once over the
+/// whole source extent* rather than per grid cell, so the two clauses face
+/// wildly different row counts and the cheap one must go first:
+///
+/// - `former_building_covers_sql` is savagely selective — nationally ~6k of
+///   16.35M BDOT10k rows overlap a former polygon at all — and it is driven
+///   by the ~15k-row `osm_former_buildings` table.
+/// - `osm_building_covers_sql` is the expensive one: an anti-join against
+///   17.99M `osm_buildings` rows.
+///
+/// Written flat, DuckDB de-correlates both `EXISTS` clauses into nested
+/// `DELIM_JOIN`s and plans the *anti*-join underneath the semi-join, so it
+/// computes the unmatched set for all of Poland and only then keeps the ~4k
+/// rows the veto covers. The delim machinery deduplicates and materializes
+/// the correlated column — which is `b.geom`, 2.18 GB of WKB at national
+/// scale — and the query dies with DuckDB's "failed to pin block" OOM
+/// against a 4 GB `memory_limit` (measured: 71 s to failure, ~15 GB spilled
+/// to temp on the way, so raising `max_temp_directory_size` does not save
+/// it). Filtering to the veto's candidates first turns the same query into
+/// 4.7 s / 3.8 GB for bdot10k and 4.9 s / 3.9 GB for egib.
+///
+/// Reordering also restores the index, which is the non-obvious half:
+/// `osm_buildings`'s scan is an `RTREE_INDEX_SCAN` in *both* shapes, but its
+/// search window is `Bounds: deferred (from join filter)` — derived at
+/// runtime from the probe side. Probing with every building in Poland yields
+/// a whole-country bound that prunes nothing, so the index was never the
+/// problem and no index hint or `rtree_index_scan_ratio` tweak can help
+/// (forcing an R-tree walk over the full table measured 13.4 s vs 0.53 s for
+/// the sequential scan). Shrinking the probe side to ~4k geometries is what
+/// makes that deferred bound selective again.
+///
+/// **`MATERIALIZED` is insurance, not the active ingredient — the CTE is.**
+/// Measured on the real 16.35M-row table, a bare `WITH` plans identically
+/// (it differs only in losing the `CTE_SCAN` operator) and runs in 5.4 s /
+/// 3.8 GB for the same answer. The keyword is kept so a future re-plan can't
+/// fold the CTE back into the outer query, the same call this codebase makes
+/// in `compare::incremental` — and, as there, don't read its presence as
+/// something a test pins. What is pinned, by
+/// `suppressed_buildings_predicate_filters_by_the_veto_first`, is the clause
+/// order.
 pub fn suppressed_buildings_sql(
     source_table: &str,
     select_list: &str,
     area: Bounds,
     extra_filter: Option<&str>,
 ) -> String {
-    buildings_predicate(
-        source_table,
-        select_list,
-        area,
-        extra_filter,
-        FormerMode::Only,
+    let envelope = envelope_sql(area);
+    let extra = extra_filter
+        .map(|f| format!("AND {f}\n               "))
+        .unwrap_or_default();
+    format!(
+        "WITH candidates AS MATERIALIZED (
+             SELECT b.*
+             FROM {source_table} b
+             WHERE ST_Intersects(b.centroid, {envelope})
+               {extra}AND {former_covers}
+         )
+         SELECT {select_list}
+         FROM candidates b
+         WHERE NOT {osm_covers}",
+        former_covers = former_building_covers_sql(&envelope),
+        osm_covers = osm_building_covers_sql(&envelope),
     )
 }
 
@@ -382,6 +423,80 @@ mod tests {
         assert!(
             plan.contains("RTREE_INDEX_SCAN"),
             "the predicate must be able to use the centroid RTREE index, got plan: {plan}"
+        );
+    }
+
+    /// `suppressed_buildings_sql` must apply the former-building veto *first*,
+    /// building the candidate set the `osm_buildings` anti-join then runs over
+    /// — not spell both clauses flat the way `unmatched_buildings_sql` does.
+    /// Its one caller runs it once over the whole source extent, where the
+    /// flat shape plans the 17.99M-row anti-join *underneath* the semi-join
+    /// and OOMs; see the function's doc comment for the measurements.
+    ///
+    /// Deliberately a structural assertion rather than an `EXPLAIN` one: on
+    /// the real 16.35M-row table the plan is the same with and without
+    /// `MATERIALIZED` (bare `WITH` measured 5.4 s / 3.8 GB against the
+    /// keyword's 4.7 s / 3.8 GB, identical answer), so asserting on plan text
+    /// would pin the keyword instead of the property that actually matters.
+    #[test]
+    fn suppressed_buildings_predicate_filters_by_the_veto_first() {
+        let sql = suppressed_buildings_sql("bsrc", "COUNT(*)", (14.0, 49.0, 25.0, 55.0), None);
+
+        // "osm_former_buildings" does not contain "osm_buildings" as a
+        // substring, so these two finds cannot collide.
+        let veto_at = sql
+            .find("FROM osm_former_buildings")
+            .expect("the veto clause must be present");
+        let anti_join_at = sql
+            .find("FROM osm_buildings")
+            .expect("the osm_buildings anti-join must be present");
+        assert!(
+            veto_at < anti_join_at,
+            "the selective former-building veto must be evaluated before the \
+             expensive osm_buildings anti-join, got: {sql}"
+        );
+        assert!(
+            sql.contains("WITH candidates AS MATERIALIZED"),
+            "the veto must build a candidates CTE that the anti-join then \
+             filters, got: {sql}"
+        );
+    }
+
+    /// The CTE restructure moved the `ST_Intersects(b.centroid, ...)` scoping
+    /// filter inside `candidates`, so this is the suppressed-side twin of
+    /// `unmatched_buildings_predicate_uses_the_centroid_rtree_index`: the
+    /// source table's centroid RTREE index must still be reachable through
+    /// the CTE boundary.
+    #[test]
+    fn suppressed_buildings_predicate_uses_the_centroid_rtree_index() {
+        let c = conn();
+        c.execute_batch(
+            "CREATE INDEX bsrc_centroid_idx ON bsrc USING RTREE (centroid);
+             INSERT INTO osm_former_buildings VALUES
+                 (1, 'way', 'demolished:building', 'yes',
+                  ST_MakeEnvelope(20.55, 52.05, 20.551, 52.051));
+             INSERT INTO bsrc (LOKALNYID, geom)
+                 SELECT 'b' || i,
+                        ST_MakeEnvelope(20.0 + i * 0.0001, 52.0,
+                                        20.0 + i * 0.0001 + 0.00005, 52.00005)
+                 FROM range(20000) t(i);
+             UPDATE bsrc SET centroid = ST_Centroid(geom);",
+        )
+        .unwrap();
+
+        let sql = suppressed_buildings_sql("bsrc", "b.LOKALNYID", (20.5, 52.0, 20.6, 52.1), None);
+        let mut stmt = c.prepare(&format!("EXPLAIN {sql}")).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut plan = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
+        }
+        // Substring "RTREE_IN" rather than the full operator name: DuckDB's
+        // EXPLAIN truncates labels to fit box width in wide plans (same
+        // reason as server::tiles and compare::totals).
+        assert!(
+            plan.contains("RTREE_IN"),
+            "the candidates CTE must still reach the centroid RTREE index, got plan: {plan}"
         );
     }
 

@@ -9,6 +9,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::download::download_file;
 use crate::osm::encoding;
+use crate::osm::geometry;
 use crate::osm::kvstore;
 use crate::osm::kvstore::RocksDB;
 use crate::osm::lifecycle;
@@ -151,6 +152,25 @@ pub fn import(
         );
         check_shutdown()?;
 
+        // After every insert pass, before the RTREE indexes below, so they are
+        // built over final geometry and never have to be maintained through
+        // the repair UPDATE. Covers all four polygon insert passes above from
+        // two call sites -- see `osm::geometry::repair_invalid_geometry` for
+        // why the import path scans while `update::osm` wraps inline instead.
+        // `osm_addresses` is deliberately absent: every row there is a point
+        // (`ST_Centroid`), and a point cannot be invalid.
+        let t = std::time::Instant::now();
+        let repair = geometry::repair_invalid_geometry(conn, "osm_buildings")?.merge(
+            geometry::repair_invalid_geometry(conn, "osm_former_buildings")?,
+        );
+        info!(
+            repaired = repair.repaired,
+            dropped_degenerate = repair.dropped_degenerate,
+            elapsed = %format_duration(t.elapsed()),
+            "Step done: repair invalid geometry"
+        );
+        check_shutdown()?;
+
         let t = std::time::Instant::now();
         kvstore::compact_reverse_indexes(kv);
         info!(
@@ -203,9 +223,18 @@ pub fn import(
             "OSM import complete"
         );
 
+        // The repair clause is appended only when the pass actually did
+        // something, so the usual message stays exactly as it was. Unlike the
+        // three government sources, whose clauses report rows *skipped*, this
+        // one reports rows fixed in place -- OSM data is repaired, not dropped
+        // (see `osm::geometry`'s module doc for the asymmetry).
+        let repair_clause = repair
+            .summary_clause()
+            .map(|c| format!(" {c}"))
+            .unwrap_or_default();
         Ok(format!(
             "buildings={buildings} addresses={addresses} former_buildings={former_buildings} \
-             elapsed={}",
+             elapsed={}{repair_clause}",
             format_duration(elapsed)
         ))
     })();

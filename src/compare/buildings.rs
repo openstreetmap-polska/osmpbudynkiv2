@@ -176,11 +176,20 @@ fn compare_buildings_with_cancel(
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     // Gated on an instant read of osm_former_buildings so a database that has
-    // not been re-imported -- and every test fixture -- pays nothing extra:
-    // suppressed_buildings_sql runs one whole-extent query instead of the
-    // grid's 264 cell-scoped ones, see Step 6 of the design for the cost
-    // caveat and its decision rule if this ever measures as too slow on the
-    // Poland database.
+    // not been re-imported -- and every test fixture -- pays nothing extra.
+    //
+    // Unlike the grid loop above, this is ONE query over the whole extent
+    // rather than 252 cell-scoped ones. That only works because
+    // suppressed_buildings_sql filters by the former-building veto first and
+    // runs the expensive osm_buildings anti-join over just those candidates
+    // -- see its doc comment. Spelled flat (the shape unmatched_buildings_sql
+    // uses, which is correct *per cell*), the identical query OOMs at
+    // national scale against a 4 GB memory_limit. Measured whole-extent on
+    // the Poland database: bdot10k 4.7 s / 3.8 GB, egib 4.9 s / 3.9 GB.
+    //
+    // So if this ever needs changing, the fix is not to widen the memory
+    // limit -- it is to chunk this the way the grid loop chunks its own copy
+    // of the anti-join.
     let former_building_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM osm_former_buildings", [], |r| {
             r.get(0)

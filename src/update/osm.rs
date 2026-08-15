@@ -13,6 +13,7 @@ use tracing::{debug, info};
 
 use crate::config::Config;
 use crate::download::{download_file_as_quiet, download_file_quiet};
+use crate::osm::geometry;
 use crate::osm::kvstore::RocksDB;
 use crate::osm::lifecycle;
 use crate::osm::replication::{
@@ -877,29 +878,40 @@ fn rebuild_way_geometry(
     if building_tag.is_some() {
         let building = building_tag.as_deref().unwrap_or("yes");
         let building_sql = building.replace('\'', "''");
+        let ring = way_ring_polygon_sql(&way_id.to_string());
         conn.execute_batch(&format!(
             "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
              SELECT {way_id}, 'way', '{building_sql}',
-                    ST_MakePolygon(ST_GeomFromWKB(resolve_way_coords({way_id})))
+                    {geom}
              WHERE resolve_way_coords({way_id}) IS NOT NULL
                AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords({way_id}))) >= 4
-               AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords({way_id})))"
+               AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords({way_id})))
+               AND {guard}",
+            geom = geometry::repaired_geom_sql(&ring),
+            guard = geometry::has_polygon_sql(&ring),
         ))?;
         dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way_id, "way")?;
     }
 
     if let Some((lifecycle_key, lifecycle_value)) = &former {
+        let ring = way_ring_polygon_sql("?");
         conn.execute(
-            "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
-             SELECT ?, 'way', ?, ?,
-                    ST_MakePolygon(ST_GeomFromWKB(resolve_way_coords(?)))
-             WHERE resolve_way_coords(?) IS NOT NULL
-               AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords(?))) >= 4
-               AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords(?)))",
+            &format!(
+                "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+                 SELECT ?, 'way', ?, ?,
+                        {geom}
+                 WHERE resolve_way_coords(?) IS NOT NULL
+                   AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords(?))) >= 4
+                   AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords(?)))
+                   AND {guard}",
+                geom = geometry::repaired_geom_sql(&ring),
+                guard = geometry::has_polygon_sql(&ring),
+            ),
             duckdb::params![
                 way_id,
                 lifecycle_key,
                 lifecycle_value,
+                way_id,
                 way_id,
                 way_id,
                 way_id,
@@ -927,6 +939,37 @@ fn rebuild_way_geometry(
     }
 
     Ok(())
+}
+
+/// The raw polygon a closed way's node coordinates describe, shared by
+/// `osm_buildings`' and `osm_former_buildings`' way inserts. `way_ref` is
+/// whatever the caller's statement uses to name the way -- an interpolated id
+/// for the `execute_batch` call site, a literal `?` for the parameterized one.
+///
+/// Deliberately *unrepaired*: the caller wraps it in
+/// `osm::geometry::repaired_geom_sql` for its select list and in
+/// `osm::geometry::has_polygon_sql` for its WHERE, so both see the identical
+/// inner expression. Building the repair in here instead would leave the guard
+/// with no way to ask about the same geometry without spelling it out again.
+fn way_ring_polygon_sql(way_ref: &str) -> String {
+    format!("ST_MakePolygon(ST_GeomFromWKB(resolve_way_coords({way_ref})))")
+}
+
+/// The assembled relation polygon (outer ways unioned, inner ways
+/// differenced), reading the CTE columns `relation_multipolygon_geom_sql`
+/// below produces. Same split as `way_ring_polygon_sql`: unrepaired here, so
+/// the select list and the WHERE guard can both wrap one expression.
+///
+/// This exists because that expression is long enough that spelling it twice
+/// at each of the two relation call sites -- four copies of a nested CASE --
+/// would be exactly the kind of drift the shared CTE builder below already
+/// avoids for the rest of the statement.
+fn relation_polygon_sql() -> String {
+    "CASE
+                     WHEN i.inner_geom IS NOT NULL THEN ST_Difference(o.outer_geom, i.inner_geom)
+                     ELSE o.outer_geom
+                 END"
+    .to_string()
 }
 
 /// The multipolygon assembly CTE chain shared by every relation geometry
@@ -1109,14 +1152,14 @@ fn rebuild_relation_geometry(
              {cte}
              SELECT
                  {relation_id}, 'relation', '{building_sql}',
-                 CASE
-                     WHEN i.inner_geom IS NOT NULL THEN ST_Difference(o.outer_geom, i.inner_geom)
-                     ELSE o.outer_geom
-                 END
+                 {geom}
              FROM outer_polys o
              LEFT JOIN inner_polys i ON true
-             WHERE o.outer_geom IS NOT NULL",
+             WHERE o.outer_geom IS NOT NULL
+               AND {guard}",
             cte = relation_multipolygon_geom_sql(&values_sql),
+            geom = geometry::repaired_geom_sql(&relation_polygon_sql()),
+            guard = geometry::has_polygon_sql(&relation_polygon_sql()),
         ))?;
         dirty.note_existing(
             conn,
@@ -1133,14 +1176,14 @@ fn rebuild_relation_geometry(
              {cte}
              SELECT
                  ?, 'relation', ?, ?,
-                 CASE
-                     WHEN i.inner_geom IS NOT NULL THEN ST_Difference(o.outer_geom, i.inner_geom)
-                     ELSE o.outer_geom
-                 END
+                 {geom}
              FROM outer_polys o
              LEFT JOIN inner_polys i ON true
-             WHERE o.outer_geom IS NOT NULL",
+             WHERE o.outer_geom IS NOT NULL
+               AND {guard}",
             cte = relation_multipolygon_geom_sql(&values_sql),
+            geom = geometry::repaired_geom_sql(&relation_polygon_sql()),
+            guard = geometry::has_polygon_sql(&relation_polygon_sql()),
         );
         conn.execute(
             &sql,
@@ -1243,6 +1286,169 @@ mod tests {
             )));
             INSERT INTO metadata VALUES ('osm_replication_sequence', '1000');",
         )?;
+        Ok(())
+    }
+
+    /// Seed `count` nodes starting at `first_id` from a lon/lat ring and
+    /// return the closed ref list for a way built from them.
+    fn seed_ring(kv: &RocksDB, first_id: i64, ring: &[(f64, f64)]) -> Result<Vec<i64>> {
+        for (i, (lon, lat)) in ring.iter().enumerate() {
+            kvstore::put_node(kv, first_id + i as i64, dm(*lon), dm(*lat))?;
+        }
+        let mut refs: Vec<i64> = (first_id..first_id + ring.len() as i64).collect();
+        refs.push(first_id);
+        Ok(refs)
+    }
+
+    /// The `update osm` half of `osm::geometry`'s repair (the import half is
+    /// pinned by that module's own tests). An incoming `.osc` creating a
+    /// self-intersecting building way must land as valid geometry — otherwise
+    /// the next per-cell recompute throws inside `drain_batch`, which rolls
+    /// the cell back and leaves it queued, so that cell fails on every tick
+    /// forever while serving stale tiles.
+    ///
+    /// The ring is OSM way 229993348's real coordinates: the bowtie that
+    /// actually threw `side location conflict` and rolled back a national
+    /// `compare full`.
+    #[test]
+    fn way_create_repairs_self_intersecting_geometry() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let refs = seed_ring(
+            &kv,
+            900,
+            &[
+                (15.4182745, 53.1661674),
+                (15.4182624, 53.1661753),
+                (15.41827, 53.1661467),
+                (15.4182855, 53.166089),
+                (15.4182344, 53.1660838),
+                (15.4182263, 53.1661127),
+                (15.4182028, 53.1661973),
+            ],
+        )?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                ways: vec![WayChange {
+                    action: ChangeAction::Create,
+                    id: 900,
+                    node_refs: refs,
+                    tags: vec![("building".into(), "service".into())],
+                }],
+                ..Default::default()
+            },
+        )?;
+
+        let (valid, area): (bool, f64) = conn.query_row(
+            "SELECT ST_IsValid(geom), ST_Area(geom) FROM osm_buildings WHERE osm_id = 900",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert!(
+            valid,
+            "an invalid way arriving via replication must be repaired on the way in"
+        );
+        assert!(area > 0.0, "the repair must keep the building's footprint");
+        Ok(())
+    }
+
+    /// The other side of the update path's guard: a way with no area at all
+    /// repairs to a linestring, so `has_polygon_sql` must keep it out of the
+    /// table entirely. Storing `MULTIPOLYGON EMPTY` instead would make
+    /// `note_existing`'s `ST_XMin` read NULL and fail the next edit to this
+    /// object. Coordinates are eighths so the points are exactly collinear in
+    /// f64 (see the CLAUDE.md fixture gotcha).
+    #[test]
+    fn way_create_skips_a_geometry_with_no_polygonal_part() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let refs = seed_ring(&kv, 910, &[(21.0, 52.0), (21.0625, 52.0), (21.125, 52.0)])?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                ways: vec![WayChange {
+                    action: ChangeAction::Create,
+                    id: 910,
+                    node_refs: refs,
+                    tags: vec![("building".into(), "yes".into())],
+                }],
+                ..Default::default()
+            },
+        )?;
+
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 910",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(n, 0, "a zero-area way must not be stored as an empty row");
+        Ok(())
+    }
+
+    /// The relation arm of the former-building insert, which had no test of
+    /// its own — every other former-building test drives the *way* arm, so
+    /// the relation INSERT's SQL (a different statement, built from
+    /// `relation_multipolygon_geom_sql` plus the repair wrapper and its
+    /// `has_polygon_sql` guard) was only ever exercised in production.
+    #[test]
+    fn relation_tagged_demolished_creates_a_former_building_row() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+
+        kvstore::put_relation(
+            &kv,
+            210,
+            &[(
+                100,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(&kv, 100, 210)?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                relations: vec![RelationChange {
+                    action: ChangeAction::Create,
+                    id: 210,
+                    members: vec![RelationMember {
+                        member_type: "way".into(),
+                        member_ref: 100,
+                        role: "outer".into(),
+                    }],
+                    tags: vec![
+                        ("type".into(), "multipolygon".into()),
+                        ("demolished:building".into(), "yes".into()),
+                    ],
+                }],
+                ..Default::default()
+            },
+        )?;
+
+        let (key, value, valid, area): (String, String, bool, f64) = conn.query_row(
+            "SELECT lifecycle_key, lifecycle_value, ST_IsValid(geom), ST_Area(geom)
+             FROM osm_former_buildings WHERE osm_id = 210 AND osm_type = 'relation'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        assert_eq!(
+            (key.as_str(), value.as_str()),
+            ("demolished:building", "yes")
+        );
+        assert!(valid && area > 0.0, "relation geometry must survive intact");
+
+        // The relation is not a live building, so it must not also land in
+        // osm_buildings (the disjointness rule in osm::lifecycle).
+        let buildings: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 210",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(buildings, 0);
         Ok(())
     }
 
