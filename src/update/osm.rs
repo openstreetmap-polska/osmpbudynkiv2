@@ -566,7 +566,15 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
                 )?;
             }
             ChangeAction::Create | ChangeAction::Modify => {
-                kvstore::put_node(kv, node.id, node.lon, node.lat)?;
+                // The `.osc` carries degrees as decimal text; the store keeps
+                // decimicrodegrees. `f64_to_decimicro` rounds rather than
+                // truncates -- see its doc comment.
+                kvstore::put_node(
+                    kv,
+                    node.id,
+                    encoding::f64_to_decimicro(node.lon),
+                    encoding::f64_to_decimicro(node.lat),
+                )?;
                 let way_ids = kvstore::get_node_to_ways(kv, node.id)?;
                 affected_way_ids.extend(&way_ids);
                 dirty.note_existing(conn, Layer::Addresses, "osm_addresses", node.id, "node")?;
@@ -1173,6 +1181,12 @@ mod tests {
     use crate::osm::kvstore;
     use crate::osm::replication::{NodeChange, RelationMember};
 
+    /// Test coordinates are written in degrees for readability; the store
+    /// keeps decimicrodegrees.
+    fn dm(v: f64) -> i32 {
+        encoding::f64_to_decimicro(v)
+    }
+
     /// The KV half of the shared test fixture: nodes 1-4 forming a square,
     /// and way 100 (referencing them) with its reverse index. Split out from
     /// [`setup_test_db_and_kv`] so `replaying_a_batch_over_a_partially_written_kv_store_converges_to_the_golden_state`
@@ -1180,10 +1194,10 @@ mod tests {
     /// (one that also carries a "crash" prefix's writes) without re-seeding
     /// the KV a second time.
     fn seed_kv(kv: &RocksDB) -> Result<()> {
-        kvstore::put_node(kv, 1, 20.0, 50.0)?;
-        kvstore::put_node(kv, 2, 20.001, 50.0)?;
-        kvstore::put_node(kv, 3, 20.001, 50.001)?;
-        kvstore::put_node(kv, 4, 20.0, 50.001)?;
+        kvstore::put_node(kv, 1, dm(20.0), dm(50.0))?;
+        kvstore::put_node(kv, 2, dm(20.001), dm(50.0))?;
+        kvstore::put_node(kv, 3, dm(20.001), dm(50.001))?;
+        kvstore::put_node(kv, 4, dm(20.0), dm(50.001))?;
 
         kvstore::put_way(kv, 100, &[1, 2, 3, 4, 1])?;
         for &nid in &[1i64, 2, 3, 4] {
@@ -1241,7 +1255,7 @@ mod tests {
 
         // Node should be in RocksDB
         let coords = kvstore::get_node(&kv, 10)?.unwrap();
-        assert!((coords.0 - 21.0).abs() < 1e-9);
+        assert!((encoding::decimicro_to_f64(coords.0) - 21.0).abs() < 1e-9);
 
         // Address should be in DuckDB
         let hn: String = conn.query_row(
@@ -1313,8 +1327,8 @@ mod tests {
 
         // Node should be updated in RocksDB
         let (lon, lat) = kvstore::get_node(&kv, 1)?.unwrap();
-        assert!((lon - 20.0005).abs() < 1e-9);
-        assert!((lat - 50.0005).abs() < 1e-9);
+        assert!((encoding::decimicro_to_f64(lon) - 20.0005).abs() < 1e-9);
+        assert!((encoding::decimicro_to_f64(lat) - 50.0005).abs() < 1e-9);
 
         // Building geometry should have been rebuilt
         let count: i64 = conn.query_row(
@@ -2063,10 +2077,10 @@ mod tests {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;
 
         // A separate former-building way (150), independent from way 100's square.
-        kvstore::put_node(&kv, 11, 21.0, 51.0)?;
-        kvstore::put_node(&kv, 12, 21.001, 51.0)?;
-        kvstore::put_node(&kv, 13, 21.001, 51.001)?;
-        kvstore::put_node(&kv, 14, 21.0, 51.001)?;
+        kvstore::put_node(&kv, 11, dm(21.0), dm(51.0))?;
+        kvstore::put_node(&kv, 12, dm(21.001), dm(51.0))?;
+        kvstore::put_node(&kv, 13, dm(21.001), dm(51.001))?;
+        kvstore::put_node(&kv, 14, dm(21.0), dm(51.001))?;
         kvstore::put_way(&kv, 150, &[11, 12, 13, 14, 11])?;
         for &nid in &[11i64, 12, 13, 14] {
             kvstore::add_node_to_ways(&kv, nid, 150)?;
@@ -2128,10 +2142,10 @@ mod tests {
     fn test_apply_way_delete_removes_former_building_row_and_enqueues_dirty_cells() -> Result<()> {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;
 
-        kvstore::put_node(&kv, 21, 22.0, 52.0)?;
-        kvstore::put_node(&kv, 22, 22.001, 52.0)?;
-        kvstore::put_node(&kv, 23, 22.001, 52.001)?;
-        kvstore::put_node(&kv, 24, 22.0, 52.001)?;
+        kvstore::put_node(&kv, 21, dm(22.0), dm(52.0))?;
+        kvstore::put_node(&kv, 22, dm(22.001), dm(52.0))?;
+        kvstore::put_node(&kv, 23, dm(22.001), dm(52.001))?;
+        kvstore::put_node(&kv, 24, dm(22.0), dm(52.001))?;
         kvstore::put_way(&kv, 160, &[21, 22, 23, 24, 21])?;
         for &nid in &[21i64, 22, 23, 24] {
             kvstore::add_node_to_ways(&kv, nid, 160)?;

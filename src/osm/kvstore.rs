@@ -9,12 +9,14 @@ use rocksdb::{
 
 use super::encoding;
 
-/// Column family names for the 5 key spaces.
+/// Column family names for the 5 key spaces, plus a tiny `meta` space holding
+/// the on-disk format version.
 pub const CF_NODES: &str = "nodes";
 pub const CF_WAYS: &str = "ways";
 pub const CF_RELATIONS: &str = "relations";
 pub const CF_NODE_TO_WAYS: &str = "node_to_ways";
 pub const CF_WAY_TO_RELATIONS: &str = "way_to_relations";
+pub const CF_META: &str = "meta";
 
 const ALL_CFS: &[&str] = &[
     CF_NODES,
@@ -22,7 +24,30 @@ const ALL_CFS: &[&str] = &[
     CF_RELATIONS,
     CF_NODE_TO_WAYS,
     CF_WAY_TO_RELATIONS,
+    CF_META,
 ];
+
+/// On-disk format version for this store.
+///
+/// Bump this whenever the byte layout of any key or value changes. Nothing
+/// about the layout is self-describing, so without this stamp an old store
+/// read by a new binary decodes to plausible-looking garbage rather than
+/// failing: an 8-byte `i32` coordinate pair read out of a 16-byte `f64` value
+/// yields real numbers in the wrong place, and every building silently lands
+/// somewhere in the Gulf of Guinea. There is no in-place migration — the store
+/// is rebuilt wholesale by `import osm` — so the only job here is to make the
+/// mismatch loud.
+///
+/// Version 2: `i32` decimicrodegree node values (was two `f64`), big-endian
+/// keys (was little-endian), delta+varint way ref lists (was fixed-width).
+pub const KV_FORMAT_VERSION: u32 = 2;
+
+const FORMAT_VERSION_KEY: &[u8] = b"format_version";
+
+/// Message used when the store predates [`KV_FORMAT_VERSION`]. Named so tests
+/// can assert on it exactly rather than on a substring.
+pub const FORMAT_MISMATCH_MESSAGE: &str = "RocksDB store was built by an incompatible version — re-run `import osm` \
+     to rebuild it (there is no in-place migration)";
 
 pub type RocksDB = DBWithThreadMode<MultiThreaded>;
 
@@ -120,7 +145,62 @@ pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<Ro
     let db = DBWithThreadMode::open_cf_descriptors(&db_opts, path, cfs)
         .context("Failed to open RocksDB")?;
 
+    check_or_stamp_format_version(&db)?;
+
     Ok(db)
+}
+
+/// Verify the store's format version, stamping it if the store is empty.
+///
+/// An empty store (fresh directory, or one just cleared by [`clear`]) is
+/// stamped with the current version. A store carrying data but no stamp was
+/// built before versioning existed, so it is by definition an older layout and
+/// is rejected. See [`KV_FORMAT_VERSION`] for why silence here is dangerous.
+fn check_or_stamp_format_version(db: &RocksDB) -> Result<()> {
+    let stored = db
+        .get_cf(&cf(db, CF_META), FORMAT_VERSION_KEY)
+        .context("Failed to read RocksDB format version")?;
+
+    match stored {
+        Some(bytes) => {
+            let found = u32::from_le_bytes(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!(FORMAT_MISMATCH_MESSAGE))?,
+            );
+            if found != KV_FORMAT_VERSION {
+                anyhow::bail!(
+                    "{FORMAT_MISMATCH_MESSAGE} (found version {found}, expected {KV_FORMAT_VERSION})"
+                );
+            }
+            Ok(())
+        }
+        None => {
+            if store_has_data(db) {
+                anyhow::bail!("{FORMAT_MISMATCH_MESSAGE} (found an unversioned store)");
+            }
+            stamp_format_version(db)
+        }
+    }
+}
+
+fn stamp_format_version(db: &RocksDB) -> Result<()> {
+    db.put_cf(
+        &cf(db, CF_META),
+        FORMAT_VERSION_KEY,
+        KV_FORMAT_VERSION.to_le_bytes(),
+    )
+    .context("Failed to stamp RocksDB format version")?;
+    Ok(())
+}
+
+/// Cheap "is there anything in here" probe — the nodes CF is populated first
+/// by every import, so one key there is enough to call the store non-empty.
+fn store_has_data(db: &RocksDB) -> bool {
+    db.iterator_cf(&cf(db, CF_NODES), rocksdb::IteratorMode::Start)
+        .next()
+        .is_some()
 }
 
 /// Drop and recreate all column families, effectively clearing all data.
@@ -131,6 +211,10 @@ pub fn clear(db: &RocksDB) -> Result<()> {
         db.create_cf(*name, &make_cf_opts(name, 0))
             .with_context(|| format!("Failed to recreate CF {name}"))?;
     }
+    // The meta CF was just dropped along with the rest, so the version stamp
+    // has to be rewritten or the next `open` would see a store with data and
+    // no stamp, and reject it.
+    stamp_format_version(db)?;
     Ok(())
 }
 
@@ -141,17 +225,21 @@ fn cf<'a>(db: &'a RocksDB, name: &str) -> Arc<BoundColumnFamily<'a>> {
 
 // --- Node operations ---
 
-pub fn put_node(db: &RocksDB, node_id: i64, lon: f64, lat: f64) -> Result<()> {
+/// Store a node's coordinates, given in decimicrodegrees. Callers holding
+/// degrees (the `.osc` replication path) convert with
+/// `encoding::f64_to_decimicro`.
+pub fn put_node(db: &RocksDB, node_id: i64, lon_dm: i32, lat_dm: i32) -> Result<()> {
     db.put_cf(
         &cf(db, CF_NODES),
         encoding::encode_key(node_id),
-        encoding::encode_node(lon, lat),
+        encoding::encode_node(lon_dm, lat_dm),
     )?;
     Ok(())
 }
 
+/// Read a node's coordinates back, in decimicrodegrees.
 #[allow(dead_code)]
-pub fn get_node(db: &RocksDB, node_id: i64) -> Result<Option<(f64, f64)>> {
+pub fn get_node(db: &RocksDB, node_id: i64) -> Result<Option<(i32, i32)>> {
     if let Some(value) = db.get_cf(&cf(db, CF_NODES), encoding::encode_key(node_id))? {
         let coords = encoding::decode_node(&value);
         Ok(Some(coords))
@@ -160,21 +248,25 @@ pub fn get_node(db: &RocksDB, node_id: i64) -> Result<Option<(f64, f64)>> {
     }
 }
 
-/// Batch-look-up raw node coordinates for many node IDs, concatenating the
-/// results into a single buffer suitable for direct WKB emission.
+/// Batch-look-up node coordinates for many node IDs, widening them into a
+/// single buffer of WKB coordinate pairs (two LE f64 each).
 /// Returns `Ok(None)` if *any* node is missing (callers treat missing refs
 /// as "cannot build geometry").
-pub fn multi_get_nodes_concat(db: &RocksDB, node_ids: &[i64]) -> Result<Option<Vec<u8>>> {
+///
+/// Note this widens rather than copies: node values are stored as `i32`
+/// decimicrodegrees, which is half the bytes but no longer byte-identical to
+/// WKB's layout. See `encoding::push_wkb_coords`.
+pub fn multi_get_nodes_wkb_coords(db: &RocksDB, node_ids: &[i64]) -> Result<Option<Vec<u8>>> {
     let keys: Vec<[u8; 8]> = node_ids
         .iter()
         .map(|id| encoding::encode_key(*id))
         .collect();
     let handle = cf(db, CF_NODES);
     let results = db.batched_multi_get_cf(&handle, &keys, false);
-    let mut out: Vec<u8> = Vec::with_capacity(node_ids.len() * encoding::NODE_BYTE_LEN);
+    let mut out: Vec<u8> = Vec::with_capacity(node_ids.len() * encoding::WKB_COORD_BYTE_LEN);
     for r in results {
         match r.context("batched_multi_get_cf for nodes failed")? {
-            Some(slice) => out.extend_from_slice(&slice),
+            Some(slice) => encoding::push_wkb_coords(&mut out, &slice),
             None => return Ok(None),
         }
     }
@@ -192,14 +284,14 @@ pub fn put_way(db: &RocksDB, way_id: i64, node_ids: &[i64]) -> Result<()> {
     db.put_cf(
         &cf(db, CF_WAYS),
         encoding::encode_key(way_id),
-        encoding::encode_id_list(node_ids),
+        encoding::encode_delta_id_list(node_ids),
     )?;
     Ok(())
 }
 
 pub fn get_way(db: &RocksDB, way_id: i64) -> Result<Option<Vec<i64>>> {
     if let Some(value) = db.get_cf(&cf(db, CF_WAYS), encoding::encode_key(way_id))? {
-        Ok(Some(encoding::decode_id_list(&value)))
+        Ok(Some(encoding::decode_delta_id_list(&value)))
     } else {
         Ok(None)
     }
@@ -238,7 +330,7 @@ pub fn delete_relation(db: &RocksDB, relation_id: i64) -> Result<()> {
 
 pub fn get_node_to_ways(db: &RocksDB, node_id: i64) -> Result<Vec<i64>> {
     if let Some(value) = db.get_cf(&cf(db, CF_NODE_TO_WAYS), encoding::encode_key(node_id))? {
-        Ok(encoding::decode_id_list(&value))
+        Ok(encoding::decode_fixed_id_list(&value))
     } else {
         Ok(vec![])
     }
@@ -252,7 +344,7 @@ pub fn put_node_to_ways(db: &RocksDB, node_id: i64, way_ids: &[i64]) -> Result<(
     db.put_cf(
         &cf(db, CF_NODE_TO_WAYS),
         encoding::encode_key(node_id),
-        encoding::encode_id_list(way_ids),
+        encoding::encode_fixed_id_list(way_ids),
     )?;
     Ok(())
 }
@@ -277,7 +369,7 @@ pub fn remove_node_to_ways(db: &RocksDB, node_id: i64, way_id: i64) -> Result<()
 
 pub fn get_way_to_relations(db: &RocksDB, way_id: i64) -> Result<Vec<i64>> {
     if let Some(value) = db.get_cf(&cf(db, CF_WAY_TO_RELATIONS), encoding::encode_key(way_id))? {
-        Ok(encoding::decode_id_list(&value))
+        Ok(encoding::decode_fixed_id_list(&value))
     } else {
         Ok(vec![])
     }
@@ -291,7 +383,7 @@ pub fn put_way_to_relations(db: &RocksDB, way_id: i64, relation_ids: &[i64]) -> 
     db.put_cf(
         &cf(db, CF_WAY_TO_RELATIONS),
         encoding::encode_key(way_id),
-        encoding::encode_id_list(relation_ids),
+        encoding::encode_fixed_id_list(relation_ids),
     )?;
     Ok(())
 }
@@ -338,11 +430,17 @@ pub fn new_batch() -> WriteBatch {
     WriteBatch::default()
 }
 
-pub fn batch_put_node(db: &RocksDB, batch: &mut WriteBatch, node_id: i64, lon: f64, lat: f64) {
+pub fn batch_put_node(
+    db: &RocksDB,
+    batch: &mut WriteBatch,
+    node_id: i64,
+    lon_dm: i32,
+    lat_dm: i32,
+) {
     batch.put_cf(
         &cf(db, CF_NODES),
         encoding::encode_key(node_id),
-        encoding::encode_node(lon, lat),
+        encoding::encode_node(lon_dm, lat_dm),
     );
 }
 
@@ -350,7 +448,7 @@ pub fn batch_put_way(db: &RocksDB, batch: &mut WriteBatch, way_id: i64, node_ids
     batch.put_cf(
         &cf(db, CF_WAYS),
         encoding::encode_key(way_id),
-        encoding::encode_id_list(node_ids),
+        encoding::encode_delta_id_list(node_ids),
     );
 }
 
@@ -416,31 +514,94 @@ mod tests {
         (tmp, db)
     }
 
+    fn dm(v: f64) -> i32 {
+        encoding::f64_to_decimicro(v)
+    }
+
     #[test]
     fn test_node_roundtrip() {
         let (_tmp, db) = open_tmp_db();
-        put_node(&db, 1, 20.0, 50.0).unwrap();
-        assert_eq!(get_node(&db, 1).unwrap(), Some((20.0, 50.0)));
+        put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
+        assert_eq!(get_node(&db, 1).unwrap(), Some((dm(20.0), dm(50.0))));
         delete_node(&db, 1).unwrap();
         assert_eq!(get_node(&db, 1).unwrap(), None);
     }
 
     #[test]
-    fn test_multi_get_nodes_concat() {
+    fn test_multi_get_nodes_wkb_coords() {
         let (_tmp, db) = open_tmp_db();
-        put_node(&db, 1, 20.0, 50.0).unwrap();
-        put_node(&db, 2, 21.0, 51.0).unwrap();
+        put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
+        put_node(&db, 2, dm(21.0), dm(51.0)).unwrap();
 
-        let raw = multi_get_nodes_concat(&db, &[1, 2]).unwrap().unwrap();
-        assert_eq!(raw.len(), 2 * encoding::NODE_BYTE_LEN);
+        // The buffer is widened to WKB coordinate pairs, so it is twice the
+        // stored size, not equal to it.
+        let raw = multi_get_nodes_wkb_coords(&db, &[1, 2]).unwrap().unwrap();
+        assert_eq!(raw.len(), 2 * encoding::WKB_COORD_BYTE_LEN);
         let lon = f64::from_le_bytes(raw[..8].try_into().unwrap());
         let lat = f64::from_le_bytes(raw[8..16].try_into().unwrap());
-        assert!((lon - 20.0).abs() < 1e-15);
-        assert!((lat - 50.0).abs() < 1e-15);
+        assert!((lon - 20.0).abs() < 1e-9);
+        assert!((lat - 50.0).abs() < 1e-9);
 
         // A missing node anywhere in the list yields None.
-        let res = multi_get_nodes_concat(&db, &[1, 999]).unwrap();
+        let res = multi_get_nodes_wkb_coords(&db, &[1, 999]).unwrap();
         assert!(res.is_none());
+    }
+
+    /// A store carrying data but no version stamp predates versioning, so it
+    /// must be rejected rather than decoded as if it were the current layout.
+    #[test]
+    fn unversioned_store_with_data_is_rejected_on_open() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let db = open(tmp.path(), 32, 4).unwrap();
+            put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
+            // Simulate a pre-versioning store: data present, stamp absent.
+            db.delete_cf(&cf(&db, CF_META), FORMAT_VERSION_KEY).unwrap();
+        }
+
+        let err = open(tmp.path(), 32, 4).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(FORMAT_MISMATCH_MESSAGE),
+            "got: {err:#}"
+        );
+    }
+
+    /// A store written by a *different* version must be rejected too — this is
+    /// the case that would otherwise decode to plausible-looking garbage.
+    #[test]
+    fn store_with_a_different_format_version_is_rejected_on_open() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let db = open(tmp.path(), 32, 4).unwrap();
+            put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
+            db.put_cf(
+                &cf(&db, CF_META),
+                FORMAT_VERSION_KEY,
+                (KV_FORMAT_VERSION + 1).to_le_bytes(),
+            )
+            .unwrap();
+        }
+
+        let err = open(tmp.path(), 32, 4).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(FORMAT_MISMATCH_MESSAGE),
+            "got: {err:#}"
+        );
+    }
+
+    /// `clear` drops every CF including `meta`, so it must re-stamp — otherwise
+    /// the next open sees data without a stamp and refuses to start.
+    #[test]
+    fn clear_restamps_the_format_version_so_reopen_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let db = open(tmp.path(), 32, 4).unwrap();
+            put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
+            clear(&db).unwrap();
+            put_node(&db, 2, dm(21.0), dm(51.0)).unwrap();
+        }
+        let db = open(tmp.path(), 32, 4).unwrap();
+        assert_eq!(get_node(&db, 2).unwrap(), Some((dm(21.0), dm(51.0))));
     }
 
     #[test]

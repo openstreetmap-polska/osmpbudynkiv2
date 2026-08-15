@@ -1,50 +1,19 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use duckdb::{Connection, types::Value};
+use duckdb::Connection;
+use osmpbf::{BlobDecode, BlobReader, Element, RelMemberType};
 use tracing::info;
 
 use crate::config::Config;
 use crate::download::download_file;
+use crate::osm::encoding;
 use crate::osm::kvstore;
 use crate::osm::kvstore::RocksDB;
 use crate::osm::lifecycle;
 use crate::osm::pbf_header::read_replication_info;
 use crate::utils::format_duration;
-
-fn value_to_i64_list(value: Value) -> Result<Vec<i64>> {
-    match value {
-        Value::Array(items) | Value::List(items) => items
-            .into_iter()
-            .map(|item| match item {
-                Value::BigInt(v) => Ok(v),
-                Value::Int(v) => Ok(v as i64),
-                Value::SmallInt(v) => Ok(v as i64),
-                Value::TinyInt(v) => Ok(v as i64),
-                Value::UInt(v) => Ok(v as i64),
-                Value::UBigInt(v) => Ok(v as i64),
-                _ => Err(anyhow::anyhow!("Invalid numeric element in array")),
-            })
-            .collect(),
-        _ => Err(anyhow::anyhow!("Expected array/list value")),
-    }
-}
-
-fn value_to_string_list(value: Value) -> Result<Vec<String>> {
-    match value {
-        Value::Array(items) | Value::List(items) => items
-            .into_iter()
-            .map(|item| match item {
-                Value::Text(s) => Ok(s),
-                Value::Null => Ok(String::new()),
-                Value::Enum(s) => Ok(s),
-                Value::Int(i) => Ok(i.to_string()),
-                _ => Ok(String::new()),
-            })
-            .collect(),
-        _ => Err(anyhow::anyhow!("Expected array/list value")),
-    }
-}
 
 fn reset_osm_tables(conn: &Connection, kv: &RocksDB) -> Result<()> {
     conn.execute_batch(
@@ -131,11 +100,14 @@ pub fn import(
             Ok(())
         };
 
+        // One pass writes the nodes, ways and relations key spaces together;
+        // see `stream_pbf_to_rocksdb` for why that is safe and why it replaced
+        // three separate scans.
         let t = std::time::Instant::now();
-        stream_nodes_to_rocksdb(conn, kv, pbf_str)?;
+        stream_pbf_to_rocksdb(kv, &pbf_path)?;
         info!(
             elapsed = %format_duration(t.elapsed()),
-            "Step done: stream nodes to RocksDB"
+            "Step done: stream PBF to RocksDB"
         );
         check_shutdown()?;
 
@@ -144,14 +116,6 @@ pub fn import(
         info!(
             elapsed = %format_duration(t.elapsed()),
             "Step done: import address nodes"
-        );
-        check_shutdown()?;
-
-        let t = std::time::Instant::now();
-        stream_ways_to_rocksdb(conn, kv, pbf_str)?;
-        info!(
-            elapsed = %format_duration(t.elapsed()),
-            "Step done: stream ways to RocksDB"
         );
         check_shutdown()?;
 
@@ -168,14 +132,6 @@ pub fn import(
         info!(
             elapsed = %format_duration(t.elapsed()),
             "Step done: import way former buildings"
-        );
-        check_shutdown()?;
-
-        let t = std::time::Instant::now();
-        stream_relations_to_rocksdb(conn, kv, pbf_str)?;
-        info!(
-            elapsed = %format_duration(t.elapsed()),
-            "Step done: stream relations to RocksDB"
         );
         check_shutdown()?;
 
@@ -302,68 +258,162 @@ fn import_address_nodes(conn: &Connection, pbf_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn stream_nodes_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Result<()> {
-    info!("Pass 1: Streaming nodes to RocksDB");
-
-    let sql = format!(
-        "SELECT id, lon, lat FROM ST_ReadOSM('{pbf_path}') WHERE kind = 'node' AND lon IS NOT NULL AND lat IS NOT NULL"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-    let mut batch = kvstore::new_batch();
-    let mut count = 0u64;
-    while let Some(row) = rows.next()? {
-        let id: i64 = row.get(0)?;
-        let lon: f64 = row.get(1)?;
-        let lat: f64 = row.get(2)?;
-        kvstore::batch_put_node(kv, &mut batch, id, lon, lat);
-        count += 1;
-        if count.is_multiple_of(10000) {
-            kvstore::write_batch(kv, batch)?;
-            batch = kvstore::new_batch();
-        }
-    }
-    if !count.is_multiple_of(10000) {
-        kvstore::write_batch(kv, batch)?;
-    }
-    info!(count, "Nodes streamed to RocksDB");
-    Ok(())
+/// Counts reported by [`stream_pbf_to_rocksdb`], purely for logging.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PbfCounts {
+    nodes: u64,
+    ways: u64,
+    relations: u64,
 }
 
-fn stream_ways_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Result<()> {
-    info!("Pass 2: Streaming ways to RocksDB");
+/// Stream every node, way and relation into RocksDB in a single parallel pass
+/// over the PBF.
+///
+/// # Why one pass and not three
+///
+/// This replaces what used to be three separate `ST_ReadOSM` scans (nodes,
+/// then ways, then relations), each of which decompressed the entire 2.2 GB
+/// file. Collapsing them is safe because all three are **pure writes** — none
+/// reads anything back out of RocksDB — so they have no ordering dependency on
+/// each other, and in particular this does *not* rely on the PBF being sorted
+/// by element type. The passes that do read (`resolve_node_coords` needs the
+/// nodes CF, `resolve_way_coords` the ways CF) all run after this returns.
+///
+/// # Why `BlobReader` rather than `IndexedReader`
+///
+/// `IndexedReader::create_index` only reads blob *headers* and skips the
+/// bodies, so it knows each blob's offset but not its contents; the per-blob
+/// id ranges that would let it skip anything are filled in lazily, only once a
+/// blob has actually been decompressed. Skipping therefore never helps a first
+/// pass. Reading every blob exactly once beats any amount of skipping across
+/// repeated passes.
+///
+/// # Why this loop is sequential
+///
+/// An earlier version ran the blob loop through rayon's `par_bridge`, one
+/// `WriteBatch` per blob across all 12 cores. That is *correct* — every write
+/// here is a blind put or a commutative merge, never a read-modify-write, so
+/// blobs may be decoded and committed in any order — but it was measured and
+/// dropped: it bought 41s on a 5m 00s pass (see `docs/kv_encoding_measured.md`)
+/// because the pass is bound by RocksDB write throughput and the sequential
+/// blob read, not by decode CPU. Almost all of the win over the old
+/// three-scan version comes from decompressing the file once instead of three
+/// times, not from threading. A `rayon` dependency and nondeterministic
+/// `node_to_ways` ordering were not worth 7% of one import step.
+///
+/// The same measurement covers the decompression backend: forcing
+/// `osmpbf`'s `zlib-ng` feature moved the pass to 4m 46s. Note the default
+/// build does *not* use miniz_oxide — `zip` (via `prg_convert`) already
+/// enables `flate2/zlib-rs`, which outranks `flate2`'s `rust_backend`, so the
+/// baseline is already a fast zlib. Adding `zlib-ng` on top trades a cmake +
+/// C build for ~5% of one step.
+fn stream_pbf_to_rocksdb(kv: &RocksDB, pbf_path: &Path) -> Result<PbfCounts> {
+    info!("Pass 1: Streaming nodes, ways and relations to RocksDB");
 
-    let sql = format!(
-        "SELECT id, refs FROM ST_ReadOSM('{pbf_path}') WHERE kind = 'way' AND refs IS NOT NULL AND len(refs) > 0"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-    let mut batch = kvstore::new_batch();
-    let mut count = 0u64;
+    let reader = BlobReader::from_path(pbf_path)
+        .with_context(|| format!("Failed to open PBF at {}", pbf_path.display()))?;
 
-    while let Some(row) = rows.next()? {
-        let id: i64 = row.get(0)?;
-        let refs_value: Value = row.get(1)?;
-        let refs = value_to_i64_list(refs_value)?;
-        kvstore::batch_put_way(kv, &mut batch, id, &refs);
+    let nodes = AtomicU64::new(0);
+    let ways = AtomicU64::new(0);
+    let relations = AtomicU64::new(0);
 
-        for &node_id in &refs {
-            kvstore::batch_merge_node_to_way(kv, &mut batch, node_id, id);
+    for blob in reader {
+        // Polled per blob rather than per element: a blob is ~8k elements, so
+        // this is frequent enough to stay responsive to Ctrl+C without
+        // checking an atomic millions of times.
+        crate::shutdown::check_requested()?;
+
+        let block = match blob.context("Failed to read PBF blob")?.decode()? {
+            BlobDecode::OsmData(block) => block,
+            BlobDecode::OsmHeader(_) | BlobDecode::Unknown(_) => continue,
+        };
+
+        let mut batch = kvstore::new_batch();
+        let (mut n, mut w, mut r) = (0u64, 0u64, 0u64);
+
+        for element in block.elements() {
+            match element {
+                Element::Node(node) => {
+                    kvstore::batch_put_node(
+                        kv,
+                        &mut batch,
+                        node.id(),
+                        node.decimicro_lon(),
+                        node.decimicro_lat(),
+                    );
+                    n += 1;
+                }
+                Element::DenseNode(node) => {
+                    kvstore::batch_put_node(
+                        kv,
+                        &mut batch,
+                        node.id(),
+                        node.decimicro_lon(),
+                        node.decimicro_lat(),
+                    );
+                    n += 1;
+                }
+                Element::Way(way) => {
+                    // `refs()`, not `raw_refs()` -- the latter returns the
+                    // delta-coded values straight out of the protobuf.
+                    let refs: Vec<i64> = way.refs().collect();
+                    if refs.is_empty() {
+                        continue;
+                    }
+                    kvstore::batch_put_way(kv, &mut batch, way.id(), &refs);
+                    for &node_id in &refs {
+                        kvstore::batch_merge_node_to_way(kv, &mut batch, node_id, way.id());
+                    }
+                    w += 1;
+                }
+                Element::Relation(rel) => {
+                    let members: Vec<(i64, u8, u8)> = rel
+                        .members()
+                        .map(|m| {
+                            let type_str = match m.member_type {
+                                RelMemberType::Node => "node",
+                                RelMemberType::Way => "way",
+                                RelMemberType::Relation => "relation",
+                            };
+                            (
+                                m.member_id,
+                                encoding::encode_member_type(type_str),
+                                encoding::encode_member_role(m.role().unwrap_or("")),
+                            )
+                        })
+                        .collect();
+                    if members.is_empty() {
+                        continue;
+                    }
+                    kvstore::batch_put_relation(kv, &mut batch, rel.id(), &members);
+                    for &(way_id, member_type, _) in &members {
+                        if member_type == encoding::encode_member_type("way") {
+                            kvstore::batch_merge_way_to_relation(kv, &mut batch, way_id, rel.id());
+                        }
+                    }
+                    r += 1;
+                }
+            }
         }
 
-        count += 1;
-        if count.is_multiple_of(10000) {
-            kvstore::write_batch(kv, batch)?;
-            batch = kvstore::new_batch();
-        }
-    }
-
-    if !count.is_multiple_of(10000) {
         kvstore::write_batch(kv, batch)?;
+        nodes.fetch_add(n, Ordering::Relaxed);
+        ways.fetch_add(w, Ordering::Relaxed);
+        relations.fetch_add(r, Ordering::Relaxed);
     }
 
-    info!(count, "Ways streamed to RocksDB");
-    Ok(())
+    let counts = PbfCounts {
+        nodes: nodes.load(Ordering::Relaxed),
+        ways: ways.load(Ordering::Relaxed),
+        relations: relations.load(Ordering::Relaxed),
+    };
+    info!(
+        nodes = counts.nodes,
+        ways = counts.ways,
+        relations = counts.relations,
+        "PBF streamed to RocksDB"
+    );
+    Ok(counts)
 }
 
 fn import_way_buildings_and_addresses(conn: &Connection, pbf_path: &str) -> Result<()> {
@@ -627,76 +677,6 @@ fn import_relation_former_buildings(conn: &Connection, pbf_path: &str) -> Result
     )?;
     info!(count, "Relation former buildings imported");
 
-    Ok(())
-}
-
-fn string_to_member_type(member_type: &str) -> u8 {
-    match member_type {
-        "node" => 0,
-        "way" => 1,
-        "relation" => 2,
-        _ => 3,
-    }
-}
-
-fn string_to_member_role(role: &str) -> u8 {
-    match role {
-        "outer" | "" => 0,
-        "inner" => 1,
-        _ => 2,
-    }
-}
-
-fn stream_relations_to_rocksdb(conn: &Connection, kv: &RocksDB, pbf_path: &str) -> Result<()> {
-    info!("Pass 3: Streaming relations to RocksDB");
-
-    let sql = format!(
-        "SELECT id, refs, ref_types, ref_roles FROM ST_ReadOSM('{pbf_path}') WHERE kind = 'relation' AND refs IS NOT NULL AND len(refs) > 0"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-    let mut batch = kvstore::new_batch();
-    let mut count = 0u64;
-
-    while let Some(row) = rows.next()? {
-        let id: i64 = row.get(0)?;
-        let refs = value_to_i64_list(row.get::<_, Value>(1)?)?;
-        let ref_types = value_to_string_list(row.get::<_, Value>(2)?)?;
-        let ref_roles = value_to_string_list(row.get::<_, Value>(3)?)?;
-
-        let members: Vec<(i64, u8, u8)> = refs
-            .into_iter()
-            .zip(ref_types)
-            .zip(ref_roles)
-            .map(|((ref_id, ref_type), ref_role)| {
-                (
-                    ref_id,
-                    string_to_member_type(&ref_type),
-                    string_to_member_role(&ref_role),
-                )
-            })
-            .collect();
-
-        kvstore::batch_put_relation(kv, &mut batch, id, &members);
-
-        for &(way_id, ref_type, _) in &members {
-            if ref_type == 1 {
-                kvstore::batch_merge_way_to_relation(kv, &mut batch, way_id, id);
-            }
-        }
-
-        count += 1;
-        if count.is_multiple_of(1000) {
-            kvstore::write_batch(kv, batch)?;
-            batch = kvstore::new_batch();
-        }
-    }
-
-    if !count.is_multiple_of(1000) {
-        kvstore::write_batch(kv, batch)?;
-    }
-
-    info!(count, "Relations streamed to RocksDB");
     Ok(())
 }
 

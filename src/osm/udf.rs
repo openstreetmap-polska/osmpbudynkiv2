@@ -52,7 +52,7 @@ impl VScalar for ResolveNodeCoords {
             let refs = unsafe { child.as_slice::<i64>() };
             let slice = &refs[offset..offset + length];
 
-            let raw_coords = match kvstore::multi_get_nodes_concat(&state.kv, slice)? {
+            let raw_coords = match kvstore::multi_get_nodes_wkb_coords(&state.kv, slice)? {
                 Some(bytes) => bytes,
                 None => {
                     out.set_null(i);
@@ -117,7 +117,7 @@ impl VScalar for ResolveWayCoords {
                 continue;
             }
 
-            let raw_coords = match kvstore::multi_get_nodes_concat(&state.kv, &node_ids)? {
+            let raw_coords = match kvstore::multi_get_nodes_wkb_coords(&state.kv, &node_ids)? {
                 Some(bytes) => bytes,
                 None => {
                     out.set_null(i);
@@ -150,12 +150,17 @@ pub fn register_udfs(conn: &Connection, kv: Arc<RocksDB>) -> Result<()> {
     Ok(())
 }
 
-/// Encode raw node coordinate bytes as a WKB LineString (little-endian, 2D).
-/// `raw_coords` is a flat buffer of N * 16 bytes (each 16 bytes = lon LE f64 || lat LE f64).
-/// WKB LE LineString layout is identical: header + sequence of (f64 x, f64 y) pairs.
-/// So we can copy the raw bytes directly without any float conversion.
+/// Encode WKB coordinate bytes as a WKB LineString (little-endian, 2D).
+/// `raw_coords` is a flat buffer of N * 16 bytes (each 16 bytes = lon LE f64 || lat LE f64),
+/// as produced by `kvstore::multi_get_nodes_wkb_coords`.
+/// WKB LE LineString layout is identical: header + sequence of (f64 x, f64 y) pairs,
+/// so the buffer is appended verbatim after the header.
+///
+/// Note the widening from the stored `i32` decimicrodegree form happens in
+/// `encoding::push_wkb_coords`, not here — this used to consume the stored
+/// bytes directly, back when node values were two `f64`.
 fn encode_wkb_linestring_raw(num_points: usize, raw_coords: &[u8]) -> Vec<u8> {
-    debug_assert_eq!(raw_coords.len(), num_points * encoding::NODE_BYTE_LEN);
+    debug_assert_eq!(raw_coords.len(), num_points * encoding::WKB_COORD_BYTE_LEN);
     let mut buf = Vec::with_capacity(9 + raw_coords.len());
     buf.push(0x01); // little-endian
     buf.extend_from_slice(&2u32.to_le_bytes()); // wkbLineString = 2
@@ -169,16 +174,20 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn dm(v: f64) -> i32 {
+        encoding::f64_to_decimicro(v)
+    }
+
     fn setup() -> (TempDir, Connection, Arc<RocksDB>) {
         let tmp = TempDir::new().unwrap();
         let kv = Arc::new(kvstore::open(tmp.path(), 32, 4).unwrap());
 
         // Insert some test nodes (a simple square)
-        kvstore::put_node(&kv, 1, 20.0, 50.0).unwrap();
-        kvstore::put_node(&kv, 2, 21.0, 50.0).unwrap();
-        kvstore::put_node(&kv, 3, 21.0, 51.0).unwrap();
-        kvstore::put_node(&kv, 4, 20.0, 51.0).unwrap();
-        kvstore::put_node(&kv, 5, 20.0, 50.0).unwrap(); // closing node
+        kvstore::put_node(&kv, 1, dm(20.0), dm(50.0)).unwrap();
+        kvstore::put_node(&kv, 2, dm(21.0), dm(50.0)).unwrap();
+        kvstore::put_node(&kv, 3, dm(21.0), dm(51.0)).unwrap();
+        kvstore::put_node(&kv, 4, dm(20.0), dm(51.0)).unwrap();
+        kvstore::put_node(&kv, 5, dm(20.0), dm(50.0)).unwrap(); // closing node
 
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("INSTALL spatial; LOAD spatial;")
@@ -267,7 +276,7 @@ mod tests {
         let kv = Arc::new(kvstore::open(tmp.path(), 32, 4).unwrap());
 
         for i in 0..5000i64 {
-            kvstore::put_node(&kv, i, 20.0 + (i as f64) * 0.001, 50.0).unwrap();
+            kvstore::put_node(&kv, i, dm(20.0 + (i as f64) * 0.001), dm(50.0)).unwrap();
         }
 
         let conn = Connection::open_in_memory().unwrap();

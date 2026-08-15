@@ -25,6 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = "6"
 rocksdb = { version = "0.24", default-features = false, features = ["zstd"] }
+osmpbf = "0.3.8"
 
 [dev-dependencies]
 assert_cmd = "2"
