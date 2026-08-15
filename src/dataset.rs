@@ -145,12 +145,58 @@ pub fn hashed_select(inner_select: &str) -> String {
 /// always the true total regardless of this cap.
 pub const MAX_EXAMPLE_IDS: usize = 20;
 
-/// Rows a dataset loader dropped rather than staging, for one of two
+/// `k1 IS NOT NULL AND k2 IS NOT NULL ...`, for use as a `WHERE` clause in a
+/// loader's inner select. A record with no identifier cannot be diffed (see
+/// `update::diff`, where `ANTI JOIN ... USING (id)` never matches NULL to
+/// NULL) or deduplicated, so it is dropped before it is ever written. Paired
+/// with [`deduplicate_by_key`], which enforces the other half of the same
+/// guarantee -- the two run at different points, deliberately (this one
+/// inside the load SELECT, that one after the table exists; see the plan's
+/// "Why not do both at insert").
+///
+/// This filter sits INSIDE `hashed_select`'s input, which [`ROW_HASH_VERSION`]'s
+/// doc flags as bump territory ("a source's inner select is part of the hash
+/// input"). It still needs no bump: that rule is about expressions that
+/// change a row's *value* (`ULICA_PREFIX_STRIP_SQL` is the version-2 case).
+/// A row filter changes which rows exist, never the content of a surviving
+/// row, so every surviving `_row_hash` is bit-identical.
+pub fn non_null_key_sql(key_columns: &[&str]) -> String {
+    key_columns
+        .iter()
+        .map(|k| format!("{k} IS NOT NULL"))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// `k1 IS NULL OR k2 IS NULL ...` -- exactly the rows `non_null_key_sql`
+/// excludes, for the count query each loader runs to report them (a filtered
+/// `CREATE TABLE AS SELECT` never says how many rows its `WHERE` dropped).
+///
+/// It lives here, beside its complement, rather than in either loader: the
+/// two predicates decide the same question from opposite sides, and a
+/// composite key makes the relationship easy to get wrong -- the negation of
+/// `a IS NOT NULL AND b IS NOT NULL` is `a IS NULL OR b IS NULL`, NOT
+/// `a IS NULL AND b IS NULL`. A copy per loader would let BDOT10k's
+/// two-column form drift from EGIB's one-column form without anything
+/// noticing; `non_null_key_sql_and_null_key_sql_are_complements` pins them
+/// together instead.
+pub fn null_key_sql(key_columns: &[&str]) -> String {
+    key_columns
+        .iter()
+        .map(|k| format!("{k} IS NULL"))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Rows a dataset loader dropped rather than staging, for one of four
 /// reasons: geometry that failed `ST_IsValid` (`ST_AsMVTGeom` cannot
-/// tolerate invalid geometry, see docs/invalid_geometry_tile_500s.md), or
+/// tolerate invalid geometry, see docs/invalid_geometry_tile_500s.md),
 /// geometry whose bbox spans at least one full z14 cell in either axis (see
 /// `filter_oversized_geometry` -- a corrupted merge of two unrelated
-/// features, not a real building). Both reasons drop rather than repair.
+/// features, not a real building), a NULL record key (see
+/// [`non_null_key_sql`] -- a record with no identifier cannot be diffed or
+/// deduplicated), or a duplicate record key (see [`deduplicate_by_key`]).
+/// All four reasons drop rather than repair.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadStats {
     pub skipped_invalid_geometry: i64,
@@ -162,6 +208,14 @@ pub struct LoadStats {
     /// Same cap and ordering caveat as `skipped_example_ids`, for the
     /// oversized-geometry reason.
     pub skipped_oversized_example_ids: Vec<String>,
+    /// Rows dropped for having a NULL record key (`non_null_key_sql`). No
+    /// example-ids field, unlike every other reason: the id column *is* what
+    /// is missing, so the list would be a column of NULLs.
+    pub skipped_null_key: i64,
+    pub skipped_duplicate_key: i64,
+    /// Same cap and ordering caveat as `skipped_example_ids`, for the
+    /// duplicate-key reason.
+    pub skipped_duplicate_example_ids: Vec<String>,
 }
 
 impl LoadStats {
@@ -176,6 +230,22 @@ impl LoadStats {
         self.skipped_oversized_example_ids = oversized.skipped_oversized_example_ids;
         self
     }
+
+    /// Fold in the unique-key counts from the dedup pass, the same way
+    /// `merge_oversized` folds in the oversized-geometry counts: a loader
+    /// combines `filter_invalid_geometry`'s result with
+    /// `filter_oversized_geometry`'s, and then with `deduplicate_by_key`'s
+    /// (`unique`), into the one `LoadStats` it returns. `skipped_null_key`
+    /// is copied here too even though `deduplicate_by_key` itself never sets
+    /// it -- NULL-keyed rows are gone before it ever runs -- because the
+    /// loader gets that count from a separate query against the source
+    /// parquet and needs one field on `unique` to carry it through.
+    pub fn merge_unique_key(mut self, unique: LoadStats) -> Self {
+        self.skipped_null_key = unique.skipped_null_key;
+        self.skipped_duplicate_key = unique.skipped_duplicate_key;
+        self.skipped_duplicate_example_ids = unique.skipped_duplicate_example_ids;
+        self
+    }
 }
 
 /// Render one skip-reason clause for a `job_run_log` summary message, shared
@@ -184,7 +254,16 @@ impl LoadStats {
 /// wording is written once rather than once per reason per source.
 /// `reason` reads naturally before "rows", e.g. `"invalid-geometry"` or
 /// `"oversized-geometry"`.
+///
+/// `ids` empty renders as a bare "skipped N {reason} rows", with the
+/// `(ids: ...)` parenthetical omitted entirely -- needed for the null-key
+/// reason, which by design never has example ids (see
+/// `LoadStats::skipped_null_key`) and would otherwise render the empty and
+/// slightly absurd `(ids: )`.
 pub fn format_skip_clause(reason: &str, count: i64, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return format!("skipped {count} {reason} rows");
+    }
     let shown = ids.join(", ");
     let more = (count as usize).saturating_sub(ids.len());
     if more > 0 {
@@ -325,6 +404,122 @@ pub fn filter_oversized_geometry(
     Ok(LoadStats {
         skipped_oversized_geometry,
         skipped_oversized_example_ids,
+        ..Default::default()
+    })
+}
+
+/// Delete all but one row per duplicate key from a just-loaded table,
+/// capturing example ids before they're gone. Sibling to
+/// `filter_invalid_geometry` and `filter_oversized_geometry` above, matching
+/// their shape exactly: scan for up to `MAX_EXAMPLE_IDS` example ids,
+/// `DELETE`, return a `LoadStats`. Among duplicates sharing a key, the row
+/// `order_by` ranks first survives (`"WERSJA DESC"` for BDOT10k,
+/// `"czas_pozyskania DESC"` for EGIB).
+///
+/// Two-phase SQL, deliberately: a `dup_keys` `GROUP BY` finds which keys are
+/// actually duplicated, and only those rows are fed to the ranking window.
+/// Measured on the real 17.77M-row EGIB table (851 duplicate-key groups,
+/// ~2.5k rows in `dup_keys`): two-phase 0.60s vs 7.29s for a full-table
+/// `QUALIFY row_number()` over every row -- the two-phase structure is worth
+/// far more than the choice of ranking function below.
+///
+/// **No `IS NOT NULL` guard on the key is needed here.** NULL-keyed rows
+/// never reached `table` in the first place -- see [`non_null_key_sql`],
+/// applied in the load SELECT before this ever runs. Without that
+/// precondition a `PARTITION BY` over a nullable key would be actively
+/// wrong, not merely redundant: the window would put every NULL-keyed row
+/// into one partition and keep exactly one of them, silently discarding the
+/// rest as if they were duplicates of each other.
+///
+/// **`row_number()` rather than `DISTINCT ON` or `arg_max`/`max_by`** --
+/// measured, not assumed. In this two-phase shape all three are within
+/// noise of each other (0.60s / 0.53s / 0.53s on the real table), because
+/// the cost is the `GROUP BY`, not the ranking; `row_number()` wins on
+/// shorter SQL, since `DISTINCT ON` yields the *survivors* and this is a
+/// DELETE. `arg_max` MUST NOT be used: for a group whose ordering column is
+/// all-NULL it returns NULL, that NULL lands in a `NOT IN` anti-predicate,
+/// and the predicate then evaluates to NULL for *every* row in the table --
+/// the DELETE silently removes nothing at all, table-wide. Latent rather
+/// than live today (0 NULL `czas_pozyskania`, 0 NULL `WERSJA` on the real
+/// snapshots), which is exactly what makes it dangerous: it would land with
+/// a future export, not show up in review.
+///
+/// **No tiebreak column, deliberately (2026-08-14).** 843 of 851 EGIB
+/// duplicate groups tie on `czas_pozyskania`, so which row survives is
+/// whatever the scan happened to order first. Cost of that: if scan order
+/// for a tying group flips between an import and a later refresh, that
+/// group's row reports as *modified* once -- bounded at ~843 rows per EGIB
+/// refresh against 17.5M, and self-correcting. If EGIB refresh churn ever
+/// shows a persistent ~843-row floor, this is the cause and a tiebreak is
+/// the fix.
+///
+/// **`NULLS LAST` is spelled out** rather than left to DuckDB's default,
+/// because `default_null_order` is settable and this project overrides
+/// `duckdb_init_commands` wholesale. A NULL version must never win over a
+/// dated one.
+///
+/// **`rowid` is safe here** despite CLAUDE.md's "serving tables store rows,
+/// not id references" warning -- that invariant is about *storing* a rowid
+/// across a DELETE+INSERT; this one lives and dies inside a single DELETE
+/// statement.
+///
+/// Runs strictly after the table is built and outside `hashed_select`'s
+/// projection -- the same argument `filter_oversized_geometry` already
+/// relies on -- so no `ROW_HASH_VERSION` bump is needed.
+///
+/// **Must run after `filter_invalid_geometry` and
+/// `filter_oversized_geometry`.** A duplicate pair whose newest member has
+/// bad geometry must fall back to the older, valid member instead of being
+/// collapsed down to a row one of those filters then deletes -- losing the
+/// object entirely.
+pub fn deduplicate_by_key(
+    conn: &duckdb::Connection,
+    table: &str,
+    key_columns: &[&str],
+    order_by: &str,
+    id_column: &str,
+) -> anyhow::Result<LoadStats> {
+    use anyhow::Context;
+
+    let keys = key_columns.join(", ");
+    let predicate = format!(
+        "rowid IN (
+          WITH dup_keys AS (
+            SELECT {keys} FROM {table}
+            GROUP BY {keys} HAVING count(*) > 1
+          ),
+          ranked AS (
+            SELECT t.rowid AS rid,
+                   row_number() OVER (PARTITION BY {keys} ORDER BY {order_by} NULLS LAST) AS rn
+            FROM {table} t JOIN dup_keys USING ({keys})
+          )
+          SELECT rid FROM ranked WHERE rn > 1
+        )"
+    );
+
+    let mut skipped_duplicate_example_ids = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {id_column} FROM {table} WHERE {predicate} LIMIT {MAX_EXAMPLE_IDS}"
+            ))
+            .with_context(|| format!("Failed to prepare duplicate-key scan on {table}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .with_context(|| format!("Failed to scan duplicate-key rows in {table}"))?;
+        for row in rows {
+            skipped_duplicate_example_ids.push(row.context("Failed to read duplicate-key id")?);
+        }
+    }
+
+    let skipped_duplicate_key = conn
+        .execute(&format!("DELETE FROM {table} WHERE {predicate}"), [])
+        .with_context(|| format!("Failed to delete duplicate-key rows from {table}"))?
+        as i64;
+
+    Ok(LoadStats {
+        skipped_duplicate_key,
+        skipped_duplicate_example_ids,
         ..Default::default()
     })
 }
@@ -746,5 +941,289 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(survivors, 1, "'keep' must still be the only surviving row");
+    }
+
+    #[test]
+    fn non_null_key_sql_covers_every_key_column() {
+        assert_eq!(
+            non_null_key_sql(&["PRZESTRZENNAZW", "LOKALNYID"]),
+            "PRZESTRZENNAZW IS NOT NULL AND LOKALNYID IS NOT NULL"
+        );
+    }
+
+    /// The load select keeps `non_null_key_sql` and the loaders' count query
+    /// reports `null_key_sql`, so if the two ever stop partitioning the rows
+    /// exactly the count would silently misreport what was dropped. Checked
+    /// against the database rather than by string comparison, because the
+    /// thing that matters is DuckDB's three-valued logic, not the text: for a
+    /// composite key the complement flips `AND` to `OR`, which is the easy
+    /// mistake this pins.
+    #[test]
+    fn non_null_key_sql_and_null_key_sql_are_complements() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE src (a VARCHAR, b VARCHAR);
+             INSERT INTO src VALUES
+                 ('x', 'y'), ('x', NULL), (NULL, 'y'), (NULL, NULL);",
+        )
+        .unwrap();
+
+        let keys = ["a", "b"];
+        let (kept, dropped): (i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FILTER (WHERE {}), count(*) FILTER (WHERE {}) FROM src",
+                    non_null_key_sql(&keys),
+                    null_key_sql(&keys)
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(kept, 1, "only the fully-populated key survives the filter");
+        assert_eq!(dropped, 3, "every row with any NULL key column is counted");
+        assert_eq!(
+            kept + dropped,
+            4,
+            "the two must partition the table exactly"
+        );
+    }
+
+    /// Mirrors `with_centroid_select_does_not_change_the_row_hash`: applying
+    /// `non_null_key_sql` as a `WHERE` on the load select must not change the
+    /// `_row_hash` of a row that survives it, even though the filter sits
+    /// INSIDE `hashed_select`'s input (see the doc comment on
+    /// `non_null_key_sql` for why that's still no-bump territory).
+    #[test]
+    fn non_null_key_filter_does_not_change_surviving_row_hashes() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE src (id VARCHAR, key VARCHAR, geom GEOMETRY);
+             INSERT INTO src VALUES
+                 ('1', 'a', ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
+                 ('2', NULL, ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'));",
+        )
+        .unwrap();
+
+        let inner = "SELECT id, key, geom FROM src";
+        let filtered_inner = format!(
+            "SELECT id, key, geom FROM src WHERE {}",
+            non_null_key_sql(&["key"])
+        );
+
+        conn.execute_batch(&format!(
+            "CREATE TABLE plain AS {};
+             CREATE TABLE filtered AS {};",
+            hashed_select(inner),
+            hashed_select(&filtered_inner)
+        ))
+        .unwrap();
+
+        let disagreements: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plain p JOIN filtered f USING (id)
+                 WHERE p._row_hash IS DISTINCT FROM f._row_hash",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            disagreements, 0,
+            "dropping NULL-keyed rows must not change a surviving row's _row_hash"
+        );
+
+        let filtered_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM filtered", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(filtered_count, 1, "the NULL-keyed row must be gone");
+    }
+
+    #[test]
+    fn deduplicate_by_key_keeps_the_newest_version() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id_budynku VARCHAR, wersja INTEGER, geom GEOMETRY);
+             INSERT INTO t VALUES
+                 ('dup', 1, ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
+                 ('dup', 2, ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'));",
+        )
+        .unwrap();
+
+        let stats =
+            deduplicate_by_key(&conn, "t", &["id_budynku"], "wersja DESC", "id_budynku").unwrap();
+
+        assert_eq!(stats.skipped_duplicate_key, 1);
+        assert_eq!(stats.skipped_duplicate_example_ids, vec!["dup".to_string()]);
+
+        let survivor_wersja: i32 = conn
+            .query_row("SELECT wersja FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(survivor_wersja, 2, "the newer version must survive");
+    }
+
+    /// Asserts the *count*, not which row survived -- there is deliberately
+    /// no determinism guarantee to pin here (see `deduplicate_by_key`'s doc
+    /// comment on the tiebreak decision).
+    #[test]
+    fn deduplicate_by_key_keeps_exactly_one_row_per_key_when_versions_tie() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id_budynku VARCHAR, wersja INTEGER, geom GEOMETRY);
+             INSERT INTO t VALUES
+                 ('dup', 1, ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
+                 ('dup', 1, ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'));",
+        )
+        .unwrap();
+
+        let stats =
+            deduplicate_by_key(&conn, "t", &["id_budynku"], "wersja DESC", "id_budynku").unwrap();
+        assert_eq!(stats.skipped_duplicate_key, 1);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn deduplicate_by_key_leaves_unique_tables_untouched() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id_budynku VARCHAR, wersja INTEGER, geom GEOMETRY);
+             INSERT INTO t VALUES
+                 ('a', 1, ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
+                 ('b', 1, ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'));",
+        )
+        .unwrap();
+
+        let stats =
+            deduplicate_by_key(&conn, "t", &["id_budynku"], "wersja DESC", "id_budynku").unwrap();
+
+        assert_eq!(stats, LoadStats::default());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    /// Mirrors `filter_oversized_geometry_does_not_change_surviving_row_hashes`:
+    /// deleting duplicate rows runs strictly after `hashed_select` built the
+    /// table, so a surviving row's `_row_hash` must be bit-for-bit identical
+    /// to what it was before the dedup ran -- no `ROW_HASH_VERSION` bump
+    /// needed.
+    #[test]
+    fn deduplicate_by_key_does_not_change_surviving_row_hashes() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE src (id_budynku VARCHAR, wersja INTEGER, geom GEOMETRY);
+             INSERT INTO src VALUES
+                 ('keep', 1, ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
+                 ('dup', 1, ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))')),
+                 ('dup', 2, ST_GeomFromText('POLYGON((0 0, 3 0, 3 3, 0 3, 0 0))'));",
+        )
+        .unwrap();
+
+        let inner = "SELECT id_budynku, wersja, geom FROM src";
+        conn.execute_batch(&format!("CREATE TABLE t AS {}", hashed_select(inner)))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE hash_before AS SELECT id_budynku, wersja, _row_hash FROM t",
+        )
+        .unwrap();
+
+        let stats =
+            deduplicate_by_key(&conn, "t", &["id_budynku"], "wersja DESC", "id_budynku").unwrap();
+        assert_eq!(stats.skipped_duplicate_key, 1);
+
+        let disagreements: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hash_before h JOIN t USING (id_budynku, wersja)
+                 WHERE h._row_hash IS DISTINCT FROM t._row_hash",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            disagreements, 0,
+            "deduplication must not change a surviving row's _row_hash"
+        );
+
+        let survivors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            survivors, 2,
+            "'keep' and the surviving 'dup' row must remain"
+        );
+    }
+
+    /// BDOT10k's two-column key: the same `LOKALNYID` under two different
+    /// `PRZESTRZENNAZW` values is not a duplicate and must not be collapsed.
+    #[test]
+    fn deduplicate_by_key_composite_key() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (przestrzennazw VARCHAR, lokalnyid VARCHAR, wersja INTEGER, geom GEOMETRY);
+             INSERT INTO t VALUES
+                 ('BUBD', 'same_id', 1, ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')),
+                 ('BUBD', 'same_id', 2, ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))')),
+                 ('OT_BUBD', 'same_id', 1, ST_GeomFromText('POLYGON((0 0, 3 0, 3 3, 0 3, 0 0))'));",
+        )
+        .unwrap();
+
+        let stats = deduplicate_by_key(
+            &conn,
+            "t",
+            &["przestrzennazw", "lokalnyid"],
+            "wersja DESC",
+            "lokalnyid",
+        )
+        .unwrap();
+
+        assert_eq!(stats.skipped_duplicate_key, 1);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "same LOKALNYID under two different PRZESTRZENNAZW values must both survive"
+        );
+    }
+
+    #[test]
+    fn format_skip_clause_omits_the_ids_clause_when_there_are_none() {
+        assert_eq!(
+            format_skip_clause("null-key", 210080, &[]),
+            "skipped 210080 null-key rows"
+        );
     }
 }

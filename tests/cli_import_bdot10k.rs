@@ -40,6 +40,32 @@ fn test_import_bdot10k_from_fixture() {
         );
 }
 
+/// `fixtures/bdot10k_v2.parquet` holds 76 rows: the 74-row v1 set plus one
+/// deliberate NULL-`LOKALNYID` row and one duplicate-key row (see
+/// `fixtures/scripts/prepare_update_fixtures.sh`). Pins that `import`, not
+/// just `load_into` in isolation, ends up reporting the deduplicated/
+/// NULL-filtered count -- 76 - 1 (null key) - 1 (duplicate) = 74 -- rather
+/// than the raw parquet row count.
+#[test]
+fn test_import_bdot10k_from_v2_fixture_reports_deduplicated_count() {
+    let (cfg, _rocksdb_dir) = memory_config();
+    cmd()
+        .args([
+            "--config",
+            cfg.path().to_str().unwrap(),
+            "import",
+            "bdot10k",
+            "--file",
+            "fixtures/bdot10k_v2.parquet",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("BDOT10k import complete")
+                .and(predicate::str::contains("count=74")),
+        );
+}
+
 #[test]
 fn test_import_bdot10k_missing_file() {
     let (cfg, _rocksdb_dir) = memory_config();

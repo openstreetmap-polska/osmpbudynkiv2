@@ -9,12 +9,23 @@ use crate::dataset::LoadStats;
 use crate::download::download_file;
 use crate::utils::format_duration;
 
+/// BDOT10k's record key -- composite, unlike EGIB's. One array feeds all
+/// three sites that have to agree on it (the load select's `IS NOT NULL`
+/// filter, the count query's `IS NULL` complement, and the dedup's
+/// `PARTITION BY`), which matters more here than for a single-column key:
+/// the complement of `a IS NOT NULL AND b IS NOT NULL` is `a IS NULL OR
+/// b IS NULL`, and that asymmetry is easy to get wrong when spelled out by
+/// hand. Plan 2 moves this onto `DatasetSpec::key_columns`.
+const KEY_COLUMNS: &[&str] = &["PRZESTRZENNAZW", "LOKALNYID"];
+
 /// Create `target_table` from a BDOT10k GeoParquet file, including the
 /// `_row_hash` column, then delete any invalid-geometry rows (see
-/// `docs/invalid_geometry_tile_500s.md`) and any oversized-geometry rows
-/// (see `dataset::filter_oversized_geometry`). Does NOT create an index --
-/// callers that need one create it themselves, and the update path
-/// deliberately does not.
+/// `docs/invalid_geometry_tile_500s.md`), any oversized-geometry rows (see
+/// `dataset::filter_oversized_geometry`), drop any row with a NULL record
+/// key (see `dataset::non_null_key_sql`), and finally collapse duplicate
+/// keys down to one row each (see `dataset::deduplicate_by_key`). Does NOT
+/// create an index -- callers that need one create it themselves, and the
+/// update path deliberately does not.
 ///
 /// Workaround: DuckDB's automatic GeoParquet conversion and ST_Read (GDAL)
 /// both fail on BDOT10k files because their CRS (EPSG:2180) is stored as a
@@ -25,28 +36,83 @@ use crate::utils::format_duration;
 ///
 /// `enable_geoparquet_conversion` has GLOBAL scope in DuckDB — it's visible
 /// to every connection sharing this database instance, not just this one, so
-/// it must be restored before returning. Left disabled, it silently breaks
-/// any later automatic GeoParquet decoding on the same instance — e.g.
-/// EGIB's `load_into`, which relies on the default being on.
+/// it must be restored before returning -- on the success path AND the error
+/// path, or a failed load leaks the disabled setting process-wide for as
+/// long as the process runs. DuckDB rejects this file's CRS at bind time for
+/// ANY query against it, regardless of which columns are projected, so the
+/// null-key count query below has to share the same disabled window as the
+/// `CREATE TABLE`, not run after the setting is restored -- both live inside
+/// one closure, and the restoring `SET` runs unconditionally right after it,
+/// before either the closure's error or its result is inspected. Left
+/// disabled, it silently breaks any later automatic GeoParquet decoding on
+/// the same instance — e.g. EGIB's `load_into`, which relies on the default
+/// being on.
 pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> Result<LoadStats> {
+    let non_null = crate::dataset::non_null_key_sql(KEY_COLUMNS);
     let inner = format!(
         "SELECT * EXCLUDE(GEOM), \
          ST_Transform(ST_GeomFromWKB(GEOM), 'EPSG:2180', 'EPSG:4326') AS geom \
-         FROM '{parquet_path}'"
+         FROM '{parquet_path}' WHERE {non_null}"
     );
     let select =
         crate::dataset::BDOT10K.with_centroid_select(&crate::dataset::hashed_select(&inner));
-    conn.execute_batch(&format!(
-        "SET enable_geoparquet_conversion = false;
-         DROP TABLE IF EXISTS {target_table};
-         CREATE TABLE {target_table} AS {select};
-         SET enable_geoparquet_conversion = true;"
-    ))
-    .with_context(|| format!("Failed to load BDOT10k data into {target_table}"))?;
+
+    conn.execute_batch("SET enable_geoparquet_conversion = false;")
+        .with_context(|| format!("Failed to disable GeoParquet conversion for {target_table}"))?;
+    let loaded = (|| -> Result<i64> {
+        // A filtered CTAS doesn't report how many rows its WHERE excluded, so
+        // count them with a second, narrow query against the same parquet
+        // file -- cheap, since parquet column pruning means it reads only
+        // the key columns, not the whole file. Must run in this same
+        // disabled-conversion window; see the doc comment above.
+        let null_key_rows: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM '{parquet_path}' WHERE {}",
+                    crate::dataset::null_key_sql(KEY_COLUMNS)
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("Failed to count NULL-keyed rows in {parquet_path}"))?;
+
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {target_table};
+             CREATE TABLE {target_table} AS {select};"
+        ))
+        .with_context(|| format!("Failed to load BDOT10k data into {target_table}"))?;
+
+        Ok(null_key_rows)
+    })();
+    // Restore before propagating: see the GLOBAL-scope note above -- an
+    // early `?` on `loaded` here would leave conversion disabled for every
+    // other connection sharing this instance, whether the closure above
+    // succeeded or not.
+    conn.execute_batch("SET enable_geoparquet_conversion = true;")
+        .with_context(|| {
+            format!("Failed to re-enable GeoParquet conversion after {target_table}")
+        })?;
+    let null_key_rows = loaded?;
 
     let stats = crate::dataset::filter_invalid_geometry(conn, target_table, "LOKALNYID")?;
     let oversized = crate::dataset::filter_oversized_geometry(conn, target_table, "LOKALNYID")?;
-    Ok(stats.merge_oversized(oversized))
+    // Must come after both geometry filters above: a duplicate pair whose
+    // newest member has bad geometry must fall back to the older valid
+    // member rather than being collapsed down to a row a geometry filter
+    // then deletes, losing the object entirely. The NULL-key half of the
+    // same "the key is usable" guarantee is enforced up in the load SELECT
+    // instead, via `non_null_key_sql` above -- see that function's doc
+    // comment for why the two run at different points rather than together
+    // here.
+    let mut unique = crate::dataset::deduplicate_by_key(
+        conn,
+        target_table,
+        KEY_COLUMNS,
+        "WERSJA DESC",
+        "LOKALNYID",
+    )?;
+    unique.skipped_null_key = null_key_rows;
+    Ok(stats.merge_oversized(oversized).merge_unique_key(unique))
 }
 
 pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str) -> Result<()> {
@@ -71,10 +137,11 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
             "Step done: load table"
         );
 
-        // `load_into` itself is one `CREATE TABLE AS SELECT ... read_parquet(...)`
-        // statement (plus the two single-statement geometry filters it calls)
-        // -- no Rust-side loop to check inside. This is the one Rust-level
-        // step boundary `import` actually has: between the table load above
+        // `load_into` itself is a short, fixed sequence of single-statement
+        // queries (the null-key count, the `CREATE TABLE AS SELECT`, the two
+        // geometry filters, the dedup delete) -- no Rust-side loop to check
+        // inside. This is the one Rust-level step boundary `import` actually
+        // has: between the table load above
         // and the (also lengthy, on the real 16M-row table) RTREE index build
         // below. Bails with an Err, matching `import::osm::import`'s
         // `check_shutdown` convention -- a table loaded but not yet indexed
@@ -122,12 +189,23 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
     outcome.map(|_| ())
 }
 
-/// Human-readable message for the `job_run_log` row. Reports both skip
-/// reasons `load_into` can produce -- invalid geometry and oversized
-/// geometry -- via the shared `dataset::format_skip_clause`, so a change to
-/// one clause's wording can't drift from the other's.
+/// Human-readable message for the `job_run_log` row. Reports all four skip
+/// reasons `load_into` can produce -- invalid geometry, oversized geometry,
+/// NULL record key, and duplicate record key -- via the shared
+/// `dataset::format_skip_clause`, so a change to one clause's wording can't
+/// drift from the others'. Ordered in the order `load_into` applies the
+/// filters: the NULL-key `WHERE` runs first (inside the load SELECT), so it
+/// leads; invalid- and oversized-geometry run next in that order; dedup runs
+/// last, after both geometry filters (see `load_into`'s comment on why).
 fn summarize(stats: &LoadStats) -> String {
     let mut parts = Vec::new();
+    if stats.skipped_null_key > 0 {
+        parts.push(crate::dataset::format_skip_clause(
+            "null-key",
+            stats.skipped_null_key,
+            &[],
+        ));
+    }
     if stats.skipped_invalid_geometry > 0 {
         parts.push(crate::dataset::format_skip_clause(
             "invalid-geometry",
@@ -142,8 +220,15 @@ fn summarize(stats: &LoadStats) -> String {
             &stats.skipped_oversized_example_ids,
         ));
     }
+    if stats.skipped_duplicate_key > 0 {
+        parts.push(crate::dataset::format_skip_clause(
+            "duplicate-key",
+            stats.skipped_duplicate_key,
+            &stats.skipped_duplicate_example_ids,
+        ));
+    }
     if parts.is_empty() {
-        "no invalid or oversized geometry".to_string()
+        "no rows skipped".to_string()
     } else {
         parts.join("; ")
     }
@@ -257,6 +342,76 @@ mod tests {
         );
     }
 
+    /// Unlike the two filters above, the NULL-key filter now lives inside
+    /// `load_into`'s load SELECT (`non_null_key_sql`), not in a standalone
+    /// helper that can be seeded and called in isolation -- so this has to
+    /// go through `load_into` with a real parquet path to exercise it at
+    /// all. That's exactly why `fixtures/bdot10k_v2.parquet` gained a
+    /// deliberate NULL-`LOKALNYID` row (see
+    /// `fixtures/scripts/prepare_update_fixtures.sh`): the four committed v1
+    /// fixtures have no NULL keys, so nothing else in the suite reaches this
+    /// path.
+    #[test]
+    fn load_into_drops_null_keyed_rows() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        let stats = load_into(&conn, "bdot10k_buildings", "fixtures/bdot10k_v2.parquet").unwrap();
+
+        assert_eq!(stats.skipped_null_key, 1);
+        let null_keyed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bdot10k_buildings WHERE LOKALNYID IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_keyed, 0, "no NULL-keyed row may survive load_into");
+    }
+
+    /// Same "must go through `load_into`" rationale as
+    /// `load_into_drops_null_keyed_rows` above -- the dedup runs on the table
+    /// `load_into` just built, so a fixture with a real duplicate key is the
+    /// only way to exercise it end to end. `bdot10k_v2.parquet`'s duplicate
+    /// pair shares one `(PRZESTRZENNAZW, LOKALNYID)` key with a strictly
+    /// OLDER `WERSJA` on the extra copy, so the part that actually matters
+    /// here is confirming the *newer* row -- not just *a* row -- is the one
+    /// that survives.
+    #[test]
+    fn load_into_collapses_duplicate_keys() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        let stats = load_into(&conn, "bdot10k_buildings", "fixtures/bdot10k_v2.parquet").unwrap();
+
+        assert_eq!(stats.skipped_duplicate_key, 1);
+        assert!(
+            !stats.skipped_duplicate_example_ids.is_empty(),
+            "the deleted duplicate's id must be captured for the job log"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bdot10k_buildings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 74, "duplicate collapses down to one row per key");
+
+        // `prepare_update_fixtures.sh` set the duplicate's WERSJA one day
+        // OLDER than the fixture's uniform WERSJA; if that older copy had
+        // won the tie-break instead of the pre-existing row, this count
+        // would be nonzero.
+        let kept_old_version: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bdot10k_buildings
+                 WHERE WERSJA < TIMESTAMPTZ '2025-06-01 14:00:00+02'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kept_old_version, 0,
+            "the older duplicate must have lost the WERSJA DESC tie-break"
+        );
+    }
+
     #[test]
     fn import_records_success_with_no_skips_in_job_run_log() {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
@@ -274,10 +429,7 @@ mod tests {
         let log = crate::job_log::read_all(&conn).unwrap();
         let entry = log.get("import:bdot10k").expect("entry must be present");
         assert_eq!(entry.outcome, "Success");
-        assert_eq!(
-            entry.message.as_deref(),
-            Some("no invalid or oversized geometry")
-        );
+        assert_eq!(entry.message.as_deref(), Some("no rows skipped"));
     }
 
     #[test]

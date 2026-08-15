@@ -9,18 +9,28 @@ use crate::dataset::LoadStats;
 use crate::download::download_file;
 use crate::utils::format_duration;
 
+/// EGIB's record key. One array feeds all three sites that have to agree on
+/// it -- the load select's `IS NOT NULL` filter, the count query's `IS NULL`
+/// complement, and the dedup's `PARTITION BY` -- so they cannot drift.
+/// Plan 2 moves this onto `DatasetSpec::key_columns`.
+const KEY_COLUMNS: &[&str] = &["id_budynku"];
+
 /// Create `target_table` from an EGIB GeoParquet file, including the
 /// `_row_hash` column, then delete any invalid-geometry rows (see
-/// `docs/invalid_geometry_tile_500s.md`) and any oversized-geometry rows
-/// (see `dataset::filter_oversized_geometry`). Does NOT create an index.
+/// `docs/invalid_geometry_tile_500s.md`), any oversized-geometry rows (see
+/// `dataset::filter_oversized_geometry`), drop any row with a NULL record
+/// key (see `dataset::non_null_key_sql`), and finally collapse duplicate
+/// keys down to one row each (see `dataset::deduplicate_by_key`). Does NOT
+/// create an index.
 ///
 /// Geometry is transformed from EPSG:2180 to EPSG:4326 for uniform spatial
 /// comparisons.
 pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> Result<LoadStats> {
+    let non_null = crate::dataset::non_null_key_sql(KEY_COLUMNS);
     let inner = format!(
         "SELECT * EXCLUDE(geometry, geometry_bbox), \
          ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom \
-         FROM '{parquet_path}'"
+         FROM '{parquet_path}' WHERE {non_null}"
     );
     let select = crate::dataset::EGIB.with_centroid_select(&crate::dataset::hashed_select(&inner));
     let select = crate::mappings::egib::with_rodzaj_kod_select(&select);
@@ -30,9 +40,40 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
     ))
     .with_context(|| format!("Failed to load EGIB data into {target_table}"))?;
 
+    // A filtered CTAS doesn't report how many rows its WHERE excluded, so
+    // count them with a second, narrow query against the same parquet file --
+    // cheap, since parquet column pruning means it reads only the key
+    // column, not the whole file.
+    let null_key_rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM '{parquet_path}' WHERE {}",
+                crate::dataset::null_key_sql(KEY_COLUMNS)
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("Failed to count NULL-keyed rows in {parquet_path}"))?;
+
     let stats = crate::dataset::filter_invalid_geometry(conn, target_table, "id_budynku")?;
     let oversized = crate::dataset::filter_oversized_geometry(conn, target_table, "id_budynku")?;
-    Ok(stats.merge_oversized(oversized))
+    // Must come after both geometry filters above: a duplicate pair whose
+    // newest member has bad geometry must fall back to the older valid
+    // member rather than being collapsed down to a row a geometry filter
+    // then deletes, losing the object entirely. The NULL-key half of the
+    // same "the key is usable" guarantee is enforced up in the load SELECT
+    // instead, via `non_null_key_sql` above -- see that function's doc
+    // comment for why the two run at different points rather than together
+    // here.
+    let mut unique = crate::dataset::deduplicate_by_key(
+        conn,
+        target_table,
+        KEY_COLUMNS,
+        "czas_pozyskania DESC",
+        "id_budynku",
+    )?;
+    unique.skipped_null_key = null_key_rows;
+    Ok(stats.merge_oversized(oversized).merge_unique_key(unique))
 }
 
 pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str) -> Result<()> {
@@ -57,10 +98,11 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
             "Step done: load table"
         );
 
-        // `load_into` itself is one `CREATE TABLE AS SELECT` statement (plus
-        // the two single-statement geometry filters and the rodzaj_kod
-        // cascade it calls) -- no Rust-side loop to check inside. This is
-        // the one Rust-level step boundary `import` actually has: between
+        // `load_into` itself is a short, fixed sequence of single-statement
+        // queries (the `CREATE TABLE AS SELECT` with its rodzaj_kod cascade,
+        // the null-key count, the two geometry filters, the dedup delete) --
+        // no Rust-side loop to check inside. This is the one Rust-level step
+        // boundary `import` actually has: between
         // the table load above and the (also lengthy, on the real 17M-row
         // table) RTREE index build below. Bails with an Err, matching
         // `import::osm::import`'s `check_shutdown` convention -- a table
@@ -105,12 +147,23 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
     outcome.map(|_| ())
 }
 
-/// Human-readable message for the `job_run_log` row. Reports both skip
-/// reasons `load_into` can produce -- invalid geometry and oversized
-/// geometry -- via the shared `dataset::format_skip_clause`, so a change to
-/// one clause's wording can't drift from the other's.
+/// Human-readable message for the `job_run_log` row. Reports all four skip
+/// reasons `load_into` can produce -- invalid geometry, oversized geometry,
+/// NULL record key, and duplicate record key -- via the shared
+/// `dataset::format_skip_clause`, so a change to one clause's wording can't
+/// drift from the others'. Ordered in the order `load_into` applies the
+/// filters: the NULL-key `WHERE` runs first (inside the load SELECT), so it
+/// leads; invalid- and oversized-geometry run next in that order; dedup runs
+/// last, after both geometry filters (see `load_into`'s comment on why).
 fn summarize(stats: &LoadStats) -> String {
     let mut parts = Vec::new();
+    if stats.skipped_null_key > 0 {
+        parts.push(crate::dataset::format_skip_clause(
+            "null-key",
+            stats.skipped_null_key,
+            &[],
+        ));
+    }
     if stats.skipped_invalid_geometry > 0 {
         parts.push(crate::dataset::format_skip_clause(
             "invalid-geometry",
@@ -125,8 +178,15 @@ fn summarize(stats: &LoadStats) -> String {
             &stats.skipped_oversized_example_ids,
         ));
     }
+    if stats.skipped_duplicate_key > 0 {
+        parts.push(crate::dataset::format_skip_clause(
+            "duplicate-key",
+            stats.skipped_duplicate_key,
+            &stats.skipped_duplicate_example_ids,
+        ));
+    }
     if parts.is_empty() {
-        "no invalid or oversized geometry".to_string()
+        "no rows skipped".to_string()
     } else {
         parts.join("; ")
     }
@@ -240,6 +300,74 @@ mod tests {
         );
     }
 
+    /// Unlike the two filters above, the NULL-key filter now lives inside
+    /// `load_into`'s load SELECT (`non_null_key_sql`), not in a standalone
+    /// helper that can be seeded and called in isolation -- so this has to
+    /// go through `load_into` with a real parquet path to exercise it at
+    /// all. That's exactly why `fixtures/egib_v2.parquet` gained a
+    /// deliberate NULL-`id_budynku` row (see
+    /// `fixtures/scripts/prepare_update_fixtures.sh`): the four committed v1
+    /// fixtures have no NULL keys, so nothing else in the suite reaches this
+    /// path.
+    #[test]
+    fn load_into_drops_null_keyed_rows() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        let stats = load_into(&conn, "egib_buildings", "fixtures/egib_v2.parquet").unwrap();
+
+        assert_eq!(stats.skipped_null_key, 1);
+        let null_keyed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM egib_buildings WHERE id_budynku IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_keyed, 0, "no NULL-keyed row may survive load_into");
+    }
+
+    /// Same "must go through `load_into`" rationale as
+    /// `load_into_drops_null_keyed_rows` above -- the dedup runs on the table
+    /// `load_into` just built, so a fixture with a real duplicate key is the
+    /// only way to exercise it end to end. `egib_v2.parquet`'s duplicate pair
+    /// shares one `id_budynku` key with a strictly OLDER `czas_pozyskania` on
+    /// the extra copy, so the part that actually matters here is confirming
+    /// the *newer* row -- not just *a* row -- is the one that survives.
+    #[test]
+    fn load_into_collapses_duplicate_keys() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        let stats = load_into(&conn, "egib_buildings", "fixtures/egib_v2.parquet").unwrap();
+
+        assert_eq!(stats.skipped_duplicate_key, 1);
+        assert!(
+            !stats.skipped_duplicate_example_ids.is_empty(),
+            "the deleted duplicate's id must be captured for the job log"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM egib_buildings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 74, "duplicate collapses down to one row per key");
+
+        // `prepare_update_fixtures.sh` set the duplicate's czas_pozyskania to
+        // the lexicographically (== chronologically, for this format) OLDER
+        // '2020-01-01 00:00'; if that older copy had won the tie-break
+        // instead of the pre-existing row, this count would be nonzero.
+        let kept_old_version: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM egib_buildings WHERE czas_pozyskania < '2026-01-01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kept_old_version, 0,
+            "the older duplicate must have lost the czas_pozyskania DESC tie-break"
+        );
+    }
+
     #[test]
     fn import_records_success_with_no_skips_in_job_run_log() {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
@@ -257,10 +385,7 @@ mod tests {
         let log = crate::job_log::read_all(&conn).unwrap();
         let entry = log.get("import:egib").expect("entry must be present");
         assert_eq!(entry.outcome, "Success");
-        assert_eq!(
-            entry.message.as_deref(),
-            Some("no invalid or oversized geometry")
-        );
+        assert_eq!(entry.message.as_deref(), Some("no rows skipped"));
     }
 
     #[test]

@@ -264,9 +264,10 @@ pub fn refresh(
 }
 
 /// Human-readable message for the `job_run_log` row. Uses
-/// `dataset::format_skip_clause` for both skip reasons -- see
-/// `dataset::LoadStats` for why a loader can drop rows for either
-/// invalid or oversized geometry.
+/// `dataset::format_skip_clause` for all four skip reasons -- see
+/// `dataset::LoadStats` for why a loader can drop rows for invalid
+/// geometry, oversized geometry, a NULL record key, or a duplicate record
+/// key.
 fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> String {
     let mut msg = format!(
         "added {} modified {} removed {}",
@@ -286,6 +287,22 @@ fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> 
             "oversized-geometry",
             stats.skipped_oversized_geometry,
             &stats.skipped_oversized_example_ids,
+        ));
+    }
+    if stats.skipped_null_key > 0 {
+        msg.push_str("; ");
+        msg.push_str(&crate::dataset::format_skip_clause(
+            "null-key",
+            stats.skipped_null_key,
+            &[],
+        ));
+    }
+    if stats.skipped_duplicate_key > 0 {
+        msg.push_str("; ");
+        msg.push_str(&crate::dataset::format_skip_clause(
+            "duplicate-key",
+            stats.skipped_duplicate_key,
+            &stats.skipped_duplicate_example_ids,
         ));
     }
     msg
