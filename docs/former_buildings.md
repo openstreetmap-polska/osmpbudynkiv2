@@ -122,6 +122,100 @@ keeps passing unchanged, and the veto is index-accelerated on both sides —
 `osm_former_buildings.geom` reaches its own RTREE index
 (`osm_former_buildings_geom_idx`) the same way `osm_buildings.geom` does.
 
+That holds **per grid cell**, which is how `unmatched_buildings_sql` is
+always called. It does *not* hold for the whole-extent `suppressed` count —
+see below.
+
+## The whole-extent `suppressed` count (measured 2026-08-15, national data)
+
+`compare_buildings` runs `suppressed_buildings_sql` once over the source
+table's full extent rather than per 0.5° cell. On the first national run with
+a populated `osm_former_buildings` (15,412 rows), that query died:
+
+```
+Error: Failed to count suppressed rows for bdot10k
+Caused by: Out of Memory Error: failed to pin block of size 256.0 KiB (3.7 GiB/3.7 GiB used)
+```
+
+Note what had *not* failed: the grid loop's transaction had already
+committed (486,451 `bdot10k_unmatched` rows, 114,792 `cell_totals`). Only the
+statistic in the log line failed — but it returns `Err`, so `compare full`
+aborted before EGIB and PRG ran at all.
+
+**Diagnosis.** Isolating the two halves at full extent:
+
+| clause | full extent |
+|---|---|
+| `EXISTS osm_former_buildings` only | 3.4 s, fine |
+| `NOT EXISTS osm_buildings` only | **OOM, same error**, 71 s |
+
+Four things compound, and only the last one is fixable:
+
+1. The outer `bdot10k_buildings` scan drops from `RTREE_INDEX_SCAN` to
+   `Sequential Scan` — see the threshold table below. **This is correct**:
+   forcing the index with `SET rtree_index_scan_ratio=1.0` measured 13.4 s
+   against the sequential scan's 0.53 s.
+2. Both correlated subqueries de-correlate into nested `LEFT_DELIM_JOIN`s
+   whose duplicate elimination hashes and materializes the correlated column
+   — which is `b.geom`, the polygon blob. The join condition is literally
+   `geom IS NOT DISTINCT FROM geom`, over 2.18 GB of WKB (16.0M
+   `eksploatowany` rows), against a 3.7 GiB budget.
+3. The plan order is inverted: the `ANTI` join (`osm_buildings`, 17,986,808
+   rows) sits *below* the `SEMI` join (`osm_former_buildings`, 15,412 rows),
+   so it computes Poland's entire unmatched set and then discards 99.97% of
+   it.
+4. Spilling doesn't help — the failing run wrote ~15 GB to the temp
+   directory and still died. `max_temp_directory_size` is not the lever.
+
+**The index is a red herring, which is the counter-intuitive part.**
+`osm_buildings` gets an `RTREE_INDEX_SCAN` in the failing plan too:
+
+```
+RTREE_INDEX_SCAN
+  Table:  osm_buildings
+  Index:  osm_buildings_geom_idx
+  Bounds: deferred (from join filter)
+  ~17,986,823 rows
+```
+
+`Bounds: deferred (from join filter)` means the search window is derived at
+runtime from the probe side. Per cell, that's one cell and the index prunes
+18M rows down to a few thousand. At full extent the probe side is every
+building in Poland, so the derived bound is Poland: the index is used, works
+perfectly, and prunes nothing. An R-tree only pays in proportion to what the
+query window *excludes*.
+
+**Fix (implemented).** `suppressed_buildings_sql` filters by the veto first,
+in a `candidates` CTE, and anti-joins `osm_buildings` over just those rows —
+shrinking the deferred bound's probe side from ~16M geometries to ~4k:
+
+| source | before | after | answer |
+|---|---|---|---|
+| bdot10k | OOM @ 71 s | **4.7 s / 3.8 GB** | 4,154 |
+| egib | (never reached) | **4.9 s / 3.9 GB** | 3,803 |
+
+bdot10k's 4,154 is consistent with the 4,718 veto yield measured above:
+the difference is the rows already covered by a live `osm_buildings` polygon,
+which the suppression count deliberately excludes so
+`matched + unmatched + suppressed = total` stays exact.
+
+`MATERIALIZED` is kept as insurance but is **not** the active ingredient —
+bare `WITH` plans identically apart from losing the `CTE_SCAN` operator, and
+runs in 5.4 s / 3.8 GB for the same answer. The CTE is what matters.
+
+### R-tree index-scan threshold (DuckDB 1.5.5, spatial `eb1e57c`)
+
+The spatial extension takes an R-tree scan only when the estimated match
+count is at or below `max(rtree_index_scan_min_rows, rtree_index_scan_ratio ×
+table_rows)` — defaults 8192 and 0.075, so 1,226,385 rows for
+`bdot10k_buildings`. Measured cutover:
+
+| window (lat 49–55) | rows matched | plan |
+|---|---:|---|
+| lon 14–15.33 | 525,715 | `RTREE_INDEX_SCAN` |
+| lon 14–16 | 1,023,865 | `Sequential Scan` |
+| full extent | 16,351,813 | `Sequential Scan` |
+
 ## DuckDB syntax notes
 
 Verified on DuckDB 1.5.5, matching the bundled `duckdb = 1.10505.0`:
