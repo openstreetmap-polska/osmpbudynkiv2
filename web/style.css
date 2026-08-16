@@ -87,6 +87,17 @@
   --draw-outline: #0f8a6b;
   --draw-fill: #0f8a6b;
   --draw-invalid: var(--danger);
+  /* Recently-downloaded /package export areas (updates-fill/updates-outline
+     in app.js, fed by GET /updates). Orange: the one warm hue not already
+     spoken for by a *live* map layer -- --ramp-1.._5 is close but is the
+     z5-13 aggregate grid's density ramp, a different section of the legend
+     shown at a different scale, and --building-unmatched's red plus
+     --address-unmatched's blue are both taken. Redefined for dark mode like
+     the building/address colours (unlike --ratio-0.._4/--draw-outline/
+     --building-outline-all, which stay fixed because they're anchored to the
+     always-light OSM raster specifically) since this also has to read
+     clearly as a legend swatch against the panel's own dark background. */
+  --updates: #d97706;
   --font-label: ui-sans-serif, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --font-data: ui-monospace, "SFMono-Regular", "IBM Plex Mono", Menlo, Consolas, monospace;
 }
@@ -110,6 +121,7 @@
     --ramp-3: #ff7d54;
     --ramp-4: #ef5b6b;
     --ramp-5: #b8496f;
+    --updates: #f0a03c;
     /* --ratio-0.._4 are intentionally absent -- see their definition above:
        they paint onto a basemap that is light in both themes. Only the
        sentinel is re-tuned, since it also has to hold up in the legend. */
@@ -429,6 +441,14 @@ body {
 .swatch[data-swatch="addresses"].swatch-all {
   background: var(--address-all);
   border-left-color: var(--address-all);
+}
+
+/* updates-fill/updates-outline both paint at var(--updates) -- see the
+   token's own comment in :root above -- so one swatch (fill tint + solid
+   left border, same recipe as .swatch-all above) represents both. */
+.swatch[data-swatch="updates"] {
+  background: color-mix(in srgb, var(--updates) 20%, transparent);
+  border-left-color: var(--updates);
 }
 
 .hint {

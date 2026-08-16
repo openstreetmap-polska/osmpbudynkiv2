@@ -35,6 +35,9 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const drawOutlineColor = rootStyle.getPropertyValue("--draw-outline").trim();
   const drawFillColor = rootStyle.getPropertyValue("--draw-fill").trim();
   const drawInvalidColor = rootStyle.getPropertyValue("--draw-invalid").trim();
+  // Recently-downloaded /package export areas, fed by GET /updates -- see the
+  // updates-fill/updates-outline layers and pollUpdates below.
+  const updatesColor = rootStyle.getPropertyValue("--updates").trim();
 
   // agg_cells carries integer count attributes, but what a given
   // count *means* changes sharply across z5-11: bz = min(z + 5, 14) caps at
@@ -328,6 +331,30 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     },
   ];
 
+  // ---- recently-downloaded /package export areas ----
+  //
+  // One plain GeoJSON source (like "draw" below), refreshed wholesale on a
+  // timer by pollUpdates rather than tied to the vector tile scheme -- an
+  // export area is unrelated to z14 cells and needs to render the same way
+  // at every zoom, not just z14+. No minzoom for the same reason.
+  // fill-opacity is kept low so overlapping export areas stay legible as a
+  // wash rather than stacking into solid colour, and so buildings/addresses
+  // drawn on top of it (see the layers array below) aren't tinted away.
+  const updatesLayers = [
+    {
+      id: "updates-fill",
+      type: "fill",
+      source: "updates",
+      paint: { "fill-color": updatesColor, "fill-opacity": 0.12 },
+    },
+    {
+      id: "updates-outline",
+      type: "line",
+      source: "updates",
+      paint: { "line-color": updatesColor, "line-width": 1.6 },
+    },
+  ];
+
   // ---- "draw an area to download" overlay ----
   //
   // One plain GeoJSON source holding whatever the current drawing/selection
@@ -433,9 +460,17 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           type: "geojson",
           data: { type: "FeatureCollection", features: [] },
         },
+        updates: {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        },
       },
       layers: [
         { id: "osm", type: "raster", source: "osm" },
+        // Before buildingLayers/addresses so those features' own colours
+        // stay crisp on top of the translucent export-area wash instead of
+        // it tinting them.
+        ...updatesLayers,
         ...buildingLayers,
         {
           id: "addresses-all-circle",
@@ -521,6 +556,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     "buildings-unmatched-fill",
     "addresses-all-circle",
     "addresses-unmatched-circle",
+    "updates-fill",
   ];
 
   function escapeHtml(value) {
@@ -696,7 +732,31 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       });
   }
 
+  // updates-fill's properties (exported_at/datasets/address_count/
+  // building_count, see UpdateProperties in src/server/updates.rs) don't
+  // follow the tile attribute shape describeFeature below parses -- datasets
+  // is a real array (a plain GeoJSON source, not MVT, carries JSON types
+  // as-is) and there's no OSM-tags preview to split out -- so this builds
+  // the popup shape directly instead of routing through that parser.
+  // DATASET_LABELS is declared further down (the package-download section)
+  // but already initialized by the time any click can fire.
+  function describeUpdateFeature(props) {
+    const datasets = Array.isArray(props.datasets) ? props.datasets : [];
+    return {
+      title: "Pobrany obszar",
+      status: "Eksport",
+      attributes: [
+        ["exported_at", "Data eksportu", fmtTimestamp(props.exported_at)],
+        ["datasets", "Warstwy", datasets.map((d) => DATASET_LABELS[d] || d).join(", ") || "—"],
+        ["address_count", "Adresy", String(props.address_count)],
+        ["building_count", "Budynki", String(props.building_count)],
+      ],
+      tags: [],
+    };
+  }
+
   function describeFeature(layerId, props) {
+    if (layerId === "updates-fill") return describeUpdateFeature(props);
     const attributes = [];
     let tags = [];
     // Insertion order is the tile's attribute order, which follows the
@@ -860,8 +920,10 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   const legendBuildingsGroup = document.querySelector(".legend-group[data-building-source]");
   const legendAddressesGroup = document.querySelector(".legend-group[data-address-source]");
+  const legendUpdatesGroup = document.querySelector(".legend-group[data-updates-source]");
   const buildingSourceButtons = legendBuildingsGroup.querySelectorAll(".source-btn");
   const addressSourceButtons = legendAddressesGroup.querySelectorAll(".source-btn");
+  const updatesSourceButtons = legendUpdatesGroup.querySelectorAll(".source-btn");
 
   // "off"/"bdot10k"/"egib" and "off"/"prg": one mutually-exclusive control per
   // category replaces the old pair of "all"/"unmatched" checkboxes -- picking
@@ -879,6 +941,17 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
   for (const b of addressSourceButtons) {
     b.setAttribute("aria-pressed", String(b.dataset.addressSource === addressSource));
+  }
+
+  // "on"/"off": recently-downloaded export areas are their own single
+  // registry-less overlay (see pollUpdates below), so there's no third state
+  // to pick between the way buildingSource/addressSource choose a registry --
+  // just visible or not. Not restored from the URL hash: unlike the other
+  // three toggles it's not a *view* of one map layer's data, and adding a
+  // fourth hash field for a low-stakes default-on overlay isn't worth it.
+  let updatesVisible = legendUpdatesGroup.dataset.updatesSource !== "off";
+  for (const b of updatesSourceButtons) {
+    b.setAttribute("aria-pressed", String(b.dataset.updatesSource === (updatesVisible ? "on" : "off")));
   }
 
   function setLayerVisible(layerId, visible) {
@@ -908,6 +981,11 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     setLayerVisible("addresses-unmatched-label", visible);
   }
 
+  function applyUpdatesVisibility() {
+    setLayerVisible("updates-fill", updatesVisible);
+    setLayerVisible("updates-outline", updatesVisible);
+  }
+
   function wireLegend() {
     for (const btn of buildingSourceButtons) {
       btn.addEventListener("click", () => {
@@ -935,11 +1013,25 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         writeStateHash();
       });
     }
+    for (const btn of updatesSourceButtons) {
+      btn.addEventListener("click", () => {
+        updatesVisible = btn.dataset.updatesSource === "on";
+        legendUpdatesGroup.dataset.updatesSource = btn.dataset.updatesSource;
+        for (const b of updatesSourceButtons) {
+          b.setAttribute("aria-pressed", String(b === btn));
+        }
+        applyUpdatesVisibility();
+      });
+    }
     // Layer visibility starts as "none" in the style spec above; derive the
     // real initial state from the buttons' own aria-pressed default here
-    // instead of duplicating it.
+    // instead of duplicating it. updates-fill/-outline have no such default
+    // (they start visible, see the layers array above), but applying it here
+    // too keeps this one call site the single source of "what's on at
+    // startup" instead of splitting it across two places.
     applyBuildingVisibility();
     applyAddressVisibility();
+    applyUpdatesVisibility();
   }
 
   // ---- low-zoom aggregate controls (z5-13) ----
@@ -1025,10 +1117,12 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   if (map.isStyleLoaded()) {
     wireLegend();
     wireAggLegend();
+    pollUpdates();
   } else {
     map.once("load", () => {
       wireLegend();
       wireAggLegend();
+      pollUpdates();
     });
   }
 
@@ -1302,6 +1396,28 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   pollStatus();
   setInterval(pollStatus, 30000);
+
+  // ---- recently-downloaded /package export areas ----
+  //
+  // GET /updates with no ?minutes= uses the server's own default window
+  // (config [updates].default_minutes, 60 by default -- see
+  // src/server/updates.rs) rather than picking a separate value here, so a
+  // deployment that changes the window doesn't need this file touched too.
+  // Polled on the response's own Cache-Control max-age (60s by default,
+  // [cache].updates_max_age_seconds) -- polling faster would just re-fetch
+  // the same cached body.
+  async function pollUpdates() {
+    try {
+      const res = await fetch("/updates");
+      if (!res.ok) throw new Error(`updates ${res.status}`);
+      const data = await res.json();
+      map.getSource("updates").setData(data);
+    } catch (err) {
+      console.error("failed to load /updates", err);
+    }
+  }
+
+  setInterval(pollUpdates, 60000);
 
   // ---- package download ----
 
