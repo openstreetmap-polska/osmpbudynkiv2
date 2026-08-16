@@ -128,7 +128,7 @@ egib_building_types = "https://raw.githubusercontent.com/openstreetmap-polska/os
 # Status is in-memory only (resets on restart) — see GET /status.
 [jobs.osm_update]
 # When true, OSM minutely diffs are applied every `interval_seconds`.
-enabled = false
+enabled = true
 # How often to start a run. Runs never overlap: the next tick waits
 # for the previous run to complete.
 interval_seconds = 60
@@ -155,7 +155,7 @@ timeout_seconds = 600
 # Prunes old rows from the /package export log (see [updates] and the
 # GET /updates endpoint below).
 [jobs.export_log_prune]
-enabled = false
+enabled = true
 interval_seconds = 86400
 # How long package_exports rows are kept before being deleted.
 retention_days = 365
@@ -189,7 +189,7 @@ timeout_seconds = 7200
 # OSM updates) by recomputing the affected z14 cells' *_unmatched serving
 # tables. Keeps /tiles and /package results current between full comparisons.
 [jobs.match_refresh]
-enabled = false
+enabled = true
 interval_seconds = 30
 timeout_seconds = 300
 # Max number of distinct dirty (source, cell) recomputed per tick.
@@ -234,7 +234,7 @@ timeout_seconds = 1800
 # Unlike the dataset refreshes this enqueues no dirty cells and triggers no
 # recompute -- the mapping is applied when /package builds its response.
 [jobs.street_mappings_update]
-enabled = false
+enabled = true
 interval_seconds = 86400
 timeout_seconds = 300
 
@@ -248,7 +248,7 @@ timeout_seconds = 300
 # mappings ship in the binary's repository and most deployments will load
 # them once via `import building-types`.
 [jobs.building_types_update]
-enabled = false
+enabled = true
 interval_seconds = 86400
 timeout_seconds = 300
 
