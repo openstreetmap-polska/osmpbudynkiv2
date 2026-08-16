@@ -448,6 +448,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           type: "raster",
           tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
           tileSize: 256,
+          maxzoom: 19,
           attribution: "podkład mapowy &copy; współautorzy OpenStreetMap",
         },
         unmatched: {
