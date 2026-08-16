@@ -67,6 +67,39 @@ pub fn normalized_name_sql(expr: &str) -> String {
     format!("NULLIF(lower(trim({expr})), '')")
 }
 
+/// Canonical form of a housenumber for *matching* — never for display or
+/// export, which keep the original (merely trimmed) value carried in
+/// `prg_unmatched`/OSM tags untouched.
+///
+/// Case-folds (DuckDB's `UPPER`/`TRIM` are backed by utf8proc, which
+/// case-folds Polish diacritics correctly — Polish, unlike Turkish, has no
+/// casing rule that needs a locale-aware collation, so no ICU dependency is
+/// needed here), trims, folds `-` and `\` to `/` (PRG spells a double
+/// housenumber "45-47", OSM spells the identical one "45/47" — see PRG
+/// `9d0f1c57-797c-4035-96ef-11ab4100197f`, 2.4 m from OSM node 4365400981,
+/// both "Przyrodnicza" in Zgierz), and collapses a 1–2 digit number
+/// separated from a single letter suffix by a space onto it ("12 A" ->
+/// "12A"). Measured nationally: applying this in place of bare
+/// `UPPER(TRIM(...))` picks up 877 additional proximity matches among
+/// addresses `prg_unmatched` already carried, with no macro-scale change in
+/// match volume.
+///
+/// The `-`/`\` -> `/` fold is deliberately generic rather than scoped to
+/// "double housenumber" — a bare hyphen or backslash never has a different
+/// meaning in a Polish housenumber. It does *not* attempt to canonicalize
+/// "oficyna"/"of."/"blok"/"bl" annex markers — those were measured
+/// separately and found too inconsistent between PRG and OSM (bare number,
+/// "-of", or doubled "-ofof" all appear for the same annex concept) to
+/// canonicalize without a design decision on which OSM shape is authoritative.
+pub fn normalized_housenumber_sql(expr: &str) -> String {
+    format!(
+        "regexp_replace(
+             UPPER(TRIM(replace(replace({expr}, '\\', '/'), '-', '/'))),
+             '^(\\d{{1,2}}) ([A-Za-z])$', '\\1\\2'
+         )"
+    )
+}
+
 pub fn buffer(b: Bounds, deg: f64) -> Bounds {
     (b.0 - deg, b.1 - deg, b.2 + deg, b.3 + deg)
 }
@@ -284,8 +317,9 @@ pub fn suppressed_buildings_sql(
 
 /// Unmatched address rows: a government point within `write` for which no
 /// `osm_addresses` point (read from `read`) satisfies any of three rules.
-/// Every rule requires an equal normalized housenumber; NULL housenumber never
-/// matches, since SQL `= NULL` is never true.
+/// Every rule requires an equal normalized housenumber — `hn(...)` below is
+/// `normalized_housenumber_sql`, matching-only, never the raw stored value —
+/// and NULL housenumber never matches, since SQL `= NULL` is never true.
 ///
 /// ```text
 /// matched(a) := EXISTS osm o WHERE hn(o) = hn(a) AND (
@@ -350,6 +384,8 @@ pub fn unmatched_addresses_in_cell_sql(
     let mapping_joins = resolved_street_join_sql("c");
     let osm_street = normalized_name_sql("o.street");
     let osm_city = normalized_name_sql("o.city");
+    let src_hn = normalized_housenumber_sql("a.numer_porzadkowy");
+    let osm_hn = normalized_housenumber_sql("o.housenumber");
     // The CTEs are named `addr_*` rather than `candidates`/`resolved` so a
     // future caller wanting its own outer CTE cannot collide with them.
     format!(
@@ -371,7 +407,7 @@ pub fn unmatched_addresses_in_cell_sql(
            AND NOT EXISTS (
                SELECT 1 FROM osm_addresses o
                WHERE ST_Intersects(o.geom, {read_envelope})
-                 AND UPPER(TRIM(o.housenumber)) = UPPER(TRIM(a.numer_porzadkowy))
+                 AND {osm_hn} = {src_hn}
                  AND (
                       ST_Distance_Sphere(o.geom, a.geom) <= {dist}
                    OR (
@@ -896,6 +932,49 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
+    }
+
+    /// The motivating record for `normalized_housenumber_sql`: PRG
+    /// `9d0f1c57-797c-4035-96ef-11ab4100197f` spells a double housenumber
+    /// "45-47", OSM node 4365400981 spells the identical address "45/47",
+    /// 2.4 m apart on "Przyrodnicza" in Zgierz. Without the `-`/`\` -> `/`
+    /// fold this pair fails rule A on a bare text mismatch despite agreeing
+    /// on everything else.
+    #[test]
+    fn housenumber_dash_folds_to_slash_for_matching() {
+        let c = conn();
+        osm_addr(&c, 1, "45/47", None, None);
+        prg(&c, "dash", "45-47", None, None, None, 0.0002);
+        assert!(
+            unmatched_addr_ids(&c).is_empty(),
+            "PRG '45-47' must match OSM '45/47'"
+        );
+    }
+
+    /// A backslash is the same fold as a dash — some PRG exports use it in
+    /// place of a hyphen for the identical double-housenumber notation.
+    #[test]
+    fn housenumber_backslash_folds_to_slash_for_matching() {
+        let c = conn();
+        osm_addr(&c, 1, "45/47", None, None);
+        prg(&c, "backslash", "45\\47", None, None, None, 0.0002);
+        assert!(
+            unmatched_addr_ids(&c).is_empty(),
+            "PRG '45\\47' must match OSM '45/47'"
+        );
+    }
+
+    /// "12 A" and "12A" are the same housenumber, differing only in whether
+    /// a space separates the number from a single-letter suffix.
+    #[test]
+    fn housenumber_space_before_letter_suffix_collapses_for_matching() {
+        let c = conn();
+        osm_addr(&c, 1, "12A", None, None);
+        prg(&c, "spaced", "12 A", None, None, None, 0.0002);
+        assert!(
+            unmatched_addr_ids(&c).is_empty(),
+            "PRG '12 A' must match OSM '12A'"
+        );
     }
 
     #[test]

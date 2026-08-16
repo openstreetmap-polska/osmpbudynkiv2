@@ -4,7 +4,8 @@ use tracing::info;
 
 use crate::compare::in_transaction;
 use crate::compare::rule::{
-    MATCH_DISTANCE_METERS, NAME_MATCH_DISTANCE_METERS, normalized_name_sql,
+    MATCH_DISTANCE_METERS, NAME_MATCH_DISTANCE_METERS, normalized_housenumber_sql,
+    normalized_name_sql,
 };
 use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
 use crate::utils::format_duration;
@@ -65,8 +66,10 @@ pub fn compare_prg(conn: &Connection) -> Result<()> {
 /// predicate** rather than calling it — the iteration strategy genuinely
 /// differs, and `full_and_per_cell_paths_agree` is what pins the two texts to
 /// the same answer. What it does *not* restate is the distance constants, the
-/// name normalization, or the street-mapping resolution chain: those are
-/// imported.
+/// name normalization, the housenumber normalization
+/// (`rule::normalized_housenumber_sql` — comparison-only; the row this INSERT
+/// writes still carries `s.numer_porzadkowy`'s original, merely-trimmed
+/// value), or the street-mapping resolution chain: those are imported.
 ///
 /// **The name rules are extra `OR` branches on the existing join, not extra
 /// UNION-ed branches keyed on the street name.** The equi-key stays
@@ -106,6 +109,8 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
     let mapping_joins = resolved_street_join_sql("a");
     let osm_street = normalized_name_sql("street");
     let osm_city = normalized_name_sql("city");
+    let src_hn = normalized_housenumber_sql("a.numer_porzadkowy");
+    let osm_hn = normalized_housenumber_sql("housenumber");
     conn.execute_batch(&format!(
         "INSERT INTO prg_unmatched
          (geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy,
@@ -116,7 +121,7 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
          ),
          src_norm AS (
              SELECT a.lokalny_id,
-                    UPPER(TRIM(a.numer_porzadkowy)) AS _hn,
+                    {src_hn} AS _hn,
                     FLOOR(ST_X(a.geom) / {GRID_KEY_DEG})::BIGINT AS _gx,
                     FLOOR(ST_Y(a.geom) / {GRID_KEY_DEG})::BIGINT AS _gy,
                     {src_street} AS _street,
@@ -126,7 +131,7 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
              {mapping_joins}
          ),
          osm_norm AS (
-             SELECT UPPER(TRIM(housenumber)) AS _hn,
+             SELECT {osm_hn} AS _hn,
                     FLOOR(ST_X(geom) / {GRID_KEY_DEG})::BIGINT AS _gx,
                     FLOOR(ST_Y(geom) / {GRID_KEY_DEG})::BIGINT AS _gy,
                     {osm_street} AS _street,
@@ -317,6 +322,42 @@ mod tests {
 
         run(&conn);
         assert_eq!(unmatched_count(&conn), 0);
+    }
+
+    /// The grid-key path's own copy of the motivating record for
+    /// `normalized_housenumber_sql` (see the twin test in
+    /// `compare::rule::tests`): PRG "45-47" must match OSM "45/47". This
+    /// path restates the predicate in different SQL, so it needs its own
+    /// pin rather than trusting the per-cell rule's test alone.
+    #[test]
+    fn housenumber_dash_folds_to_slash_for_matching() {
+        let conn = setup();
+        insert_prg(&conn, "p1", "45-47", "ST_Point(21.01, 52.21)");
+        conn.execute_batch(
+            "INSERT INTO osm_addresses VALUES (1, 'node', '45/47', NULL, NULL, NULL, ST_Point(21.01, 52.21));",
+        )
+        .unwrap();
+
+        run(&conn);
+        assert_eq!(
+            unmatched_count(&conn),
+            0,
+            "PRG '45-47' must match OSM '45/47'"
+        );
+    }
+
+    /// "12 A" and "12A" must match on the grid-key path too.
+    #[test]
+    fn housenumber_space_before_letter_suffix_collapses_for_matching() {
+        let conn = setup();
+        insert_prg(&conn, "p1", "12 A", "ST_Point(21.01, 52.21)");
+        conn.execute_batch(
+            "INSERT INTO osm_addresses VALUES (1, 'node', '12A', NULL, NULL, NULL, ST_Point(21.01, 52.21));",
+        )
+        .unwrap();
+
+        run(&conn);
+        assert_eq!(unmatched_count(&conn), 0, "PRG '12 A' must match OSM '12A'");
     }
 
     /// NULL housenumbers on both sides → SQL NULL ≠ NULL in joins → no match → unmatched.
