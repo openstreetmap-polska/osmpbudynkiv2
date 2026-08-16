@@ -212,19 +212,14 @@ body {
   line-height: 1.4;
 }
 
-.panel h2 {
-  margin: 0 0 8px;
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  color: var(--ink-soft);
-}
-
 .panel-legend {
   left: 16px;
   bottom: 16px;
   width: 236px;
+  /* Header lives in .panel-toggle now (see .panel-status, the pattern this
+     was copied from); the section itself carries no padding of its own so
+     the toggle button can be a flush, full-width click target. */
+  padding: 0;
 }
 
 .legend-group + .legend-group {
@@ -459,10 +454,17 @@ body {
 
 .panel-download {
   right: 16px;
-  /* Clears the compact AttributionControl MapLibre auto-adds in the same
-     corner (~24px button + 10px margin from the map edge). */
+  /* Clears the AttributionControl app.js adds in the same corner (~20px tall
+     text bar + 10px margin from the map edge). Explicitly non-compact (see
+     the `new maplibregl.AttributionControl({ compact: false })` call in
+     app.js) so the attribution text is always visible instead of collapsing
+     behind a click-to-reveal "i" button -- same footprint, so this clearance
+     didn't need to grow. */
   bottom: 44px;
   width: 240px;
+  /* Header lives in .panel-toggle now, same reasoning as .panel-legend
+     above. */
+  padding: 0;
 }
 
 button {
@@ -569,6 +571,7 @@ button {
 .panel-toggle {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
   width: 100%;
   padding: 10px 16px;
@@ -578,6 +581,30 @@ button {
   text-transform: uppercase;
   font-size: 10px;
   letter-spacing: 0.12em;
+}
+
+.panel-toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* CSS-only chevron (border triangle, no icon asset) pointing down when the
+   panel body is visible, rotated to point right (collapsed = "expand me")
+   when [aria-expanded="false"] -- toggled purely by that attribute so it
+   never drifts out of sync with the actual panel-body [hidden] state, which
+   app.js sets in the same click handler. */
+.panel-toggle-icon {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--ink-soft);
+  transition: transform 0.15s ease;
+}
+.panel-toggle[aria-expanded="false"] .panel-toggle-icon {
+  transform: rotate(-90deg);
 }
 
 .status-dot {
@@ -610,6 +637,15 @@ button {
 .panel-body {
   padding: 0 16px 14px;
   border-top: 1px solid var(--line);
+}
+
+/* Unlike #status-body's own first child (#status-table, which already
+   carries margin-top: 10px), the legend's and download panel's first
+   children have no top spacing of their own, so they'd otherwise butt
+   straight up against the border-top above. */
+.panel-legend .panel-body,
+.panel-download .panel-body {
+  padding-top: 10px;
 }
 
 .status-table-scroll {
@@ -744,6 +780,36 @@ button {
     right: 16px;
     bottom: calc(16px + 15px + 96px);
   }
+}
+
+/* `color` needs pinning: the credit text ("&copy; OpenStreetMap
+   contributors", see the `osm` source's `attribution` in app.js) is plain
+   text, not a link, so MapLibre's own `.maplibregl-ctrl-attrib a` rule never
+   touches it; without an explicit color here it inherits `color: var(--ink)`
+   from body, which in dark mode is a light tone -- rendered over a light
+   background, that's light-on-white. Pinned to the same rgba(0,0,0,.75)
+   MapLibre already uses for the linked variant, so both are legible in both
+   color schemes without depending on this app's theme tokens. background-
+   color is bumped from MapLibre's own default (a 50%-alpha white, which
+   reads as a soft gradient over a busy basemap rather than a solid plate)
+   to a near-opaque white -- deliberately not this app's `--paper`/
+   `--paper-raised` tokens, which flip dark in dark mode and would go
+   dark-text-on-dark-background against the `color` pinned above.
+   font-size/line-height are bumped from what the control would otherwise
+   just inherit (`.maplibregl-map`'s base 12px/20px in maplibre-gl.css,
+   MapLibre sets no font-size of its own on the attribution control), since
+   compact:false keeps this permanently on-screen rather than the small
+   click-to-reveal text it was sized for.
+   Selector must repeat `.maplibregl-ctrl-attrib` (matching maplibre-gl.css's
+   own `.maplibregl-ctrl.maplibregl-ctrl-attrib`, specificity 0,2,0) -- a
+   plain single-class override loses background-color to that rule despite
+   loading after it in the stylesheet, since specificity is checked before
+   source order (see the CLAUDE.md-worthy trap this already caused once). */
+.maplibregl-ctrl-attrib.maplibregl-ctrl-attrib {
+  color: rgba(0, 0, 0, 0.75);
+  background-color: rgba(255, 255, 255, 0.92);
+  font-size: 14px;
+  line-height: 22px;
 }
 
 .maplibregl-popup-content {

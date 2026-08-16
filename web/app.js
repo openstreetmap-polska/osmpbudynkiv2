@@ -448,7 +448,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           type: "raster",
           tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
           tileSize: 256,
-          attribution: "&copy; OpenStreetMap contributors",
+          attribution: "podkład mapowy &copy; współautorzy OpenStreetMap",
         },
         unmatched: {
           type: "vector",
@@ -537,9 +537,17 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     zoom: 6,
     minZoom: 5,
     maxZoom: 19,
-    hash: "map"
+    hash: "map",
+    // Suppresses MapLibre's default (compact, auto-collapsing) attribution
+    // control so the explicit non-compact one added below is the only one.
+    attributionControl: false,
   });
   map.addControl(new maplibregl.NavigationControl(), "top-right");
+  // `compact: false` keeps the attribution text always visible instead of
+  // MapLibre's default behaviour of collapsing it behind a click-to-reveal
+  // "i" button once the map narrows -- the default hides exactly the credit
+  // (OpenStreetMap contributors) this deployment is obligated to show.
+  map.addControl(new maplibregl.AttributionControl({ compact: false }), "bottom-right");
 
   // Mouse-wheel zoom speed. MapLibre's default wheelZoomRate (1/450) maps a
   // typical notch (~100 deltaY) to ~0.15 zoom levels -- roughly 6-7 notches
@@ -1164,11 +1172,22 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     TimedOut: "przekroczono limit czasu",
   };
 
-  statusToggle.addEventListener("click", () => {
-    const expanded = statusToggle.getAttribute("aria-expanded") === "true";
-    statusToggle.setAttribute("aria-expanded", String(!expanded));
-    statusBody.hidden = expanded;
-  });
+  // Shared fold/unfold behaviour for every collapsible panel (status,
+  // legend, download) -- a toggle button and the [hidden] body it controls,
+  // wired identically so aria-expanded and the chevron in
+  // .panel-toggle-icon (see style.css) never drift out of sync with the
+  // actual visibility.
+  function wirePanelToggle(toggle, body) {
+    toggle.addEventListener("click", () => {
+      const expanded = toggle.getAttribute("aria-expanded") === "true";
+      toggle.setAttribute("aria-expanded", String(!expanded));
+      body.hidden = expanded;
+    });
+  }
+
+  wirePanelToggle(statusToggle, statusBody);
+  wirePanelToggle(document.getElementById("legend-toggle"), document.getElementById("legend-body"));
+  wirePanelToggle(document.getElementById("download-toggle"), document.getElementById("download-body"));
 
   // /status carries timestamps in two shapes: the in-memory job registry
   // emits plain RFC3339 UTC ("...Z"), while job_run_log's ran_at and

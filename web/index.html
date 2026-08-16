@@ -22,7 +22,17 @@
   </header>
 
   <section class="panel panel-legend" aria-label="Legenda">
-    <h2>Legenda</h2>
+    <button
+      id="legend-toggle"
+      class="panel-toggle"
+      type="button"
+      aria-expanded="true"
+      aria-controls="legend-body"
+    >
+      <span class="panel-toggle-label">Legenda</span>
+      <span class="panel-toggle-icon" aria-hidden="true"></span>
+    </button>
+    <div id="legend-body" class="panel-body">
 
     <div class="legend-group" data-building-source="bdot10k">
       <div class="legend-group-header">
@@ -107,10 +117,21 @@
       <br>
       Przy % braków kolor pokazuje udział obiektów niedopasowanych, a nasycenie ich liczbę.
     </p>
+    </div>
   </section>
 
   <section class="panel panel-download" aria-label="Pobierz paczkę">
-    <h2>Pobierz paczkę</h2>
+    <button
+      id="download-toggle"
+      class="panel-toggle"
+      type="button"
+      aria-expanded="true"
+      aria-controls="download-body"
+    >
+      <span class="panel-toggle-label">Pobierz paczkę</span>
+      <span class="panel-toggle-icon" aria-hidden="true"></span>
+    </button>
+    <div id="download-body" class="panel-body">
     <button id="download-btn" type="button" class="download-btn">Pobierz widoczny obszar</button>
     <button id="draw-btn" type="button" class="download-btn">Narysuj obszar</button>
 
@@ -133,6 +154,7 @@
          committed polygon's envelope + vertex count once selected -- see
          updateDrawHint/selectedHintText in app.js. -->
     <p id="draw-hint" class="hint" hidden></p>
+    </div>
   </section>
 
   <dialog id="download-feedback" class="feedback-modal">
@@ -159,7 +181,8 @@
       aria-expanded="false"
       aria-controls="status-body"
     >
-      Status <span id="status-dot" class="status-dot" aria-hidden="true"></span>
+      <span class="panel-toggle-label">Status <span id="status-dot" class="status-dot" aria-hidden="true"></span></span>
+      <span class="panel-toggle-icon" aria-hidden="true"></span>
     </button>
     <div id="status-body" class="panel-body" hidden>
       <div class="status-table-scroll">
