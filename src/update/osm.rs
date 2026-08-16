@@ -1657,13 +1657,14 @@ mod tests {
     /// The fixture point is deliberately NOT the original (21.0, 51.0):
     /// verified that point sits at z14 cell (9147, 5484), but the buffered
     /// read at 51.0 - OSM_MATCH_BUFFER_DEG lands in cell_y 5485 -- a real
-    /// latitude boundary just 0.001 degrees south of it. That would make
-    /// this test assert 2 for reasons that have nothing to do with the
-    /// layer-gating it's meant to cover, and everything to do with an
-    /// accident of the fixture's position. Repositioning to the interior of
-    /// the same cell (its `tile_to_bbox` midpoint, the technique
-    /// `compare::incremental`'s tests already use) keeps the assertion about
-    /// layer gating rather than boundary geometry.
+    /// latitude boundary sits only a small fraction of a degree south of
+    /// 51.0, well within reach of the buffer whatever `OSM_MATCH_BUFFER_DEG`'s
+    /// exact value is. That would make this test assert 2 for reasons that
+    /// have nothing to do with the layer-gating it's meant to cover, and
+    /// everything to do with an accident of the fixture's position.
+    /// Repositioning to the interior of the same cell (its `tile_to_bbox`
+    /// midpoint, the technique `compare::incremental`'s tests already use)
+    /// keeps the assertion about layer gating rather than boundary geometry.
     #[test]
     fn test_apply_node_create_enqueues_prg_dirty_cells() -> Result<()> {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;

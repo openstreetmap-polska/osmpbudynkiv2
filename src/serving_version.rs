@@ -18,10 +18,21 @@
 //! things that change what a tile renders touch *no* dirty cell and *no*
 //! `*_unmatched` row at all:
 //!
-//! - `street_name_mappings` and the two `*_building_types` tables
+//! - The two `*_building_types` tables
 //!   (`bdot10k_building_types`/`egib_building_types`) change tile `tags`
-//!   purely at serve time -- see the CLAUDE.md gotchas on street-name and
-//!   building-type mapping. Loading a new mapping file recomputes nothing.
+//!   purely at serve time -- see the CLAUDE.md gotcha on building-type
+//!   mapping. Loading a new building-type file recomputes nothing.
+//! - `street_name_mappings` is a **partial** case, and the distinction
+//!   matters. It used to belong in the bullet above, but the address match
+//!   rule now resolves PRG's street name through it (`compare::rule`'s rule
+//!   B), so a mapping edit *can* change which addresses are unmatched. Its
+//!   loader therefore enqueues dirty cells for the addresses it can flip, and
+//!   the drain moves their `computed_at` — per-cell coverage, eventually. The
+//!   epoch bump in that loader is still required rather than superseded: it
+//!   covers the window before those cells drain (an undrained cell serves the
+//!   old match decision with the new serve-time `addr:street`), plus the
+//!   `addresses_all` layer and the z5-z13 tiers, which no per-cell version
+//!   reaches at all.
 //! - The `addresses_all`/`buildings_all` legend layers read the raw
 //!   `prg_addresses`/`bdot10k_buildings`/`egib_buildings` tables directly,
 //!   never the `*_unmatched` serving tables, so per-cell `computed_at` never

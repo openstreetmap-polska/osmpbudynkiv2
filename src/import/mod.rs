@@ -73,8 +73,9 @@ pub fn run(
             match &outcome {
                 Ok(stats) => {
                     let msg = format!(
-                        "loaded {} mapping rows ({} not present in current PRG data)",
-                        stats.rows_loaded, stats.rows_absent_from_prg
+                        "loaded {} mapping rows ({} not present in current PRG data, \
+                         {} dirty cell(s) enqueued)",
+                        stats.rows_loaded, stats.rows_absent_from_prg, stats.cells_enqueued
                     );
                     let _ = crate::job_log::record(
                         conn,

@@ -1,10 +1,14 @@
 //! Periodic refresh of the curated street-name mapping file.
 //!
-//! Unlike the dataset refreshes this touches no geometry and enqueues no
-//! dirty cells: the mapping is applied at serving time, so a new file takes
-//! effect on the next `/package` request with no recompute. The last seen
-//! ETag lives in `metadata` rather than `dataset_refreshes`, whose columns
-//! exist for snapshot diffing that does not apply here.
+//! Unlike the dataset refreshes this touches no geometry, but it does now
+//! enqueue dirty cells: the PRG<->OSM address match rule has a branch that
+//! compares PRG's street name resolved through `street_name_mappings`
+//! against OSM's `addr:street`, so a mapping edit can change which
+//! addresses are unmatched, not just how they render. `mappings::load_from_path`
+//! diffs the old and new mapping contents and enqueues the affected z14
+//! cells for the drain -- see `mappings::street_names::enqueue_mapping_delta_cells`.
+//! The last seen ETag lives in `metadata` rather than `dataset_refreshes`,
+//! whose columns exist for snapshot diffing that does not apply here.
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
@@ -99,8 +103,9 @@ impl Job for StreetMappingsUpdateJob {
                     )?;
                 }
                 let msg = format!(
-                    "loaded {} mapping rows ({} not present in current PRG data)",
-                    stats.rows_loaded, stats.rows_absent_from_prg
+                    "loaded {} mapping rows ({} not present in current PRG data, \
+                     {} dirty cell(s) enqueued)",
+                    stats.rows_loaded, stats.rows_absent_from_prg, stats.cells_enqueued
                 );
                 let _ = crate::job_log::record(&conn, JOB_LOG_KEY, "Success", Some(&msg));
             }

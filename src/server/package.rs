@@ -17,6 +17,8 @@ use duckdb::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
+
 use super::AppState;
 
 /// Datasets that can be included in a package. Output order is fixed:
@@ -393,11 +395,18 @@ pub fn feature(
 /// Matching is precomputed upstream (see src/compare/) into `prg_unmatched`;
 /// this is a plain spatial read of that serving table clipped to the polygon.
 /// `addr:street` is resolved through `street_name_mappings` here — the only
-/// place PRG street names reach the outside world. The COALESCE chain *is* the
-/// priority rule: settlement row, then global row, then the raw PRG name, so
-/// an empty mapping table degrades to serving names verbatim rather than
-/// erroring. Matching never reads street names (see compare::addresses), so
-/// this cannot change which addresses are unmatched.
+/// place PRG street names reach the outside world. The chain has one home,
+/// `mappings::street_names::resolved_street_join_sql`/`resolved_street_expr_sql`,
+/// and the COALESCE *is* the priority rule: settlement row, then global row,
+/// then the raw PRG name, so an empty mapping table degrades to serving names
+/// verbatim rather than erroring.
+///
+/// The same resolution is now also a **match** input — `compare::rule`'s rule
+/// B compares the resolved name against OSM's `addr:street` at up to 150 m —
+/// which is why the loader enqueues dirty cells. Nothing about *this* query
+/// changed as a result: it still reads `prg_unmatched`, which the compare has
+/// already decided. But the old reassurance that a mapping edit "cannot change
+/// which addresses are unmatched" no longer holds anywhere.
 pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<AddressRow>> {
     let (x1, y1, x2, y2) = (area.min_lon, area.min_lat, area.max_lon, area.max_lat);
     // Envelope bounds are validated finite f64s (parsed and range-checked by
@@ -418,17 +427,14 @@ pub fn unmatched_addresses(conn: &Connection, area: &RequestArea) -> Result<Vec<
     // Polygon legitimately returns a MultiPolygon (it splits at the
     // self-intersection) -- that's the correct, intended repair, not
     // something to normalise away.
+    let resolved_street = resolved_street_expr_sql("a");
+    let mapping_joins = resolved_street_join_sql("a");
     let sql = format!(
         "SELECT ST_AsGeoJSON(a.geom), a.numer_porzadkowy,
-                COALESCE(loc.osm_street_name, gl.osm_street_name, a.ulica),
+                {resolved_street},
                 a.miejscowosc, a.kod_pocztowy, a.teryt_miejscowosc
          FROM prg_unmatched a
-         LEFT JOIN street_name_mappings loc
-                ON lower(trim(loc.prg_street_name)) = lower(trim(a.ulica))
-               AND loc.teryt_simc_code = a.teryt_miejscowosc
-         LEFT JOIN street_name_mappings gl
-                ON lower(trim(gl.prg_street_name)) = lower(trim(a.ulica))
-               AND gl.teryt_simc_code IS NULL
+         {mapping_joins}
          WHERE ST_Intersects(a.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
            AND ST_Intersects(a.geom, ST_MakeValid(ST_GeomFromGeoJSON(?)))"
     );

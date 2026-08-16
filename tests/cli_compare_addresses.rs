@@ -94,6 +94,15 @@ fn test_compare_addresses_default() {
     // The PRG fixture has 3 lubuskie addresses. The OSM fixture has Warsaw
     // addresses. None of them share housenumber + proximity, so all 3 PRG
     // rows become candidates.
+    //
+    // This asserts the CLI wires the comparison up at all -- it is *not*
+    // coverage of the match rule, and must not be read as such. The two
+    // fixtures are hundreds of kilometres apart, so no PRG row ever shares a
+    // grid key with an OSM row and no pair reaches any distance or name test.
+    // The count stayed 3 unchanged when the street and locality rules landed,
+    // and would stay 3 if every rule were deleted. The rule's actual coverage
+    // is `compare::rule::tests`, `compare::addresses::full_and_per_cell_paths_agree`
+    // and `compare::full_vs_incremental_equivalence`.
     let conn = Connection::open(&db_path).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM prg_unmatched", [], |row| row.get(0))

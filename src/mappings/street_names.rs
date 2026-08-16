@@ -14,11 +14,46 @@ use anyhow::{Context, Result, bail};
 use duckdb::Connection;
 use tracing::{info, warn};
 
+use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql};
+
 #[allow(dead_code)]
 pub const MAPPINGS_TABLE: &str = "street_name_mappings";
 
 #[allow(dead_code)]
 const STAGING_TABLE: &str = "street_name_mappings__staging";
+
+/// The two LEFT JOINs that resolve `{alias}.ulica` through
+/// `street_name_mappings`: the settlement-scoped row (`loc`) wins over the
+/// global row (`gl`). Emitted as bare join text so a caller can splice it into
+/// whatever FROM clause it already has; pair it with
+/// [`resolved_street_expr_sql`], which names the result.
+///
+/// **This cannot fan out -- but only because the loader says so.** At most one
+/// `loc` row and one `gl` row can match, because [`validate_and_swap`] rejects
+/// duplicate `(lower(prg_street_name), teryt_simc_code)` keys before the swap.
+/// The table itself carries no UNIQUE constraint (see `db::create_schema`), so
+/// a hand-INSERTed duplicate duplicates rows in every consumer.
+pub fn resolved_street_join_sql(alias: &str) -> String {
+    format!(
+        "LEFT JOIN street_name_mappings loc
+                ON lower(trim(loc.prg_street_name)) = lower(trim({alias}.ulica))
+               AND loc.teryt_simc_code = {alias}.teryt_miejscowosc
+         LEFT JOIN street_name_mappings gl
+                ON lower(trim(gl.prg_street_name)) = lower(trim({alias}.ulica))
+               AND gl.teryt_simc_code IS NULL"
+    )
+}
+
+/// The COALESCE naming [`resolved_street_join_sql`]'s output: settlement row,
+/// then global row, then the raw PRG name -- so an empty mapping table
+/// degrades to serving PRG names verbatim rather than erroring.
+///
+/// Deliberately *unnormalized*: consumers normalize differently (`/package`
+/// serves it raw, `/tiles` wraps it in `NULLIF(trim(...), '')`, the match rule
+/// lowercases it), so normalization belongs at the call site.
+pub fn resolved_street_expr_sql(alias: &str) -> String {
+    format!("COALESCE(loc.osm_street_name, gl.osm_street_name, {alias}.ulica)")
+}
 
 /// Outcome of one successful load.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +64,10 @@ pub struct LoadStats {
     /// but a large count against a populated database means the file has
     /// drifted from what PRG currently publishes.
     pub rows_absent_from_prg: i64,
+    /// z14 `match_dirty_cells` rows enqueued for the drain because this load
+    /// changed the (settlement, PRG name) -> OSM name triple for at least one
+    /// PRG address's street. See `enqueue_mapping_delta_cells`.
+    pub cells_enqueued: i64,
 }
 
 /// Replace the contents of `street_name_mappings` with the rows in `path`.
@@ -56,6 +95,97 @@ pub fn load_from_path(conn: &Connection, path: &Path) -> Result<LoadStats> {
     let result = validate_and_swap(conn, path_str);
     let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {STAGING_TABLE}"));
     result
+}
+
+/// Enqueue the z14 `match_dirty_cells` rows a mapping swap invalidates.
+///
+/// The PRG<->OSM address match rule now has a branch that compares PRG's
+/// street name *resolved through `street_name_mappings`* against OSM's
+/// `addr:street` at up to 150 m, so a mapping edit can flip an address
+/// between matched and unmatched -- this table is no longer serving-time
+/// only, and the drain needs to know which cells to recompute.
+///
+/// Must be called before the caller deletes `{MAPPINGS_TABLE}`'s contents:
+/// this reads the live table's pre-swap rows, which are half the symmetric
+/// difference against `{STAGING_TABLE}` and gone one statement later. (Same
+/// read-before-write ordering as `update::changeset::insert_change_areas`.)
+///
+/// No drain race, though it looks like there is one: DuckDB's `now()` is
+/// transaction-start-scoped, so the rows this inserts can be stamped
+/// *earlier* than a concurrent `compare::drain::drain_batch`'s
+/// `batch_start`, whose paired delete is `enqueued_at <= batch_start`. That
+/// delete only ever sees rows in its own snapshot, though: either the drain
+/// starts after this swap commits (it sees the new mapping *and* this queue
+/// row -> correct recompute, then delete), or before it (it sees neither ->
+/// the row survives untouched to the next tick). There is no interleaving
+/// where the delete fires without the corresponding recompute having run.
+fn enqueue_mapping_delta_cells(conn: &Connection) -> Result<i64> {
+    // `prg_addresses` is created by `import prg`, not by `db::create_schema`,
+    // so it is legitimately absent when `import street-mappings` runs first
+    // on a fresh database. Probe the catalog explicitly instead of
+    // swallowing a query error the way `rows_absent_from_prg` above does
+    // (`.unwrap_or(0)`) -- a swallowed error here would silently skip the
+    // enqueue forever instead of just once on a fresh database.
+    let prg_addresses_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = 'prg_addresses'",
+            [],
+            |r| r.get(0),
+        )
+        .context("Failed to probe for prg_addresses")?;
+    if prg_addresses_exists == 0 {
+        return Ok(0);
+    }
+
+    let z = CHANGE_CELL_ZOOM;
+    let cx = cell_x_sql("p.geom");
+    let cy = cell_y_sql("p.geom");
+    // `execute` (not `execute_batch`), same reason as `enqueue_all`'s
+    // comment: the return value must be the number of rows *this* INSERT
+    // added, not the queue's total depth for 'prg' afterwards.
+    let n = conn
+        .execute(
+            &format!(
+                "INSERT INTO match_dirty_cells (source, cell_z, cell_x, cell_y, enqueued_at)
+                 WITH triples_live AS (
+                     SELECT teryt_simc_code, lower(prg_street_name) AS n, osm_street_name
+                     FROM {MAPPINGS_TABLE}
+                 ),
+                 triples_new AS (
+                     SELECT teryt_simc_code, lower(prg_street_name) AS n, osm_street_name
+                     FROM {STAGING_TABLE}
+                 ),
+                 -- Each EXCEPT below must be parenthesized: EXCEPT and UNION
+                 -- share precedence and are left-associative, so the
+                 -- unparenthesized form silently parses as
+                 -- ((A EXCEPT B) UNION B) EXCEPT A, not the symmetric
+                 -- difference this needs. Correctness, not style.
+                 changed AS (
+                     (SELECT * FROM triples_live EXCEPT SELECT * FROM triples_new)
+                     UNION
+                     (SELECT * FROM triples_new EXCEPT SELECT * FROM triples_live)
+                 )
+                 -- EXCEPT compares NULLs as equal (verified in DuckDB 1.5.5).
+                 -- That is what keeps an unchanged *global* row (NULL
+                 -- teryt_simc_code) out of `changed`; rewriting this as
+                 -- `NOT EXISTS ... AND teryt_simc_code = ...` would put every
+                 -- global row into the delta on every reload.
+                 --
+                 -- The full triple is compared above but only the name is
+                 -- projected below -- deliberately over-broad: a
+                 -- settlement-scoped edit dirties that name's addresses
+                 -- nationally. It's cheap, and it removes a whole class of
+                 -- \"which addresses could this row have applied to\"
+                 -- reasoning.
+                 SELECT DISTINCT 'prg', {z}, {cx}, {cy}, now()
+                 FROM prg_addresses p
+                 WHERE p.geom IS NOT NULL
+                   AND lower(trim(p.ulica)) IN (SELECT DISTINCT n FROM changed)"
+            ),
+            [],
+        )
+        .context("Failed to enqueue dirty cells for changed mappings")?;
+    Ok(n as i64)
 }
 
 #[allow(dead_code)]
@@ -140,44 +270,61 @@ fn validate_and_swap(conn: &Connection, path_str: &str) -> Result<LoadStats> {
 
     conn.execute_batch("BEGIN TRANSACTION")
         .context("Failed to begin mapping swap")?;
-    // `/tiles` and `/package` apply this mapping at serve time with no dirty
-    // cell and no recompute (see CLAUDE.md's street-name gotcha and
-    // `serving_version`'s module doc), so a landed swap is exactly the "no
-    // per-cell version tracks this" case the global epoch exists for.
+    // The mapping is no longer serving-time only: the PRG<->OSM address
+    // match rule now has a branch that compares PRG's street name resolved
+    // through street_name_mappings against OSM's addr:street, so a mapping
+    // edit can flip an address between matched and unmatched (see CLAUDE.md's
+    // street-name gotcha). enqueue_mapping_delta_cells must run first, before
+    // the DELETE below discards the live rows it needs to diff against.
     // Chained via `.context().and_then(...)` (converting the duckdb::Error
-    // into anyhow::Error first, so the two calls' error types line up) so
-    // the bump is folded into the same fallible value the swap already is
-    // and lands or rolls back with it below -- this is the one home for the
-    // load (both call sites go through here), so bumping anywhere else would
-    // risk a second, divergent copy.
-    let swap = conn
-        .execute_batch(&format!(
-            "DELETE FROM {MAPPINGS_TABLE};
-         INSERT INTO {MAPPINGS_TABLE} (teryt_simc_code, prg_street_name, osm_street_name)
-         SELECT teryt_simc_code, prg_street_name, osm_street_name FROM {STAGING_TABLE};"
-        ))
-        .context("Failed to apply mapping swap")
-        .and_then(|()| crate::serving_version::bump_serving_epoch(conn));
-    match swap {
-        Ok(()) => conn
-            .execute_batch("COMMIT")
-            .context("Failed to commit mapping swap")?,
+    // into anyhow::Error first, so the calls' error types line up) so the
+    // enqueue and the bump are folded into the same fallible value the swap
+    // already is and land or roll back with it below -- this is the one home
+    // for the load (both call sites go through here), so doing either step
+    // anywhere else would risk a second, divergent copy.
+    let swap = enqueue_mapping_delta_cells(conn)
+        .and_then(|cells_enqueued| {
+            conn.execute_batch(&format!(
+                "DELETE FROM {MAPPINGS_TABLE};
+             INSERT INTO {MAPPINGS_TABLE} (teryt_simc_code, prg_street_name, osm_street_name)
+             SELECT teryt_simc_code, prg_street_name, osm_street_name FROM {STAGING_TABLE};"
+            ))
+            .context("Failed to apply mapping swap")
+            .map(|()| cells_enqueued)
+        })
+        // Even with the per-cell enqueue above, an undrained cell keeps
+        // serving the old match decision alongside the new serve-time
+        // addr:street until the drain catches up, and the addresses_all
+        // legend layer plus z5-z13 tiles are epoch-only (see
+        // `serving_version`'s module doc) -- so this bump is still required
+        // on top of the enqueue, not replaced by it.
+        .and_then(|cells_enqueued| {
+            crate::serving_version::bump_serving_epoch(conn).map(|()| cells_enqueued)
+        });
+    let cells_enqueued = match swap {
+        Ok(cells_enqueued) => {
+            conn.execute_batch("COMMIT")
+                .context("Failed to commit mapping swap")?;
+            cells_enqueued
+        }
         Err(e) => {
             if let Err(rb) = conn.execute_batch("ROLLBACK") {
                 warn!(error = %rb, "Failed to roll back mapping swap");
             }
             return Err(e).context("Failed to replace mapping table contents");
         }
-    }
+    };
 
     info!(
         rows = rows_loaded,
         absent_from_prg = rows_absent_from_prg,
+        cells_enqueued,
         "Loaded street name mappings"
     );
     Ok(LoadStats {
         rows_loaded: rows_loaded as usize,
         rows_absent_from_prg,
+        cells_enqueued,
     })
 }
 
@@ -211,6 +358,46 @@ mod tests {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap();
         rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// The builders exist so the settlement-beats-global-beats-raw priority
+    /// has one home. This pins that order end to end in DuckDB rather than
+    /// asserting on the SQL text, which would pass for a chain that resolves
+    /// in the wrong order.
+    #[test]
+    fn resolved_street_builders_produce_a_working_priority_chain() {
+        let conn = setup_db();
+        conn.execute_batch(
+            "CREATE TABLE a (ulica VARCHAR, teryt_miejscowosc VARCHAR);
+             INSERT INTO a VALUES
+                 ('gen. Kruka', '0956069'),   -- has both a settlement and a global row
+                 ('gen. Kruka', '0000001'),   -- only the global row applies
+                 ('Polna',      '0956069');   -- no mapping at all
+             INSERT INTO street_name_mappings VALUES
+                 ('0956069', 'gen. Kruka', 'Generała Michała Kruka'),
+                 (NULL,      'gen. Kruka', 'Generała Kruka');",
+        )
+        .unwrap();
+        let sql = format!(
+            "SELECT {} FROM a {} ORDER BY 1",
+            resolved_street_expr_sql("a"),
+            resolved_street_join_sql("a"),
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let got: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "Generała Kruka".to_string(),         // global row
+                "Generała Michała Kruka".to_string(), // settlement row wins
+                "Polna".to_string(),                  // falls through to the raw name
+            ],
+            "settlement row must beat the global row, which must beat the raw PRG name"
+        );
     }
 
     #[test]
@@ -292,8 +479,8 @@ mod tests {
     fn counts_rows_whose_prg_name_is_absent_from_prg_addresses() {
         let conn = setup_db();
         conn.execute_batch(
-            "CREATE TABLE prg_addresses (lokalny_id VARCHAR, ulica VARCHAR);
-             INSERT INTO prg_addresses VALUES ('1', 'gen. Kruka');",
+            "CREATE TABLE prg_addresses (lokalny_id VARCHAR, ulica VARCHAR, geom GEOMETRY);
+             INSERT INTO prg_addresses VALUES ('1', 'gen. Kruka', ST_Point(21.0, 52.0));",
         )
         .unwrap();
         let f = write_csv(",gen. Kruka,Generała Kruka\n,gone. Street,Whatever Street\n");
@@ -311,6 +498,10 @@ mod tests {
         let stats = load_from_path(&conn, f.path()).unwrap();
         assert_eq!(stats.rows_loaded, 1);
         assert_eq!(stats.rows_absent_from_prg, 0);
+        assert_eq!(
+            stats.cells_enqueued, 0,
+            "no prg_addresses table means nothing to enqueue"
+        );
     }
 
     /// This mapping changes what `/tiles` renders (`addr:street`) with no
@@ -343,5 +534,206 @@ mod tests {
             crate::serving_version::read_serving_epoch(&conn).unwrap(),
             0
         );
+    }
+
+    /// Creates `prg_addresses` with the shape `enqueue_mapping_delta_cells`
+    /// reads (`ulica` + `geom`), so the tests below can seed real addresses.
+    fn setup_db_with_prg_addresses(rows_sql: &str) -> duckdb::Connection {
+        let conn = setup_db();
+        conn.execute_batch(&format!(
+            "CREATE TABLE prg_addresses (lokalny_id VARCHAR, ulica VARCHAR, geom GEOMETRY);
+             {rows_sql}"
+        ))
+        .unwrap();
+        conn
+    }
+
+    fn dirty_prg_cell_count(conn: &duckdb::Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'prg'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Scale claim from the design doc: a reload whose contents are byte-for-
+    /// byte identical to what's already loaded must enqueue nothing, even
+    /// though matching addresses exist and would enqueue on a real change.
+    #[test]
+    fn reload_with_identical_contents_enqueues_no_cells() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES ('1', 'gen. Kruka', ST_Point(21.0, 52.0));",
+        );
+        let f = write_csv(",gen. Kruka,Generała Kruka\n");
+        load_from_path(&conn, f.path()).unwrap();
+
+        let f2 = write_csv(",gen. Kruka,Generała Kruka\n");
+        let stats = load_from_path(&conn, f2.path()).unwrap();
+        assert_eq!(
+            stats.cells_enqueued, 0,
+            "identical mapping contents must not enqueue anything"
+        );
+    }
+
+    #[test]
+    fn changing_a_mapping_target_enqueues_the_cells_of_addresses_with_that_prg_name() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES ('1', 'gen. Kruka', ST_Point(21.0, 52.0));",
+        );
+        let first = write_csv(",gen. Kruka,Generała Kruka\n");
+        load_from_path(&conn, first.path()).unwrap();
+
+        let second = write_csv(",gen. Kruka,Generała Michała Kruka\n");
+        let stats = load_from_path(&conn, second.path()).unwrap();
+        assert_eq!(
+            stats.cells_enqueued, 1,
+            "the one cell holding the address whose mapped target changed"
+        );
+    }
+
+    #[test]
+    fn adding_a_mapping_enqueues_cells() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES
+                 ('1', 'Polna', ST_Point(21.0, 52.0)),
+                 ('2', 'gen. Kruka', ST_Point(19.0, 50.0));",
+        );
+        let first = write_csv(",Polna,Polna Ulica\n");
+        load_from_path(&conn, first.path()).unwrap();
+
+        let second = write_csv(",Polna,Polna Ulica\n,gen. Kruka,Generała Kruka\n");
+        let stats = load_from_path(&conn, second.path()).unwrap();
+        assert_eq!(
+            stats.cells_enqueued, 1,
+            "only the newly-added row's addresses, not the unchanged Polna row's"
+        );
+    }
+
+    #[test]
+    fn removing_a_mapping_enqueues_cells() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES
+                 ('1', 'Polna', ST_Point(21.0, 52.0)),
+                 ('2', 'gen. Kruka', ST_Point(19.0, 50.0));",
+        );
+        let first = write_csv(",Polna,Polna Ulica\n,gen. Kruka,Generała Kruka\n");
+        load_from_path(&conn, first.path()).unwrap();
+
+        let second = write_csv(",Polna,Polna Ulica\n");
+        let stats = load_from_path(&conn, second.path()).unwrap();
+        assert_eq!(
+            stats.cells_enqueued, 1,
+            "the removed row's addresses, not the still-present Polna row's"
+        );
+    }
+
+    /// Pins that the *full triple* is compared, not just the (name, target)
+    /// pair: the (name, target) pair below is byte-identical across the two
+    /// loads, only `teryt_simc_code` changes, and that alone must enqueue.
+    #[test]
+    fn changing_only_the_simc_scope_enqueues() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES ('1', 'gen. Kruka', ST_Point(21.0, 52.0));",
+        );
+        let first = write_csv(",gen. Kruka,Generała Kruka\n");
+        load_from_path(&conn, first.path()).unwrap();
+
+        let second = write_csv("0956069,gen. Kruka,Generała Kruka\n");
+        let stats = load_from_path(&conn, second.path()).unwrap();
+        assert_eq!(
+            stats.cells_enqueued, 1,
+            "the (name, target) pair is unchanged but the scope differs, so the full \
+             triple must still be flagged as changed"
+        );
+    }
+
+    /// Pins `EXCEPT`'s NULL-as-equal behaviour: a reload where only a
+    /// *settlement*-scoped row changes must not also enqueue the untouched
+    /// global row's (NULL `teryt_simc_code`) addresses.
+    #[test]
+    fn an_unchanged_global_row_is_not_in_the_symmetric_difference() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES
+                 ('1', 'gen. Kruka', ST_Point(21.0, 52.0)),
+                 ('2', 'Polna', ST_Point(19.0, 50.0));",
+        );
+        let first = write_csv(",gen. Kruka,Generała Kruka\n0956069,Polna,Polna Ulica\n");
+        load_from_path(&conn, first.path()).unwrap();
+
+        // Only the settlement-scoped Polna row's target changes.
+        let second = write_csv(",gen. Kruka,Generała Kruka\n0956069,Polna,Nowa Polna\n");
+        let stats = load_from_path(&conn, second.path()).unwrap();
+        assert_eq!(
+            stats.cells_enqueued, 1,
+            "the untouched global row (NULL teryt_simc_code) must not appear in the delta"
+        );
+    }
+
+    #[test]
+    fn addresses_with_other_street_names_are_not_enqueued() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES
+                 ('1', 'gen. Kruka', ST_Point(21.0, 52.0)),
+                 ('2', 'Polna', ST_Point(19.0, 50.0));",
+        );
+        let first = write_csv(",gen. Kruka,Generała Kruka\n");
+        load_from_path(&conn, first.path()).unwrap();
+
+        let second = write_csv(",gen. Kruka,Generała Michała Kruka\n");
+        let stats = load_from_path(&conn, second.path()).unwrap();
+        assert_eq!(
+            stats.cells_enqueued, 1,
+            "only gen. Kruka's cell, not Polna's -- Polna's mapping never changed"
+        );
+    }
+
+    #[test]
+    fn enqueue_matches_ulica_case_and_whitespace_insensitively() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES ('1', '  GEN. KRUKA  ', ST_Point(21.0, 52.0));",
+        );
+        let first = write_csv(",gen. Kruka,Generała Kruka\n");
+        load_from_path(&conn, first.path()).unwrap();
+
+        let second = write_csv(",gen. Kruka,Generała Michała Kruka\n");
+        let stats = load_from_path(&conn, second.path()).unwrap();
+        assert_eq!(
+            stats.cells_enqueued, 1,
+            "case/whitespace differences between ulica and prg_street_name must still match"
+        );
+    }
+
+    #[test]
+    fn enqueue_skips_addresses_with_null_ulica_and_null_geom() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES
+                 ('1', NULL, ST_Point(21.0, 52.0)),
+                 ('2', 'gen. Kruka', NULL),
+                 ('3', 'gen. Kruka', ST_Point(19.0, 50.0));",
+        );
+        let first = write_csv(",gen. Kruka,Generała Kruka\n");
+        load_from_path(&conn, first.path()).unwrap();
+
+        let second = write_csv(",gen. Kruka,Generała Michała Kruka\n");
+        let stats = load_from_path(&conn, second.path()).unwrap();
+        assert_eq!(
+            stats.cells_enqueued, 1,
+            "the NULL-ulica and NULL-geom rows must be skipped, not crash the query \
+             or inflate the count"
+        );
+    }
+
+    /// Mirror of `failed_load_does_not_bump_the_serving_epoch`: a rejected
+    /// load must not enqueue dirty cells for a mapping swap that never
+    /// happened.
+    #[test]
+    fn failed_load_enqueues_no_cells() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES ('1', 'gen. Kruka', ST_Point(21.0, 52.0));",
+        );
+        let bad = write_csv(",B,Bbb\n,b,Bbb2\n");
+        load_from_path(&conn, bad.path()).unwrap_err();
+        assert_eq!(dirty_prg_cell_count(&conn), 0);
     }
 }

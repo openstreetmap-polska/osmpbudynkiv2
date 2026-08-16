@@ -7,7 +7,10 @@ use anyhow::Context;
 
 use super::AppState;
 use super::http_cache;
+use std::sync::LazyLock;
+
 use super::package::{ADJACENCY_READ_BUFFER_DEG, BDOT10K_ADJACENCY_KEY, EGIB_ADJACENCY_KEY};
+use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
 use crate::serving_version;
 use crate::tile_math::tile_to_bbox;
 
@@ -65,7 +68,15 @@ use crate::tile_math::tile_to_bbox;
 // constants rather than re-typing them. Both omit `package`'s polygon-clip
 // predicate (`ST_Intersects(_, ST_GeomFromGeoJSON(?))`) since tiles are
 // always rectangular, unlike a `/package` request area.
-const ADDRESSES_MVT_SQL: &str = "
+/// Built once at first use rather than declared `const`, because the street
+/// resolution comes from `mappings::street_names`'s shared builders — the same
+/// text `/package` and both compare paths use. The resulting SQL is
+/// semantically identical to the hand-written chain this replaced, so
+/// `serving_version::TILE_FORMAT_VERSION` must **not** move for it: nothing
+/// about what a tile contains changed.
+static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "
     WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
     candidates AS MATERIALIZED (
         SELECT a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc,
@@ -76,14 +87,9 @@ const ADDRESSES_MVT_SQL: &str = "
     ),
     resolved AS (
         SELECT candidates.*,
-               NULLIF(trim(COALESCE(loc.osm_street_name, gl.osm_street_name, candidates.ulica)), '') AS resolved_street
+               NULLIF(trim({resolved_street}), '') AS resolved_street
         FROM candidates
-        LEFT JOIN street_name_mappings loc
-               ON lower(trim(loc.prg_street_name)) = lower(trim(candidates.ulica))
-              AND loc.teryt_simc_code = candidates.teryt_miejscowosc
-        LEFT JOIN street_name_mappings gl
-               ON lower(trim(gl.prg_street_name)) = lower(trim(candidates.ulica))
-              AND gl.teryt_simc_code IS NULL
+        {mapping_joins}
     )
     SELECT ST_AsMVT(t, 'addresses', 4096, 'geom') AS mvt
     FROM (
@@ -106,7 +112,11 @@ const ADDRESSES_MVT_SQL: &str = "
         FROM resolved, bbox
     ) t
     WHERE t.geom IS NOT NULL
-";
+",
+        resolved_street = resolved_street_expr_sql("candidates"),
+        mapping_joins = resolved_street_join_sql("candidates"),
+    )
+});
 
 const BUILDINGS_MVT_SQL: &str = "
     WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
@@ -598,7 +608,7 @@ pub async fn serve_tile(
         // min_lon, min_lat, max_lon, max_lat order.
         let addresses = query_mvt_layer(
             &conn,
-            ADDRESSES_MVT_SQL,
+            ADDRESSES_MVT_SQL.as_str(),
             duckdb::params![
                 min_lon, min_lat, max_lon, max_lat, // bbox CTE
                 min_lon, min_lat, max_lon, max_lat, // resolved (prg_unmatched) filter
@@ -988,7 +998,7 @@ mod tests {
         // a plan with many sibling branches (BUILDINGS_MVT_SQL's four scans)
         // renders as "RTREE_IN..." -- verified by printing the plan and
         // comparing against the untruncated single-scan ADDRESSES_MVT_SQL case.
-        let addr_plan = plan_of(ADDRESSES_MVT_SQL, &addr_params_dyn);
+        let addr_plan = plan_of(ADDRESSES_MVT_SQL.as_str(), &addr_params_dyn);
         assert!(
             addr_plan.contains("RTREE_IN"),
             "addresses MVT query must use the RTREE index, got plan:\n{addr_plan}"

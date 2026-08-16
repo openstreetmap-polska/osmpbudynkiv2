@@ -3,13 +3,24 @@ use duckdb::Connection;
 use tracing::info;
 
 use crate::compare::in_transaction;
-use crate::compare::rule::MATCH_DISTANCE_METERS;
+use crate::compare::rule::{
+    MATCH_DISTANCE_METERS, NAME_MATCH_DISTANCE_METERS, normalized_name_sql,
+};
+use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
 use crate::utils::format_duration;
 
 /// Grid cell size in degrees for the spatial grid-key matching strategy.
-/// 0.005° ≈ 340 m east-west at 52 °N and ≈ 556 m north-south — both well above
-/// the 50 m match distance. Any two addresses within 50 m therefore fall in the
-/// same or adjacent grid cells, so a ±1 cell neighbourhood is always sufficient.
+/// 0.005° ≈ 343 m east-west at 52 °N (≈ 320 m at Poland's northern edge) and
+/// ≈ 556 m north-south — both above the *widest* match distance any rule uses,
+/// `NAME_MATCH_DISTANCE_METERS`. Any two addresses within that distance
+/// therefore fall in the same or adjacent grid cells, so a ±1 cell
+/// neighbourhood is always sufficient.
+///
+/// **Headroom is now 2.1×, not 6.4×** — widening the name rules to 150 m spent
+/// most of what 50 m left over. `grid_key_cell_is_wider_than_the_widest_match_distance`
+/// computes the requirement rather than trusting this comment, because the
+/// failure mode is silent: a match that straddles two cells simply stops being
+/// found, with no error.
 const GRID_KEY_DEG: f64 = 0.005;
 
 pub fn compare_prg(conn: &Connection) -> Result<()> {
@@ -44,10 +55,31 @@ pub fn compare_prg(conn: &Connection) -> Result<()> {
 /// This function avoids that by assigning each address an integer (gx, gy) key
 /// derived from `floor(coord / GRID_KEY_DEG)`. Each source address is expanded to
 /// its 3×3 neighbourhood (9 rows) and equality-joined against OSM on
-/// (normalised_housenumber, gx, gy). Because GRID_KEY_DEG ≈ 340 m >> 50 m match
-/// distance, any genuine within-50-m match is guaranteed to land in the same or an
-/// adjacent cell — no valid match is missed. DuckDB parallelises the hash join
-/// across all available threads in a single pass; no Rust-level loop is needed.
+/// (normalised_housenumber, gx, gy). Because GRID_KEY_DEG ≈ 320 m at Poland's
+/// northern edge >> the widest match distance, any genuine match is guaranteed
+/// to land in the same or an adjacent cell — no valid match is missed. DuckDB
+/// parallelises the hash join across all available threads in a single pass; no
+/// Rust-level loop is needed.
+///
+/// **This is the one place that legitimately restates `compare::rule`'s address
+/// predicate** rather than calling it — the iteration strategy genuinely
+/// differs, and `full_and_per_cell_paths_agree` is what pins the two texts to
+/// the same answer. What it does *not* restate is the distance constants, the
+/// name normalization, or the street-mapping resolution chain: those are
+/// imported.
+///
+/// **The name rules are extra `OR` branches on the existing join, not extra
+/// UNION-ed branches keyed on the street name.** The equi-key stays
+/// `(_hn, _gx, _gy)`, so the join emits exactly the pair set it emitted before
+/// the name rules existed — the fan-out above is bit-for-bit unchanged and the
+/// O(n²) analysis stands verbatim. A keyed-branch variant would be strictly
+/// more work for an identical answer, since every pair the name rules can match
+/// is already a pair this join produces (they only relax the *distance*, never
+/// the key).
+///
+/// No index concerns apply here, unlike the per-cell path in
+/// `compare::incremental`: this is a designed full scan over both tables, so
+/// there is no RTREE window to lose and no candidate CTE to preserve one.
 ///
 /// Writes only unmatched rows into `prg_unmatched`, tagged with the z14 cell of
 /// their point and `computed_at`. This clears the table then inserts, and the
@@ -64,6 +96,16 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
     conn.execute_batch("DELETE FROM prg_unmatched;")?;
     let cx = crate::tile_math::cell_x_sql("s.geom");
     let cy = crate::tile_math::cell_y_sql("s.geom");
+    // The name rules resolve PRG's street through `street_name_mappings`, the
+    // same chain `compare::rule` and `/package` use. The joins go in
+    // `src_norm`, *before* the 9× CROSS JOIN: two probes against a ~3k-row
+    // build side for each of 8.6M addresses, not for each of 77.5M expanded
+    // tuples.
+    let src_street = normalized_name_sql(&resolved_street_expr_sql("a"));
+    let src_place = normalized_name_sql("a.miejscowosc");
+    let mapping_joins = resolved_street_join_sql("a");
+    let osm_street = normalized_name_sql("street");
+    let osm_city = normalized_name_sql("city");
     conn.execute_batch(&format!(
         "INSERT INTO prg_unmatched
          (geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy,
@@ -73,22 +115,28 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
              VALUES (-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)
          ),
          src_norm AS (
-             SELECT lokalny_id,
-                    UPPER(TRIM(numer_porzadkowy)) AS _hn,
-                    FLOOR(ST_X(geom) / {GRID_KEY_DEG})::BIGINT AS _gx,
-                    FLOOR(ST_Y(geom) / {GRID_KEY_DEG})::BIGINT AS _gy,
-                    geom
-             FROM prg_addresses
+             SELECT a.lokalny_id,
+                    UPPER(TRIM(a.numer_porzadkowy)) AS _hn,
+                    FLOOR(ST_X(a.geom) / {GRID_KEY_DEG})::BIGINT AS _gx,
+                    FLOOR(ST_Y(a.geom) / {GRID_KEY_DEG})::BIGINT AS _gy,
+                    {src_street} AS _street,
+                    {src_place} AS _place,
+                    a.geom
+             FROM prg_addresses a
+             {mapping_joins}
          ),
          osm_norm AS (
              SELECT UPPER(TRIM(housenumber)) AS _hn,
                     FLOOR(ST_X(geom) / {GRID_KEY_DEG})::BIGINT AS _gx,
                     FLOOR(ST_Y(geom) / {GRID_KEY_DEG})::BIGINT AS _gy,
+                    {osm_street} AS _street,
+                    {osm_city} AS _city,
                     geom
              FROM osm_addresses
          ),
          src_expanded AS (
-             SELECT s.lokalny_id, s._hn, s.geom, s._gx + o.dx AS _sgx, s._gy + o.dy AS _sgy
+             SELECT s.lokalny_id, s._hn, s.geom, s._street, s._place,
+                    s._gx + o.dx AS _sgx, s._gy + o.dy AS _sgy
              FROM src_norm s CROSS JOIN neighbor_offsets o
          ),
          matched_ids AS (
@@ -96,7 +144,20 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
              FROM src_expanded s
              JOIN osm_norm o
                ON  s._hn = o._hn AND s._sgx = o._gx AND s._sgy = o._gy
-               AND ST_Distance_Sphere(o.geom, s.geom) <= {MATCH_DISTANCE_METERS}
+               AND (
+                        ST_Distance_Sphere(o.geom, s.geom) <= {MATCH_DISTANCE_METERS}
+                     OR (
+                             ST_Distance_Sphere(o.geom, s.geom) <= {NAME_MATCH_DISTANCE_METERS}
+                         AND (
+                                  s._street = o._street
+                               OR (
+                                      s._street IS NULL
+                                  AND o._street IS NULL
+                                  AND s._place = o._city
+                                  )
+                             )
+                         )
+                   )
          )
          SELECT s.geom, s.lokalny_id, s.numer_porzadkowy, s.ulica, s.miejscowosc,
                 s.kod_pocztowy, s.teryt_miejscowosc, s.wazny_od_lub_data_nadania,
@@ -151,6 +212,29 @@ mod tests {
     fn insert_prg(conn: &Connection, id: &str, hn: &str, point_sql: &str) {
         conn.execute_batch(&format!(
             "INSERT INTO prg_addresses VALUES ('{id}', '{hn}', NULL, NULL, NULL, NULL, NULL, NULL, NULL, {point_sql});"
+        ))
+        .unwrap();
+    }
+
+    /// Like [`insert_prg`], but populating the two columns the name rules
+    /// read: `ulica` (resolved through `street_name_mappings`) and
+    /// `miejscowosc`.
+    fn insert_prg_named(
+        conn: &Connection,
+        id: &str,
+        hn: &str,
+        ulica: Option<&str>,
+        miejscowosc: Option<&str>,
+        point_sql: &str,
+    ) {
+        let lit = |v: Option<&str>| match v {
+            Some(s) => format!("'{}'", s.replace('\'', "''")),
+            None => "NULL".to_string(),
+        };
+        conn.execute_batch(&format!(
+            "INSERT INTO prg_addresses VALUES ('{id}', '{hn}', {}, {}, NULL, NULL, NULL, NULL, NULL, {point_sql});",
+            lit(ulica),
+            lit(miejscowosc),
         ))
         .unwrap();
     }
@@ -311,9 +395,171 @@ mod tests {
         );
     }
 
+    /// Rule B in the grid-key path: ~133 m apart, same housenumber, agreeing
+    /// street → matched. The twin with a differing street stays unmatched, so
+    /// the test can't pass by the distance branch alone.
+    #[test]
+    fn matched_at_133m_via_street_excluded_from_unmatched() {
+        let conn = setup();
+        insert_prg_named(
+            &conn,
+            "same",
+            "44",
+            Some("Warszawska"),
+            None,
+            "ST_Point(21.01, 52.2112)",
+        );
+        insert_prg_named(
+            &conn,
+            "other",
+            "44",
+            Some("Polna"),
+            None,
+            "ST_Point(21.02, 52.2112)",
+        );
+        conn.execute_batch(
+            "INSERT INTO osm_addresses VALUES
+                 (1, 'node', '44', 'Warszawska', NULL, NULL, ST_Point(21.01, 52.21)),
+                 (2, 'node', '44', 'Warszawska', NULL, NULL, ST_Point(21.02, 52.21));",
+        )
+        .unwrap();
+
+        run(&conn);
+        assert_eq!(unmatched_ids(&conn), vec!["other".to_string()]);
+    }
+
+    /// Rule B reads the *mapped* street name. Raw equality is not enough once a
+    /// mapping rewrites PRG's side — the same property `compare::rule`'s
+    /// `address_matches_on_the_mapped_name_not_the_raw_name` pins for the
+    /// per-cell path.
+    #[test]
+    fn grid_key_path_matches_on_the_mapped_street_name() {
+        let conn = setup();
+        conn.execute_batch(
+            "INSERT INTO street_name_mappings VALUES (NULL, 'gen. Kruka', 'Generała Kruka');",
+        )
+        .unwrap();
+        insert_prg_named(
+            &conn,
+            "raw-equal",
+            "5",
+            Some("gen. Kruka"),
+            None,
+            "ST_Point(21.01, 52.2112)",
+        );
+        insert_prg_named(
+            &conn,
+            "mapped",
+            "6",
+            Some("gen. Kruka"),
+            None,
+            "ST_Point(21.02, 52.2112)",
+        );
+        conn.execute_batch(
+            "INSERT INTO osm_addresses VALUES
+                 (1, 'node', '5', 'gen. Kruka', NULL, NULL, ST_Point(21.01, 52.21)),
+                 (2, 'node', '6', 'Generała Kruka', NULL, NULL, ST_Point(21.02, 52.21));",
+        )
+        .unwrap();
+
+        run(&conn);
+        assert_eq!(unmatched_ids(&conn), vec!["raw-equal".to_string()]);
+    }
+
+    /// Rule C in the grid-key path: streetless on both sides, agreeing
+    /// locality. The `osm_addresses.city` column is `COALESCE(addr:city,
+    /// addr:place)` at every insert site, which is what makes a Polish
+    /// place-address reachable here at all.
+    #[test]
+    fn matched_at_133m_via_locality_excluded_from_unmatched() {
+        let conn = setup();
+        insert_prg_named(
+            &conn,
+            "same-place",
+            "7",
+            None,
+            Some("Rychnowo"),
+            "ST_Point(21.01, 52.2112)",
+        );
+        insert_prg_named(
+            &conn,
+            "other-place",
+            "7",
+            None,
+            Some("Inne"),
+            "ST_Point(21.02, 52.2112)",
+        );
+        conn.execute_batch(
+            "INSERT INTO osm_addresses VALUES
+                 (1, 'node', '7', NULL, 'Rychnowo', NULL, ST_Point(21.01, 52.21)),
+                 (2, 'node', '7', NULL, 'Rychnowo', NULL, ST_Point(21.02, 52.21));",
+        )
+        .unwrap();
+
+        run(&conn);
+        assert_eq!(unmatched_ids(&conn), vec!["other-place".to_string()]);
+    }
+
+    /// The ±1 neighbourhood must still cover the *widened* distance. PRG at
+    /// lon=14.4991 → gx=2899, OSM at lon=14.5009 → gx=2900 (adjacent), ~123 m
+    /// apart — beyond rule A, inside the name rules. Under a grid key too
+    /// narrow for 150 m this pair would silently never be compared.
+    #[test]
+    fn adjacent_grid_cells_within_150m_match() {
+        let conn = setup();
+        insert_prg_named(
+            &conn,
+            "p1",
+            "5",
+            Some("Warszawska"),
+            None,
+            "ST_Point(14.4991, 52.25)",
+        );
+        conn.execute_batch(
+            "INSERT INTO osm_addresses VALUES
+                 (1, 'node', '5', 'Warszawska', NULL, NULL, ST_Point(14.5009, 52.25));",
+        )
+        .unwrap();
+
+        run(&conn);
+        assert_eq!(
+            unmatched_count(&conn),
+            0,
+            "a name match in an adjacent grid cell must still be found"
+        );
+    }
+
+    /// `GRID_KEY_DEG`'s headroom over the widest match distance dropped from
+    /// 6.4× to 2.1× when the name rules landed. Compute the requirement rather
+    /// than trusting the constant's doc comment: a grid cell narrower than the
+    /// match distance would make a straddling pair vanish from the ±1
+    /// neighbourhood, with no error and no failing assertion anywhere else.
+    #[test]
+    fn grid_key_cell_is_wider_than_the_widest_match_distance() {
+        // Poland's northern edge, where a degree of longitude is shortest and
+        // a grid cell therefore spans the fewest metres.
+        let m_per_deg_lon = 111_320.0 * 54.84_f64.to_radians().cos();
+        let cell_width_m = GRID_KEY_DEG * m_per_deg_lon;
+        assert!(
+            cell_width_m > NAME_MATCH_DISTANCE_METERS,
+            "GRID_KEY_DEG spans {cell_width_m} m at 54.84N, which must exceed \
+             NAME_MATCH_DISTANCE_METERS ({NAME_MATCH_DISTANCE_METERS} m) for the \
+             +/-1 cell neighbourhood to be sufficient"
+        );
+    }
+
     /// The full grid-key path and the per-cell rule must agree on the unmatched
     /// set. Seed a spread of addresses (some matched, some not, some near cell
     /// edges) and compare the two id sets.
+    ///
+    /// **The single most valuable test in this module.** The two paths express
+    /// the same three rules in structurally different SQL — an `OR`-ed join
+    /// condition over a 3×3 grid-key expansion here, a correlated `NOT EXISTS`
+    /// over a resolved-CTE chain in `compare::rule` — so nothing but this
+    /// keeps them answering the same question. The fixture deliberately
+    /// exercises every branch *and its negative*, including a non-empty
+    /// `street_name_mappings`, since a rule that never fires in the fixture is
+    /// a rule this test does not pin.
     #[test]
     fn full_and_per_cell_paths_agree() {
         use crate::compare::rule::{OSM_MATCH_BUFFER_DEG, buffer, unmatched_addresses_in_cell_sql};
@@ -322,13 +568,42 @@ mod tests {
 
         let conn = setup(); // creates prg_addresses + osm_addresses via init_db
         conn.execute_batch(
-            "INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, geom) VALUES
-                ('a','12', ST_Point(21.010, 52.210)),   -- matched (osm ~22m)
-                ('b','12', ST_Point(21.010, 52.212)),   -- too far -> unmatched
-                ('c','7',  ST_Point(21.050, 52.250)),   -- no osm -> unmatched
-                ('d','9',  ST_Point(21.0001, 52.2001)); -- near a cell edge
+            "INSERT INTO street_name_mappings VALUES
+                (NULL,      'gen. Kruka', 'Generała Kruka'),
+                ('0956069', 'gen. Kruka', 'Generała Michała Kruka');
+             INSERT INTO prg_addresses
+                 (lokalny_id, numer_porzadkowy, ulica, miejscowosc, teryt_miejscowosc, geom) VALUES
+                -- rule A and its negative
+                ('a','12', NULL, NULL, NULL, ST_Point(21.010, 52.210)),   -- matched (osm ~22m)
+                ('b','12', NULL, NULL, NULL, ST_Point(21.010, 52.212)),   -- too far -> unmatched
+                ('c','7',  NULL, NULL, NULL, ST_Point(21.050, 52.250)),   -- no osm -> unmatched
+                ('d','9',  NULL, NULL, NULL, ST_Point(21.0001, 52.2001)), -- near a cell edge
+                -- rule B: agreeing street at ~133m
+                ('e','44', 'Warszawska', NULL, NULL, ST_Point(21.020, 52.2112)),
+                -- rule B negative: differing street at ~133m
+                ('f','44', 'Polna', NULL, NULL, ST_Point(21.030, 52.2112)),
+                -- rule B through a mapping: raw-equal but mapped away -> unmatched
+                ('g','5', 'gen. Kruka', NULL, NULL, ST_Point(21.040, 52.2112)),
+                -- rule B through the settlement-scoped mapping -> matched
+                ('h','6', 'gen. Kruka', NULL, '0956069', ST_Point(21.060, 52.2112)),
+                -- rule C: streetless, agreeing locality at ~133m
+                ('i','7', NULL, 'Rychnowo', NULL, ST_Point(21.070, 52.2112)),
+                -- rule C negative: OSM carries a street, so the gate closes
+                ('j','7', NULL, 'Rychnowo', NULL, ST_Point(21.080, 52.2112)),
+                -- empty-string street must behave as absent, routing through rule C
+                ('k','8', '', 'Rychnowo', NULL, ST_Point(21.090, 52.2112)),
+                -- beyond every distance, despite an agreeing street
+                ('l','44', 'Warszawska', NULL, NULL, ST_Point(21.100, 52.2116));
              INSERT INTO osm_addresses VALUES
-                (1,'node','12',NULL,NULL,NULL, ST_Point(21.010, 52.2102));",
+                (1,'node','12',NULL,NULL,NULL, ST_Point(21.010, 52.2102)),
+                (2,'node','44','Warszawska',NULL,NULL, ST_Point(21.020, 52.210)),
+                (3,'node','44','Warszawska',NULL,NULL, ST_Point(21.030, 52.210)),
+                (4,'node','5','gen. Kruka',NULL,NULL, ST_Point(21.040, 52.210)),
+                (5,'node','6','Generała Michała Kruka',NULL,NULL, ST_Point(21.060, 52.210)),
+                (6,'node','7',NULL,'Rychnowo',NULL, ST_Point(21.070, 52.210)),
+                (7,'node','7','Polna','Rychnowo',NULL, ST_Point(21.080, 52.210)),
+                (8,'node','8','',   'Rychnowo',NULL, ST_Point(21.090, 52.210)),
+                (9,'node','44','Warszawska',NULL,NULL, ST_Point(21.100, 52.210));",
         )
         .unwrap();
 
@@ -343,6 +618,16 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect()
         };
+        // Pin the expected set outright, not just "the two agree": two paths
+        // that both dropped the name rules would agree perfectly and pass.
+        assert_eq!(
+            full,
+            ["b", "c", "d", "f", "g", "j", "l"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>(),
+            "every rule and its negative must land where the fixture says"
+        );
 
         // Per-cell path over the distinct cells the addresses fall in.
         let mut cells = BTreeSet::new();
@@ -351,6 +636,14 @@ mod tests {
             (21.010, 52.212),
             (21.050, 52.250),
             (21.0001, 52.2001),
+            (21.020, 52.2112),
+            (21.030, 52.2112),
+            (21.040, 52.2112),
+            (21.060, 52.2112),
+            (21.070, 52.2112),
+            (21.080, 52.2112),
+            (21.090, 52.2112),
+            (21.100, 52.2116),
         ] {
             cells.insert(lonlat_to_tile(lon, lat, CHANGE_CELL_ZOOM));
         }

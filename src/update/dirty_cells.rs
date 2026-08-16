@@ -475,14 +475,23 @@ mod tests {
     /// An address point close enough to a cell edge that
     /// `OSM_MATCH_BUFFER_DEG` reaches past it must enqueue both cells; one
     /// safely inside must enqueue only its own.
+    ///
+    /// Correct by construction for any `OSM_MATCH_BUFFER_DEG` smaller than
+    /// half a z14 cell in both axes (see the sibling
+    /// `note_point_address_at_cell_centre_stays_in_one_cell` test, which
+    /// pins that precondition) -- the offset below is derived from the
+    /// constant itself rather than a hardcoded distance, so it stays a valid
+    /// "closer to the edge than one buffer-width" probe whatever the
+    /// constant's current value is.
     #[test]
     fn note_point_address_near_a_cell_edge_reaches_the_neighbour() {
         let c = conn();
         let (min_lon, min_lat, _, max_lat) = tile_to_bbox(CHANGE_CELL_ZOOM, 9147, 5411);
         let mid_lat = (min_lat + max_lat) / 2.0;
-        // 0.0005 degrees inside the west edge -- closer than
-        // OSM_MATCH_BUFFER_DEG (0.001), so the buffered read reaches past it.
-        let lon = min_lon + 0.0005;
+        // Half a buffer-width inside the west edge -- closer to the edge
+        // than OSM_MATCH_BUFFER_DEG itself, so the buffered read reaches
+        // past it regardless of the constant's value.
+        let lon = min_lon + OSM_MATCH_BUFFER_DEG / 2.0;
 
         let mut d = DirtyCells::default();
         d.note_point(Layer::Addresses, lon, mid_lat);
@@ -501,6 +510,14 @@ mod tests {
         );
     }
 
+    /// The property this pins: `OSM_MATCH_BUFFER_DEG` is smaller than half a
+    /// z14 cell in both axes, so a point at the cell's centre -- the point
+    /// furthest from every edge -- cannot have its buffered envelope reach a
+    /// neighbour. No offset is derived from the constant here (the centre
+    /// needs none), but the assertion only holds under that precondition; if
+    /// `OSM_MATCH_BUFFER_DEG` ever grows past half a cell width at Polish
+    /// latitudes, this test would start failing, which is the correct signal
+    /// to revisit the reach rather than a false alarm.
     #[test]
     fn note_point_address_at_cell_centre_stays_in_one_cell() {
         let c = conn();

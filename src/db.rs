@@ -239,7 +239,10 @@ fn create_schema(conn: &Connection) -> Result<()> {
 
         -- Dirty-cell queue drained by the match_refresh job. Duplicates allowed
         -- (deduped on drain). source is 'bdot10k'|'egib'|'prg'; an OSM building
-        -- edit enqueues bdot10k+egib, an OSM address edit enqueues prg.
+        -- edit enqueues bdot10k+egib, an OSM address edit enqueues prg, and a
+        -- street_name_mappings reload enqueues prg for the addresses whose
+        -- resolved street name changed (the mapping is a match input, not just
+        -- a serve-time lookup -- see compare::rule's rule B).
         -- The cells a producer enqueues are the exact reach of the match
         -- rule's OSM read, not a neighbourhood margin: an edited object's
         -- bbox cells, widened by update::dirty_cells::layer_buffer_deg (0 for

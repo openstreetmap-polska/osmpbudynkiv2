@@ -326,15 +326,34 @@ mod full_vs_incremental_equivalence {
     fn full_compare_and_reconcile_drain_agree_on_prg() {
         let c = conn();
         c.execute_batch(
-            "INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, wazny_od_lub_data_nadania, geom) VALUES
-                 ('matched', '12', DATE '2012-04-27', ST_Point(21.010, 52.210)),
-                 ('unmatched', '7', DATE '2021-03-09', ST_Point(21.050, 52.250)),
+            "INSERT INTO street_name_mappings VALUES
+                 (NULL, 'gen. Kruka', 'Generała Kruka');
+             INSERT INTO prg_addresses
+                 (lokalny_id, numer_porzadkowy, ulica, miejscowosc,
+                  wazny_od_lub_data_nadania, geom) VALUES
+                 ('matched', '12', NULL, NULL, DATE '2012-04-27', ST_Point(21.010, 52.210)),
+                 ('unmatched', '7', NULL, NULL, DATE '2021-03-09', ST_Point(21.050, 52.250)),
                  -- Far outside Poland; PRG's full compare has never had a
                  -- bbox clamp, but this keeps the fixture parallel to the
                  -- bdot10k test above and exercises a far-away point anyway.
-                 ('far', '3', NULL, ST_Point(30.0, 60.0));
+                 ('far', '3', NULL, NULL, NULL, ST_Point(30.0, 60.0)),
+                 -- The name rules, end to end: each of these is ~133m from its
+                 -- OSM neighbour, so rule A cannot decide any of them. Without
+                 -- rows that only the name rules can match, reconcile+drain
+                 -- would agree with the full compare on a fixture that never
+                 -- exercises the branches this test is here to cover.
+                 ('by-street', '44', 'Warszawska', NULL, NULL, ST_Point(21.020, 52.2112)),
+                 ('wrong-street', '44', 'Polna', NULL, NULL, ST_Point(21.030, 52.2112)),
+                 ('by-mapping', '5', 'gen. Kruka', NULL, NULL, ST_Point(21.040, 52.2112)),
+                 ('by-place', '7', NULL, 'Rychnowo', NULL, ST_Point(21.070, 52.2112)),
+                 ('wrong-place', '7', NULL, 'Inne', NULL, ST_Point(21.080, 52.2112));
              INSERT INTO osm_addresses VALUES
-                 (1,'node','12',NULL,NULL,NULL, ST_Point(21.010, 52.2102));",
+                 (1,'node','12',NULL,NULL,NULL, ST_Point(21.010, 52.2102)),
+                 (2,'node','44','Warszawska',NULL,NULL, ST_Point(21.020, 52.210)),
+                 (3,'node','44','Warszawska',NULL,NULL, ST_Point(21.030, 52.210)),
+                 (4,'node','5','Generała Kruka',NULL,NULL, ST_Point(21.040, 52.210)),
+                 (5,'node','7',NULL,'Rychnowo',NULL, ST_Point(21.070, 52.210)),
+                 (6,'node','7',NULL,'Rychnowo',NULL, ST_Point(21.080, 52.210));",
         )
         .unwrap();
 
@@ -348,13 +367,17 @@ mod full_vs_incremental_equivalence {
         let full_totals = totals_snapshot(&c, "prg");
         assert_eq!(
             full.len(),
-            2,
-            "sanity: 'matched' excluded, 'unmatched' and 'far' present"
+            4,
+            "sanity: 'unmatched', 'far', 'wrong-street' and 'wrong-place' present; \
+             the three name-rule matches and the 50m match excluded"
         );
+        // cell_totals is one row per z14 cell, not per address: the eight
+        // addresses above fall in six distinct cells (the ones at 21.010/21.020
+        // share a cell, as do 21.030/21.040/21.050).
         assert_eq!(
             full_totals.len(),
-            3,
-            "sanity: all three addresses count towards a denominator, matched or not"
+            6,
+            "sanity: every address counts towards its cell's denominator, matched or not"
         );
 
         c.execute_batch("DELETE FROM prg_unmatched; DELETE FROM cell_totals;")

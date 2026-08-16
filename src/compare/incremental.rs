@@ -90,20 +90,25 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, St
                  a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania, \
                  a.teryt_gmina, a.gmina, {cx}, {cy}, now()"
             );
-            // Only the write envelope scopes the candidate CTE -- the read
-            // buffer applies to the osm_addresses subquery inside
-            // unmatched_addresses_in_cell_sql, not to the prg_addresses scan.
-            let candidates = format!(
-                "WITH candidates AS MATERIALIZED (
-                     SELECT * FROM prg_addresses a
-                     WHERE ST_Intersects(a.geom, {})
-                 )\n",
-                envelope_sql(write)
-            );
-            // Same write-narrow guard as the buildings branch above.
+            // Unlike the buildings branch above, this one does *not* build its
+            // own candidate CTE: `unmatched_addresses_in_cell_sql` owns a
+            // two-CTE chain of its own (`addr_candidates` -> `addr_resolved`,
+            // resolving the street name through `street_name_mappings` for the
+            // name rules), and two `WITH` keywords in one statement is a
+            // syntax error. So the source table goes straight through and the
+            // rule applies the write envelope itself; the outer alias `a` is
+            // `addr_resolved`, which carries `SELECT c.*` — every
+            // `prg_addresses` column, so `select` below still binds.
+            //
+            // Same write-narrow guard as the buildings branch above, and it
+            // stays *outside* the rule's CTEs for the same reason: an
+            // expression-equality filter on the indexed column alongside the
+            // ST_Intersects flips RTREE_INDEX_SCAN to a sequential scan
+            // (docs/per_cell_recompute_cell_guard_scan.md), and the CTE
+            // boundary is what defuses that.
             let inner = format!(
-                "{candidates}{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
-                unmatched_addresses_in_cell_sql("candidates", &select, write, read)
+                "{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
+                unmatched_addresses_in_cell_sql("prg_addresses", &select, write, read)
             );
             Ok((
                 "prg_unmatched",
@@ -190,7 +195,14 @@ mod tests {
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
-                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);",
+                 ZRODLODANYCHGEOMETRYCZNYCH VARCHAR);
+             -- Created by `import prg`, not by create_schema, so the fixture
+             -- has to declare it the same way compare::mod's does.
+             CREATE TABLE prg_addresses (
+                 lokalny_id VARCHAR, numer_porzadkowy VARCHAR, ulica VARCHAR,
+                 miejscowosc VARCHAR, kod_pocztowy VARCHAR, teryt_miejscowosc VARCHAR,
+                 wazny_od_lub_data_nadania DATE, teryt_gmina VARCHAR, gmina VARCHAR,
+                 geom GEOMETRY);",
         )
         .unwrap();
         c
@@ -440,6 +452,84 @@ mod tests {
         assert!(
             plan.contains("RTREE_IN"),
             "the drained cell's candidate CTE must use the centroid RTREE index, got plan: {plan}"
+        );
+    }
+
+    /// The prg twin of the test above, and the one that changed shape: the
+    /// address branch no longer builds its own candidate CTE — the rule owns
+    /// an `addr_candidates` -> `addr_resolved` chain, and `addr_resolved` is a
+    /// `LEFT JOIN` against `street_name_mappings` sitting directly downstream
+    /// of the filtered CTE. That is exactly the configuration
+    /// `server::tiles`'s doc comment warns can be re-planned into a
+    /// `SEQ_SCAN` + `FILTER`, so the mapping table is seeded here rather than
+    /// left empty — an empty build side gives the optimizer nothing to chew on
+    /// and the test would pass for the wrong reason.
+    ///
+    /// `osm_addresses` is left empty and unindexed (what `db::create_schema`
+    /// gives you before `import osm`), so a "RTREE_IN" match can only be
+    /// coming from `prg_addresses`.
+    #[test]
+    fn drain_prg_candidate_cte_uses_the_geom_rtree_index() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO street_name_mappings VALUES (NULL, 'gen. Kruka', 'Generała Kruka');
+             INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, geom)
+                 SELECT 'a' || i, '1', ST_Point(20.0 + i * 0.0001, 52.0)
+                 FROM range(20000) t(i);
+             CREATE INDEX prg_addresses_geom_idx ON prg_addresses USING RTREE (geom);",
+        )
+        .unwrap();
+
+        let (cx, cy) = lonlat_to_tile(20.5005, 52.0, CHANGE_CELL_ZOOM);
+        let (_, _, inner) = build_sql("prg", cx as i32, cy as i32).unwrap();
+
+        let mut stmt = c.prepare(&format!("EXPLAIN {inner}")).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut plan = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
+        }
+        assert!(
+            plan.contains("RTREE_IN"),
+            "the drained cell's address CTE must use the geom RTREE index, got plan: {plan}"
+        );
+    }
+
+    /// A drained cell must apply the name rules, not just proximity. The
+    /// address here is ~133 m from its OSM neighbour — outside
+    /// `MATCH_DISTANCE_METERS`, inside `NAME_MATCH_DISTANCE_METERS` — and the
+    /// street name agrees only after the mapping is applied, so this fails
+    /// both if the branch is missing and if it compares the raw PRG name.
+    #[test]
+    fn recompute_matches_an_address_via_the_street_rule() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO street_name_mappings VALUES (NULL, 'gen. Kruka', 'Generała Kruka');
+             INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, ulica, geom) VALUES
+                 ('mapped',    '5', 'gen. Kruka', ST_Point(21.010, 52.2112)),
+                 ('raw-equal', '6', 'gen. Kruka', ST_Point(21.011, 52.2112));
+             INSERT INTO osm_addresses VALUES
+                 (1,'node','5','Generała Kruka',NULL,NULL, ST_Point(21.010, 52.210)),
+                 (2,'node','6','gen. Kruka',NULL,NULL, ST_Point(21.011, 52.210));",
+        )
+        .unwrap();
+
+        let (cx, cy) = lonlat_to_tile(21.010, 52.2112, CHANGE_CELL_ZOOM);
+        recompute_cell(&c, "prg", cx as i32, cy as i32).unwrap();
+
+        let ids: Vec<String> = {
+            let mut s = c
+                .prepare("SELECT lokalny_id FROM prg_unmatched ORDER BY lokalny_id")
+                .unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["raw-equal".to_string()],
+            "the mapped name matches at ~133m; raw equality does not"
         );
     }
 }
