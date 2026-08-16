@@ -96,6 +96,12 @@ pub struct JobConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub timeout_seconds: u64,
+    /// When false, the job's first run is skipped at server start and it
+    /// waits a full `interval_seconds` before running for the first time.
+    /// Useful for jobs like the government dataset refreshes, where running
+    /// immediately on every server restart (deploys, crashes) is undesirable
+    /// but `osm_update`-style "catch up right away" behavior is not needed.
+    pub run_on_start: bool,
 }
 
 impl Default for JobConfig {
@@ -104,6 +110,7 @@ impl Default for JobConfig {
             enabled: true,
             interval_seconds: 60,
             timeout_seconds: 600,
+            run_on_start: true,
         }
     }
 }
@@ -124,6 +131,8 @@ pub struct OsmUpdateConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub timeout_seconds: u64,
+    /// See `JobConfig::run_on_start`.
+    pub run_on_start: bool,
     /// How many replication diffs to download ahead of the sequence
     /// currently being applied, during catch-up.
     pub prefetch_ahead: usize,
@@ -146,6 +155,7 @@ impl Default for OsmUpdateConfig {
             enabled: true,
             interval_seconds: 60,
             timeout_seconds: 600,
+            run_on_start: true,
             prefetch_ahead: 8,
             batch_commit_threshold: 20,
             batch_size: 20,
@@ -159,6 +169,8 @@ pub struct ExportLogPruneConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub timeout_seconds: u64,
+    /// See `JobConfig::run_on_start`.
+    pub run_on_start: bool,
     /// How long package_exports rows are kept before being pruned.
     pub retention_days: u64,
 }
@@ -169,6 +181,7 @@ impl Default for ExportLogPruneConfig {
             enabled: true,
             interval_seconds: 86400,
             timeout_seconds: 60,
+            run_on_start: true,
             retention_days: 365,
         }
     }
@@ -180,6 +193,8 @@ pub struct MatchRefreshConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub timeout_seconds: u64,
+    /// See `JobConfig::run_on_start`.
+    pub run_on_start: bool,
     /// Max number of distinct dirty (source, cell) recomputed per tick.
     pub batch_size: usize,
 }
@@ -190,6 +205,7 @@ impl Default for MatchRefreshConfig {
             enabled: true,
             interval_seconds: 30,
             timeout_seconds: 300,
+            run_on_start: true,
             batch_size: 512,
         }
     }
@@ -227,6 +243,8 @@ pub struct MatchReconcileConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub timeout_seconds: u64,
+    /// See `JobConfig::run_on_start`.
+    pub run_on_start: bool,
 }
 
 impl Default for MatchReconcileConfig {
@@ -235,6 +253,7 @@ impl Default for MatchReconcileConfig {
             enabled: false,
             interval_seconds: 86400,
             timeout_seconds: 1800,
+            run_on_start: true,
         }
     }
 }
@@ -323,6 +342,7 @@ impl Default for JobsConfig {
             enabled: true,
             interval_seconds: 86400,
             timeout_seconds,
+            run_on_start: true,
         };
         Self {
             osm_update: OsmUpdateConfig::default(),
@@ -337,6 +357,7 @@ impl Default for JobsConfig {
                 enabled: false,
                 interval_seconds: 86400,
                 timeout_seconds: 300,
+                run_on_start: true,
             },
             // Same rationale as street_mappings_update: applied at serve
             // time, so a stale mapping is harmless and there is no urgency
@@ -345,6 +366,7 @@ impl Default for JobsConfig {
                 enabled: false,
                 interval_seconds: 86400,
                 timeout_seconds: 300,
+                run_on_start: true,
             },
         }
     }
@@ -843,12 +865,36 @@ max_minutes = 720
         assert!(config.jobs.bdot10k_update.enabled);
         assert_eq!(config.jobs.bdot10k_update.interval_seconds, 86400);
         assert_eq!(config.jobs.bdot10k_update.timeout_seconds, 3600);
+        assert!(config.jobs.bdot10k_update.run_on_start);
         assert!(config.jobs.egib_update.enabled);
         assert_eq!(config.jobs.egib_update.interval_seconds, 86400);
         assert_eq!(config.jobs.egib_update.timeout_seconds, 3600);
+        assert!(config.jobs.egib_update.run_on_start);
         assert!(config.jobs.prg_update.enabled);
         assert_eq!(config.jobs.prg_update.interval_seconds, 86400);
         assert_eq!(config.jobs.prg_update.timeout_seconds, 7200);
+        assert!(config.jobs.prg_update.run_on_start);
+    }
+
+    #[test]
+    fn test_dataset_update_job_run_on_start_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[jobs.bdot10k_update]
+enabled = true
+interval_seconds = 3600
+timeout_seconds = 300
+run_on_start = false
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert!(!config.jobs.bdot10k_update.run_on_start);
+        // Untouched jobs keep the default.
+        assert!(config.jobs.egib_update.run_on_start);
     }
 
     #[test]

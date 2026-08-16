@@ -151,6 +151,7 @@ timeout_seconds = 600
 # after decompression), which is a reason to keep this modest. Applies
 # only during catch-up.
 # batch_size = 20
+run_on_start = true
 
 # Prunes old rows from the /package export log (see [updates] and the
 # GET /updates endpoint below).
@@ -159,6 +160,7 @@ enabled = true
 interval_seconds = 86400
 # How long package_exports rows are kept before being deleted.
 retention_days = 365
+run_on_start = false
 
 # Government dataset refreshes. Each downloads the current snapshot, diffs it
 # against the live table, and applies only the difference in a single
@@ -169,21 +171,31 @@ retention_days = 365
 # publisher has not republished. The three refreshes also share a process-wide
 # lock so at most one runs at a time, since staging all three simultaneously
 # could exceed memory_limit.
+#
+# By default every job (this trio included) runs once immediately when the
+# server starts, then again every interval_seconds. Government snapshots are
+# republished irregularly (unlike osm_update, which genuinely wants to catch
+# up right away), so running on every restart -- deploys, crashes -- is often
+# just wasted work against an unchanged snapshot. Set run_on_start = false
+# below to skip that first run and wait a full interval_seconds instead.
 [jobs.bdot10k_update]
 enabled = false
 interval_seconds = 86400
 timeout_seconds = 3600
+run_on_start = false
 
 [jobs.egib_update]
 enabled = false
 interval_seconds = 86400
 timeout_seconds = 3600
+run_on_start = false
 
 # PRG streams ~16 GML files out of a ~1.7GB zip, so it gets a longer timeout.
 [jobs.prg_update]
 enabled = false
 interval_seconds = 86400
 timeout_seconds = 7200
+run_on_start = false
 
 # Drains the dirty-cell queue (populated by government dataset refreshes and
 # OSM updates) by recomputing the affected z14 cells' *_unmatched serving
@@ -192,6 +204,7 @@ timeout_seconds = 7200
 enabled = true
 interval_seconds = 30
 timeout_seconds = 300
+run_on_start = true
 # Max number of distinct dirty (source, cell) recomputed per tick.
 #
 # A cell recompute costs roughly 0.01-0.2s on a Poland-scale database,
@@ -222,6 +235,7 @@ batch_size = 512
 enabled = false
 interval_seconds = 86400
 timeout_seconds = 1800
+run_on_start = false
 
 # Re-downloads the curated street-name mapping file and reloads it. A HEAD
 # request compares the ETag against the last load, so a daily poll costs one
@@ -237,6 +251,7 @@ timeout_seconds = 1800
 enabled = true
 interval_seconds = 86400
 timeout_seconds = 300
+run_on_start = false
 
 # Re-downloads the curated BDOT10k/EGIB building-type mapping files and
 # reloads them. Each file has its own ETag check and its own job_run_log
@@ -251,6 +266,7 @@ timeout_seconds = 300
 enabled = true
 interval_seconds = 86400
 timeout_seconds = 300
+run_on_start = false
 
 # GeoJSON data package endpoint (GET/POST /package, served by the `run` subcommand).
 [package]

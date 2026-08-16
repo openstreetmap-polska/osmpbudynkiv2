@@ -159,6 +159,10 @@ pub struct JobConfigResolved {
     pub enabled: bool,
     pub interval: Duration,
     pub timeout: Duration,
+    /// When false, the job's first tick is delayed by a full `interval`
+    /// instead of firing immediately on scheduler start. See
+    /// `crate::config::JobConfig::run_on_start`.
+    pub run_on_start: bool,
 }
 
 impl From<&JobConfig> for JobConfigResolved {
@@ -167,6 +171,7 @@ impl From<&JobConfig> for JobConfigResolved {
             enabled: c.enabled,
             interval: Duration::from_secs(c.interval_seconds),
             timeout: Duration::from_secs(c.timeout_seconds),
+            run_on_start: c.run_on_start,
         }
     }
 }
@@ -195,6 +200,15 @@ impl Scheduler {
             } else {
                 JobState::Disabled
             };
+            // When the first run is delayed (`!run_on_start`), reflect that
+            // in `next_run_at` right away rather than leaving it `None`
+            // until a run completes -- otherwise `/status` can't
+            // distinguish "will run shortly" from "waiting a full interval".
+            let next_run_at = if cfg.enabled && !cfg.run_on_start {
+                Some(format_rfc3339(SystemTime::now() + cfg.interval))
+            } else {
+                None
+            };
             registry.insert(JobStatus {
                 name: job.name(),
                 enabled: cfg.enabled,
@@ -205,7 +219,7 @@ impl Scheduler {
                 last_finished_at: None,
                 last_duration_ms: None,
                 last_outcome: None,
-                next_run_at: None,
+                next_run_at,
                 run_count: 0,
                 log_keys: job.log_keys().to_vec(),
             });
@@ -289,7 +303,16 @@ pub(crate) async fn supervise(
     config: Arc<AppConfig>,
 ) {
     let name = job.name();
-    let mut ticker = tokio::time::interval(cfg.interval);
+    // `tokio::time::interval`'s first tick fires immediately, which is what
+    // gives every job a run right at scheduler start. When `run_on_start` is
+    // false, build the ticker with `interval_at` instead so the first tick
+    // doesn't land until a full `cfg.interval` has elapsed -- `interval`
+    // itself has no knob for this.
+    let mut ticker = if cfg.run_on_start {
+        tokio::time::interval(cfg.interval)
+    } else {
+        tokio::time::interval_at(tokio::time::Instant::now() + cfg.interval, cfg.interval)
+    };
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
@@ -598,6 +621,7 @@ mod tests {
             enabled: true,
             interval: Duration::from_millis(50),
             timeout: Duration::from_secs(5),
+            run_on_start: true,
         };
         let call_count = Arc::new(AtomicUsize::new(0));
         let job = Arc::new(ScriptedJob {
@@ -645,12 +669,67 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_skips_first_run_when_run_on_start_is_false() {
+        let (w, kv, cfg, _dir) = make_parts();
+        let job_cfg = JobConfigResolved {
+            enabled: true,
+            interval: Duration::from_millis(150),
+            timeout: Duration::from_secs(5),
+            run_on_start: false,
+        };
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let job = Arc::new(ScriptedJob {
+            name: "test_skip_first",
+            sleep_each: Duration::from_millis(5),
+            outcomes: vec![Ok(())],
+            call_count: call_count.clone(),
+            current: Arc::new(AtomicUsize::new(0)),
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = make_registry_for("test_skip_first", &job_cfg);
+        let notify = Arc::new(Notify::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let handle = tokio::spawn(supervise(
+            job,
+            job_cfg,
+            registry.clone(),
+            notify.clone(),
+            stop.clone(),
+            cancel,
+            w,
+            kv,
+            cfg,
+        ));
+
+        // Well inside one interval: no run should have happened yet.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "run_on_start = false must skip the immediate first run"
+        );
+
+        let cc = call_count.clone();
+        assert!(
+            wait_until(|| cc.load(Ordering::SeqCst) >= 1, Duration::from_secs(2)).await,
+            "expected a run once the first interval elapsed"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        notify.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn supervisor_records_error_and_keeps_running() {
         let (w, kv, cfg, _dir) = make_parts();
         let job_cfg = JobConfigResolved {
             enabled: true,
             interval: Duration::from_millis(50),
             timeout: Duration::from_secs(5),
+            run_on_start: true,
         };
         let call_count = Arc::new(AtomicUsize::new(0));
         let job = Arc::new(ScriptedJob {
@@ -703,6 +782,7 @@ mod tests {
             enabled: true,
             interval: Duration::from_millis(50),
             timeout: Duration::from_millis(100),
+            run_on_start: true,
         };
         let call_count = Arc::new(AtomicUsize::new(0));
         let current = Arc::new(AtomicUsize::new(0));
@@ -761,6 +841,7 @@ mod tests {
             enabled: true,
             interval: Duration::from_secs(60),
             timeout: Duration::from_secs(5),
+            run_on_start: true,
         };
         let job = Arc::new(ScriptedJob {
             name: "test_shutdown",
