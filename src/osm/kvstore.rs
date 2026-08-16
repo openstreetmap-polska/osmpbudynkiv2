@@ -262,11 +262,16 @@ pub fn multi_get_nodes_wkb_coords(db: &RocksDB, node_ids: &[i64]) -> Result<Opti
         .map(|id| encoding::encode_key(*id))
         .collect();
     let handle = cf(db, CF_NODES);
-    let results = db.batched_multi_get_cf(&handle, &keys, false);
+    // `sorted_input: false` -- a way's refs are near-consecutive but not
+    // guaranteed sorted, and `true` on unsorted keys is incorrect, not merely
+    // slower.
+    let batch = db
+        .batched_multi_get_pinned_batch_cf(&handle, &keys, false)
+        .context("batched MultiGet for nodes failed")?;
     let mut out: Vec<u8> = Vec::with_capacity(node_ids.len() * encoding::WKB_COORD_BYTE_LEN);
-    for r in results {
-        match r.context("batched_multi_get_cf for nodes failed")? {
-            Some(slice) => encoding::push_wkb_coords(&mut out, &slice),
+    for r in batch.iter() {
+        match r.context("batched MultiGet for nodes failed")? {
+            Some(bytes) => encoding::push_wkb_coords(&mut out, bytes),
             None => return Ok(None),
         }
     }
@@ -486,7 +491,7 @@ pub fn batch_merge_way_to_relation(
     );
 }
 
-pub fn write_batch(db: &RocksDB, batch: WriteBatch) -> Result<()> {
+pub fn write_batch(db: &RocksDB, batch: &WriteBatch) -> Result<()> {
     // Bulk import: skip the WAL. If the process dies mid-import the DB is
     // thrown away and restarted from the PBF anyway.
     let mut wo = WriteOptions::new();

@@ -346,6 +346,11 @@ fn stream_pbf_to_rocksdb(kv: &RocksDB, pbf_path: &Path) -> Result<PbfCounts> {
     let ways = AtomicU64::new(0);
     let relations = AtomicU64::new(0);
 
+    // Reused across every blob instead of allocated fresh per blob (~30k
+    // blobs for the Poland extract): `clear()` retains the C++-side buffer
+    // capacity, avoiding a create/destroy pair per blob.
+    let mut batch = kvstore::new_batch();
+
     for blob in reader {
         // Polled per blob rather than per element: a blob is ~8k elements, so
         // this is frequent enough to stay responsive to Ctrl+C without
@@ -357,7 +362,6 @@ fn stream_pbf_to_rocksdb(kv: &RocksDB, pbf_path: &Path) -> Result<PbfCounts> {
             BlobDecode::OsmHeader(_) | BlobDecode::Unknown(_) => continue,
         };
 
-        let mut batch = kvstore::new_batch();
         let (mut n, mut w, mut r) = (0u64, 0u64, 0u64);
 
         for element in block.elements() {
@@ -425,7 +429,8 @@ fn stream_pbf_to_rocksdb(kv: &RocksDB, pbf_path: &Path) -> Result<PbfCounts> {
             }
         }
 
-        kvstore::write_batch(kv, batch)?;
+        kvstore::write_batch(kv, &batch)?;
+        batch.clear();
         nodes.fetch_add(n, Ordering::Relaxed);
         ways.fetch_add(w, Ordering::Relaxed);
         relations.fetch_add(r, Ordering::Relaxed);
