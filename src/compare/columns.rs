@@ -29,11 +29,22 @@ pub struct ClassificationColumns {
 /// code-level constant at every call site, never external input.
 pub fn classification_columns(source_table: &str) -> ClassificationColumns {
     match source_table {
+        // PRZESTRZENNAZW is carried for a different reason from every other
+        // column here, and it is not display: it is the *other half of
+        // BDOT10k's record key*. `dataset::BDOT10K.key_columns` is the
+        // composite (PRZESTRZENNAZW, LOKALNYID) and LOKALNYID alone is not
+        // unique, so without this column the serving table -- and therefore
+        // `/tiles` and `/package`, which read only the serving table -- cannot
+        // express a complete identity for a BDOT10k building. `POST /report`
+        // needs one: a report keyed on a non-unique id would veto an arbitrary
+        // one of the colliding buildings. EGIB (`id_budynku`) and PRG
+        // (`lokalny_id`) have single-column keys and already carry them.
         "bdot10k_buildings" => ClassificationColumns {
-            dest_names: "funkcja_szczegolowa, funkcja_ogolna, liczba_kondygnacji, \
+            dest_names: "PRZESTRZENNAZW, funkcja_szczegolowa, funkcja_ogolna, liczba_kondygnacji, \
                          KATEGORIAISTNIENIA, NAZWA, FSBUD, INFORMACJADODATKOWA, KODKST, \
                          ZRODLODANYCHGEOMETRYCZNYCH",
-            source_exprs: "b.PRZEWAZAJACAFUNKCJABUDYNKU, b.FUNKCJAOGOLNABUDYNKU, b.LICZBAKONDYGNACJI, \
+            source_exprs: "b.PRZESTRZENNAZW, b.PRZEWAZAJACAFUNKCJABUDYNKU, b.FUNKCJAOGOLNABUDYNKU, \
+                           b.LICZBAKONDYGNACJI, \
                            b.KATEGORIAISTNIENIA, b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA, b.KODKST, \
                            b.ZRODLODANYCHGEOMETRYCZNYCH",
         },

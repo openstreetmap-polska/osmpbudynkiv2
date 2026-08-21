@@ -39,8 +39,69 @@ pub enum Command {
         #[command(subcommand)]
         action: QueueAction,
     },
+    /// Inspect and manage user reports that exclude government objects from
+    /// matching (see `POST /report`)
+    Reports {
+        #[command(subcommand)]
+        action: ReportsAction,
+    },
     /// Run HTTP service with background data updates
     Run,
+}
+
+#[derive(Subcommand)]
+pub enum ReportsAction {
+    /// List reports, newest first
+    List {
+        /// Restrict to one source: bdot10k, egib or prg
+        #[arg(long)]
+        source: Option<String>,
+        /// Restrict to one lifecycle state: active, expired or revoked
+        #[arg(long)]
+        status: Option<String>,
+        /// Only reports submitted at or after this timestamp (e.g. 2026-08-16
+        /// or '2026-08-16 14:00:00')
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Retire a report so its object is proposed for import again. Either one
+    /// report by id, or -- because nothing identifying the submitter is
+    /// stored -- every active report in a time window, which is the only way
+    /// to unwind an abusive burst.
+    Revoke {
+        /// Report id to revoke
+        id: Option<i64>,
+        /// Revoke every active report submitted at or after this timestamp
+        #[arg(long, conflicts_with = "id")]
+        since: Option<String>,
+        /// Narrow a --since revoke to one source
+        #[arg(long, requires = "since")]
+        source: Option<String>,
+    },
+    /// Retire reports whose government record has changed or disappeared, so
+    /// the object becomes importable again. Runs automatically after every
+    /// import and every dataset refresh; this is the manual safety net.
+    Reconcile {
+        /// Restrict to one source; default is every source
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Write every report to a JSONL file.
+    ///
+    /// `object_reports` is the only table in this database that cannot be
+    /// rebuilt from an external source, so this is the backup path -- a
+    /// database rebuilt with `import full` starts with no reports at all.
+    Export {
+        /// Destination file ('-' for stdout)
+        file: std::path::PathBuf,
+    },
+    /// Load reports from a JSONL file written by `reports export`
+    Import {
+        /// Source file
+        file: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

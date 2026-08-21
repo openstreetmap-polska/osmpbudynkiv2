@@ -237,6 +237,22 @@ interval_seconds = 86400
 timeout_seconds = 1800
 run_on_start = false
 
+# Retires reports (see [reports] below) whose government record has changed or
+# disappeared, so the object is proposed for import again.
+#
+# Disabled by default, but not for match_reconcile's cost reason -- this is
+# O(active reports), not O(source table), and is cheap enough to run hourly.
+# It is off because it is pure safety net: the same reconcile already runs
+# inside every dataset refresh's apply transaction and after every `import`
+# arm, so the only thing left for this job to find is a change applied while
+# this process wasn't running -- an offline `import`, or a restored snapshot.
+# Enable it if your deployment does either of those routinely.
+[jobs.reports_reconcile]
+enabled = false
+interval_seconds = 86400
+timeout_seconds = 300
+run_on_start = false
+
 # Re-downloads the curated street-name mapping file and reloads it. A HEAD
 # request compares the ETag against the last load, so a daily poll costs one
 # round-trip when the file has not changed.
@@ -273,6 +289,29 @@ run_on_start = false
 # Maximum allowed area of a request's bounding box, in square degrees.
 # 0.04 = 0.2° x 0.2° which is roughly 14 x 22 km in Poland.
 max_area_sq_deg = 0.04
+
+# POST /report endpoint -- users marking a government object as one that should
+# not be proposed for import (bad source data, or OSM already maps it in a way
+# the match rule cannot see). An active report vetoes its object out of the
+# *_unmatched serving tables until the underlying record changes, at which point
+# the report is retired automatically and the object becomes importable again.
+#
+# This is the only endpoint where an anonymous client writes rows that change
+# what every other user sees. Two things about that are deliberate: there is no
+# rate limit, and nothing identifying the submitter is stored -- no address, no
+# hash of one. Cleanup after an abusive burst is therefore time-scoped rather
+# than actor-scoped: `reports revoke --since <timestamp>`, with `enabled = false`
+# below as the immediate stop.
+#
+# Reports are also the only data in the database that cannot be rebuilt from an
+# external source -- `import full` restores everything else, but not these. Back
+# them up with `reports export`.
+[reports]
+# Master switch. false makes POST /report a 404 with no redeploy needed.
+enabled = true
+# Cap on objects per request. Bounds one request, not a sequence of them: its
+# real job is to make a mis-drawn bulk selection cheap to recover from.
+max_objects_per_request = 100
 
 # GET /updates endpoint (recent /package export activity as GeoJSON).
 [updates]

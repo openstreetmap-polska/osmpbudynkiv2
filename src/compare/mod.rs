@@ -194,7 +194,7 @@ mod full_vs_incremental_equivalence {
         // enqueue_all touches all three government tables unconditionally,
         // so all three must exist even if a given test only seeds one.
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -286,8 +286,18 @@ mod full_vs_incremental_equivalence {
                  -- Suppressed by the former-building veto: covered by
                  -- osm_former_buildings above, not by osm_buildings, so it
                  -- must be neither matched nor unmatched under either path.
-                 ('former', ST_MakeEnvelope(23.0,54.0,23.001,54.001));
-             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);",
+                 ('former', ST_MakeEnvelope(23.0,54.0,23.001,54.001)),
+                 -- Vetoed by a user report. Identical to 'lonely' in every
+                 -- respect the match rule inspects, so the report is the only
+                 -- thing separating them -- a path that dropped the veto puts
+                 -- this back in the unmatched set and fails the count below.
+                 ('reported', ST_MakeEnvelope(24.0,54.5,24.001,54.501));
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             INSERT INTO object_reports
+                 (report_id, source, record_key, signature, reason, note,
+                  reported_at, cell_x, cell_y, status, resolved_at)
+             VALUES (1, 'bdot10k', [NULL, 'reported'], 'sig', 'does_not_exist',
+                     NULL, now(), NULL, NULL, 'active', NULL);",
         )
         .unwrap();
 
@@ -297,12 +307,15 @@ mod full_vs_incremental_equivalence {
         assert_eq!(
             full.len(),
             2,
-            "sanity: 'inside' matched, 'former' suppressed, 'lonely' and 'stray' unmatched"
+            "sanity: 'inside' matched, 'former' suppressed, 'reported' vetoed, \
+             'lonely' and 'stray' unmatched"
         );
         assert_eq!(
             full_totals.len(),
-            4,
-            "sanity: all four buildings count towards a denominator, matched, unmatched or suppressed"
+            5,
+            "sanity: all five buildings count towards a denominator -- a reported \
+             building stays comparable, exactly like a suppressed one, so \
+             `cell_totals` must not shrink when someone files a report"
         );
 
         c.execute_batch("DELETE FROM bdot10k_unmatched; DELETE FROM cell_totals;")
@@ -657,7 +670,7 @@ mod clear_and_repopulate_is_atomic {
         ];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -699,8 +712,15 @@ mod clear_and_repopulate_is_atomic {
 
         let err = compare_bdot10k(&c).expect_err("compare must fail on the stale serving schema");
         let chain = format!("{err:#}").to_lowercase();
+        // DuckDB's binder reports the *first* column of the INSERT list the
+        // destination lacks, so this name tracks the head of
+        // `classification_columns`'s `dest_names` -- currently PRZESTRZENNAZW,
+        // the carried half of BDOT10k's composite key. The specific column is
+        // incidental; what the assertion is really pinning is that the failure
+        // came from the INSERT rather than from anything earlier, which is what
+        // proves the DELETE had already run inside the transaction.
         assert!(
-            chain.contains("kategoriaistnienia"),
+            chain.contains("przestrzennazw"),
             "the failure must come from the INSERT naming a missing carried column \
              (that is what proves the DELETE had already run), got: {chain}"
         );

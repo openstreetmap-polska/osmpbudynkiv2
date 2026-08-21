@@ -109,6 +109,17 @@
 //!   CLI-driven path for one source, and its `*_unmatched` rewrite already
 //!   moves that source's per-cell `computed_at`. Bumping here would flush
 //!   every tile in the country for a change local to one source.
+//! - `POST /report`, and every other writer of `object_reports`
+//!   (`reports::insert`, `reports::revoke`, `reports::reconcile_source`).
+//!   `/tiles` never reads `object_reports`; a report reaches a tile only by
+//!   changing what a recompute writes into `<source>_unmatched`, and each of
+//!   those writers enqueues the affected z14 cell so the drain moves that
+//!   cell's `computed_at`. This is the same argument as `import osm`/`update
+//!   osm` above, and the stakes are higher: reports arrive one user action at
+//!   a time, so bumping would flush every cached tile in the country per
+//!   click. Note this is exactly why `object_reports` is deliberately *not* a
+//!   `/tiles` input -- rendering a "reported" layer would make the epoch bump
+//!   unavoidable.
 
 use anyhow::{Context, Result};
 use duckdb::Connection;
@@ -125,7 +136,15 @@ pub const SERVING_EPOCH_KEY: &str = "serving_epoch";
 /// the data changed, only how it's rendered), so a client's cached `ETag`
 /// would keep matching and every existing client would serve the stale shape
 /// forever, with no way to self-heal short of a manual cache-buster.
-pub const TILE_FORMAT_VERSION: u32 = 1;
+///
+/// History:
+/// - 1: initial.
+/// - 2: the `buildings` layer gained `PRZESTRZENNAZW`, the carried half of
+///   BDOT10k's composite record key, so `POST /report` can be given a complete
+///   identity for a building. Without this bump a client holding a v1 tile
+///   would keep an `ETag` that still matches and would never see the new
+///   attribute, leaving its report action permanently unable to build a key.
+pub const TILE_FORMAT_VERSION: u32 = 2;
 
 /// Record that the live serving state moved in a way no per-cell version
 /// tracks. A **counter**, not a timestamp -- deliberately, so a backwards

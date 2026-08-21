@@ -1,6 +1,7 @@
 mod http_cache;
 pub mod jobs;
 mod package;
+mod reports;
 mod tile_cache;
 mod tiles;
 mod updates;
@@ -214,6 +215,22 @@ pub async fn run(
                 run_on_start: config.jobs.match_reconcile.run_on_start,
             },
         ),
+        // Safety net for reports whose record changed while this process was
+        // not the one applying the change -- an offline `import`, a restored
+        // snapshot. Off by default; see ReportsReconcileConfig.
+        (
+            Arc::new(jobs::reports_reconcile::ReportsReconcileJob) as Arc<dyn jobs::Job>,
+            jobs::JobConfigResolved {
+                enabled: config.jobs.reports_reconcile.enabled,
+                interval: std::time::Duration::from_secs(
+                    config.jobs.reports_reconcile.interval_seconds,
+                ),
+                timeout: std::time::Duration::from_secs(
+                    config.jobs.reports_reconcile.timeout_seconds,
+                ),
+                run_on_start: config.jobs.reports_reconcile.run_on_start,
+            },
+        ),
         (
             Arc::new(jobs::street_mappings_update::StreetMappingsUpdateJob::new())
                 as Arc<dyn jobs::Job>,
@@ -340,6 +357,11 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::get(package::get_package).post(package::post_package),
         )
         .route("/updates", axum::routing::get(updates::get_updates))
+        // The one endpoint an anonymous client can write through. It sets no
+        // Cache-Control of its own, so the outermost `if_not_present` layer
+        // below stamps it `no-store` -- which is what we want: a cached report
+        // response would be meaningless.
+        .route("/report", axum::routing::post(reports::post_report))
         .with_state(state)
         // Static frontend assets, served from a directory deployed alongside
         // the binary (see Config::web_dir) rather than embedded at compile

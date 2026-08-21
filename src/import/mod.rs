@@ -22,10 +22,12 @@ pub fn run(
         ImportSource::Osm { file } => osm::import(conn, kv, config, file.as_deref(), &urls.osm_pbf),
         ImportSource::Bdot10k { file } => {
             bdot10k::import(conn, config, file.as_deref(), &urls.bdot10k)?;
+            reconcile_reports(conn, &crate::dataset::BDOT10K);
             bump_serving_epoch(conn)
         }
         ImportSource::Egib { file } => {
             egib::import(conn, config, file.as_deref(), &urls.egib)?;
+            reconcile_reports(conn, &crate::dataset::EGIB);
             bump_serving_epoch(conn)
         }
         ImportSource::Prg { file, terc_file } => {
@@ -36,6 +38,7 @@ pub fn run(
                 terc_file.as_deref(),
                 &urls.prg,
             )?;
+            reconcile_reports(conn, &crate::dataset::PRG);
             bump_serving_epoch(conn)
         }
         ImportSource::StreetMappings { file, url } => {
@@ -178,6 +181,16 @@ pub fn run(
                 terc_file.as_deref(),
                 &urls.prg,
             )?;
+            // All three government sources were rebuilt wholesale, so every
+            // source's reports need re-checking -- see `reconcile_reports`.
+            // OSM is not a reported source and has no entry here.
+            for spec in [
+                &crate::dataset::BDOT10K,
+                &crate::dataset::EGIB,
+                &crate::dataset::PRG,
+            ] {
+                reconcile_reports(conn, spec);
+            }
             bump_serving_epoch(conn)
         }
     }
@@ -219,6 +232,37 @@ fn load_building_type_file(
         }
     }
     Ok(stats)
+}
+
+/// Retire user reports whose records changed across a re-import.
+///
+/// **This is the only thing that catches that case.** A refresh detects change
+/// via `update::diff`, and `update::dataset::refresh` retires reports inside
+/// its apply transaction on the strength of it. An `import` has no diff at all
+/// — it rebuilds the table wholesale — so without this call a report submitted
+/// before a re-import would keep vetoing its object forever, even though the
+/// record it described was replaced. The content signature is what makes this
+/// possible without a second copy of the old data to compare against.
+///
+/// Best-effort: a reconcile failure must not fail an otherwise-successful
+/// import, because the import's own work has already landed and the standing
+/// safety nets (`reports reconcile`, the background job) re-cover it. Warn
+/// rather than propagate, the same call `package::log_export` makes.
+fn reconcile_reports(conn: &Connection, spec: &crate::dataset::DatasetSpec) {
+    match crate::reports::reconcile_source(conn, spec) {
+        Ok(stats) if stats.total_expired() > 0 => info!(
+            source = spec.name,
+            changed = stats.expired_changed,
+            removed = stats.expired_removed,
+            "retired user reports whose records moved on"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(
+            source = spec.name,
+            error = %e,
+            "could not reconcile user reports after import; run `reports reconcile`"
+        ),
+    }
 }
 
 /// Bump the serving epoch after an import rebuilds a dataset table.

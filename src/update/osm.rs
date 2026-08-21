@@ -1788,7 +1788,7 @@ mod tests {
     fn osc_xml_flows_through_parse_apply_drain_into_the_serving_table() -> Result<()> {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -1889,7 +1889,7 @@ mod tests {
     {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -2199,7 +2199,7 @@ mod tests {
     {
         let (conn, kv, _dir) = setup_test_db_and_kv()?;
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -2911,7 +2911,7 @@ mod tests {
         // thread writes (that writes OSM buildings around lon 20, these
         // government buildings sit at lon 30+).
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,

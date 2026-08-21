@@ -121,7 +121,7 @@ static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
 const BUILDINGS_MVT_SQL: &str = "
     WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
     bdot10k_pkg AS MATERIALIZED (
-        SELECT b.rowid AS rid, b.LOKALNYID AS id, b.geom,
+        SELECT b.rowid AS rid, b.LOKALNYID AS id, b.PRZESTRZENNAZW, b.geom,
                ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
                b.funkcja_szczegolowa, b.funkcja_ogolna, b.liczba_kondygnacji,
                b.KATEGORIAISTNIENIA, b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA,
@@ -142,7 +142,7 @@ const BUILDINGS_MVT_SQL: &str = "
         GROUP BY p.rid
     ),
     bdot10k_final AS (
-        SELECT pkg.geom, 'bdot10k' AS source, pkg.id,
+        SELECT pkg.geom, 'bdot10k' AS source, pkg.id, pkg.PRZESTRZENNAZW,
                pkg.funkcja_szczegolowa, pkg.funkcja_ogolna,
                pkg.liczba_kondygnacji::INTEGER AS levels_above_ground,
                pkg.KATEGORIAISTNIENIA, pkg.NAZWA, pkg.FSBUD, pkg.INFORMACJADODATKOWA,
@@ -185,7 +185,7 @@ const BUILDINGS_MVT_SQL: &str = "
         GROUP BY p.rid
     ),
     egib_final AS (
-        SELECT pkg.geom, 'egib' AS source, pkg.id,
+        SELECT pkg.geom, 'egib' AS source, pkg.id, NULL::VARCHAR AS PRZESTRZENNAZW,
                NULL::VARCHAR AS funkcja_szczegolowa, NULL::VARCHAR AS funkcja_ogolna,
                pkg.kondygnacje_nadziemne AS levels_above_ground,
                NULL::VARCHAR AS KATEGORIAISTNIENIA, NULL::VARCHAR AS NAZWA,
@@ -210,6 +210,10 @@ const BUILDINGS_MVT_SQL: &str = "
     SELECT ST_AsMVT(t, 'buildings', 4096, 'geom') AS mvt
     FROM (
         SELECT ST_AsMVTGeom(u.geom, bbox.geom, 4096, 256, true) AS geom, u.id, u.source,
+               -- Identity, not display: the other half of BDOT10k's composite
+               -- key, so the frontend's report action can send a complete
+               -- record key. NULL for egib, whose id_budynku is the whole key.
+               u.PRZESTRZENNAZW,
                u.funkcja_szczegolowa, u.funkcja_ogolna, u.levels_above_ground,
                u.KATEGORIAISTNIENIA, u.NAZWA, u.FSBUD, u.INFORMACJADODATKOWA,
                u.KODKST, u.ZRODLODANYCHGEOMETRYCZNYCH,

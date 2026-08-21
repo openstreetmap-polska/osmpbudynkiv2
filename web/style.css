@@ -511,7 +511,8 @@ button {
 .feedback-modal[data-state="ok"] {
   border-color: var(--ok);
 }
-#download-feedback-title {
+#download-feedback-title,
+#report-modal-title {
   margin: 0 0 10px;
   font-size: 10px;
   font-weight: 700;
@@ -536,16 +537,19 @@ button {
   margin: 1px 0 0;
   font-family: var(--font-data);
 }
-#download-feedback-text {
+#download-feedback-text,
+#report-modal-text {
   margin: 0 0 14px;
   font-family: var(--font-data);
   font-size: 12px;
   line-height: 1.5;
 }
-.feedback-modal[data-state="error"] #download-feedback-text {
+.feedback-modal[data-state="error"] #download-feedback-text,
+.feedback-modal[data-state="error"] #report-modal-text {
   color: var(--danger);
 }
-.feedback-modal[data-state="ok"] #download-feedback-text {
+.feedback-modal[data-state="ok"] #download-feedback-text,
+.feedback-modal[data-state="ok"] #report-modal-text {
   color: var(--ok);
 }
 .feedback-modal-close {
@@ -556,6 +560,88 @@ button {
 }
 .feedback-modal-close:hover {
   background: var(--accent-soft);
+}
+
+/* ---- report modal (#report-modal) ----
+   Shares .feedback-modal's box, backdrop and data-state colouring with
+   #download-feedback; only the form inside it is new. */
+.report-reasons {
+  margin: 0 0 12px;
+  padding: 0;
+  border: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+}
+.report-reasons legend {
+  padding: 0;
+  margin-bottom: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-soft);
+}
+.report-reasons label {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  cursor: pointer;
+}
+.report-reasons input {
+  flex: none;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.report-note-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-soft);
+}
+#report-note {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 12px;
+  padding: 6px 8px;
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-family: var(--font-data);
+  font-size: 12px;
+  /* Vertical only: a horizontal drag would push the textarea past the
+     dialog's max-width and the whole modal would grow with it. */
+  resize: vertical;
+}
+/* #report-submit reuses .download-btn, whose width:100%/margin-top are meant
+   for a stacked panel button -- neutralised here so the two actions share one
+   row evenly instead of the submit button claiming the whole width. */
+.report-modal-actions {
+  display: flex;
+  gap: 8px;
+}
+.report-modal-actions > * {
+  flex: 1;
+  margin-top: 0;
+}
+/* Demoted from .feedback-modal-close's filled accent: that class is the only
+   button in #download-feedback, whereas here it sits beside the submit and two
+   equally-weighted filled buttons read as two equally-likely actions. */
+#report-cancel {
+  background: var(--paper);
+  color: var(--ink-soft);
+  border-color: var(--line);
+}
+#report-cancel:hover {
+  background: var(--paper);
+  border-color: var(--ink-soft);
+  color: var(--ink);
 }
 
 .panel-status {
@@ -911,6 +997,30 @@ button {
   padding-top: 10px;
   border-top: 1px solid var(--line);
 }
+/* "Zgłoś problem", shown only on the two unmatched layers (see reportKeyFor
+   in app.js). Sits outside .feature-popup-body so it stays put while the
+   attribute list scrolls, and reads as a secondary action -- outlined rather
+   than filled like .download-btn, since the primary thing a popup does is
+   show information. */
+.feature-popup-actions {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.report-btn {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--paper);
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-size: 11px;
+}
+.report-btn:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
 /* Shared box for the inline SVG hint icons (kstHint/exclusionHint in
    app.js) -- both icons render at the same viewBox/size, but this fixes
    their layout box explicitly so hover/click hit-testing lines up with what

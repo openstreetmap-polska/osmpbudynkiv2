@@ -195,6 +195,31 @@ pub fn refresh(
             ))
             .with_context(|| format!("Failed to apply delta to {live}"))?;
 
+            // Runs AFTER the delta so it reads post-refresh values: a report
+            // whose record upstream just corrected must see the corrected row
+            // and retire, making the object importable again. Inside the apply
+            // transaction so a rolled-back refresh cannot retire reports for a
+            // delta that never landed.
+            //
+            // Cheap enough to be unconditional -- it is O(active reports for
+            // this source), never O(source table), because the content
+            // signature is only ever evaluated for rows carrying a report.
+            //
+            // It enqueues the retired reports' cells itself. That overlaps
+            // with `insert_dirty_cells` above (an expiring report is by
+            // definition on a modified or removed record, whose cell is
+            // already queued), which is harmless: duplicates in
+            // match_dirty_cells are expected and deduped on drain.
+            let report_stats = crate::reports::reconcile_source(conn, spec)?;
+            if report_stats.total_expired() > 0 {
+                info!(
+                    source = spec.name,
+                    changed = report_stats.expired_changed,
+                    removed = report_stats.expired_removed,
+                    "retired user reports whose records moved on"
+                );
+            }
+
             // Fires on EVERY landed refresh, even a 0/0/0 diff (no added,
             // modified or removed keys at all): a refresh can rewrite raw
             // columns `/tiles` reads (`centroid`, `rodzaj_kod`) that sit

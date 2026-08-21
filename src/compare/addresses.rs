@@ -111,6 +111,13 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
     let osm_city = normalized_name_sql("city");
     let src_hn = normalized_housenumber_sql("a.numer_porzadkowy");
     let osm_hn = normalized_housenumber_sql("housenumber");
+    // The user-report veto, spliced in from `compare::rule` rather than
+    // restated. This query legitimately restates the *match* rule for
+    // performance (see the module doc), but the veto is a clause, not a
+    // strategy -- calling the shared builder keeps its text single-homed even
+    // though everything around it differs from the per-cell path. Correlates
+    // on `s`, the final projection's alias over `prg_addresses`.
+    let reported = crate::compare::rule::reported_sql(&crate::dataset::PRG, "s");
     conn.execute_batch(&format!(
         "INSERT INTO prg_unmatched
          (geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy,
@@ -168,7 +175,8 @@ fn compare_addresses_in_txn(conn: &Connection) -> Result<()> {
                 s.kod_pocztowy, s.teryt_miejscowosc, s.wazny_od_lub_data_nadania,
                 s.teryt_gmina, s.gmina, {cx}, {cy}, now()
          FROM prg_addresses s
-         WHERE NOT EXISTS (SELECT 1 FROM matched_ids m WHERE m.lokalny_id = s.lokalny_id);"
+         WHERE NOT EXISTS (SELECT 1 FROM matched_ids m WHERE m.lokalny_id = s.lokalny_id)
+           AND NOT {reported};"
     ))
     .context("Failed to run address comparison query")?;
 
@@ -634,7 +642,22 @@ mod tests {
                 -- empty-string street must behave as absent, routing through rule C
                 ('k','8', '', 'Rychnowo', NULL, ST_Point(21.090, 52.2112)),
                 -- beyond every distance, despite an agreeing street
-                ('l','44', 'Warszawska', NULL, NULL, ST_Point(21.100, 52.2116));
+                ('l','44', 'Warszawska', NULL, NULL, ST_Point(21.100, 52.2116)),
+                -- user-report veto and its negative: 'm' and 'n' are identical
+                -- in every respect the match rule looks at (both unmatched on
+                -- distance), so the ONLY thing separating them is the report on
+                -- 'm'. A path that dropped the veto would put 'm' back in the
+                -- expected set below and fail.
+                ('m','21', NULL, NULL, NULL, ST_Point(21.110, 52.250)),
+                ('n','21', NULL, NULL, NULL, ST_Point(21.120, 52.250));
+             -- Reported directly rather than through `reports::insert` so the
+             -- fixture states the stored row plainly; the signature is not read
+             -- by the veto (only `reports::reconcile_source` reads it).
+             INSERT INTO object_reports
+                 (report_id, source, record_key, signature, reason, note,
+                  reported_at, cell_x, cell_y, status, resolved_at)
+             VALUES (1, 'prg', ['m'], 'sig', 'does_not_exist', NULL,
+                     now(), NULL, NULL, 'active', NULL);
              INSERT INTO osm_addresses VALUES
                 (1,'node','12',NULL,NULL,NULL, ST_Point(21.010, 52.2102)),
                 (2,'node','44','Warszawska',NULL,NULL, ST_Point(21.020, 52.210)),
@@ -663,7 +686,7 @@ mod tests {
         // that both dropped the name rules would agree perfectly and pass.
         assert_eq!(
             full,
-            ["b", "c", "d", "f", "g", "j", "l"]
+            ["b", "c", "d", "f", "g", "j", "l", "n"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<BTreeSet<_>>(),
@@ -685,6 +708,9 @@ mod tests {
             (21.080, 52.2112),
             (21.090, 52.2112),
             (21.100, 52.2116),
+            // 'm' (reported) and 'n' (its unreported twin)
+            (21.110, 52.250),
+            (21.120, 52.250),
         ] {
             cells.insert(lonlat_to_tile(lon, lat, CHANGE_CELL_ZOOM));
         }
@@ -692,6 +718,7 @@ mod tests {
         for (cx, cy) in cells {
             let w = tile_to_bbox(CHANGE_CELL_ZOOM, cx, cy);
             let sql = unmatched_addresses_in_cell_sql(
+                &crate::dataset::PRG,
                 "prg_addresses",
                 "a.lokalny_id",
                 w,

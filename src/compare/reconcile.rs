@@ -60,7 +60,7 @@ mod tests {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (lokalny_id VARCHAR, geom GEOMETRY);
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES ('a', ST_MakeEnvelope(21.0,52.0,21.001,52.001));
@@ -90,7 +90,7 @@ mod tests {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (lokalny_id VARCHAR, geom GEOMETRY);
 
@@ -168,7 +168,7 @@ mod tests {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (lokalny_id VARCHAR, geom GEOMETRY);
              INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES ('a', ST_MakeEnvelope(21.0,52.0,21.001,52.001));

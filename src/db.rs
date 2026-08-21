@@ -163,6 +163,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
             cell_x INTEGER,
             cell_y INTEGER,
             computed_at TIMESTAMP WITH TIME ZONE,
+            -- Not a display attribute: the other half of BDOT10k's composite
+            -- record key (PRZESTRZENNAZW, LOKALNYID). LOKALNYID alone is not
+            -- unique, so POST /report cannot identify a building without it.
+            -- See compare::columns::classification_columns.
+            PRZESTRZENNAZW VARCHAR,
             funkcja_szczegolowa VARCHAR,
             funkcja_ogolna VARCHAR,
             liczba_kondygnacji SMALLINT,
@@ -279,6 +284,55 @@ fn create_schema(conn: &Connection) -> Result<()> {
             cell_x INTEGER,
             cell_y INTEGER,
             total INTEGER
+        );
+
+        -- User-submitted reports that a government object should not be
+        -- proposed for import (bad source data, or OSM already maps it in a way
+        -- compare::rule cannot see). An active row vetoes its object out of
+        -- <source>_unmatched via compare::rule::reported_sql -- the same shape
+        -- as the osm_former_buildings suppression veto, and like it the object
+        -- stays in cell_totals (it is comparable; someone has decided how to
+        -- handle it), unlike a BDOT10K_EKSPLOATOWANY_FILTER-excluded row.
+        --
+        -- This is the ONLY table in this database holding data that cannot be
+        -- reconstructed from an external source. Everything else is derived
+        -- from OSM/PRG/BDOT10k/EGIB or the mapping CSVs and a lost database is
+        -- a re-import away; these are not. `reports export`/`reports import`
+        -- is the backup path.
+        --
+        -- source is 'bdot10k'|'egib'|'prg', always read off DatasetSpec.name
+        -- and never typed as a literal, spelled identically to
+        -- match_dirty_cells.source. record_key holds the key column values in
+        -- DatasetSpec.key_columns order -- BDOT10k's key is the composite
+        -- (PRZESTRZENNAZW, LOKALNYID), which is why this is a list and not a
+        -- single column.
+        --
+        -- No UNIQUE constraint, deliberately: duplicate reports on one object
+        -- are harmless *because* the veto is phrased NOT EXISTS rather than a
+        -- LEFT JOIN. Rewriting it as a join would make a duplicate report
+        -- duplicate rows in <source>_unmatched -- the exact fan-out failure
+        -- documented for street_name_mappings.
+        --
+        -- `signature` is DatasetSpec::content_signature_sql at report time; a
+        -- report lapses (status='expired') once it no longer matches the live
+        -- record, which is what makes a corrected record importable again.
+        -- See reports::reconcile_source.
+        --
+        -- Nothing identifying the submitter is stored -- no address, no hash of
+        -- one, no user agent. Cleanup after an abusive burst is time-scoped
+        -- (`reports revoke --since`), not actor-scoped, by design.
+        CREATE TABLE IF NOT EXISTS object_reports (
+            report_id BIGINT,
+            source VARCHAR,
+            record_key VARCHAR[],
+            signature VARCHAR,
+            reason VARCHAR,
+            note VARCHAR,
+            reported_at TIMESTAMP WITH TIME ZONE,
+            cell_x INTEGER,
+            cell_y INTEGER,
+            status VARCHAR,
+            resolved_at TIMESTAMP WITH TIME ZONE
         );
 
         ",

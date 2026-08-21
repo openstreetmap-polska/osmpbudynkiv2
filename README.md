@@ -31,10 +31,10 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] Web map frontend (MapLibre GL JS, `web/`) — layer legend, per-feature popups showing source attributes and the tags an import would write, status panel, and package download for either the visible area or a drawn one (rectangle, polygon or freehand)
 - [x] Ignore buildings that are mapped as no longer existing or ruins — OSM ways/relations tagged with a lifecycle-prefixed key (`demolished:building`, `destroyed:building`, `abandoned:building`, `was:building`, `razed:building`, `removed:building`, `disused:building`, `ruins:building`) are imported into `osm_former_buildings` and suppress the government building they overlap from `compare buildings`, instead of proposing it for import. Requires an `import osm` re-run to populate on a database from before this feature (see [`docs/former_buildings.md`](docs/former_buildings.md))
 - [x] Tile caching
+- [x] Endpoint for reporting records to exclude (bad source data, comparison mismatches) — `POST /report` marks a government object as one that should not be proposed for import, keyed on its registry identity. An active report vetoes the object out of the `*_unmatched` serving tables (so out of `/tiles`, `/package` and JOSM) until the underlying record changes, at which point the report is retired automatically and the object becomes importable again. Reported from the map's feature popup; managed offline with `reports list|revoke|reconcile|export|import`. Nothing identifying the submitter is stored — see the `[reports]` section of `example_config.toml` for what that means for abuse control
 
 ## Not yet implemented
 
-- [ ] Endpoint for reporting records to exclude (bad source data, comparison mismatches)
 - [ ] Random location endpoint (jump to an area with data to review)
 
 ## Building
@@ -154,7 +154,8 @@ The config file controls:
 - **`[teryt]`** — TERYT/TERC dictionary settings for the PRG import (download vs. local `file_path`)
 - **`[package]`** — `/package` endpoint limits (`max_area_sq_deg`, default 0.04)
 - **`[updates]`** — `/updates` time window limits (`default_minutes`, `max_minutes`)
-- **`[jobs.*]`** — background jobs, each with `enabled`, `interval_seconds` and a per-run timeout: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, `match_refresh` (drains the dirty-cell queue to keep `*_unmatched` serving tables current; also takes `batch_size`), `match_reconcile` (periodically re-enqueues every live cell as a safety net), `street_mappings_update` and `building_types_update` (re-fetch the mapping CSVs from `download_urls`), and `export_log_prune` (`retention_days`, default 365). Only one dataset refresh runs at a time, regardless of how the schedules line up.
+- **`[reports]`** — `POST /report` (`enabled`, default true — false makes the route a 404; `max_objects_per_request`, default 100)
+- **`[jobs.*]`** — background jobs, each with `enabled`, `interval_seconds` and a per-run timeout: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, `match_refresh` (drains the dirty-cell queue to keep `*_unmatched` serving tables current; also takes `batch_size`), `match_reconcile` (periodically re-enqueues every live cell as a safety net), `reports_reconcile` (retires reports whose government record changed while this process wasn't the one applying the change), `street_mappings_update` and `building_types_update` (re-fetch the mapping CSVs from `download_urls`), and `export_log_prune` (`retention_days`, default 365). Only one dataset refresh runs at a time, regardless of how the schedules line up.
 
 All fields are optional — only specify what you want to override. Note that `duckdb_init_commands` is fully replaced if specified (not merged with defaults).
 
@@ -314,6 +315,40 @@ rebuild is wanted without redoing the whole comparison. `queue drain` is the
 manual, one-shot equivalent of what `match_refresh` does on a schedule inside
 `run`.
 
+### reports — manage user reports offline
+
+```bash
+# What has been reported, newest first
+cargo run -- reports list
+cargo run -- reports list --source bdot10k --status active --limit 200
+cargo run -- reports list --since '2026-08-16 14:00:00'
+
+# Retire one report so its object is proposed for import again
+cargo run -- reports revoke 41
+# ...or every active report submitted in a window. Because nothing identifying
+# the submitter is stored, this is the only way to unwind an abusive burst
+cargo run -- reports revoke --since '2026-08-16 14:00:00' --source prg
+
+# Retire reports whose government record has changed or disappeared. Runs
+# automatically inside every dataset refresh and after every import; this is
+# the manual safety net (also available as the reports_reconcile job)
+cargo run -- reports reconcile
+
+# Back up and restore. object_reports is the only table in this database that
+# cannot be rebuilt from an external source -- `import full` restores
+# everything else and starts with no reports at all
+cargo run -- reports export reports.jsonl
+cargo run -- reports import reports.jsonl
+```
+
+A revoked, expired or imported report only changes what is served once the
+affected cells are recomputed, so follow any of these with `queue drain` (or
+let a running server's `match_refresh` job get to it).
+
+`reports import` reallocates ids from the current maximum rather than
+preserving them, so importing into a database that already has reports cannot
+collide; a round trip is faithful in content, not in id.
+
 ### run — HTTP service
 
 ```bash
@@ -331,6 +366,20 @@ Serves:
   request). The request area (bounding box) is capped by the
   `[package] max_area_sq_deg` config setting (default 0.04 sq deg).
 - `/updates` — recent `/package` export activity (timestamp, area, datasets, feature counts) as GeoJSON, `Cache-Control: public, max-age=60`. A background job prunes entries older than `[jobs.export_log_prune] retention_days` (default 365).
+- `POST /report` — mark government objects as ones that should not be proposed
+  for import. Body is `{"reason": ..., "note": ..., "objects": [{"source": ...,
+  "key": {...}}]}`, where `key` names exactly the source's key columns
+  (`PRZESTRZENNAZW` + `LOKALNYID` for bdot10k, `id_budynku` for egib,
+  `lokalny_id` for prg) and `reason` is one of `does_not_exist`,
+  `bad_geometry`, `bad_attributes`, `already_in_osm`, `duplicate`, `other`
+  (which requires a note). A key that matches no live record is rejected per
+  object rather than failing the request. Each accepted report enqueues its
+  z14 cell, so the object leaves `*_unmatched` on the next drain. Capped at
+  `[reports] max_objects_per_request` objects; `[reports] enabled = false`
+  turns the route into a 404 with no redeploy. Nothing about the submitter is
+  captured or stored — see the `[reports]` comment in `example_config.toml`
+  for what that means for abuse control, and the `reports` CLI above for the
+  time-scoped cleanup path it leaves.
 
 The `match_refresh` background job keeps `/tiles` and `/package` fresh between
 full `compare` runs, by draining `match_dirty_cells` on a schedule (see
@@ -359,6 +408,14 @@ classification and display attributes `/tiles` and the popups show) come from
 rebuild those tables wholesale. Re-running the whole setup sequence above is
 the reliable way to bring an old database forward.
 
+`POST /report` in particular needs `bdot10k_unmatched.PRZESTRZENNAZW`, which is
+the other half of BDOT10k's composite key and was added with the feature — a
+database predating it needs `bdot10k_unmatched` recreated and `compare bdot10k`
+re-run, or every BDOT10k tile fails to render. With one exception, everything
+here is a rebuild-and-recompute story: `object_reports` is the only table in
+this database that **cannot** be reconstructed from an external source, so run
+`reports export` before rebuilding a database that has any.
+
 ```bash
 # bbox: minLon,minLat,maxLon,maxLat; datasets: prg, bdot10k, egib, or all (default)
 curl 'http://127.0.0.1:3000/package?bbox=20.99,52.19,21.02,52.22&datasets=prg,bdot10k'
@@ -370,6 +427,10 @@ curl -X POST 'http://127.0.0.1:3000/package?datasets=all' \
 # Recent export activity (default: last 60 minutes)
 curl 'http://127.0.0.1:3000/updates'
 curl 'http://127.0.0.1:3000/updates?minutes=1440'
+
+# Report an object as one that should not be proposed for import
+curl -X POST 'http://127.0.0.1:3000/report' -H 'content-type: application/json' \
+  -d '{"reason":"does_not_exist","objects":[{"source":"egib","key":{"id_budynku":"146509_8.0001.120.1_BUD"}}]}'
 ```
 
 Background jobs (OSM and government-dataset refreshes, the dirty-cell drain,

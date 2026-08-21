@@ -158,6 +158,23 @@ fn job_run_log_or_default(state: &AppState) -> BTreeMap<String, JobRunLogEntry> 
     }
 }
 
+/// Same swallow-into-default contract as every other `/status` sub-read: a
+/// diagnostic field must never be the reason the endpoint fails.
+fn report_counts_or_default(state: &AppState) -> crate::reports::ReportCounts {
+    let counts = state
+        .pool
+        .get()
+        .map_err(anyhow::Error::from)
+        .and_then(|conn| crate::reports::counts(&conn));
+    match counts {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to count object_reports for /status");
+            crate::reports::ReportCounts::default()
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub jobs: Vec<JobStatus>,
@@ -171,21 +188,27 @@ pub struct StatusResponse {
     /// go through for their DB reads.
     pub tile_cache_hits: u64,
     pub tile_cache_misses: u64,
+    /// User reports by lifecycle state. `active` is the number currently
+    /// vetoing objects out of the serving tables; a growing `expired` count is
+    /// the registries fixing records people complained about.
+    pub reports: crate::reports::ReportCounts,
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let jobs = state.registry.snapshot();
     let tile_cache_hits = state.tile_cache.hits();
     let tile_cache_misses = state.tile_cache.misses();
-    let (match_staleness, job_run_log, osm_replication) = tokio::task::spawn_blocking(move || {
-        (
-            match_staleness_or_default(&state),
-            job_run_log_or_default(&state),
-            osm_replication_state_or_default(&state),
-        )
-    })
-    .await
-    .unwrap_or_default();
+    let (match_staleness, job_run_log, osm_replication, reports) =
+        tokio::task::spawn_blocking(move || {
+            (
+                match_staleness_or_default(&state),
+                job_run_log_or_default(&state),
+                osm_replication_state_or_default(&state),
+                report_counts_or_default(&state),
+            )
+        })
+        .await
+        .unwrap_or_default();
     Json(StatusResponse {
         jobs,
         match_staleness,
@@ -193,6 +216,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         osm_replication,
         tile_cache_hits,
         tile_cache_misses,
+        reports,
     })
 }
 

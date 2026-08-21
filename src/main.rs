@@ -8,6 +8,7 @@ mod import;
 mod job_log;
 mod mappings;
 mod osm;
+mod reports;
 mod server;
 mod serving_version;
 mod shutdown;
@@ -82,6 +83,7 @@ fn main() -> Result<()> {
         }
         Command::Compare { target } => compare::run(&conn, target)?,
         Command::Queue { action } => compare::run_queue(&conn, action)?,
+        Command::Reports { action } => reports::run(&conn, action)?,
         Command::Run => {
             let rt = tokio::runtime::Runtime::new()?;
             let config = Arc::new(config);

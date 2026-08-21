@@ -265,8 +265,11 @@ mod tests {
             "SET geometry_always_xy = true".to_string(),
         ];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
-        c.execute_batch("CREATE TABLE bsrc (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);")
-            .unwrap();
+        c.execute_batch(
+            "CREATE TABLE bsrc (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR,
+                                geom GEOMETRY, centroid GEOMETRY);",
+        )
+        .unwrap();
         c
     }
 
@@ -274,7 +277,13 @@ mod tests {
     /// rather than unwrapping, so the same helper can assert both that the
     /// unrepaired pair throws and that the repaired one does not.
     fn run_match_rule(c: &Connection) -> Result<i64, duckdb::Error> {
-        let sql = unmatched_buildings_sql("bsrc", "COUNT(*)", (15.0, 53.0, 15.5, 53.5), None);
+        let sql = unmatched_buildings_sql(
+            &crate::dataset::BDOT10K,
+            "bsrc",
+            "COUNT(*)",
+            (15.0, 53.0, 15.5, 53.5),
+            None,
+        );
         c.query_row(&sql, [], |r| r.get::<_, i64>(0))
     }
 

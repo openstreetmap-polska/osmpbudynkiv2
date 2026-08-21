@@ -6,6 +6,7 @@ use crate::compare::rule::{
     BDOT10K_EKSPLOATOWANY_FILTER, OSM_MATCH_BUFFER_DEG, buffer, envelope_sql,
     unmatched_addresses_in_cell_sql, unmatched_buildings_sql,
 };
+use crate::dataset::{BDOT10K, EGIB, PRG};
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
 /// Builds the `(dest_table, insert_cols, inner_select)` triple
@@ -40,16 +41,17 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, St
     let write = tile_to_bbox(CHANGE_CELL_ZOOM, cell_x as u32, cell_y as u32);
     match source {
         "bdot10k" | "egib" => {
-            let (src, id, dest, extra_filter) = if source == "bdot10k" {
+            let (spec, id, dest, extra_filter) = if source == "bdot10k" {
                 (
-                    "bdot10k_buildings",
+                    &BDOT10K,
                     "LOKALNYID",
                     "bdot10k_unmatched",
                     Some(BDOT10K_EKSPLOATOWANY_FILTER),
                 )
             } else {
-                ("egib_buildings", "id_budynku", "egib_unmatched", None)
+                (&EGIB, "id_budynku", "egib_unmatched", None)
             };
+            let src = spec.table;
             let cx = cell_x_sql("b.centroid");
             let cy = cell_y_sql("b.centroid");
             let cc = classification_columns(src);
@@ -73,7 +75,7 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, St
             // that owns it.
             let inner = format!(
                 "{candidates}{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
-                unmatched_buildings_sql("candidates", &select, write, extra_filter)
+                unmatched_buildings_sql(spec, "candidates", &select, write, extra_filter)
             );
             Ok((
                 dest,
@@ -108,7 +110,7 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, St
             // boundary is what defuses that.
             let inner = format!(
                 "{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
-                unmatched_addresses_in_cell_sql("prg_addresses", &select, write, read)
+                unmatched_addresses_in_cell_sql(&PRG, "prg_addresses", &select, write, read)
             );
             Ok((
                 "prg_unmatched",
@@ -191,7 +193,7 @@ mod tests {
         ];
         let c = init_db(Path::new(":memory:"), &init, None).unwrap();
         c.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,

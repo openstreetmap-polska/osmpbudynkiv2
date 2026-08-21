@@ -10,10 +10,17 @@
 //! `compare::full_vs_incremental_equivalence` (full `compare` vs.
 //! reconcile+drain, end to end).
 
+use crate::dataset::DatasetSpec;
 use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
 
 /// (min_lon, min_lat, max_lon, max_lat).
 pub type Bounds = (f64, f64, f64, f64);
+
+/// `object_reports.status` for a report that is currently in force. The other
+/// two values (`expired`, `revoked`) are inert — see `reports::status`, which
+/// owns the vocabulary; this constant exists so the veto below and the reports
+/// module cannot disagree about which string means "applies".
+pub const REPORT_ACTIVE: &str = "active";
 
 /// Distance within which a bare housenumber agreement is enough to call an
 /// address matched — proximity alone, no name evidence.
@@ -183,6 +190,42 @@ fn former_building_covers_sql(envelope: &str) -> String {
     )
 }
 
+/// The user-report veto: true when `alias` names a government record someone
+/// has reported as one that should not be proposed for import.
+///
+/// Same one-home reasoning as the two clause builders above, and the same
+/// negate-here/require-there pairing: `unmatched_buildings_sql` and
+/// `unmatched_addresses_in_cell_sql` negate it, `reported_buildings_sql`
+/// requires it, and `compare::addresses::compare_addresses_in_txn` — which
+/// legitimately restates the surrounding address query for performance —
+/// splices in this same text rather than writing its own. That is the only
+/// reason this one is `pub` where the former-building pair is private.
+///
+/// **Phrased `EXISTS`, never a `LEFT JOIN`, and that is load-bearing.**
+/// `object_reports` carries no UNIQUE constraint, so an object can legitimately
+/// carry several reports (two users, two reasons). Under `EXISTS` that is
+/// simply "reported"; under a join it would emit one `<source>_unmatched` row
+/// per report — the exact fan-out that `street_name_mappings` has to prevent
+/// with a duplicate-key check at load. Here it costs nothing to be immune
+/// instead. `rule::tests::two_reports_on_one_object_still_suppress_exactly_one_row`
+/// is the guard.
+///
+/// Unlike the geometric vetoes above this needs no envelope: it correlates on
+/// the record key, which is already narrowed by whatever scoping filter the
+/// surrounding query applies to `alias`.
+pub fn reported_sql(spec: &DatasetSpec, alias: &str) -> String {
+    format!(
+        "EXISTS (
+               SELECT 1 FROM object_reports r
+               WHERE r.status = '{REPORT_ACTIVE}'
+                 AND r.source = '{source}'
+                 AND r.record_key = {key}
+           )",
+        source = spec.name,
+        key = spec.key_list_sql(alias),
+    )
+}
+
 /// Unmatched building rows: government centroid within `area`, and no
 /// osm_buildings polygon whose footprint covers at least
 /// `MIN_OVERLAP_FRACTION` of the government building's own footprint (osm
@@ -219,7 +262,14 @@ fn former_building_covers_sql(envelope: &str) -> String {
 ///
 /// `extra_filter`, when set, is ANDed into the WHERE clause alongside the
 /// `b`-aliased source row (see `BDOT10K_EKSPLOATOWANY_FILTER`).
+///
+/// `spec` identifies the source for the user-report veto (`reported_sql`) and
+/// is deliberately a separate parameter from `source_table`: the per-cell path
+/// passes the string `"candidates"` there, a CTE over the live table, so the
+/// spec cannot be recovered from the table name. The CTE is `SELECT *`, so the
+/// key columns the veto correlates on are present on the alias either way.
 pub fn unmatched_buildings_sql(
+    spec: &DatasetSpec,
     source_table: &str,
     select_list: &str,
     area: Bounds,
@@ -234,9 +284,11 @@ pub fn unmatched_buildings_sql(
          FROM {source_table} b
          WHERE ST_Intersects(b.centroid, {envelope})
            {extra}AND NOT {osm_covers}
-           AND NOT {former_covers}",
+           AND NOT {former_covers}
+           AND NOT {reported}",
         osm_covers = osm_building_covers_sql(&envelope),
         former_covers = former_building_covers_sql(&envelope),
+        reported = reported_sql(spec, "b"),
     )
 }
 
@@ -315,6 +367,58 @@ pub fn suppressed_buildings_sql(
     )
 }
 
+/// Rows the *user-report* veto removes from `unmatched_buildings_sql`, and
+/// nothing else does — the operator-facing count that shows whether reporting
+/// is doing anything at all, in the same spirit as `suppressed_buildings_sql`.
+///
+/// The four categories are disjoint by construction, in this precedence:
+/// covered by OSM (`matched`) > covered by a former building (`suppressed`) >
+/// reported (`reported`) > `unmatched`. So this requires the report veto *and*
+/// negates both geometric ones, exactly mirroring the clause set
+/// `unmatched_buildings_sql` uses, which is what keeps
+/// `matched + suppressed + reported + unmatched = total` exact. Folding
+/// reporting into `matched` instead would make it invisible — an operator
+/// checking whether the feature works would have no number to look at.
+///
+/// **Same CTE-first shape as `suppressed_buildings_sql`, for the same reason.**
+/// Its one caller runs it once over the whole national extent, not per grid
+/// cell, and the clauses meet wildly different row counts: the report join is
+/// savagely selective (a handful of rows out of 16.35M), while
+/// `osm_building_covers_sql` anti-joins ~18M `osm_buildings`. Written flat,
+/// DuckDB de-correlates both `EXISTS` clauses into nested `DELIM_JOIN`s and can
+/// plan the anti-join underneath, computing the unmatched set for all of Poland
+/// and materializing the correlated `b.geom` — 2.18 GB of WKB, which is how
+/// `suppressed_buildings_sql` OOMed before it was reordered. Build the veto's
+/// candidates first and anti-join over those. `MATERIALIZED` is insurance
+/// against a future re-plan, not the active ingredient; the CTE is.
+pub fn reported_buildings_sql(
+    spec: &DatasetSpec,
+    source_table: &str,
+    select_list: &str,
+    area: Bounds,
+    extra_filter: Option<&str>,
+) -> String {
+    let envelope = envelope_sql(area);
+    let extra = extra_filter
+        .map(|f| format!("AND {f}\n               "))
+        .unwrap_or_default();
+    format!(
+        "WITH candidates AS MATERIALIZED (
+             SELECT b.*
+             FROM {source_table} b
+             WHERE ST_Intersects(b.centroid, {envelope})
+               {extra}AND {reported}
+         )
+         SELECT {select_list}
+         FROM candidates b
+         WHERE NOT {osm_covers}
+           AND NOT {former_covers}",
+        reported = reported_sql(spec, "b"),
+        osm_covers = osm_building_covers_sql(&envelope),
+        former_covers = former_building_covers_sql(&envelope),
+    )
+}
+
 /// Unmatched address rows: a government point within `write` for which no
 /// `osm_addresses` point (read from `read`) satisfies any of three rules.
 /// Every rule requires an equal normalized housenumber — `hn(...)` below is
@@ -370,6 +474,7 @@ pub fn suppressed_buildings_sql(
 /// `RTREE_INDEX_SCAN` on `prg_addresses.geom` and `osm_addresses.geom`. Don't
 /// read a measurement into the keyword that isn't there.
 pub fn unmatched_addresses_in_cell_sql(
+    spec: &DatasetSpec,
     source_table: &str,
     select_list: &str,
     write: Bounds,
@@ -386,6 +491,12 @@ pub fn unmatched_addresses_in_cell_sql(
     let osm_city = normalized_name_sql("o.city");
     let src_hn = normalized_housenumber_sql("a.numer_porzadkowy");
     let osm_hn = normalized_housenumber_sql("o.housenumber");
+    // Correlates on `a`, the outer alias (`addr_resolved`, which carries
+    // `SELECT c.*` and so still has the key columns). Sits outside the
+    // `NOT EXISTS` on `osm_addresses` rather than inside it: a report means
+    // "never propose this", which is independent of whether OSM has anything
+    // nearby at all.
+    let reported = reported_sql(spec, "a");
     // The CTEs are named `addr_*` rather than `candidates`/`resolved` so a
     // future caller wanting its own outer CTE cannot collide with them.
     format!(
@@ -404,6 +515,7 @@ pub fn unmatched_addresses_in_cell_sql(
          SELECT {select_list}
          FROM addr_resolved a
          WHERE ST_Intersects(a.geom, {write_envelope})
+           AND NOT {reported}
            AND NOT EXISTS (
                SELECT 1 FROM osm_addresses o
                WHERE ST_Intersects(o.geom, {read_envelope})
@@ -429,6 +541,7 @@ pub fn unmatched_addresses_in_cell_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::{BDOT10K, PRG};
     use crate::db::init_db;
     use std::path::Path;
 
@@ -446,7 +559,14 @@ mod tests {
             // rule reads: the housenumber, plus the three the name rules
             // resolve through (`ulica` and `teryt_miejscowosc` select the
             // street mapping, `miejscowosc` is rule C's locality).
-            "CREATE TABLE bsrc (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+            // `bsrc` carries PRZESTRZENNAZW as well as LOKALNYID so these
+            // tests can pass the real `dataset::BDOT10K` spec and exercise its
+            // genuine *composite* key through the report veto, rather than a
+            // single-column stand-in that would hide a list-arity bug. Rows
+            // that leave it NULL are fine: a report can only match a row whose
+            // whole key list is equal, and no test inserts a NULL-keyed report.
+            "CREATE TABLE bsrc (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR,
+                                geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE asrc (lokalny_id VARCHAR, numer_porzadkowy VARCHAR,
                                 ulica VARCHAR, miejscowosc VARCHAR,
                                 teryt_miejscowosc VARCHAR, geom GEOMETRY);",
@@ -467,7 +587,13 @@ mod tests {
              UPDATE bsrc SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
-        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let sql = unmatched_buildings_sql(
+            &BDOT10K,
+            "bsrc",
+            "b.LOKALNYID",
+            (14.0, 49.0, 25.0, 55.0),
+            None,
+        );
         let ids: Vec<String> = {
             let mut s = c.prepare(&sql).unwrap();
             s.query_map([], |r| r.get(0))
@@ -519,7 +645,13 @@ mod tests {
             "fixture must reproduce a centroid landing outside every OSM way"
         );
 
-        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let sql = unmatched_buildings_sql(
+            &BDOT10K,
+            "bsrc",
+            "b.LOKALNYID",
+            (14.0, 49.0, 25.0, 55.0),
+            None,
+        );
         let ids: Vec<String> = {
             let mut s = c.prepare(&sql).unwrap();
             s.query_map([], |r| r.get(0))
@@ -549,7 +681,13 @@ mod tests {
              UPDATE bsrc SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
-        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let sql = unmatched_buildings_sql(
+            &BDOT10K,
+            "bsrc",
+            "b.LOKALNYID",
+            (14.0, 49.0, 25.0, 55.0),
+            None,
+        );
         let ids: Vec<String> = {
             let mut s = c.prepare(&sql).unwrap();
             s.query_map([], |r| r.get(0))
@@ -569,6 +707,18 @@ mod tests {
     /// ever goes back to wrapping the indexed column in `ST_Centroid()`, this
     /// fails, because an RTREE index cannot be used through a function
     /// applied to the indexed column.
+    ///
+    /// Asserts against `EXPLAIN (FORMAT JSON)`, not the default box-drawing
+    /// pretty-printer, and that is deliberate. The pretty-printer sizes its
+    /// boxes to fit the plan's width and *truncates operator labels* in a wide
+    /// multi-branch plan — adding the user-report veto made this plan wide
+    /// enough that `RTREE_INDEX_SCAN` rendered as `RTREE_INDE...` and this
+    /// assertion failed while the index was still very much in use (verified
+    /// against the JSON plan, which showed `RTREE_INDEX_SCAN` on `bsrc` via
+    /// `bsrc_centroid_idx`). Elsewhere in this codebase that hazard is worked
+    /// around by asserting the substring `"RTREE_IN"`; JSON is the better
+    /// answer, because it also lets the *index name* be pinned, so the test
+    /// cannot pass on some unrelated table's R-tree scan.
     #[test]
     fn unmatched_buildings_predicate_uses_the_centroid_rtree_index() {
         let c = conn();
@@ -583,8 +733,14 @@ mod tests {
         )
         .unwrap();
 
-        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (20.5, 52.0, 20.6, 52.1), None);
-        let mut stmt = c.prepare(&format!("EXPLAIN {sql}")).unwrap();
+        let sql = unmatched_buildings_sql(
+            &BDOT10K,
+            "bsrc",
+            "b.LOKALNYID",
+            (20.5, 52.0, 20.6, 52.1),
+            None,
+        );
+        let mut stmt = c.prepare(&format!("EXPLAIN (FORMAT JSON) {sql}")).unwrap();
         let mut rows = stmt.query([]).unwrap();
         let mut plan = String::new();
         while let Some(row) = rows.next().unwrap() {
@@ -593,6 +749,11 @@ mod tests {
         assert!(
             plan.contains("RTREE_INDEX_SCAN"),
             "the predicate must be able to use the centroid RTREE index, got plan: {plan}"
+        );
+        assert!(
+            plan.contains("bsrc_centroid_idx"),
+            "the R-tree scan must be the source table's centroid index, not some \
+             other table's, got plan: {plan}"
         );
     }
 
@@ -686,7 +847,13 @@ mod tests {
                   ST_MakeEnvelope(20.9999,51.9999,21.0011,52.0011));",
         )
         .unwrap();
-        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let sql = unmatched_buildings_sql(
+            &BDOT10K,
+            "bsrc",
+            "b.LOKALNYID",
+            (14.0, 49.0, 25.0, 55.0),
+            None,
+        );
         let ids: Vec<String> = {
             let mut s = c.prepare(&sql).unwrap();
             s.query_map([], |r| r.get(0))
@@ -722,7 +889,13 @@ mod tests {
              UPDATE bsrc SET centroid = ST_Centroid(geom);",
         )
         .unwrap();
-        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let sql = unmatched_buildings_sql(
+            &BDOT10K,
+            "bsrc",
+            "b.LOKALNYID",
+            (14.0, 49.0, 25.0, 55.0),
+            None,
+        );
         let ids: Vec<String> = {
             let mut s = c.prepare(&sql).unwrap();
             s.query_map([], |r| r.get(0))
@@ -757,7 +930,13 @@ mod tests {
             .unwrap();
         assert_eq!(empty_osm_buildings, 0, "sanity: osm_buildings is empty");
 
-        let sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", (14.0, 49.0, 25.0, 55.0), None);
+        let sql = unmatched_buildings_sql(
+            &BDOT10K,
+            "bsrc",
+            "b.LOKALNYID",
+            (14.0, 49.0, 25.0, 55.0),
+            None,
+        );
         let ids: Vec<String> = {
             let mut s = c.prepare(&sql).unwrap();
             s.query_map([], |r| r.get(0))
@@ -794,7 +973,7 @@ mod tests {
         .unwrap();
         let area = (14.0, 49.0, 25.0, 55.0);
 
-        let unmatched_sql = unmatched_buildings_sql("bsrc", "b.LOKALNYID", area, None);
+        let unmatched_sql = unmatched_buildings_sql(&BDOT10K, "bsrc", "b.LOKALNYID", area, None);
         let unmatched: Vec<String> = {
             let mut s = c.prepare(&unmatched_sql).unwrap();
             s.query_map([], |r| r.get(0))
@@ -837,6 +1016,7 @@ mod tests {
         )
         .unwrap();
         let sql = unmatched_buildings_sql(
+            &BDOT10K,
             "bsrc",
             "b.LOKALNYID",
             (14.0, 49.0, 25.0, 55.0),
@@ -922,6 +1102,7 @@ mod tests {
 
     fn unmatched_addr_ids(c: &duckdb::Connection) -> Vec<String> {
         let sql = unmatched_addresses_in_cell_sql(
+            &PRG,
             "asrc",
             "a.lokalny_id",
             ADDR_AREA,
@@ -1241,6 +1422,7 @@ mod tests {
         .unwrap();
         let area = (20.5, 51.99, 20.6, 52.01);
         let sql = unmatched_addresses_in_cell_sql(
+            &PRG,
             "asrc",
             "a.lokalny_id",
             area,

@@ -173,6 +173,42 @@
     <button id="download-feedback-close" type="button" class="feedback-modal-close">Zamknij</button>
   </dialog>
 
+  <!-- Reporting an object as one that should not be proposed for import.
+       Opened from the "Zgłoś problem" button in a feature popup; posts to
+       /report. The reason list mirrors reports::Reason in the Rust source --
+       see the REPORT_REASONS sync-point comment in app.js. -->
+  <dialog id="report-modal" class="feedback-modal">
+    <h2 id="report-modal-title">Zgłoś problem z obiektem</h2>
+    <dl class="feedback-modal-details">
+      <div>
+        <dt>Obiekt</dt>
+        <dd id="report-modal-object"></dd>
+      </div>
+    </dl>
+    <!-- Deliberately not wrapped in a <form>. A <form method="dialog"> would
+         give the radios implicit submission, so Enter on a focused radio
+         would close the dialog with the report unsent; nothing here needs
+         form semantics, since same-name radios group without one. -->
+    <div>
+      <fieldset class="report-reasons">
+        <legend>Powód</legend>
+        <label><input type="radio" name="report-reason" value="does_not_exist" checked> Obiekt nie istnieje w terenie</label>
+        <label><input type="radio" name="report-reason" value="bad_geometry"> Błędna geometria</label>
+        <label><input type="radio" name="report-reason" value="bad_attributes"> Błędne atrybuty</label>
+        <label><input type="radio" name="report-reason" value="already_in_osm"> Jest już w OSM (porównanie nie wykryło)</label>
+        <label><input type="radio" name="report-reason" value="duplicate"> Duplikat innego rekordu</label>
+        <label><input type="radio" name="report-reason" value="other"> Inne (wymaga opisu)</label>
+      </fieldset>
+      <label class="report-note-label" for="report-note">Opis (opcjonalny)</label>
+      <textarea id="report-note" rows="3" maxlength="500"></textarea>
+      <p id="report-modal-text" role="status" aria-live="polite"></p>
+      <div class="report-modal-actions">
+        <button id="report-submit" type="button" class="download-btn">Wyślij zgłoszenie</button>
+        <button id="report-cancel" type="button" class="feedback-modal-close">Anuluj</button>
+      </div>
+    </div>
+  </dialog>
+
   <section class="panel panel-status" aria-label="Status zadań">
     <button
       id="status-toggle"

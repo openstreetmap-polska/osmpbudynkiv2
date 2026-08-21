@@ -91,7 +91,7 @@ mod tests {
         // so a bare `init_db` doesn't have them -- `enqueue_all` needs at
         // least empty tables to select from.
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);
              CREATE TABLE prg_addresses (lokalny_id VARCHAR, geom GEOMETRY);",
         )

@@ -636,6 +636,14 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     return key in ATTRIBUTE_LABELS ? ATTRIBUTE_LABELS[key] : key;
   }
 
+  // The one deliberate exception to attributeLabel's fall-through: BDOT10k's
+  // PRZESTRZENNAZW is carried by BUILDINGS_MVT_SQL purely so a report can name
+  // a complete BDOT10k identity -- its key is the composite
+  // (PRZESTRZENNAZW, LOKALNYID), see reportKeyFor below. It's a namespace
+  // identifier, not information about the building, so it's read by the report
+  // builder and kept out of the displayed attribute list.
+  const POPUP_HIDDEN_ATTRIBUTES = new Set(["PRZESTRZENNAZW"]);
+
   // ADDRESSES_MVT_SQL has no single `tags` column like BUILDINGS_MVT_SQL --
   // it projects the OSM tag preview as separate addr:*/source:addr columns
   // directly on the feature (see the "addresses -- OSM tag preview" group in
@@ -781,6 +789,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         tags = parseTags(props[key]);
         continue;
       }
+      if (POPUP_HIDDEN_ATTRIBUTES.has(key)) continue;
       if (ADDRESS_TAG_KEYS.has(key)) {
         tags.push([key, formatValue(key, props[key])]);
         continue;
@@ -794,6 +803,8 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       status: layerId.includes("unmatched") ? "Niedopasowany" : "W rejestrze",
       attributes,
       tags,
+      // null for anything not reportable -- see reportKeyFor.
+      report: reportKeyFor(layerId, props),
     };
   }
 
@@ -808,7 +819,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     return `<h4 class="feature-popup-section">${escapeHtml(heading)}</h4><dl>${rowsHtml}</dl>`;
   }
 
-  function popupHtml({ title, status, attributes, tags }) {
+  function popupHtml({ title, status, attributes, tags, report }) {
     // Each present only when it has rows -- a feature with no OSM-tag preview
     // (or, in principle, no plain attributes) shows a single section rather
     // than an empty one with nothing under its heading.
@@ -817,10 +828,19 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       "Tagi OSM",
       tags.map(([key, value]) => [key, key, value === "" ? "—" : value])
     );
+    // The button carries no identity of its own: the object it refers to lives
+    // in popupReport, set by the same handler that built this HTML. Encoding
+    // the key into a data- attribute instead would need an attribute-safe
+    // escaper, and escapeHtml is not one -- it defers to innerHTML
+    // serialization, which leaves quotes untouched.
+    const actionsHtml = report
+      ? `<div class="feature-popup-actions">` +
+        `<button type="button" class="report-btn">Zgłoś problem</button></div>`
+      : "";
     return (
       `<div class="feature-popup"><h3>${escapeHtml(title)}` +
       `<span class="feature-status">${escapeHtml(status)}</span></h3>` +
-      `<div class="feature-popup-body">${attributesHtml}${tagsHtml}</div></div>`
+      `<div class="feature-popup-body">${attributesHtml}${tagsHtml}</div>${actionsHtml}</div>`
     );
   }
 
@@ -846,10 +866,11 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   map.on("click", CLICKABLE_LAYERS, (e) => {
     if (appDrawState === "drawing") return;
     const feature = e.features[0];
-    popup
-      .setLngLat(e.lngLat)
-      .setHTML(popupHtml(describeFeature(feature.layer.id, feature.properties)))
-      .addTo(map);
+    const described = describeFeature(feature.layer.id, feature.properties);
+    popupReport = described.report
+      ? { target: described.report, label: reportLabel(described.title, described.report) }
+      : null;
+    popup.setLngLat(e.lngLat).setHTML(popupHtml(described)).addTo(map);
   });
   map.on("click", (e) => {
     if (appDrawState === "drawing") return;
@@ -871,6 +892,207 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   map.on("mouseleave", CLICKABLE_LAYERS, () => {
     if (appDrawState === "drawing") return;
     map.getCanvas().style.cursor = "";
+  });
+
+  // ---- reporting an object ----
+  //
+  // POST /report (src/server/reports.rs) records "stop proposing this object
+  // for import". The report vetoes the object out of <source>_unmatched from
+  // the moment the match_refresh drain reaches the z14 cell the insert
+  // enqueued -- so it disappears from this map's unmatched layers, /package
+  // and JOSM, and comes back on its own once the underlying government record
+  // changes. Nothing about the submitter is sent or stored.
+  //
+  // Sync point: the reason values in #report-modal's radios mirror
+  // reports::Reason (src/reports/mod.rs), and REPORT_NOTE_REQUIRED mirrors the
+  // one member of that vocabulary the server rejects without a note. Both are
+  // kept in step by hand, like BDOT10K_EKSPLOATOWANY above -- nothing
+  // generates a contract between the two languages, and a drifted value here
+  // surfaces as a 400 rather than as anything silent.
+  const REPORT_NOTE_REQUIRED = "other";
+
+  // Short registry names for the modal's object line. Deliberately not
+  // DATASET_LABELS (the /package layer picker further down), whose values name
+  // a layer ("Budynki (BDOT10k)") rather than a registry and would read
+  // redundantly next to the feature's own title.
+  const REGISTRY_LABELS = { bdot10k: "BDOT10k", egib: "EGiB", prg: "PRG" };
+
+  // Assigned by the CLICKABLE_LAYERS click handler above and read by the
+  // delegated .report-btn listener below; null whenever the open popup is for
+  // something not reportable. Declared after its writer for the same reason
+  // appDrawState is: both only ever run from a later user gesture.
+  let popupReport = null;
+
+  // The identity a report needs, per layer, because each MVT select projects a
+  // different one (src/server/tiles.rs). BUILDINGS_MVT_SQL emits `source` +
+  // `id` + `PRZESTRZENNAZW` -- the last NULL for egib, and ST_AsMVT drops NULL
+  // attributes, so an egib feature simply carries no such property.
+  // ADDRESSES_MVT_SQL emits `lokalny_id` and no `source` at all, prg being the
+  // only address registry, so it is named here instead of read off the
+  // feature. The key column names must match DatasetSpec.key_columns exactly
+  // (src/dataset.rs) -- the server exact-matches the set rather than looking
+  // each one up, so a stray or missing column is a 400, not a silent misread.
+  //
+  // Returns null for every layer but the two unmatched ones. Reporting a
+  // matched object would store a row that changes nothing anyone can see (the
+  // veto only removes rows from *_unmatched), and the z12-13 `points` layer
+  // carries no id to key on at all -- both consistent with CLICKABLE_LAYERS
+  // already being z14-only.
+  function reportKeyFor(layerId, props) {
+    if (layerId === "buildings-unmatched-fill") {
+      if (props.source === "bdot10k") {
+        if (!props.PRZESTRZENNAZW || !props.id) return null;
+        return {
+          source: "bdot10k",
+          key: { PRZESTRZENNAZW: String(props.PRZESTRZENNAZW), LOKALNYID: String(props.id) },
+        };
+      }
+      if (props.source === "egib") {
+        if (!props.id) return null;
+        return { source: "egib", key: { id_budynku: String(props.id) } };
+      }
+      return null;
+    }
+    if (layerId === "addresses-unmatched-circle") {
+      if (!props.lokalny_id) return null;
+      return { source: "prg", key: { lokalny_id: String(props.lokalny_id) } };
+    }
+    return null;
+  }
+
+  function reportLabel(title, report) {
+    const registry = REGISTRY_LABELS[report.source] || report.source;
+    return `${title} — ${registry} — ${Object.values(report.key).join(" / ")}`;
+  }
+
+  const reportModal = document.getElementById("report-modal");
+  const reportModalObject = document.getElementById("report-modal-object");
+  const reportModalText = document.getElementById("report-modal-text");
+  const reportNote = document.getElementById("report-note");
+  const reportSubmit = document.getElementById("report-submit");
+  const reportCancel = document.getElementById("report-cancel");
+
+  // The object the open dialog is about. Cleared on close so a target can
+  // never outlive the dialog opening that set it.
+  let reportTarget = null;
+
+  function setReportFeedback(message, state) {
+    reportModalText.textContent = message;
+    if (state) {
+      reportModal.dataset.state = state;
+    } else {
+      delete reportModal.dataset.state;
+    }
+  }
+
+  // Shared with runDownload further down: an error body is read as text first
+  // because res.json() consumes the same stream, so a failed parse would leave
+  // no way to fall back to the raw text. Both endpoints render a 400 the same
+  // way ({"error": "..."} via server::error_response), so both want this.
+  async function readErrorDetail(res) {
+    try {
+      const bodyText = (await res.text()).trim();
+      try {
+        return JSON.parse(bodyText)?.error || bodyText || null;
+      } catch {
+        return bodyText || null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  function statusText(res) {
+    return `${res.status}${res.statusText ? ` ${res.statusText}` : ""}`;
+  }
+
+  // Delegated rather than bound to the button, because MapLibre replaces the
+  // popup's entire inner HTML on every setHTML and any listener bound to the
+  // old button would go with it. The guard is the same one every other map
+  // interaction handler carries: an already-open popup survives entering
+  // drawing mode, so its button is still clickable there.
+  map.getContainer().addEventListener("click", (e) => {
+    if (appDrawState === "drawing") return;
+    if (!e.target.closest || !e.target.closest(".report-btn")) return;
+    if (!popupReport) return;
+    reportTarget = popupReport.target;
+    reportModalObject.textContent = popupReport.label;
+    reportNote.value = "";
+    setReportFeedback("", null);
+    reportSubmit.disabled = false;
+    if (!reportModal.open) reportModal.showModal();
+  });
+
+  reportCancel.addEventListener("click", () => reportModal.close());
+  // Same light-dismiss handling as #download-feedback: a click landing on the
+  // dialog element itself but outside its content box is a backdrop click.
+  reportModal.addEventListener("click", (e) => {
+    if (e.target === reportModal) reportModal.close();
+  });
+  reportModal.addEventListener("close", () => {
+    reportTarget = null;
+  });
+
+  reportSubmit.addEventListener("click", async () => {
+    if (!reportTarget) return;
+    const checked = reportModal.querySelector('input[name="report-reason"]:checked');
+    const reason = checked ? checked.value : null;
+    const note = reportNote.value.trim();
+    if (!reason) {
+      setReportFeedback("Wybierz powód zgłoszenia.", "error");
+      return;
+    }
+    // Checked here as well as on the server so the common mistake costs a
+    // round trip's worth of nothing; the server's check is the real one.
+    if (reason === REPORT_NOTE_REQUIRED && note === "") {
+      setReportFeedback("Powód „Inne” wymaga opisu.", "error");
+      return;
+    }
+
+    reportSubmit.disabled = true;
+    setReportFeedback("Wysyłanie…", null);
+    try {
+      const res = await fetch("/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason, note: note || null, objects: [reportTarget] }),
+      });
+      if (!res.ok) {
+        const detail = await readErrorDetail(res);
+        setReportFeedback(
+          detail ? `Błąd ${statusText(res)}: ${detail}` : `Zgłoszenie nie powiodło się (${statusText(res)})`,
+          "error",
+        );
+        reportSubmit.disabled = false;
+        return;
+      }
+      const data = await res.json();
+      if (data.accepted && data.accepted.length) {
+        // No optimistic client-side hiding of the reported feature. The
+        // unmatched layers already carry a legend-driven `filter` (see
+        // sourceFilter), so a report-driven setFilter would fight the source
+        // toggle for ownership of it -- and the drain that really removes the
+        // object runs on the order of seconds, after which the next tile fetch
+        // shows the truth. Saying so is more honest than faking it.
+        setReportFeedback(
+          "Zgłoszenie przyjęte. Obiekt zniknie z warstwy niedopasowanych po najbliższym odświeżeniu danych.",
+          "ok",
+        );
+        popup.remove();
+        popupReport = null;
+      } else {
+        const rejected = data.rejected && data.rejected[0];
+        setReportFeedback(
+          rejected && rejected.error ? `Zgłoszenie odrzucone: ${rejected.error}` : "Zgłoszenie odrzucone.",
+          "error",
+        );
+        reportSubmit.disabled = false;
+      }
+    } catch (err) {
+      setReportFeedback(`Błąd sieci: ${err.message || err}`, "error");
+      console.error("report submission failed", err);
+      reportSubmit.disabled = false;
+    }
   });
 
   // ---- state <-> URL hash ----
@@ -2063,20 +2285,8 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     try {
       const res = await fetch(request.url, request.init);
       if (!res.ok) {
-        // Read the body as text first -- res.json() consumes the same stream,
-        // so a failed .json() parse would leave no way to fall back to raw text.
-        let detail = null;
-        try {
-          const bodyText = (await res.text()).trim();
-          try {
-            detail = JSON.parse(bodyText)?.error || bodyText || null;
-          } catch {
-            detail = bodyText || null;
-          }
-        } catch {
-          detail = null;
-        }
-        const statusPart = `${res.status}${res.statusText ? ` ${res.statusText}` : ""}`;
+        const detail = await readErrorDetail(res);
+        const statusPart = statusText(res);
         setFeedback(detail ? `Błąd ${statusPart}: ${detail}` : `Żądanie nie powiodło się (${statusPart})`, "error");
         return;
       }

@@ -5,9 +5,11 @@ use tracing::info;
 use crate::compare::columns::classification_columns;
 use crate::compare::in_transaction;
 use crate::compare::rule::{
-    BDOT10K_EKSPLOATOWANY_FILTER, suppressed_buildings_sql, unmatched_buildings_sql,
+    BDOT10K_EKSPLOATOWANY_FILTER, reported_buildings_sql, suppressed_buildings_sql,
+    unmatched_buildings_sql,
 };
 use crate::compare::totals;
+use crate::dataset::{BDOT10K, DatasetSpec, EGIB};
 use crate::tile_math::{cell_x_sql, cell_y_sql};
 use crate::utils::format_duration;
 
@@ -17,8 +19,7 @@ const GRID_STEP: f64 = 0.5;
 pub fn compare_bdot10k(conn: &Connection) -> Result<()> {
     compare_buildings(
         conn,
-        "bdot10k",
-        "bdot10k_buildings",
+        &BDOT10K,
         "LOKALNYID",
         "bdot10k_unmatched",
         Some(BDOT10K_EKSPLOATOWANY_FILTER),
@@ -26,28 +27,24 @@ pub fn compare_bdot10k(conn: &Connection) -> Result<()> {
 }
 
 pub fn compare_egib(conn: &Connection) -> Result<()> {
-    compare_buildings(
-        conn,
-        "egib",
-        "egib_buildings",
-        "id_budynku",
-        "egib_unmatched",
-        None,
-    )
+    compare_buildings(conn, &EGIB, "id_budynku", "egib_unmatched", None)
 }
 
+/// `spec` replaces what used to be a separate `label`/`source_table` pair:
+/// `spec.name` is the label (identical to `match_dirty_cells.source`) and
+/// `spec.table` the live table, so the two can no longer be passed
+/// inconsistently, and the user-report veto gets the key columns it correlates
+/// on from the same place.
 fn compare_buildings(
     conn: &Connection,
-    label: &str,
-    source_table: &str,
+    spec: &DatasetSpec,
     id_col: &str,
     dest: &str,
     extra_filter: Option<&str>,
 ) -> Result<()> {
     compare_buildings_with_cancel(
         conn,
-        label,
-        source_table,
+        spec,
         id_col,
         dest,
         extra_filter,
@@ -63,13 +60,14 @@ fn compare_buildings(
 /// passes `&crate::shutdown::is_requested`.
 fn compare_buildings_with_cancel(
     conn: &Connection,
-    label: &str,
-    source_table: &str,
+    spec: &DatasetSpec,
     id_col: &str,
     dest: &str,
     extra_filter: Option<&str>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
+    let label = spec.name;
+    let source_table = spec.table;
     info!(source = label, "Comparing buildings against OSM");
     let t = std::time::Instant::now();
 
@@ -129,7 +127,8 @@ fn compare_buildings_with_cancel(
                 }
                 let (x_hi, y_hi) = (x + GRID_STEP, y + GRID_STEP);
                 let area = (x, y, x_hi, y_hi);
-                let inner = unmatched_buildings_sql(source_table, &select, area, extra_filter);
+                let inner =
+                    unmatched_buildings_sql(spec, source_table, &select, area, extra_filter);
                 // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
                 // closed on all four cell edges, so a centroid exactly on a grid
                 // line would satisfy two neighbouring cells' predicates. Restrict
@@ -205,8 +204,33 @@ fn compare_buildings_with_cancel(
     } else {
         0
     };
+    // The user-report veto's own count, on exactly the same terms as
+    // `suppressed` above: gated on an instant read so a database with no
+    // reports (and every test fixture) pays nothing, and phrased CTE-first by
+    // `reported_buildings_sql` so the whole-extent run cannot reproduce the
+    // OOM described there. Without this number, a reported building would be
+    // indistinguishable from a matched one in this log line -- and this is
+    // precisely the number an operator checks to see whether reporting works.
+    let active_reports: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM object_reports WHERE source = ? AND status = ?",
+            duckdb::params![spec.name, crate::compare::rule::REPORT_ACTIVE],
+            |r| r.get(0),
+        )
+        .context("Failed to count active object_reports")?;
+    let reported: i64 = if active_reports > 0 {
+        conn.query_row(
+            &reported_buildings_sql(spec, source_table, "COUNT(*)", extent, extra_filter),
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("Failed to count reported rows for {label}"))?
+    } else {
+        0
+    };
     info!(
-        source = label, total, unmatched, suppressed, matched = total - unmatched - suppressed,
+        source = label, total, unmatched, suppressed, reported,
+        matched = total - unmatched - suppressed - reported,
         elapsed = %format_duration(t.elapsed()),
         "buildings comparison complete"
     );
@@ -306,7 +330,7 @@ mod tests {
     fn writes_only_unmatched_rows_with_cell_tags() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -346,7 +370,7 @@ mod tests {
     fn compare_is_idempotent() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -372,7 +396,7 @@ mod tests {
     fn refuses_to_build_a_grid_around_a_wild_coordinate() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -403,7 +427,7 @@ mod tests {
     fn covers_a_row_outside_the_historical_poland_bbox() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -441,7 +465,7 @@ mod tests {
     fn compare_chunked_duplicates_source_on_cell_boundary() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -483,7 +507,7 @@ mod tests {
     fn excludes_non_eksploatowany_buildings_from_unmatched_and_totals() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR,
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -522,7 +546,7 @@ mod tests {
     fn former_building_excludes_from_unmatched_but_cell_totals_still_counts_it() {
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -587,7 +611,7 @@ mod tests {
 
         let conn = setup();
         conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+            "CREATE TABLE bdot10k_buildings (PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR, LICZBAKONDYGNACJI SMALLINT,
                  KATEGORIAISTNIENIA VARCHAR DEFAULT 'eksploatowany',
                  NAZWA VARCHAR, FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -613,8 +637,7 @@ mod tests {
 
         let err = compare_buildings_with_cancel(
             &conn,
-            "bdot10k",
-            "bdot10k_buildings",
+            &BDOT10K,
             "LOKALNYID",
             "bdot10k_unmatched",
             Some(BDOT10K_EKSPLOATOWANY_FILTER),

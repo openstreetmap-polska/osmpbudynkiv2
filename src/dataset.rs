@@ -136,7 +136,119 @@ impl DatasetSpec {
             (None, None) => "(FALSE)".to_string(),
         }
     }
+
+    /// SQL for this source's record key under `alias`, as a `VARCHAR[]` list
+    /// literal in `key_columns` order: `[a.k1::VARCHAR, a.k2::VARCHAR]`.
+    ///
+    /// The list shape exists because BDOT10k's key is the composite
+    /// `(PRZESTRZENNAZW, LOKALNYID)` while EGIB's and PRG's are single columns,
+    /// and `object_reports` stores all three in one table. The `::VARCHAR`
+    /// casts are not decoration: every key column happens to be `VARCHAR`
+    /// today, so an uncast list would work by accident, and a future source
+    /// with a numeric key would silently produce a list of a different type
+    /// that compares equal to nothing.
+    ///
+    /// **DuckDB's list `=` treats NULL as equal to NULL** -- verified, not
+    /// assumed: `[NULL] = [NULL]` is `true` and `[NULL,'x'] = ['a','x']` is
+    /// `false`, i.e. the `EXCEPT`/`IS NOT DISTINCT FROM` semantics, not scalar
+    /// `=`'s. So a NULL-keyed report *would* match a NULL-keyed live record
+    /// rather than harmlessly matching nothing, and the thing preventing a
+    /// silent wrong-row veto is that neither can exist: `non_null_key_sql`
+    /// drops NULL-keyed records at load, and `reports::insert` resolves every
+    /// report against a live row before storing it. Do not relax either on the
+    /// assumption that NULL is inert here.
+    pub fn key_list_sql(&self, alias: &str) -> String {
+        let items = self
+            .key_columns
+            .iter()
+            .map(|c| format!("{alias}.{c}::VARCHAR"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{items}]")
+    }
+
+    /// A digest of everything this source treats as *content*, for detecting
+    /// that a record has changed since some earlier point in time without
+    /// having a second copy of it to diff against.
+    ///
+    /// Built from the same `compared_columns` + `compare_geometry` as
+    /// [`changed_predicate_sql`], and that pairing is the whole point: "did
+    /// this record change" must have one answer, whether it is asked by the
+    /// refresh diff (which has both versions in hand) or by
+    /// `reports::reconcile_source` (which has only a stored signature). If the
+    /// two ever disagree, a user report either lapses while its object is
+    /// unchanged or survives a change that should have revived the object.
+    /// `dataset::tests::signature_changes_exactly_when_the_diff_says_modified`
+    /// pins them together.
+    ///
+    /// **This is not the old `_row_hash`/`ROW_HASH_VERSION`, and the difference
+    /// is the entire reason that mechanism was removed.** `_row_hash` hashed
+    /// *every* column of *every* row, so it could not tell a record changing
+    /// from its serialization changing -- one BDOT10k re-export rewrote all
+    /// 16,344,762 rows and enqueued every z14 cell in Poland. This hashes only
+    /// the curated compared set (BDOT10k's excludes geometry for exactly that
+    /// reason), and it is only ever evaluated for rows that carry a report:
+    /// `O(active reports)`, never `O(source table)`. It cannot cause a
+    /// full-table rewrite because nothing rewrites a table on its account.
+    ///
+    /// NULL handling is explicit because DuckDB's `concat` *skips* NULL inputs
+    /// rather than propagating them, which would make `(NULL, 'x')` and
+    /// `('x', NULL)` hash identically. Each element is `COALESCE`d to a
+    /// sentinel and elements are separated, so neither can happen.
+    ///
+    /// Geometry is digested as `hex(ST_AsWKB(...))` rather than the bare
+    /// `GEOMETRY`, matching `changed_predicate_sql`'s reason for `ST_AsWKB`:
+    /// native geometry comparison measured 24.18s against 2.50s on the real
+    /// 17.5M-row EGIB table.
+    pub fn content_signature_sql(&self, alias: &str) -> String {
+        // chr(30) = record separator, chr(31) = unit separator. Both are
+        // control characters that cannot occur in these sources' text columns
+        // or in hex output, so neither a value containing the separator nor a
+        // value equal to the NULL sentinel is reachable.
+        const NULL_SENTINEL: &str = "chr(30)";
+        const SEPARATOR: &str = "chr(31)";
+
+        let mut parts: Vec<String> = self
+            .compared_columns
+            .iter()
+            .map(|c| format!("COALESCE({alias}.{c}::VARCHAR, {NULL_SENTINEL})"))
+            .collect();
+
+        if self.compare_geometry {
+            parts.push(format!(
+                "COALESCE(hex(ST_AsWKB({alias}.geom)), {NULL_SENTINEL})"
+            ));
+        }
+
+        // Nothing is compared, so nothing can ever change -- mirroring
+        // `changed_predicate_sql`'s `(FALSE)` arm. `concat()` with no arguments
+        // is a syntax error, so this case needs its own constant.
+        if parts.is_empty() {
+            return "md5('')".to_string();
+        }
+
+        format!("md5(concat({}))", parts.join(&format!(", {SEPARATOR}, ")))
+    }
 }
+
+/// Look a source up by the name it is known by everywhere else -- CLI
+/// arguments, `match_dirty_cells.source`, `object_reports.source`, job names.
+///
+/// Returns `None` rather than panicking because the one caller that matters
+/// (`server::reports`) resolves a string straight out of an HTTP request body,
+/// where an unknown source is a 400 and not a bug.
+pub fn spec_by_name(name: &str) -> Option<&'static DatasetSpec> {
+    match name {
+        "bdot10k" => Some(&BDOT10K),
+        "egib" => Some(&EGIB),
+        "prg" => Some(&PRG),
+        _ => None,
+    }
+}
+
+/// Every source, in a stable order, for callers that sweep all of them
+/// (`reports::reconcile_all`, `compare::reconcile::enqueue_all`'s shape).
+pub const ALL_SPECS: &[&DatasetSpec] = &[&BDOT10K, &EGIB, &PRG];
 
 pub const BDOT10K: DatasetSpec = DatasetSpec {
     name: "bdot10k",
@@ -643,6 +755,132 @@ pub fn drop_ordering_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property the whole report-expiry mechanism rests on:
+    /// `content_signature_sql` must differ *exactly* when
+    /// `changed_predicate_sql` says the record was modified.
+    ///
+    /// If the signature were more sensitive, reports would expire on churn the
+    /// diff deliberately ignores -- reinstating exactly the PRG-version and
+    /// BDOT10k-re-serialization noise `compared_columns` was tuned to exclude.
+    /// If it were less sensitive, a corrected record would stay vetoed forever.
+    /// Neither failure produces an error; both are silent, which is why this is
+    /// a property test over a matrix rather than a couple of examples.
+    #[test]
+    fn signature_changes_exactly_when_the_diff_says_modified() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+
+        // Pairs of (a, b, geom) values covering: identical rows, each compared
+        // column moving alone, geometry moving alone, NULL appearing and
+        // disappearing, NULL-vs-NULL (which must NOT read as changed), and the
+        // ('x', NULL) / (NULL, 'x') transposition -- the case a naive
+        // `concat` would hash identically, because DuckDB's concat skips NULLs
+        // rather than propagating them.
+        conn.execute_batch(
+            "CREATE TABLE l (id VARCHAR, a VARCHAR, b VARCHAR, geom GEOMETRY);
+             CREATE TABLE s (id VARCHAR, a VARCHAR, b VARCHAR, geom GEOMETRY);
+             INSERT INTO l VALUES
+                 ('same',      'x',  'y',  ST_Point(1,1)),
+                 ('a_moved',   'x',  'y',  ST_Point(1,1)),
+                 ('b_moved',   'x',  'y',  ST_Point(1,1)),
+                 ('geom_moved','x',  'y',  ST_Point(1,1)),
+                 ('to_null',   'x',  'y',  ST_Point(1,1)),
+                 ('from_null', NULL, 'y',  ST_Point(1,1)),
+                 ('both_null', NULL, NULL, ST_Point(1,1)),
+                 ('transposed','x',  NULL, ST_Point(1,1)),
+                 ('null_geom', 'x',  'y',  NULL);
+             INSERT INTO s VALUES
+                 ('same',      'x',  'y',  ST_Point(1,1)),
+                 ('a_moved',   'X!', 'y',  ST_Point(1,1)),
+                 ('b_moved',   'x',  'Y!', ST_Point(1,1)),
+                 ('geom_moved','x',  'y',  ST_Point(2,2)),
+                 ('to_null',   NULL, 'y',  ST_Point(1,1)),
+                 ('from_null', 'x',  'y',  ST_Point(1,1)),
+                 ('both_null', NULL, NULL, ST_Point(1,1)),
+                 ('transposed',NULL, 'x',  ST_Point(1,1)),
+                 ('null_geom', 'x',  'y',  NULL);",
+        )
+        .unwrap();
+
+        // Both polarities of `compare_geometry`, since BDOT10k excludes
+        // geometry while EGIB and PRG include it -- the signature has to track
+        // that choice, not make its own.
+        for compare_geometry in [true, false] {
+            let spec = DatasetSpec {
+                name: "test",
+                table: "l",
+                key_columns: &["id"],
+                compared_columns: &["a", "b"],
+                compare_geometry,
+                geom_kind: GeomKind::Point,
+            };
+            let sql = format!(
+                "SELECT l.id, {changed}, {sig_s} IS DISTINCT FROM {sig_l}
+                 FROM l JOIN s USING (id) ORDER BY l.id",
+                changed = spec.changed_predicate_sql("s", "l"),
+                sig_s = spec.content_signature_sql("s"),
+                sig_l = spec.content_signature_sql("l"),
+            );
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let rows: Vec<(String, bool, bool)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(rows.len(), 9, "every fixture row must be compared");
+            for (id, diff_says_changed, signature_differs) in rows {
+                assert_eq!(
+                    diff_says_changed, signature_differs,
+                    "compare_geometry={compare_geometry}, row '{id}': the diff and the \
+                     signature disagree about whether this record changed"
+                );
+            }
+        }
+    }
+
+    /// The specific trap the NULL sentinel and separator exist for: without
+    /// them, `concat` would skip NULLs and hash ('x', NULL) and (NULL, 'x')
+    /// identically, so a record whose two attributes swapped would keep its
+    /// report alive forever. Asserted directly rather than left implicit in the
+    /// matrix above, because it is the one case where a plausible simpler
+    /// implementation is silently wrong.
+    #[test]
+    fn signature_distinguishes_a_null_from_a_shifted_value() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        let spec = DatasetSpec {
+            name: "test",
+            table: "t",
+            key_columns: &["id"],
+            compared_columns: &["a", "b"],
+            compare_geometry: false,
+            geom_kind: GeomKind::Point,
+        };
+        conn.execute_batch(
+            "CREATE TABLE t (id VARCHAR, a VARCHAR, b VARCHAR);
+             INSERT INTO t VALUES ('l', 'x', NULL), ('r', NULL, 'x');",
+        )
+        .unwrap();
+        let differ: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT (SELECT {sig} FROM t WHERE id = 'l')
+                         IS DISTINCT FROM (SELECT {sig} FROM t WHERE id = 'r')",
+                    sig = spec.content_signature_sql("t"),
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(differ, "('x', NULL) and (NULL, 'x') must not hash alike");
+    }
 
     #[test]
     fn representative_point_reads_the_stored_centroid_for_polygons() {

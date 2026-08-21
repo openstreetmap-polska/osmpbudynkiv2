@@ -88,6 +88,7 @@ pub struct Config {
     pub package: PackageConfig,
     pub updates: UpdatesConfig,
     pub cache: CacheConfig,
+    pub reports: ReportsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -258,6 +259,34 @@ impl Default for MatchReconcileConfig {
     }
 }
 
+/// `jobs.reports_reconcile` — retire reports whose government record changed or
+/// disappeared. Off by default, but for a different reason than
+/// `match_reconcile` above: the cost is trivial (`O(active reports)`, not
+/// `O(source table)`), it is simply that `reports::reconcile_source` already
+/// runs inside every dataset refresh and every import, so this only ever finds
+/// something after an *offline* change — an import run against a stopped
+/// server, or a restored snapshot. See `server::jobs::reports_reconcile`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ReportsReconcileConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    /// See `JobConfig::run_on_start`.
+    pub run_on_start: bool,
+}
+
+impl Default for ReportsReconcileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: 86400,
+            timeout_seconds: 300,
+            run_on_start: false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct UpdatesConfig {
@@ -330,6 +359,7 @@ pub struct JobsConfig {
     pub prg_update: JobConfig,
     pub match_refresh: MatchRefreshConfig,
     pub match_reconcile: MatchReconcileConfig,
+    pub reports_reconcile: ReportsReconcileConfig,
     pub street_mappings_update: JobConfig,
     pub building_types_update: JobConfig,
 }
@@ -353,6 +383,7 @@ impl Default for JobsConfig {
             prg_update: daily(7200),
             match_refresh: MatchRefreshConfig::default(),
             match_reconcile: MatchReconcileConfig::default(),
+            reports_reconcile: ReportsReconcileConfig::default(),
             street_mappings_update: JobConfig {
                 enabled: false,
                 interval_seconds: 86400,
@@ -383,6 +414,34 @@ impl Default for PackageConfig {
     fn default() -> Self {
         Self {
             max_area_sq_deg: 0.04,
+        }
+    }
+}
+
+/// `POST /report`, the one endpoint where an anonymous client writes rows that
+/// change what every other user sees.
+///
+/// There is deliberately no rate limit and nothing identifying the submitter is
+/// stored -- see the `object_reports` comment in `db::create_schema`. The
+/// controls are the two below plus after-the-fact `reports revoke --since`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ReportsConfig {
+    /// Master switch. `false` makes `POST /report` a 404 without a redeploy --
+    /// the operator's immediate answer to abuse, since nothing else throttles
+    /// the endpoint.
+    pub enabled: bool,
+    /// Cap on objects per request. Bounds one request, not a sequence of them:
+    /// its real job is to make a mis-drawn bulk selection cheap to recover from
+    /// rather than to stop a determined abuser.
+    pub max_objects_per_request: usize,
+}
+
+impl Default for ReportsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_objects_per_request: 100,
         }
     }
 }
@@ -442,6 +501,7 @@ impl Default for Config {
             package: PackageConfig::default(),
             updates: UpdatesConfig::default(),
             cache: CacheConfig::default(),
+            reports: ReportsConfig::default(),
         }
     }
 }
