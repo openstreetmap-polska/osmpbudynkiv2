@@ -565,35 +565,6 @@ button {
 /* ---- report modal (#report-modal) ----
    Shares .feedback-modal's box, backdrop and data-state colouring with
    #download-feedback; only the form inside it is new. */
-.report-reasons {
-  margin: 0 0 12px;
-  padding: 0;
-  border: none;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  font-size: 12px;
-}
-.report-reasons legend {
-  padding: 0;
-  margin-bottom: 6px;
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--ink-soft);
-}
-.report-reasons label {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  cursor: pointer;
-}
-.report-reasons input {
-  flex: none;
-  margin: 0;
-  accent-color: var(--accent);
-}
 .report-note-label {
   display: block;
   margin-bottom: 4px;

@@ -23,7 +23,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::dataset::spec_by_name;
-use crate::reports::{self, Outcome, Reason, ReportTarget};
+use crate::reports::{self, Outcome, ReportTarget};
 use crate::server::AppState;
 
 /// One object in a request body. `key` is a map rather than a positional array
@@ -38,7 +38,6 @@ struct ObjectBody {
 
 #[derive(Debug, Deserialize)]
 struct ReportBody {
-    reason: String,
     #[serde(default)]
     note: Option<String>,
     objects: Vec<ObjectBody>,
@@ -70,7 +69,6 @@ struct ReportResponse {
 #[derive(Debug)]
 struct ValidRequest {
     targets: Vec<ReportTarget>,
-    reason: Reason,
     note: Option<String>,
 }
 
@@ -86,21 +84,10 @@ fn parse_report_body(body: &str, max_objects: usize) -> Result<ValidRequest, Str
     let parsed: ReportBody =
         serde_json::from_str(body).map_err(|e| format!("invalid JSON body: {e}"))?;
 
-    let reason = Reason::parse(&parsed.reason).ok_or_else(|| {
-        format!(
-            "unknown reason '{}'; expected one of: {}",
-            parsed.reason,
-            Reason::vocabulary()
-        )
-    })?;
-
     let note = parsed
         .note
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty());
-    if reason == Reason::Other && note.is_none() {
-        return Err("reason 'other' requires a note".to_string());
-    }
 
     if parsed.objects.is_empty() {
         return Err("objects must not be empty".to_string());
@@ -144,11 +131,7 @@ fn parse_report_body(body: &str, max_objects: usize) -> Result<ValidRequest, Str
         targets.push(ReportTarget { spec, key });
     }
 
-    Ok(ValidRequest {
-        targets,
-        reason,
-        note,
-    })
+    Ok(ValidRequest { targets, note })
 }
 
 pub async fn post_report(State(state): State<AppState>, body: String) -> Response {
@@ -172,12 +155,7 @@ pub async fn post_report(State(state): State<AppState>, body: String) -> Respons
             .iter()
             .map(|t| t.spec.name.to_string())
             .collect();
-        let (outcomes, stats) = reports::insert(
-            &conn,
-            &request.targets,
-            request.reason,
-            request.note.as_deref(),
-        )?;
+        let (outcomes, stats) = reports::insert(&conn, &request.targets, request.note.as_deref())?;
 
         let mut accepted = Vec::new();
         let mut rejected = Vec::new();
@@ -313,7 +291,7 @@ mod handler_tests {
         let state = state_with(true);
         let (status, body) = post(
             state.clone(),
-            r#"{"reason":"does_not_exist","objects":[
+            r#"{"objects":[
                  {"source":"bdot10k","key":{"PRZESTRZENNAZW":"04","LOKALNYID":"bud-1"}},
                  {"source":"bdot10k","key":{"PRZESTRZENNAZW":"04","LOKALNYID":"gone"}}]}"#,
         )
@@ -342,8 +320,7 @@ mod handler_tests {
     #[tokio::test]
     async fn a_rejected_request_stores_nothing() {
         for body in [
-            r#"{"reason":"nope","objects":[{"source":"bdot10k","key":{"PRZESTRZENNAZW":"04","LOKALNYID":"bud-1"}}]}"#,
-            r#"{"reason":"does_not_exist","objects":[{"source":"bdot10k","key":{"LOKALNYID":"bud-1"}}]}"#,
+            r#"{"objects":[{"source":"bdot10k","key":{"LOKALNYID":"bud-1"}}]}"#,
             r#"garbage"#,
         ] {
             let state = state_with(true);
@@ -363,10 +340,7 @@ mod handler_tests {
     #[tokio::test]
     async fn over_the_configured_cap_is_a_400() {
         let one = r#"{"source":"bdot10k","key":{"PRZESTRZENNAZW":"04","LOKALNYID":"bud-1"}}"#;
-        let body = format!(
-            r#"{{"reason":"duplicate","objects":[{},{},{}]}}"#,
-            one, one, one
-        );
+        let body = format!(r#"{{"objects":[{},{},{}]}}"#, one, one, one);
         let (status, json) = post(state_with(true), &body).await;
         assert_eq!(status, 400);
         assert!(
@@ -381,7 +355,7 @@ mod handler_tests {
     async fn the_config_kill_switch_closes_the_endpoint() {
         let (status, _) = post(
             state_with(false),
-            r#"{"reason":"does_not_exist","objects":[
+            r#"{"objects":[
                  {"source":"bdot10k","key":{"PRZESTRZENNAZW":"04","LOKALNYID":"bud-1"}}]}"#,
         )
         .await;
@@ -400,7 +374,7 @@ mod handler_tests {
                 .method("POST")
                 .uri("/report")
                 .body(Body::from(
-                    r#"{"reason":"does_not_exist","objects":[
+                    r#"{"objects":[
                          {"source":"bdot10k","key":{"PRZESTRZENNAZW":"04","LOKALNYID":"bud-1"}}]}"#
                         .to_string(),
                 ))
@@ -424,12 +398,11 @@ mod tests {
     #[test]
     fn accepts_a_well_formed_composite_key() {
         let r = parse_report_body(
-            r#"{"reason":"does_not_exist","objects":[
+            r#"{"objects":[
                  {"source":"bdot10k","key":{"PRZESTRZENNAZW":"04","LOKALNYID":"x"}}]}"#,
             MAX,
         )
         .unwrap();
-        assert_eq!(r.reason, Reason::DoesNotExist);
         // Ordered by `key_columns`, not by the JSON object's own order.
         assert_eq!(r.targets[0].key, vec!["04".to_string(), "x".to_string()]);
     }
@@ -440,7 +413,7 @@ mod tests {
     #[test]
     fn key_order_in_the_json_object_does_not_matter() {
         let a = parse_report_body(
-            r#"{"reason":"duplicate","objects":[
+            r#"{"objects":[
                  {"source":"bdot10k","key":{"LOKALNYID":"x","PRZESTRZENNAZW":"04"}}]}"#,
             MAX,
         )
@@ -449,21 +422,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_source_reason_and_oversized_batches() {
+    fn rejects_unknown_source_and_oversized_batches() {
         let cases = [
             (
-                r#"{"reason":"does_not_exist","objects":[{"source":"osm","key":{"id":"1"}}]}"#,
+                r#"{"objects":[{"source":"osm","key":{"id":"1"}}]}"#,
                 "unknown source",
             ),
-            (
-                r#"{"reason":"vandalism","objects":[{"source":"prg","key":{"lokalny_id":"a"}}]}"#,
-                "unknown reason",
-            ),
-            (
-                r#"{"reason":"duplicate","objects":[]}"#,
-                "must not be empty",
-            ),
-            (r#"{"reason":"duplicate"}"#, "invalid JSON body"),
+            (r#"{"objects":[]}"#, "must not be empty"),
+            (r#"{}"#, "invalid JSON body"),
             (r#"not json at all"#, "invalid JSON body"),
         ];
         for (body, expected) in cases {
@@ -472,7 +438,7 @@ mod tests {
         }
 
         let many = format!(
-            r#"{{"reason":"duplicate","objects":[{}]}}"#,
+            r#"{{"objects":[{}]}}"#,
             std::iter::repeat_n(r#"{"source":"prg","key":{"lokalny_id":"a"}}"#, 3)
                 .collect::<Vec<_>>()
                 .join(",")
@@ -489,7 +455,7 @@ mod tests {
     #[test]
     fn rejects_a_partial_composite_key() {
         let err = parse_report_body(
-            r#"{"reason":"does_not_exist","objects":[
+            r#"{"objects":[
                  {"source":"bdot10k","key":{"LOKALNYID":"x"}}]}"#,
             MAX,
         )
@@ -500,7 +466,7 @@ mod tests {
     #[test]
     fn rejects_a_key_with_the_right_arity_but_a_wrong_column_name() {
         let err = parse_report_body(
-            r#"{"reason":"does_not_exist","objects":[
+            r#"{"objects":[
                  {"source":"bdot10k","key":{"LOKALNYID":"x","lokalnyid":"y"}}]}"#,
             MAX,
         )
@@ -509,16 +475,9 @@ mod tests {
     }
 
     #[test]
-    fn other_requires_a_note_and_whitespace_is_not_one() {
-        for body in [
-            r#"{"reason":"other","objects":[{"source":"prg","key":{"lokalny_id":"a"}}]}"#,
-            r#"{"reason":"other","note":"   ","objects":[{"source":"prg","key":{"lokalny_id":"a"}}]}"#,
-        ] {
-            let err = parse_report_body(body, MAX).expect_err("must demand an explanation");
-            assert!(err.contains("requires a note"), "got '{err}'");
-        }
+    fn note_is_trimmed() {
         let ok = parse_report_body(
-            r#"{"reason":"other","note":" wrong shape ","objects":[
+            r#"{"note":" wrong shape ","objects":[
                  {"source":"prg","key":{"lokalny_id":"a"}}]}"#,
             MAX,
         )
@@ -529,7 +488,7 @@ mod tests {
     #[test]
     fn rejects_an_empty_key_value() {
         let err = parse_report_body(
-            r#"{"reason":"duplicate","objects":[{"source":"prg","key":{"lokalny_id":"  "}}]}"#,
+            r#"{"objects":[{"source":"prg","key":{"lokalny_id":"  "}}]}"#,
             MAX,
         )
         .expect_err("an empty id is not an id");

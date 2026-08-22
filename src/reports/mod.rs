@@ -52,75 +52,6 @@ pub const STATUS_EXPIRED: &str = "expired";
 /// decided the report was wrong.
 pub const STATUS_REVOKED: &str = "revoked";
 
-/// Why an object is being reported.
-///
-/// A closed vocabulary rather than free text, for two reasons: it is the only
-/// input a caller controls that ends up stored, and the categories are what
-/// make the reports *useful* later — `AlreadyInOsm` in particular is the
-/// "comparison mismatch" case from the roadmap line, and a pile of those is
-/// direct evidence about where `compare::rule` is too strict. Mirrored in
-/// `web/app.js`; keep the two in sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reason {
-    /// The building or address does not exist on the ground.
-    DoesNotExist,
-    /// It exists, but the registry geometry is wrong (misplaced, malformed).
-    BadGeometry,
-    /// It exists and is roughly in the right place, but its attributes are
-    /// wrong (function, house number, street).
-    BadAttributes,
-    /// OSM already has it; the match rule failed to see the correspondence.
-    AlreadyInOsm,
-    /// The registry holds it more than once.
-    Duplicate,
-    /// Anything else. Requires a note — an uncategorised report with no
-    /// explanation is not actionable by anyone.
-    Other,
-}
-
-impl Reason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Reason::DoesNotExist => "does_not_exist",
-            Reason::BadGeometry => "bad_geometry",
-            Reason::BadAttributes => "bad_attributes",
-            Reason::AlreadyInOsm => "already_in_osm",
-            Reason::Duplicate => "duplicate",
-            Reason::Other => "other",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "does_not_exist" => Reason::DoesNotExist,
-            "bad_geometry" => Reason::BadGeometry,
-            "bad_attributes" => Reason::BadAttributes,
-            "already_in_osm" => Reason::AlreadyInOsm,
-            "duplicate" => Reason::Duplicate,
-            "other" => Reason::Other,
-            _ => return None,
-        })
-    }
-
-    /// Every accepted value, for error messages and the CLI's help text.
-    pub const ALL: &'static [Reason] = &[
-        Reason::DoesNotExist,
-        Reason::BadGeometry,
-        Reason::BadAttributes,
-        Reason::AlreadyInOsm,
-        Reason::Duplicate,
-        Reason::Other,
-    ];
-
-    pub fn vocabulary() -> String {
-        Reason::ALL
-            .iter()
-            .map(|r| r.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
 /// One object a caller wants reported, already resolved to a spec.
 #[derive(Debug, Clone)]
 pub struct ReportTarget {
@@ -159,14 +90,10 @@ pub struct InsertStats {
 pub fn insert(
     conn: &Connection,
     targets: &[ReportTarget],
-    reason: Reason,
     note: Option<&str>,
 ) -> Result<(Vec<Outcome>, InsertStats)> {
     if targets.is_empty() {
         return Ok((Vec::new(), InsertStats::default()));
-    }
-    if reason == Reason::Other && note.map(str::trim).is_none_or(str::is_empty) {
-        bail!("reason 'other' requires a note");
     }
 
     conn.execute_batch("BEGIN TRANSACTION")
@@ -189,7 +116,7 @@ pub fn insert(
         let mut stats = InsertStats::default();
 
         for target in targets {
-            let inserted = insert_one(conn, target, next_id, reason, note)?;
+            let inserted = insert_one(conn, target, next_id, note)?;
             if inserted {
                 outcomes.push(Outcome::Accepted { report_id: next_id });
                 stats.accepted += 1;
@@ -225,7 +152,6 @@ fn insert_one(
     conn: &Connection,
     target: &ReportTarget,
     report_id: i64,
-    reason: Reason,
     note: Option<&str>,
 ) -> Result<bool> {
     let spec = target.spec;
@@ -242,9 +168,9 @@ fn insert_one(
 
     let sql = format!(
         "INSERT INTO object_reports
-             (report_id, source, record_key, signature, reason, note,
+             (report_id, source, record_key, signature, note,
               reported_at, cell_x, cell_y, status, resolved_at)
-         SELECT {report_id}, '{source}', {key_list}, {signature}, ?, ?,
+         SELECT {report_id}, '{source}', {key_list}, {signature}, ?,
                 now(), {cx}, {cy}, '{STATUS_ACTIVE}', NULL
          FROM {table} b
          WHERE {key_list} = list_value({placeholders})
@@ -254,7 +180,6 @@ fn insert_one(
     );
 
     let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
-    params.push(Box::new(reason.as_str().to_string()));
     params.push(Box::new(note.map(str::to_string)));
     for value in &target.key {
         params.push(Box::new(value.clone()));
@@ -534,7 +459,6 @@ pub struct ReportRow {
     pub source: String,
     pub record_key: Vec<String>,
     pub signature: Option<String>,
-    pub reason: String,
     pub note: Option<String>,
     pub reported_at: String,
     pub cell_x: Option<i32>,
@@ -600,7 +524,7 @@ pub fn list(
         None => String::new(),
     };
     let sql = format!(
-        "SELECT report_id, source, to_json(record_key)::VARCHAR, signature, reason, note,
+        "SELECT report_id, source, to_json(record_key)::VARCHAR, signature, note,
                 reported_at::VARCHAR, cell_x, cell_y, status, resolved_at::VARCHAR
          FROM object_reports {filter}
          ORDER BY report_id DESC{limit_sql}"
@@ -624,13 +548,12 @@ pub fn list(
                     })?
                 },
                 signature: r.get(3)?,
-                reason: r.get(4)?,
-                note: r.get(5)?,
-                reported_at: r.get(6)?,
-                cell_x: r.get(7)?,
-                cell_y: r.get(8)?,
-                status: r.get(9)?,
-                resolved_at: r.get(10)?,
+                note: r.get(4)?,
+                reported_at: r.get(5)?,
+                cell_x: r.get(6)?,
+                cell_y: r.get(7)?,
+                status: r.get(8)?,
+                resolved_at: r.get(9)?,
             })
         })
         .context("Failed to read object_reports")?;
@@ -666,16 +589,15 @@ pub fn import_rows(conn: &Connection, rows: &[ReportRow]) -> Result<i64> {
         for row in rows {
             conn.execute(
                 "INSERT INTO object_reports
-                     (report_id, source, record_key, signature, reason, note,
+                     (report_id, source, record_key, signature, note,
                       reported_at, cell_x, cell_y, status, resolved_at)
-                 VALUES (?, ?, CAST(? AS VARCHAR[]), ?, ?, ?, ?::TIMESTAMPTZ, ?, ?, ?,
+                 VALUES (?, ?, CAST(? AS VARCHAR[]), ?, ?, ?::TIMESTAMPTZ, ?, ?, ?,
                          ?::TIMESTAMPTZ)",
                 duckdb::params![
                     next_id,
                     row.source,
                     serde_json::to_string(&row.record_key)?,
                     row.signature,
-                    row.reason,
                     row.note,
                     row.reported_at,
                     row.cell_x,
@@ -740,11 +662,10 @@ pub fn run(conn: &Connection, action: crate::cli::ReportsAction) -> Result<()> {
             }
             for r in &rows {
                 println!(
-                    "{:>6}  {:<8} {:<9} {:<16} {}  key={:?}{}",
+                    "{:>6}  {:<8} {:<9} {}  key={:?}{}",
                     r.report_id,
                     r.source,
                     r.status,
-                    r.reason,
                     r.reported_at,
                     r.record_key,
                     r.note
@@ -905,13 +826,7 @@ mod tests {
             "precondition: the building is unmatched before anyone reports it"
         );
 
-        let (outcomes, stats) = insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::DoesNotExist,
-            None,
-        )
-        .unwrap();
+        let (outcomes, stats) = insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
         assert!(matches!(outcomes[0], Outcome::Accepted { .. }));
         assert_eq!(stats.accepted, 1);
         assert_eq!(
@@ -949,7 +864,6 @@ mod tests {
                 // keyed on LOKALNYID alone.
                 bdot_target(&["99", "bud-1"]),
             ],
-            Reason::DoesNotExist,
             None,
         )
         .unwrap();
@@ -969,20 +883,8 @@ mod tests {
     fn two_reports_on_one_object_still_suppress_exactly_one_row() {
         let c = conn();
         let (cx, cy) = seed_building(&c);
-        insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::DoesNotExist,
-            None,
-        )
-        .unwrap();
-        insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::BadGeometry,
-            None,
-        )
-        .unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
         assert_eq!(count(&c, "SELECT COUNT(*) FROM object_reports"), 2);
 
         recompute_cell(&c, "bdot10k", cx, cy).unwrap();
@@ -1004,13 +906,7 @@ mod tests {
     fn an_expired_or_revoked_report_does_not_suppress() {
         let c = conn();
         let (cx, cy) = seed_building(&c);
-        insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::DoesNotExist,
-            None,
-        )
-        .unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
         for status in [STATUS_EXPIRED, STATUS_REVOKED] {
             c.execute(
                 "UPDATE object_reports SET status = ?",
@@ -1030,13 +926,7 @@ mod tests {
     fn reconcile_expires_a_report_whose_record_changed_and_enqueues_its_cell() {
         let c = conn();
         let (cx, cy) = seed_building(&c);
-        insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::DoesNotExist,
-            None,
-        )
-        .unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
         c.execute_batch("DELETE FROM match_dirty_cells;").unwrap();
 
         // WERSJA is in BDOT10k's compared_columns, so bumping it is exactly
@@ -1067,13 +957,7 @@ mod tests {
     fn reconcile_expires_a_report_whose_record_was_removed() {
         let c = conn();
         seed_building(&c);
-        insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::DoesNotExist,
-            None,
-        )
-        .unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
         c.execute_batch("DELETE FROM bdot10k_buildings;").unwrap();
         let stats = reconcile_source(&c, &BDOT10K).unwrap();
         assert_eq!(stats.expired_removed, 1);
@@ -1084,13 +968,7 @@ mod tests {
     fn reconcile_leaves_an_unchanged_report_alone() {
         let c = conn();
         seed_building(&c);
-        insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::DoesNotExist,
-            None,
-        )
-        .unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
         c.execute_batch("DELETE FROM match_dirty_cells;").unwrap();
         let stats = reconcile_source(&c, &BDOT10K).unwrap();
         assert_eq!(stats, ReconcileStats::default(), "nothing changed upstream");
@@ -1122,7 +1000,6 @@ mod tests {
                 spec: &PRG,
                 key: vec!["adr-1".to_string()],
             }],
-            Reason::DoesNotExist,
             None,
         )
         .unwrap();
@@ -1144,31 +1021,10 @@ mod tests {
     }
 
     #[test]
-    fn reason_other_requires_a_note() {
-        let c = conn();
-        seed_building(&c);
-        let err = insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::Other,
-            Some("   "),
-        )
-        .expect_err("whitespace is not an explanation");
-        assert!(format!("{err:#}").contains("requires a note"));
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM object_reports"), 0);
-    }
-
-    #[test]
     fn revoke_since_unwinds_a_burst_and_restores_the_objects() {
         let c = conn();
         let (cx, cy) = seed_building(&c);
-        insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::DoesNotExist,
-            None,
-        )
-        .unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
         recompute_cell(&c, "bdot10k", cx, cy).unwrap();
         assert_eq!(count(&c, "SELECT COUNT(*) FROM bdot10k_unmatched"), 0);
 
@@ -1191,13 +1047,7 @@ mod tests {
     fn counts_reports_by_status() {
         let c = conn();
         seed_building(&c);
-        insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::DoesNotExist,
-            None,
-        )
-        .unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
         assert_eq!(
             counts(&c).unwrap(),
             ReportCounts {
@@ -1226,13 +1076,7 @@ mod tests {
     fn listing_without_a_limit_returns_every_report() {
         let c = conn();
         seed_building(&c);
-        insert(
-            &c,
-            &[bdot_target(&["04", "bud-1"])],
-            Reason::DoesNotExist,
-            None,
-        )
-        .unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
 
         let all = list(&c, None, None, None, None).unwrap();
         assert_eq!(all.len(), 1);

@@ -654,9 +654,9 @@ mod tests {
              -- fixture states the stored row plainly; the signature is not read
              -- by the veto (only `reports::reconcile_source` reads it).
              INSERT INTO object_reports
-                 (report_id, source, record_key, signature, reason, note,
+                 (report_id, source, record_key, signature, note,
                   reported_at, cell_x, cell_y, status, resolved_at)
-             VALUES (1, 'prg', ['m'], 'sig', 'does_not_exist', NULL,
+             VALUES (1, 'prg', ['m'], 'sig', NULL,
                      now(), NULL, NULL, 'active', NULL);
              INSERT INTO osm_addresses VALUES
                 (1,'node','12',NULL,NULL,NULL, ST_Point(21.010, 52.2102)),

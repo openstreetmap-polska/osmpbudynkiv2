@@ -403,12 +403,10 @@ Serves:
   `[package] max_area_sq_deg` config setting (default 0.04 sq deg).
 - `/updates` — recent `/package` export activity (timestamp, area, datasets, feature counts) as GeoJSON, `Cache-Control: public, max-age=60`. A background job prunes entries older than `[jobs.export_log_prune] retention_days` (default 365).
 - `POST /report` — mark government objects as ones that should not be proposed
-  for import. Body is `{"reason": ..., "note": ..., "objects": [{"source": ...,
+  for import. Body is `{"note": ..., "objects": [{"source": ...,
   "key": {...}}]}`, where `key` names exactly the source's key columns
   (`PRZESTRZENNAZW` + `LOKALNYID` for bdot10k, `id_budynku` for egib,
-  `lokalny_id` for prg) and `reason` is one of `does_not_exist`,
-  `bad_geometry`, `bad_attributes`, `already_in_osm`, `duplicate`, `other`
-  (which requires a note). A key that matches no live record is rejected per
+  `lokalny_id` for prg). A key that matches no live record is rejected per
   object rather than failing the request. Each accepted report enqueues its
   z14 cell, so the object leaves `*_unmatched` on the next drain. Capped at
   `[reports] max_objects_per_request` objects; `[reports] enabled = false`
@@ -466,7 +464,7 @@ curl 'http://127.0.0.1:3000/updates?minutes=1440'
 
 # Report an object as one that should not be proposed for import
 curl -X POST 'http://127.0.0.1:3000/report' -H 'content-type: application/json' \
-  -d '{"reason":"does_not_exist","objects":[{"source":"egib","key":{"id_budynku":"146509_8.0001.120.1_BUD"}}]}'
+  -d '{"objects":[{"source":"egib","key":{"id_budynku":"146509_8.0001.120.1_BUD"}}]}'
 ```
 
 Background jobs (OSM and government-dataset refreshes, the dirty-cell drain,

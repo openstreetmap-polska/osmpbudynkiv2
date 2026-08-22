@@ -903,14 +903,6 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // and JOSM, and comes back on its own once the underlying government record
   // changes. Nothing about the submitter is sent or stored.
   //
-  // Sync point: the reason values in #report-modal's radios mirror
-  // reports::Reason (src/reports/mod.rs), and REPORT_NOTE_REQUIRED mirrors the
-  // one member of that vocabulary the server rejects without a note. Both are
-  // kept in step by hand, like BDOT10K_EKSPLOATOWANY above -- nothing
-  // generates a contract between the two languages, and a drifted value here
-  // surfaces as a 400 rather than as anything silent.
-  const REPORT_NOTE_REQUIRED = "other";
-
   // Short registry names for the modal's object line. Deliberately not
   // DATASET_LABELS (the /package layer picker further down), whose values name
   // a layer ("Budynki (BDOT10k)") rather than a registry and would read
@@ -1035,19 +1027,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   reportSubmit.addEventListener("click", async () => {
     if (!reportTarget) return;
-    const checked = reportModal.querySelector('input[name="report-reason"]:checked');
-    const reason = checked ? checked.value : null;
     const note = reportNote.value.trim();
-    if (!reason) {
-      setReportFeedback("Wybierz powód zgłoszenia.", "error");
-      return;
-    }
-    // Checked here as well as on the server so the common mistake costs a
-    // round trip's worth of nothing; the server's check is the real one.
-    if (reason === REPORT_NOTE_REQUIRED && note === "") {
-      setReportFeedback("Powód „Inne” wymaga opisu.", "error");
-      return;
-    }
 
     reportSubmit.disabled = true;
     setReportFeedback("Wysyłanie…", null);
@@ -1055,7 +1035,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       const res = await fetch("/report", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason, note: note || null, objects: [reportTarget] }),
+        body: JSON.stringify({ note: note || null, objects: [reportTarget] }),
       });
       if (!res.ok) {
         const detail = await readErrorDetail(res);
