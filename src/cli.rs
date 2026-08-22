@@ -45,6 +45,36 @@ pub enum Command {
         #[command(subcommand)]
         action: ReportsAction,
     },
+    /// Bootstrap a fresh database end to end: `import full`, `update osm`
+    /// (catch up OSM to the current replication sequence), `compare full`,
+    /// then `queue drain` (safety net for anything the OSM catch-up
+    /// enqueued). Run `run` afterwards to start serving.
+    Init {
+        /// Path to local OSM PBF file (skips download)
+        #[arg(long)]
+        osm_file: Option<PathBuf>,
+        /// Path to local BDOT10k file (skips download)
+        #[arg(long)]
+        bdot10k_file: Option<PathBuf>,
+        /// Path to local EGIB file (skips download)
+        #[arg(long)]
+        egib_file: Option<PathBuf>,
+        /// Path to local PRG file (skips download)
+        #[arg(long)]
+        prg_file: Option<PathBuf>,
+        /// Path to a TERC (TERYT) dictionary file (.zip or .xml), for the PRG import
+        #[arg(long)]
+        terc_file: Option<PathBuf>,
+        /// Path to a local street-name mapping CSV (skips download)
+        #[arg(long)]
+        street_mappings_file: Option<PathBuf>,
+        /// Path to a local BDOT10k building-type mapping CSV (skips download)
+        #[arg(long)]
+        bdot10k_building_types_file: Option<PathBuf>,
+        /// Path to a local EGIB building-type mapping CSV (skips download)
+        #[arg(long)]
+        egib_building_types_file: Option<PathBuf>,
+    },
     /// Run HTTP service with background data updates
     Run,
 }
@@ -209,7 +239,7 @@ pub enum ImportSource {
         #[arg(long)]
         egib_url: Option<String>,
     },
-    /// Run all imports in sequence (OSM, BDOT10k, EGIB, PRG)
+    /// Run all imports in sequence (OSM, BDOT10k, EGIB, PRG, street mappings, building types)
     Full {
         /// Path to local OSM PBF file (skips download)
         #[arg(long)]
@@ -226,6 +256,15 @@ pub enum ImportSource {
         /// Path to a TERC (TERYT) dictionary file (.zip or .xml), for the PRG import
         #[arg(long)]
         terc_file: Option<PathBuf>,
+        /// Path to a local street-name mapping CSV (skips download)
+        #[arg(long)]
+        street_mappings_file: Option<PathBuf>,
+        /// Path to a local BDOT10k building-type mapping CSV (skips download)
+        #[arg(long)]
+        bdot10k_building_types_file: Option<PathBuf>,
+        /// Path to a local EGIB building-type mapping CSV (skips download)
+        #[arg(long)]
+        egib_building_types_file: Option<PathBuf>,
     },
 }
 

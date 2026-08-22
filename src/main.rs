@@ -84,6 +84,47 @@ fn main() -> Result<()> {
         Command::Compare { target } => compare::run(&conn, target)?,
         Command::Queue { action } => compare::run_queue(&conn, action)?,
         Command::Reports { action } => reports::run(&conn, action)?,
+        Command::Init {
+            osm_file,
+            bdot10k_file,
+            egib_file,
+            prg_file,
+            terc_file,
+            street_mappings_file,
+            bdot10k_building_types_file,
+            egib_building_types_file,
+        } => {
+            import::run(
+                &conn,
+                &kv,
+                cli::ImportSource::Full {
+                    osm_file,
+                    bdot10k_file,
+                    egib_file,
+                    prg_file,
+                    terc_file,
+                    street_mappings_file,
+                    bdot10k_building_types_file,
+                    egib_building_types_file,
+                },
+                &config,
+                &config.download_urls,
+            )?;
+            shutdown::check_requested()?;
+            update::run(
+                &conn,
+                &kv,
+                cli::UpdateSource::Osm,
+                &config,
+                &config.download_urls,
+                true,
+                &|| false,
+            )?;
+            shutdown::check_requested()?;
+            compare::run(&conn, cli::CompareTarget::Full)?;
+            shutdown::check_requested()?;
+            compare::run_queue(&conn, cli::QueueAction::Drain { batch_size: 512 })?;
+        }
         Command::Run => {
             let rt = tokio::runtime::Runtime::new()?;
             let config = Arc::new(config);

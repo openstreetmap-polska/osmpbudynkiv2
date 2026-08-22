@@ -42,131 +42,32 @@ pub fn run(
             bump_serving_epoch(conn)
         }
         ImportSource::StreetMappings { file, url } => {
-            let outcome = (|| -> Result<crate::mappings::LoadStats> {
-                let (path, was_downloaded) = match file {
-                    Some(p) => (p, false),
-                    None => {
-                        let src = url.as_deref().unwrap_or(&urls.street_mappings);
-                        let downloaded = crate::download::download_file_as(
-                            src,
-                            &config.download_dir(),
-                            "street_names_mappings.csv",
-                        )?;
-                        (downloaded, true)
-                    }
-                };
-                let stats = crate::mappings::load_from_path(conn, &path)?;
-
-                if was_downloaded {
-                    if config.cleanup_downloaded_files {
-                        info!(path = %path.display(), "Cleaning up downloaded file");
-                        let _ = std::fs::remove_file(&path);
-                    } else {
-                        warn!(
-                            path = %path.display(),
-                            "cleanup_downloaded_files is false; leaving downloaded file in place \
-                             (it will be reused on the next run since download_file_as skips \
-                             re-downloading an existing destination)"
-                        );
-                    }
-                }
-
-                Ok(stats)
-            })();
-            match &outcome {
-                Ok(stats) => {
-                    let msg = format!(
-                        "loaded {} mapping rows ({} not present in current PRG data, \
-                         {} dirty cell(s) enqueued)",
-                        stats.rows_loaded, stats.rows_absent_from_prg, stats.cells_enqueued
-                    );
-                    let _ = crate::job_log::record(
-                        conn,
-                        "import:street-mappings",
-                        "Success",
-                        Some(&msg),
-                    );
-                }
-                Err(e) => {
-                    let _ = crate::job_log::record(
-                        conn,
-                        "import:street-mappings",
-                        "Error",
-                        Some(&format!("{e:#}")),
-                    );
-                }
-            }
-            outcome.map(|_| ())
+            run_street_mappings_import(conn, config, file, url.as_deref(), &urls.street_mappings)
         }
         ImportSource::BuildingTypes {
             bdot10k_file,
             egib_file,
             bdot10k_url,
             egib_url,
-        } => {
-            use crate::mappings::building_types::{BDOT10K, BuildingTypeStats, EGIB};
-
-            let outcome = (|| -> Result<(BuildingTypeStats, BuildingTypeStats)> {
-                let bdot10k_stats = load_building_type_file(
-                    conn,
-                    config,
-                    &BDOT10K,
-                    bdot10k_file,
-                    bdot10k_url
-                        .as_deref()
-                        .unwrap_or(&urls.bdot10k_building_types),
-                    "bdot10k_building_types.csv",
-                )?;
-                let egib_stats = load_building_type_file(
-                    conn,
-                    config,
-                    &EGIB,
-                    egib_file,
-                    egib_url.as_deref().unwrap_or(&urls.egib_building_types),
-                    "egib_building_types.csv",
-                )?;
-                Ok((bdot10k_stats, egib_stats))
-            })();
-
-            match &outcome {
-                Ok((b, e)) => {
-                    let msg = format!(
-                        "bdot10k: loaded {} rows ({} keys absent from source, {} source keys \
-                         / {} source rows uncovered); egib: loaded {} rows ({} keys absent \
-                         from source, {} source keys / {} source rows uncovered)",
-                        b.rows_loaded,
-                        b.keys_absent_from_source,
-                        b.source_keys_uncovered,
-                        b.source_rows_uncovered,
-                        e.rows_loaded,
-                        e.keys_absent_from_source,
-                        e.source_keys_uncovered,
-                        e.source_rows_uncovered,
-                    );
-                    let _ = crate::job_log::record(
-                        conn,
-                        "import:building-types",
-                        "Success",
-                        Some(&msg),
-                    );
-                }
-                Err(e) => {
-                    let _ = crate::job_log::record(
-                        conn,
-                        "import:building-types",
-                        "Error",
-                        Some(&format!("{e:#}")),
-                    );
-                }
-            }
-            outcome.map(|_| ())
-        }
+        } => run_building_types_import(
+            conn,
+            config,
+            (
+                bdot10k_file,
+                bdot10k_url.as_deref(),
+                &urls.bdot10k_building_types,
+            ),
+            (egib_file, egib_url.as_deref(), &urls.egib_building_types),
+        ),
         ImportSource::Full {
             osm_file,
             bdot10k_file,
             egib_file,
             prg_file,
             terc_file,
+            street_mappings_file,
+            bdot10k_building_types_file,
+            egib_building_types_file,
         } => {
             osm::import(conn, kv, config, osm_file.as_deref(), &urls.osm_pbf)?;
             crate::shutdown::check_requested()?;
@@ -181,6 +82,25 @@ pub fn run(
                 terc_file.as_deref(),
                 &urls.prg,
             )?;
+            crate::shutdown::check_requested()?;
+            run_street_mappings_import(
+                conn,
+                config,
+                street_mappings_file,
+                None,
+                &urls.street_mappings,
+            )?;
+            crate::shutdown::check_requested()?;
+            run_building_types_import(
+                conn,
+                config,
+                (
+                    bdot10k_building_types_file,
+                    None,
+                    &urls.bdot10k_building_types,
+                ),
+                (egib_building_types_file, None, &urls.egib_building_types),
+            )?;
             // All three government sources were rebuilt wholesale, so every
             // source's reports need re-checking -- see `reconcile_reports`.
             // OSM is not a reported source and has no entry here.
@@ -194,6 +114,134 @@ pub fn run(
             bump_serving_epoch(conn)
         }
     }
+}
+
+/// Resolve `file` vs. downloading from `url`/`default_url`, load the street-name
+/// mappings through `mappings::load_from_path`, clean up a downloaded file per
+/// `config.cleanup_downloaded_files`, and record the outcome to `job_run_log`.
+/// Shared by the standalone `import street-mappings` command and `import full`.
+fn run_street_mappings_import(
+    conn: &Connection,
+    config: &Config,
+    file: Option<std::path::PathBuf>,
+    url: Option<&str>,
+    default_url: &str,
+) -> Result<()> {
+    let outcome = (|| -> Result<crate::mappings::LoadStats> {
+        let (path, was_downloaded) = match file {
+            Some(p) => (p, false),
+            None => {
+                let src = url.unwrap_or(default_url);
+                let downloaded = crate::download::download_file_as(
+                    src,
+                    &config.download_dir(),
+                    "street_names_mappings.csv",
+                )?;
+                (downloaded, true)
+            }
+        };
+        let stats = crate::mappings::load_from_path(conn, &path)?;
+
+        if was_downloaded {
+            if config.cleanup_downloaded_files {
+                info!(path = %path.display(), "Cleaning up downloaded file");
+                let _ = std::fs::remove_file(&path);
+            } else {
+                warn!(
+                    path = %path.display(),
+                    "cleanup_downloaded_files is false; leaving downloaded file in place \
+                     (it will be reused on the next run since download_file_as skips \
+                     re-downloading an existing destination)"
+                );
+            }
+        }
+
+        Ok(stats)
+    })();
+    match &outcome {
+        Ok(stats) => {
+            let msg = format!(
+                "loaded {} mapping rows ({} not present in current PRG data, \
+                 {} dirty cell(s) enqueued)",
+                stats.rows_loaded, stats.rows_absent_from_prg, stats.cells_enqueued
+            );
+            let _ = crate::job_log::record(conn, "import:street-mappings", "Success", Some(&msg));
+        }
+        Err(e) => {
+            let _ = crate::job_log::record(
+                conn,
+                "import:street-mappings",
+                "Error",
+                Some(&format!("{e:#}")),
+            );
+        }
+    }
+    outcome.map(|_| ())
+}
+
+/// `(file, url_override, default_url)` for one building-type mapping source.
+type BuildingTypesInput<'a> = (Option<std::path::PathBuf>, Option<&'a str>, &'a str);
+
+/// Resolve and load both building-type mapping CSVs (mirrors
+/// `run_street_mappings_import`), recording one combined `job_run_log` entry.
+/// Shared by the standalone `import building-types` command and `import full`.
+fn run_building_types_import(
+    conn: &Connection,
+    config: &Config,
+    bdot10k: BuildingTypesInput,
+    egib: BuildingTypesInput,
+) -> Result<()> {
+    use crate::mappings::building_types::{BDOT10K, BuildingTypeStats, EGIB};
+
+    let outcome = (|| -> Result<(BuildingTypeStats, BuildingTypeStats)> {
+        let (bdot10k_file, bdot10k_url, default_bdot10k_url) = bdot10k;
+        let (egib_file, egib_url, default_egib_url) = egib;
+        let bdot10k_stats = load_building_type_file(
+            conn,
+            config,
+            &BDOT10K,
+            bdot10k_file,
+            bdot10k_url.unwrap_or(default_bdot10k_url),
+            "bdot10k_building_types.csv",
+        )?;
+        let egib_stats = load_building_type_file(
+            conn,
+            config,
+            &EGIB,
+            egib_file,
+            egib_url.unwrap_or(default_egib_url),
+            "egib_building_types.csv",
+        )?;
+        Ok((bdot10k_stats, egib_stats))
+    })();
+
+    match &outcome {
+        Ok((b, e)) => {
+            let msg = format!(
+                "bdot10k: loaded {} rows ({} keys absent from source, {} source keys \
+                 / {} source rows uncovered); egib: loaded {} rows ({} keys absent \
+                 from source, {} source keys / {} source rows uncovered)",
+                b.rows_loaded,
+                b.keys_absent_from_source,
+                b.source_keys_uncovered,
+                b.source_rows_uncovered,
+                e.rows_loaded,
+                e.keys_absent_from_source,
+                e.source_keys_uncovered,
+                e.source_rows_uncovered,
+            );
+            let _ = crate::job_log::record(conn, "import:building-types", "Success", Some(&msg));
+        }
+        Err(e) => {
+            let _ = crate::job_log::record(
+                conn,
+                "import:building-types",
+                "Error",
+                Some(&format!("{e:#}")),
+            );
+        }
+    }
+    outcome.map(|_| ())
 }
 
 /// Resolve `file` vs. downloading from `url` (mirrors the `StreetMappings`

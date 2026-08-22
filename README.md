@@ -12,7 +12,7 @@ Current implementation status against the planned scope (see [`docs/project_idea
 
 - [x] CLI with TOML configuration (`--config`), built-in defaults, `RUST_LOG` override
 - [x] Storage layer: embedded DuckDB (geospatial/analytical queries) + RocksDB (raw OSM node coordinates and way/relation structure)
-- [x] `import full` — running all imports (OSM, BDOT10k, EGIB, PRG) in one command
+- [x] `import full` — running all imports (OSM, BDOT10k, EGIB, PRG, street-name and building-type mappings) in one command
 - [x] `import osm` — Poland PBF extract (auto-download or local file)
 - [x] `import prg` — address registry ZIP parsed via [prg_convert](https://github.com/ttomasz/prg_convert/), with TERC dictionary support
 - [x] `import bdot10k` / `import egib` — building registries from GeoParquet (auto-download or local file)
@@ -68,47 +68,43 @@ cargo run -- <command>
 
 ## Setting up a working instance
 
-A fresh database needs **five** commands before the server serves anything
-useful. `import full` covers only the four bulk datasets — the two mapping
-files and the comparison are separate steps, and skipping a mapping step
-degrades the output silently rather than failing (see "What happens if you
-skip a step" below).
+The `init` command bootstraps a fresh database in one shot: `import full`
+(OSM, BDOT10k, EGIB, PRG, then both mapping CSVs), `update osm` (catches OSM
+up to the current replication sequence, since the bulk PBF extract is
+already somewhat stale by the time it downloads), `compare full` (populates
+the `*_unmatched` serving tables), then `queue drain` (a safety net for
+anything the OSM catch-up enqueued — normally a no-op right after a full
+compare).
 
 ```bash
-# 1. Bulk-load the datasets: OSM, BDOT10k, EGIB, PRG
-#    (add --osm-file/--bdot10k-file/--egib-file/--prg-file/--terc-file to use
-#    local files instead of downloading; slowest step by far)
-cargo run --release -- --config config.toml import full
+# 1. Bootstrap everything in one command
+#    (accepts the same --osm-file/--bdot10k-file/--egib-file/--prg-file/
+#    --terc-file/--street-mappings-file/--bdot10k-building-types-file/
+#    --egib-building-types-file flags as `import full`, to use local files
+#    instead of downloading; slowest step by far)
+cargo run --release -- --config config.toml init
 
-# 2. Load the PRG -> OSM street name mappings (NOT part of `import full`)
-cargo run --release -- --config config.toml import street-mappings \
-  --file mappings/street_names_mappings.csv
-
-# 3. Load the BDOT10k/EGIB -> OSM building type mappings (NOT part of `import full`)
-cargo run --release -- --config config.toml import building-types \
-  --bdot10k-file mappings/bdot10k_building_types.csv \
-  --egib-file mappings/egib_building_types.csv
-
-# 4. Compare government data against OSM and populate the *_unmatched serving tables
-cargo run --release -- --config config.toml compare full
-
-# 5. Start the HTTP service (API + web frontend)
+# 2. Start the HTTP service (API + web frontend)
 cargo run --release -- --config config.toml run
 ```
 
-Steps 2 and 3 download the CSVs from this repository when `--file` is omitted;
-the copies in [`mappings/`](mappings/) are the same files, so pass them
-directly to skip the download. Steps 1–4 write to the database and DuckDB
-allows only one writer process, so **stop the server before re-running any of
-them**.
+The mapping CSVs in [`mappings/`](mappings/) are the same files `init`/
+`import full` download by default, so pass them directly (as shown in the
+`import full` example below) to skip the download. Individual `import
+street-mappings` / `import building-types` commands still exist for
+reloading just one mapping later (e.g. after editing a CSV) without
+re-running the whole bulk import — as do standalone `import full` / `update
+osm` / `compare full` / `queue drain`, if you'd rather run (or retry) the
+steps `init` bundles one at a time. Step 1 writes to the database and DuckDB
+allows only one writer process, so **stop the server before re-running it**.
 
 ### What happens if you skip a step
 
 | Skipped | Symptom |
 | --- | --- |
 | `import full` (or a single dataset import) | The server refuses to start: `Required table '<name>' is missing`. |
-| `import street-mappings` | Everything works, but `addr:street` is served exactly as PRG publishes it (`gen. Kruka` instead of `Generała Kruka`). |
-| `import building-types` | Everything works, but **every** building is exported and previewed as plain `building=yes`, no matter what its BDOT10k/EGIB classification says. There is no warning — the mapping tables are created empty by the schema and the tag resolution simply falls through to its default. |
+| `import street-mappings` (or its part of `import full`) | Everything works, but `addr:street` is served exactly as PRG publishes it (`gen. Kruka` instead of `Generała Kruka`). |
+| `import building-types` (or its part of `import full`) | Everything works, but **every** building is exported and previewed as plain `building=yes`, no matter what its BDOT10k/EGIB classification says. There is no warning — the mapping tables are created empty by the schema and the tag resolution simply falls through to its default. |
 | `compare full` | The server starts and logs `serving table '<name>' is empty`; `/tiles` and `/package` return zero features. |
 
 To check what a given database has actually had run against it, read
@@ -171,10 +167,37 @@ All fields are optional — only specify what you want to override. Note that `d
 
 ## CLI commands
 
+### init — bootstrap a fresh database
+
+```bash
+# Everything needed to get started: import full, update osm, compare full,
+# queue drain
+cargo run -- init
+
+# Same, using local files instead of downloading (any subset of flags works;
+# omitted ones still download) -- takes the same flags as `import full`
+cargo run -- init \
+  --osm-file poland-latest.osm.pbf \
+  --bdot10k-file bdot10k.parquet \
+  --egib-file egib.parquet \
+  --prg-file prg.zip \
+  --terc-file terc.zip \
+  --street-mappings-file mappings/street_names_mappings.csv \
+  --bdot10k-building-types-file mappings/bdot10k_building_types.csv \
+  --egib-building-types-file mappings/egib_building_types.csv
+```
+
+Each step still stops the whole command on the first failure. `update osm`
+needs network access to the replication feed regardless of which `--*-file`
+flags are given (there's no local-file equivalent for it, unlike the bulk
+imports); if you don't want that, run `import full` and `compare full`
+individually instead (see below).
+
 ### import — bulk-load data
 
 ```bash
-# Import everything (OSM, BDOT10k, EGIB, PRG) in sequence
+# Import everything (OSM, BDOT10k, EGIB, PRG, then the street-name and
+# building-type mappings) in sequence
 cargo run -- import full
 
 # Import everything from local files instead of downloading (any subset of flags works;
@@ -184,7 +207,10 @@ cargo run -- import full \
   --bdot10k-file bdot10k.parquet \
   --egib-file egib.parquet \
   --prg-file prg.zip \
-  --terc-file terc.zip
+  --terc-file terc.zip \
+  --street-mappings-file mappings/street_names_mappings.csv \
+  --bdot10k-building-types-file mappings/bdot10k_building_types.csv \
+  --egib-building-types-file mappings/egib_building_types.csv
 
 # Import OpenStreetMap data (downloads Poland PBF extract automatically)
 cargo run -- import osm
@@ -206,8 +232,8 @@ cargo run -- import egib --file egib.parquet
 cargo run -- import prg
 cargo run -- import prg --file prg.zip
 
-# Load the two mapping files. Neither is part of `import full` — see
-# "Setting up a working instance" above. Both download from this repository
+# Load just one mapping file later (e.g. after editing a CSV), without
+# re-running the whole bulk import. Both download from this repository
 # when no file is given.
 cargo run -- import street-mappings --file mappings/street_names_mappings.csv
 cargo run -- import building-types \
