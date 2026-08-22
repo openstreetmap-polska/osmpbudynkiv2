@@ -386,6 +386,45 @@ fn create_serving_indexes(conn: &Connection) {
 mod tests {
     use super::*;
 
+    /// Guards the version stamp the `bundled-cmake` build depends on.
+    ///
+    /// DuckDB derives its version from `git describe` inside `duckdb-sources`,
+    /// which cargo checks out without tags — so it falls back to the dummy
+    /// `v0.0.1` unless `cmake/duckdb_version.cmake` forces `OVERRIDE_GIT_DESCRIBE`
+    /// (wired up by `.cargo/config.toml`). That version string *is* the extension
+    /// repository path, so a wrong one makes every `INSTALL <extension>` 404 and
+    /// hides locally installed extensions. Without this test that surfaces as
+    /// several hundred unrelated-looking failures across the whole suite; with
+    /// it, one named test says exactly what broke.
+    ///
+    /// Asserts the shape rather than an exact string so a routine version bump
+    /// doesn't need a test edit — only the "no version at all" failure is pinned.
+    #[test]
+    fn duckdb_reports_a_real_version_so_extensions_resolve() -> Result<()> {
+        // Uses the real init commands rather than an empty list: `INSTALL spatial`
+        // is exactly what a bad version stamp breaks, and `create_schema` needs
+        // the GEOMETRY type it provides.
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init_commands, None)?;
+        let version: String = conn.query_row("SELECT version()", [], |row| row.get(0))?;
+
+        assert_ne!(
+            version, "v0.0.1",
+            "DuckDB built with its dummy version: `git describe` failed in duckdb-sources \
+             and OVERRIDE_GIT_DESCRIBE was not applied. Extension installs will 404. \
+             Check that .cargo/config.toml's CMAKE_TOOLCHAIN_FILE reaches the build \
+             (it is not covered by rerun-if-env-changed — `cargo clean -p libduckdb-sys` \
+             after changing it)."
+        );
+        let major_minor_patch = version.trim_start_matches('v');
+        assert_eq!(
+            major_minor_patch.split('.').count(),
+            3,
+            "unexpected DuckDB version shape: {version}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_init_db_creates_tables() -> Result<()> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];

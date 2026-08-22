@@ -1,0 +1,19 @@
+# Points DuckDB's CMake build at cmake/duckdb_version.cmake, which stamps the
+# real DuckDB version into the library. Without it DuckDB builds as `v0.0.1` and
+# every `INSTALL <extension>` 404s — see that file's header for the full why.
+#
+# `libduckdb-sys` has no generic CMake `-D` passthrough, and a toolchain file is
+# the one hook the `cmake` crate forwards from the environment.
+#
+# Two caveats worth knowing:
+#  * `force` is deliberately left off, so an externally set CMAKE_TOOLCHAIN_FILE
+#    (e.g. for cross-compiling) still wins — but such a build must set
+#    OVERRIDE_GIT_DESCRIBE itself or it gets the broken v0.0.1 stamp back.
+#  * `libduckdb-sys`'s build script does not declare
+#    `rerun-if-env-changed=CMAKE_TOOLCHAIN_FILE`, so editing this setting does
+#    not rebuild DuckDB on its own. `cargo clean -p libduckdb-sys` does not do
+#    it either — the package comes from a git source and the spec silently
+#    matches nothing. Delete the build cache by hand:
+#      rm -rf target/*/build/libduckdb-sys-* target/*/.fingerprint/libduckdb-sys-*
+[env]
+CMAKE_TOOLCHAIN_FILE = { value = "cmake/duckdb_version.cmake", relative = true }

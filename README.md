@@ -39,12 +39,22 @@ Current implementation status against the planned scope (see [`docs/project_idea
 
 ## Building
 
-Requires Rust toolchain (install via [rustup](https://rustup.rs/)). No external DuckDB or RocksDB installation needed — both are compiled from source as part of the build (first build takes a while due to C++ compilation).
+Requires:
+
+- Rust toolchain (install via [rustup](https://rustup.rs/)) — the exact version is pinned in `rust-toolchain.toml` and rustup installs it automatically on the first cargo command
+- A C/C++ compiler
+- **CMake** and a generator it can drive (**Ninja**, or GNU Make) — DuckDB is built through CMake rather than from the single-file amalgamation, so that its bundled jemalloc allocator is compiled in
+
+No external DuckDB or RocksDB installation is needed — both are compiled from source as part of the build (first build takes a while due to C++ compilation). DuckDB comes from a git dependency pinned to a tag, so the first build also clones the DuckDB source tree.
 
 ```bash
 cargo build             # debug build
 cargo build --release   # optimized release build
 ```
+
+The build reads `.cargo/config.toml`, which points CMake at `cmake/duckdb_version.cmake` to stamp DuckDB's version. Building from outside the repo root, or with `CMAKE_TOOLCHAIN_FILE` already set in the environment, skips that and produces a DuckDB that reports `v0.0.1` and cannot install the `spatial` extension it needs. When bumping the pinned `duckdb` tag, update `cmake/duckdb_version.cmake` to match and force a DuckDB rebuild with `rm -rf target/*/build/libduckdb-sys-* target/*/.fingerprint/libduckdb-sys-*` (`cargo clean -p libduckdb-sys` does not work on a git-sourced package).
+
+Both storage engines are built against jemalloc: DuckDB uses its own bundled, `duckdb_je_`-prefixed copy, while RocksDB pulls in `tikv-jemalloc-sys`, which also replaces the process-wide `malloc`. Set `DUCKDB_DISABLE_JEMALLOC=1` to build DuckDB with its standard allocator instead. On platforms where either build does not support jemalloc (macOS, musl, 32-bit, BSD) the respective flag is a silent no-op and the standard allocator is used.
 
 ## Running
 

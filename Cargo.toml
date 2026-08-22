@@ -8,7 +8,12 @@ anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
-duckdb = { version = "1.10505.0", features = ["bundled", "vtab", "vtab-arrow", "vscalar", "r2d2"] }
+# Git dependency, pinned to the tag matching the crates.io version we used before,
+# purely to get `bundled-cmake`: DuckDB's jemalloc lives in `duckdb-sources`
+# (`third_party/jemalloc`), which the published crate excludes, and the `bundled`
+# amalgamation backend has no jemalloc sources at all. `bundled-cmake` builds via
+# CMake with `ENABLE_JEMALLOC=ON` by default. See CLAUDE.md's jemalloc gotcha.
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.10505.0", features = ["bundled-cmake", "vtab", "vtab-arrow", "vscalar", "r2d2"] }
 r2d2 = "0.8"
 flate2 = "1"
 prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.7.0", default-features = false, features = ["download"] }
@@ -24,12 +29,15 @@ tower-http = { version = "0.6", features = ["fs", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = "6"
-rocksdb = { package = "rust-rocksdb", version = "0.52", default-features = false, features = ["zstd"] }
+rocksdb = { package = "rust-rocksdb", version = "0.52", default-features = false, features = ["zstd", "jemalloc"] }
 osmpbf = "0.3.8"
 
 [dev-dependencies]
 assert_cmd = "2"
-duckdb = { version = "1.10505.0", features = ["bundled"] }
+# Must name the same source as the normal dependency above: a registry `duckdb`
+# alongside a git one would be two packages both declaring `links = "duckdb"`,
+# which cargo rejects outright.
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.10505.0", features = ["bundled-cmake"] }
 predicates = "3"
 tempfile = "3"
 tower = "0.5"

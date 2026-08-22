@@ -1,0 +1,32 @@
+# Pins the Rust toolchain this project builds with.
+#
+# WHY AN EXACT VERSION
+# --------------------
+# The crate is edition 2024, so it needs >= 1.85 — but nothing here selected a
+# compiler before this file existed: every build used whatever `rustc` happened
+# to be on PATH. Two things make an exact pin worth the manual bumps rather than
+# tracking `stable`:
+#
+#  * `cargo clippy` and `cargo fmt -- --check` are part of this repo's normal
+#    workflow, and both are release-sensitive. A new clippy lint or a rustfmt
+#    formatting change ships on a Tuesday and breaks a working tree nobody
+#    touched. With a pin that only happens when the pin is moved deliberately.
+#  * DuckDB takes ~12 minutes to build from source here (see CLAUDE.md's
+#    jemalloc gotchas), so an unnoticed toolchain change is an expensive way to
+#    discover the toolchain changed.
+#
+# BUMPING
+# -------
+# Edit `channel`, then run `cargo clippy --all-targets`, `cargo fmt -- --check`
+# and `cargo test`. rustup fetches the new toolchain on the next cargo
+# invocation. Unlike `cmake/duckdb_version.cmake`, this version is mirrored
+# nowhere else and has no lockstep partner to keep in sync.
+#
+# This file only takes effect under rustup; a distro-packaged cargo ignores it.
+[toolchain]
+channel = "1.97.1"
+# rustfmt and clippy back the commands in CLAUDE.md's "Build & Test Commands".
+# rust-src is not needed to build — it keeps rust-analyzer able to follow
+# definitions into std, which a freshly-installed pinned toolchain would
+# otherwise lack even though the previously-active `stable` had it.
+components = ["rustfmt", "clippy", "rust-src"]
