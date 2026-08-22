@@ -10,6 +10,8 @@ use super::http_cache;
 use std::sync::LazyLock;
 
 use super::package::{ADJACENCY_READ_BUFFER_DEG, BDOT10K_ADJACENCY_KEY, EGIB_ADJACENCY_KEY};
+use crate::compare::rule::reported_sql;
+use crate::dataset::{BDOT10K, EGIB, PRG};
 use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
 use crate::serving_version;
 use crate::tile_math::tile_to_bbox;
@@ -234,9 +236,70 @@ const BUILDINGS_MVT_SQL: &str = "
 // form keeps this on the index for the same reason documented above. No tag
 // resolution here -- these layers show every government object, matched or
 // not, so there's nothing to "preview importing" for most of them.
-const ALL_ADDRESSES_MVT_SQL: &str = "
-    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom)
-    SELECT ST_AsMVT(t, 'addresses_all', 4096, 'geom') AS mvt
+//
+// `reported` is the one exception to that "no resolution" rule, and it is
+// what makes these two layers the *only* place a user-reported object is
+// visible at all. An active report vetoes its object out of `*_unmatched`
+// (see `rule::reported_sql`), so the object vanishes from the `addresses`/
+// `buildings` layers and reappears only here, where it would otherwise be
+// indistinguishable from an ordinary matched record -- the frontend showed
+// it as plain "W rejestrze" with nothing saying why it stopped being
+// offered. The flag lets the popup say "Zgłoszony" instead.
+//
+// Three things about it:
+//
+// 1. The predicate is `rule::reported_sql`, the same builder both compare
+//    paths negate, so what the popup calls "reported" is by construction the
+//    same condition that removed the row from the serving table -- the
+//    "match rule has one home" property, extended to the read path.
+// 2. `CASE WHEN ... THEN TRUE END`, not a bare boolean: `ST_AsMVT` omits a
+//    NULL attribute from the feature that has it, so only the handful of
+//    reported features pay for the flag and every other feature's bytes are
+//    unchanged. Note what this does *not* mean: the layer's key dictionary
+//    still gains the string `reported` as soon as the column exists, whether
+//    or not any feature is flagged -- verified against a real tile, and the
+//    reason the tests below read the flag per row rather than grepping bytes.
+// 3. The `MATERIALIZED` CTEs are not decoration. Before this, each source's
+//    spatial filter sat directly in the scan and reached the RTREE index; a
+//    correlated `EXISTS` added alongside it gives the optimizer licence to
+//    re-plan the filtered scan into SEQ_SCAN + FILTER, exactly as a
+//    downstream `LEFT JOIN` does (see the ADDRESSES_MVT_SQL/BUILDINGS_MVT_SQL
+//    comment above). Computing the bbox-filtered candidate set first and
+//    correlating over *that* keeps the index scan.
+//    `mvt_bbox_filter_uses_the_rtree_index` asserts on the plan and is the
+//    only thing that would catch a regression here.
+//
+// Cache correctness: `POST /report` is on `serving_version`'s must-not-bump
+// list, and this attribute does not change that. The insert enqueues the
+// object's z14 cell, the drain recomputes it, and the row leaving
+// `<source>_unmatched` moves that cell's per-cell version -- which every tile
+// rendering the object already folds in, since a surviving building's reach
+// from its own centroid's cell is <= 1 (`dataset::filter_oversized_geometry`)
+// and `z14_tile_version` reads a 3x3 ring. So the flag becomes visible in the
+// same version change that removes the object from the unmatched layer, not
+// before and not later. Revoke and expiry enqueue the same way.
+//
+// Both are built through a `projection` seam for the same reason
+// `compare::incremental` has one: `ST_AsMVT` returns opaque protobuf bytes, so
+// a test that only searches those bytes can see that a *key* exists but never
+// which features carry it -- a `reported` clause that flagged every building
+// would look identical to one that flagged the right one. Passing a plain
+// column list instead of the `ST_AsMVT(...)` call lets the tests read the flag
+// per row off the real generated SQL, wrapper aside.
+static ALL_ADDRESSES_MVT_SQL: LazyLock<String> =
+    LazyLock::new(|| all_addresses_sql("ST_AsMVT(t, 'addresses_all', 4096, 'geom') AS mvt"));
+
+fn all_addresses_sql(projection: &str) -> String {
+    format!(
+        "
+    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
+    candidates AS MATERIALIZED (
+        SELECT a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc,
+               a.kod_pocztowy, a.wazny_od_lub_data_nadania, a.teryt_gmina, a.gmina
+        FROM prg_addresses a
+        WHERE ST_Intersects(a.geom, ST_MakeEnvelope(?, ?, ?, ?))
+    )
+    SELECT {projection}
     FROM (
         SELECT ST_AsMVTGeom(a.geom, bbox.geom, 4096, 256, true) AS geom,
                a.lokalny_id,
@@ -246,45 +309,71 @@ const ALL_ADDRESSES_MVT_SQL: &str = "
                a.kod_pocztowy,
                a.wazny_od_lub_data_nadania::VARCHAR AS wazny_od_lub_data_nadania,
                a.teryt_gmina,
-               a.gmina
-        FROM prg_addresses a, bbox
-        WHERE ST_Intersects(a.geom, ST_MakeEnvelope(?, ?, ?, ?))
+               a.gmina,
+               CASE WHEN {reported} THEN TRUE END AS reported
+        FROM candidates a, bbox
     ) t
     WHERE t.geom IS NOT NULL
-";
+",
+        reported = reported_sql(&PRG, "a"),
+    )
+}
 
-const ALL_BUILDINGS_MVT_SQL: &str = "
-    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom)
-    SELECT ST_AsMVT(t, 'buildings_all', 4096, 'geom') AS mvt
+static ALL_BUILDINGS_MVT_SQL: LazyLock<String> =
+    LazyLock::new(|| all_buildings_sql("ST_AsMVT(t, 'buildings_all', 4096, 'geom') AS mvt"));
+
+fn all_buildings_sql(projection: &str) -> String {
+    format!(
+        "
+    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
+    bdot10k_candidates AS MATERIALIZED (
+        SELECT b.geom, b.PRZESTRZENNAZW, b.LOKALNYID, b.PRZEWAZAJACAFUNKCJABUDYNKU,
+               b.FUNKCJAOGOLNABUDYNKU, b.LICZBAKONDYGNACJI, b.KATEGORIAISTNIENIA,
+               b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA, b.KODKST,
+               b.ZRODLODANYCHGEOMETRYCZNYCH
+        FROM bdot10k_buildings b
+        WHERE ST_Intersects(b.geom, ST_MakeEnvelope(?, ?, ?, ?))
+    ),
+    egib_candidates AS MATERIALIZED (
+        SELECT b.geom, b.id_budynku, b.kondygnacje_nadziemne, b.kondygnacje_podziemne,
+               b.rodzaj
+        FROM egib_buildings b
+        WHERE ST_Intersects(b.geom, ST_MakeEnvelope(?, ?, ?, ?))
+    )
+    SELECT {projection}
     FROM (
         SELECT ST_AsMVTGeom(raw.geom, bbox.geom, 4096, 256, true) AS geom,
                raw.id, raw.source, raw.PRZEWAZAJACAFUNKCJABUDYNKU, raw.FUNKCJAOGOLNABUDYNKU,
                raw.levels_above_ground, raw.KATEGORIAISTNIENIA, raw.NAZWA, raw.FSBUD,
                raw.INFORMACJADODATKOWA, raw.KODKST, raw.ZRODLODANYCHGEOMETRYCZNYCH,
-               raw.kondygnacje_podziemne, raw.rodzaj
+               raw.kondygnacje_podziemne, raw.rodzaj, raw.reported
         FROM (
-            SELECT bdot10k_buildings.geom, LOKALNYID AS id, 'bdot10k' AS source,
-                   PRZEWAZAJACAFUNKCJABUDYNKU, FUNKCJAOGOLNABUDYNKU,
-                   LICZBAKONDYGNACJI::INTEGER AS levels_above_ground,
-                   KATEGORIAISTNIENIA, NAZWA, FSBUD, INFORMACJADODATKOWA,
-                   KODKST::INTEGER AS KODKST, ZRODLODANYCHGEOMETRYCZNYCH,
-                   NULL::INTEGER AS kondygnacje_podziemne, NULL::VARCHAR AS rodzaj
-            FROM bdot10k_buildings
-            WHERE ST_Intersects(bdot10k_buildings.geom, ST_MakeEnvelope(?, ?, ?, ?))
+            SELECT b.geom, b.LOKALNYID AS id, 'bdot10k' AS source,
+                   b.PRZEWAZAJACAFUNKCJABUDYNKU, b.FUNKCJAOGOLNABUDYNKU,
+                   b.LICZBAKONDYGNACJI::INTEGER AS levels_above_ground,
+                   b.KATEGORIAISTNIENIA, b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA,
+                   b.KODKST::INTEGER AS KODKST, b.ZRODLODANYCHGEOMETRYCZNYCH,
+                   NULL::INTEGER AS kondygnacje_podziemne, NULL::VARCHAR AS rodzaj,
+                   CASE WHEN {reported_bdot10k} THEN TRUE END AS reported
+            FROM bdot10k_candidates b
             UNION ALL
-            SELECT egib_buildings.geom, id_budynku AS id, 'egib' AS source,
+            SELECT b.geom, b.id_budynku AS id, 'egib' AS source,
                    NULL::VARCHAR AS PRZEWAZAJACAFUNKCJABUDYNKU, NULL::VARCHAR AS FUNKCJAOGOLNABUDYNKU,
-                   kondygnacje_nadziemne AS levels_above_ground,
+                   b.kondygnacje_nadziemne AS levels_above_ground,
                    NULL::VARCHAR AS KATEGORIAISTNIENIA, NULL::VARCHAR AS NAZWA, NULL::VARCHAR AS FSBUD,
                    NULL::VARCHAR AS INFORMACJADODATKOWA, NULL::INTEGER AS KODKST,
                    NULL::VARCHAR AS ZRODLODANYCHGEOMETRYCZNYCH,
-                   kondygnacje_podziemne, rodzaj
-            FROM egib_buildings
-            WHERE ST_Intersects(egib_buildings.geom, ST_MakeEnvelope(?, ?, ?, ?))
+                   b.kondygnacje_podziemne, b.rodzaj,
+                   CASE WHEN {reported_egib} THEN TRUE END AS reported
+            FROM egib_candidates b
         ) raw, bbox
     ) t
     WHERE t.geom IS NOT NULL
-";
+",
+        reported_bdot10k = reported_sql(&BDOT10K, "b"),
+        reported_egib = reported_sql(&EGIB, "b"),
+    )
+}
 
 // --- Tier A (z5..=z11): aggregated bins -------------------------------------
 //
@@ -648,19 +737,19 @@ pub async fn serve_tile(
         )?;
         let addresses_all = query_mvt_layer(
             &conn,
-            ALL_ADDRESSES_MVT_SQL,
+            ALL_ADDRESSES_MVT_SQL.as_str(),
             duckdb::params![
                 min_lon, min_lat, max_lon, max_lat, // bbox CTE
-                min_lon, min_lat, max_lon, max_lat, // prg_addresses filter
+                min_lon, min_lat, max_lon, max_lat, // candidates (prg_addresses) filter
             ],
         )?;
         let buildings_all = query_mvt_layer(
             &conn,
-            ALL_BUILDINGS_MVT_SQL,
+            ALL_BUILDINGS_MVT_SQL.as_str(),
             duckdb::params![
                 min_lon, min_lat, max_lon, max_lat, // bbox CTE
-                min_lon, min_lat, max_lon, max_lat, // bdot10k_buildings filter
-                min_lon, min_lat, max_lon, max_lat, // egib_buildings filter
+                min_lon, min_lat, max_lon, max_lat, // bdot10k_candidates filter
+                min_lon, min_lat, max_lon, max_lat, // egib_candidates filter
             ],
         )?;
         // Into `Bytes` once, not once per consumer: the cache stores `Bytes`
@@ -940,7 +1029,7 @@ mod tests {
                  SELECT ST_Point(20.0 + i*0.0001, 52.0), 'p' || i, '1', NULL, NULL, NULL, NULL, NULL, 0, 0, now()
                  FROM range(20000) t(i);
              CREATE TABLE bdot10k_buildings (
-                 LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR,
                  LICZBAKONDYGNACJI SMALLINT, KATEGORIAISTNIENIA VARCHAR, NAZWA VARCHAR,
                  FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -1031,7 +1120,7 @@ mod tests {
              got {bldg_scans} in plan:\n{bldg_plan}"
         );
 
-        let all_addr_plan = plan_of(ALL_ADDRESSES_MVT_SQL, &addr_params_dyn);
+        let all_addr_plan = plan_of(ALL_ADDRESSES_MVT_SQL.as_str(), &addr_params_dyn);
         assert!(
             all_addr_plan.contains("RTREE_IN"),
             "all-addresses MVT query must use the RTREE index, got plan:\n{all_addr_plan}"
@@ -1050,7 +1139,7 @@ mod tests {
         // DuckDB into preferring a SEQ_SCAN for one branch while the other
         // still shows an index scan -- which a single `.contains()` would
         // happily pass.
-        let all_bldg_plan = plan_of(ALL_BUILDINGS_MVT_SQL, &all_bldg_params_dyn);
+        let all_bldg_plan = plan_of(ALL_BUILDINGS_MVT_SQL.as_str(), &all_bldg_params_dyn);
         let all_bldg_scans = all_bldg_plan.matches("RTREE_IN").count();
         assert_eq!(
             all_bldg_scans, 2,
@@ -1080,7 +1169,7 @@ mod tests {
                  wazny_od_lub_data_nadania DATE, teryt_gmina VARCHAR, gmina VARCHAR,
                  geom GEOMETRY);
              CREATE TABLE bdot10k_buildings (
-                 LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZESTRZENNAZW VARCHAR, LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
                  PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR,
                  LICZBAKONDYGNACJI SMALLINT, KATEGORIAISTNIENIA VARCHAR, NAZWA VARCHAR,
                  FSBUD VARCHAR, INFORMACJADODATKOWA VARCHAR, KODKST TINYINT,
@@ -1512,6 +1601,151 @@ mod tests {
                 "expected tile bytes to contain {expected:?}"
             );
         }
+    }
+
+    /// --- `reported` on the two `*_all` layers ---------------------------
+    ///
+    /// These read the flag per feature through `all_buildings_sql`/
+    /// `all_addresses_sql`'s projection seam rather than searching the tile
+    /// bytes, because searching them cannot answer the question that matters.
+    /// `ST_AsMVT` writes one key dictionary per layer and omits only the
+    /// per-feature *value* for a NULL, so `reported` appears in the bytes as
+    /// soon as the column exists — verified: the byte-search version of this
+    /// test passed identically with nothing reported at all. Per-row it is
+    /// exact.
+    ///
+    /// Seeds two bdot10k buildings, one egib building and two PRG addresses in
+    /// the requested tile; `reports` is spliced in so each case varies only the
+    /// report rows.
+    fn seed_with_reports(reports: &str) -> String {
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+        format!(
+            "INSERT INTO bdot10k_buildings (PRZESTRZENNAZW, LOKALNYID, geom, centroid) VALUES
+                 ('PL.PZGiK.BDOT10k.1234', 'b1', ST_Point({mid_lon}, {mid_lat}),
+                  ST_Point({mid_lon}, {mid_lat})),
+                 ('PL.PZGiK.BDOT10k.1234', 'b2', ST_Point({mid_lon}, {mid_lat}),
+                  ST_Point({mid_lon}, {mid_lat}));
+             INSERT INTO egib_buildings (id_budynku, geom, centroid) VALUES
+                 ('e1', ST_Point({mid_lon}, {mid_lat}), ST_Point({mid_lon}, {mid_lat}));
+             INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, miejscowosc, geom) VALUES
+                 ('a1', '12', 'Warszawa', ST_Point({mid_lon}, {mid_lat})),
+                 ('a2', '14', 'Warszawa', ST_Point({mid_lon}, {mid_lat}));
+             {reports}"
+        )
+    }
+
+    /// `(id, reported)` for every feature the two `*_all` layers would emit
+    /// for tile 14/8000/4900, with the same bbox parameters `serve_tile`
+    /// binds. `reported IS NOT NULL` rather than the raw value because the
+    /// projection is `CASE WHEN ... THEN TRUE END` — the frontend sees
+    /// "attribute present", so that is what these assert on.
+    fn reported_flags(state: &AppState, sql: &str, params_groups: usize) -> Vec<(String, bool)> {
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let bbox = [min_lon, min_lat, max_lon, max_lat];
+        let flat: Vec<f64> = (0..params_groups).flat_map(|_| bbox).collect();
+        let params: Vec<&dyn duckdb::ToSql> =
+            flat.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+        let conn = state.pool.get().unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut rows = stmt.query(params.as_slice()).unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            out.push((
+                row.get::<_, String>(0).unwrap(),
+                row.get::<_, bool>(1).unwrap(),
+            ));
+        }
+        out.sort();
+        out
+    }
+
+    fn building_flags(state: &AppState) -> Vec<(String, bool)> {
+        // bbox CTE, bdot10k_candidates, egib_candidates.
+        reported_flags(
+            state,
+            &all_buildings_sql("t.id, t.reported IS NOT NULL AS reported"),
+            3,
+        )
+    }
+
+    fn address_flags(state: &AppState) -> Vec<(String, bool)> {
+        // bbox CTE, candidates.
+        reported_flags(
+            state,
+            &all_addresses_sql("t.lokalny_id, t.reported IS NOT NULL AS reported"),
+            2,
+        )
+    }
+
+    /// An active report is the one status the `*_all` layers could not show:
+    /// the veto removes its object from `<source>_unmatched`, so it drops out
+    /// of the `buildings`/`addresses` layers and reappears only here, where it
+    /// was previously indistinguishable from a matched record.
+    #[tokio::test]
+    async fn an_active_report_flags_its_own_object_and_only_that_one() {
+        let state = make_state(&seed_with_reports(
+            "INSERT INTO object_reports
+                 (report_id, source, record_key, signature, note, reported_at,
+                  cell_x, cell_y, status, resolved_at)
+             VALUES
+                 (1, 'bdot10k', ['PL.PZGiK.BDOT10k.1234', 'b1'], NULL, NULL, now(),
+                  8000, 4900, 'active', NULL),
+                 (2, 'prg', ['a1'], NULL, NULL, now(), 8000, 4900, 'active', NULL);",
+        ));
+        assert_eq!(
+            building_flags(&state),
+            vec![
+                ("b1".to_string(), true),
+                ("b2".to_string(), false),
+                ("e1".to_string(), false),
+            ],
+            "only the reported bdot10k building may carry the flag — not its \
+             unreported neighbour, and not the egib building"
+        );
+        assert_eq!(
+            address_flags(&state),
+            vec![("a1".to_string(), true), ("a2".to_string(), false)]
+        );
+    }
+
+    /// With nothing reported, no feature carries the attribute at all — which
+    /// is what keeps the flag free for the overwhelming majority of tiles
+    /// (`ST_AsMVT` omits a NULL attribute per feature).
+    #[tokio::test]
+    async fn nothing_reported_flags_nothing() {
+        let state = make_state(&seed_with_reports(""));
+        assert!(building_flags(&state).iter().all(|(_, r)| !r));
+        assert!(address_flags(&state).iter().all(|(_, r)| !r));
+    }
+
+    /// Both halves of `rule::reported_sql`'s correlation, in one negative.
+    /// The first row is a *revoked* report on a real key (so the
+    /// `status = 'active'` filter is what must reject it); the second is an
+    /// active report whose `PRZESTRZENNAZW` differs while `LOKALNYID` matches
+    /// (so the composite-key equality is what must reject it) — BDOT10k's key
+    /// is the pair, and correlating on `LOKALNYID` alone would flag a building
+    /// nobody reported. The third is an active report on the *other* registry's
+    /// id, pinning the `r.source` filter: `id_budynku` and `LOKALNYID` are
+    /// separate namespaces that can collide.
+    #[tokio::test]
+    async fn a_revoked_report_a_partial_key_or_another_registry_flags_nothing() {
+        let state = make_state(&seed_with_reports(
+            "INSERT INTO object_reports
+                 (report_id, source, record_key, signature, note, reported_at,
+                  cell_x, cell_y, status, resolved_at)
+             VALUES
+                 (1, 'bdot10k', ['PL.PZGiK.BDOT10k.1234', 'b1'], NULL, NULL, now(),
+                  8000, 4900, 'revoked', now()),
+                 (2, 'bdot10k', ['PL.PZGiK.BDOT10k.9999', 'b2'], NULL, NULL, now(),
+                  8000, 4900, 'active', NULL),
+                 (3, 'egib', ['b1'], NULL, NULL, now(), 8000, 4900, 'active', NULL);",
+        ));
+        assert!(
+            building_flags(&state).iter().all(|(_, r)| !r),
+            "a revoked report, one keyed on a different PRZESTRZENNAZW, and an \
+             egib report carrying a bdot10k id must all flag nothing"
+        );
     }
 
     /// `addr:city`/`addr:place` are mutually exclusive per address

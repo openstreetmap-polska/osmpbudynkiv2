@@ -636,13 +636,19 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     return key in ATTRIBUTE_LABELS ? ATTRIBUTE_LABELS[key] : key;
   }
 
-  // The one deliberate exception to attributeLabel's fall-through: BDOT10k's
-  // PRZESTRZENNAZW is carried by BUILDINGS_MVT_SQL purely so a report can name
-  // a complete BDOT10k identity -- its key is the composite
-  // (PRZESTRZENNAZW, LOKALNYID), see reportKeyFor below. It's a namespace
-  // identifier, not information about the building, so it's read by the report
-  // builder and kept out of the displayed attribute list.
-  const POPUP_HIDDEN_ATTRIBUTES = new Set(["PRZESTRZENNAZW"]);
+  // The two deliberate exceptions to attributeLabel's fall-through, both tile
+  // attributes that drive something in the popup rather than being displayed
+  // as a row of their own:
+  //
+  // - PRZESTRZENNAZW is carried by BUILDINGS_MVT_SQL purely so a report can
+  //   name a complete BDOT10k identity -- its key is the composite
+  //   (PRZESTRZENNAZW, LOKALNYID), see reportKeyFor below. It's a namespace
+  //   identifier, not information about the building.
+  // - reported is carried by the two *_all selects (see featureStatus below)
+  //   and becomes the popup's status chip, which is where a fact about *this
+  //   map* rather than about the government record belongs -- the same
+  //   reasoning that keeps "Niedopasowany"/"W rejestrze" out of the list.
+  const POPUP_HIDDEN_ATTRIBUTES = new Set(["PRZESTRZENNAZW", "reported"]);
 
   // ADDRESSES_MVT_SQL has no single `tags` column like BUILDINGS_MVT_SQL --
   // it projects the OSM tag preview as separate addr:*/source:addr columns
@@ -734,6 +740,33 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     return String(value);
   }
 
+  // The popup's status chip: which of the three states this feature is in,
+  // plus the hover text for the one that needs explaining. Not an attribute --
+  // it comes from which layer was clicked and from `reported`, not from the
+  // government record -- so it sits in the popup header rather than among the
+  // rows (see POPUP_HIDDEN_ATTRIBUTES).
+  //
+  // "Zgłoszony" can only ever come from the two *_all layers, and that is the
+  // whole point of it. An active user report vetoes its object out of
+  // <source>_unmatched (compare::rule::reported_sql), so the object disappears
+  // from the unmatched layers and survives only on the "wszystkie" layer --
+  // where, until the `reported` attribute existed, it was indistinguishable
+  // from a record OSM already has: the popup said "W rejestrze" and nothing
+  // explained why the object had stopped being offered for import. The
+  // attribute is set by ALL_ADDRESSES_MVT_SQL/ALL_BUILDINGS_MVT_SQL
+  // (src/server/tiles.rs) from that same shared predicate, and is absent
+  // rather than false on everything else -- ST_AsMVT drops NULL attributes --
+  // so a plain truthiness check is the right test.
+  const REPORTED_HINT =
+    "Obiekt zgłoszony przez użytkownika jako nienadający się do importu — " +
+    "nie jest proponowany do dodania do OSM. Wróci, gdy zmieni się rekord w rejestrze.";
+
+  function featureStatus(layerId, props) {
+    if (layerId.includes("unmatched")) return { status: "Niedopasowany" };
+    if (props.reported) return { status: "Zgłoszony", statusHint: REPORTED_HINT };
+    return { status: "W rejestrze" };
+  }
+
   // `tags` is the resolved k=v;k=v string the building-type mapping produced
   // -- the tags /package would export for this object. Split into individual
   // [key, value] pairs so the OSM-tags section can list one tag per row
@@ -798,9 +831,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     }
     return {
       title: layerId.startsWith("buildings-") ? "Budynek" : "Adres",
-      // Not an attribute -- it comes from which layer was clicked, not from
-      // the data -- so it sits in the header rather than among the rows.
-      status: layerId.includes("unmatched") ? "Niedopasowany" : "W rejestrze",
+      ...featureStatus(layerId, props),
       attributes,
       tags,
       // null for anything not reportable -- see reportKeyFor.
@@ -819,7 +850,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     return `<h4 class="feature-popup-section">${escapeHtml(heading)}</h4><dl>${rowsHtml}</dl>`;
   }
 
-  function popupHtml({ title, status, attributes, tags, report }) {
+  function popupHtml({ title, status, statusHint, attributes, tags, report }) {
     // Each present only when it has rows -- a feature with no OSM-tag preview
     // (or, in principle, no plain attributes) shows a single section rather
     // than an empty one with nothing under its heading.
@@ -837,9 +868,19 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       ? `<div class="feature-popup-actions">` +
         `<button type="button" class="report-btn">Zgłoś problem</button></div>`
       : "";
+    // Same hover-icon shape as kstHint/exclusionHint, on the status chip
+    // instead of an attribute value: the status word alone says what happened,
+    // the hint says why the object is no longer offered. REPORTED_HINT is a
+    // fixed literal in this file, not tile data, so -- like the exclusion
+    // hint's title -- it needs no escaping (escapeHtml is not attribute-safe
+    // anyway; it leaves quotes untouched).
+    const statusHintHtml = statusHint
+      ? ` <span class="status-hint" title="${statusHint}">${WARNING_ICON_SVG}</span>`
+      : "";
+    const statusClass = statusHint ? "feature-status feature-status-flagged" : "feature-status";
     return (
       `<div class="feature-popup"><h3>${escapeHtml(title)}` +
-      `<span class="feature-status">${escapeHtml(status)}</span></h3>` +
+      `<span class="${statusClass}">${escapeHtml(status)}${statusHintHtml}</span></h3>` +
       `<div class="feature-popup-body">${attributesHtml}${tagsHtml}</div>${actionsHtml}</div>`
     );
   }

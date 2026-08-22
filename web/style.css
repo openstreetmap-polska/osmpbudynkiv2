@@ -992,15 +992,16 @@ button {
   border-color: var(--danger);
 }
 
-/* Shared box for the inline SVG hint icons (kstHint/exclusionHint in
-   app.js) -- both icons render at the same viewBox/size, but this fixes
-   their layout box explicitly so hover/click hit-testing lines up with what
-   renders regardless of the icon's own geometry, unlike the bare Unicode
+/* Shared box for the inline SVG hint icons (kstHint/exclusionHint/the status
+   chip's hint in app.js) -- all render at the same viewBox/size, but this
+   fixes their layout box explicitly so hover/click hit-testing lines up with
+   what renders regardless of the icon's own geometry, unlike the bare Unicode
    glyphs (ⓘ/⚠) this replaced, whose rendered size varied by font/platform.
    Native `title` tooltip, so this is purely a visual affordance marking the
    value as hoverable. */
 .kst-hint,
-.exclusion-hint {
+.exclusion-hint,
+.status-hint {
   display: inline-flex;
   align-items: center;
   vertical-align: -2px;
@@ -1015,4 +1016,20 @@ button {
    hint: the building is excluded from the OSM comparison outright. */
 .exclusion-hint {
   color: var(--danger);
+}
+/* "Zgłoszony" -- the status chip for an object an active user report has
+   vetoed out of the import proposals (see featureStatus in app.js). Coloured
+   like .exclusion-hint, and for the same reason: both mark an object that
+   exists in the registry but will never be offered for import, so they should
+   read alike rather than each inventing their own signal. The chip itself
+   takes the colour too, since here the *word* is the warning and the icon only
+   carries the explanation. Colour and border only -- the chip keeps
+   .feature-status's own box so it stays baseline-aligned with the title next
+   to it, and the icon's inline-flex box handles its own alignment. */
+.feature-status-flagged,
+.status-hint {
+  color: var(--danger);
+}
+.feature-status-flagged {
+  border-color: var(--danger);
 }

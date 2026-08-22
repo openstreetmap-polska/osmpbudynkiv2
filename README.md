@@ -31,7 +31,7 @@ Current implementation status against the planned scope (see [`docs/project_idea
 - [x] Web map frontend (MapLibre GL JS, `web/`) — layer legend, per-feature popups showing source attributes and the tags an import would write, status panel, and package download for either the visible area or a drawn one (rectangle, polygon or freehand)
 - [x] Ignore buildings that are mapped as no longer existing or ruins — OSM ways/relations tagged with a lifecycle-prefixed key (`demolished:building`, `destroyed:building`, `abandoned:building`, `was:building`, `razed:building`, `removed:building`, `disused:building`, `ruins:building`) are imported into `osm_former_buildings` and suppress the government building they overlap from `compare buildings`, instead of proposing it for import. Requires an `import osm` re-run to populate on a database from before this feature (see [`docs/former_buildings.md`](docs/former_buildings.md))
 - [x] Tile caching
-- [x] Endpoint for reporting records to exclude (bad source data, comparison mismatches) — `POST /report` marks a government object as one that should not be proposed for import, keyed on its registry identity. An active report vetoes the object out of the `*_unmatched` serving tables (so out of `/tiles`, `/package` and JOSM) until the underlying record changes, at which point the report is retired automatically and the object becomes importable again. Reported from the map's feature popup; managed offline with `reports list|revoke|reconcile|export|import`. Nothing identifying the submitter is stored — see the `[reports]` section of `example_config.toml` for what that means for abuse control
+- [x] Endpoint for reporting records to exclude (bad source data, comparison mismatches) — `POST /report` marks a government object as one that should not be proposed for import, keyed on its registry identity. An active report vetoes the object out of the `*_unmatched` serving tables (so out of `/tiles`, `/package` and JOSM) until the underlying record changes, at which point the report is retired automatically and the object becomes importable again. Reported from the map's feature popup, where a reported object stays visible on the "Wszystkie" layer with a "Zgłoszony" status explaining why it is no longer being proposed; managed offline with `reports list|revoke|reconcile|export|import`. Nothing identifying the submitter is stored — see the `[reports]` section of `example_config.toml` for what that means for abuse control
 
 ## Not yet implemented
 
@@ -408,7 +408,9 @@ Serves:
   (`PRZESTRZENNAZW` + `LOKALNYID` for bdot10k, `id_budynku` for egib,
   `lokalny_id` for prg). A key that matches no live record is rejected per
   object rather than failing the request. Each accepted report enqueues its
-  z14 cell, so the object leaves `*_unmatched` on the next drain. Capped at
+  z14 cell, so the object leaves `*_unmatched` on the next drain — from then
+  on it appears only on `/tiles`' `addresses_all`/`buildings_all` layers,
+  carrying a `reported` attribute the frontend renders as "Zgłoszony". Capped at
   `[reports] max_objects_per_request` objects; `[reports] enabled = false`
   turns the route into a 404 with no redeploy. Nothing about the submitter is
   captured or stored — see the `[reports]` comment in `example_config.toml`
