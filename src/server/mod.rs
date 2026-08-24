@@ -35,8 +35,8 @@ use crate::shutdown;
 ///
 /// A clone inherits write capability (cloning does not downgrade to
 /// read-only), so this pool has no engine-enforced guarantee against writes
-/// from read-path handlers — same trust level the old single `write` mutex
-/// already relied on.
+/// from read-path handlers — read-only-ness is a convention here, not something
+/// the engine enforces.
 #[derive(Debug)]
 pub struct ClonedConnectionManager {
     base: Arc<Mutex<Connection>>,
@@ -54,8 +54,16 @@ impl r2d2::ManageConnection for ClonedConnectionManager {
     type Connection = Connection;
     type Error = duckdb::Error;
 
+    /// Recovers a poisoned guard rather than unwrapping: this is the pool's
+    /// only way to make a connection, so propagating poison would mean every
+    /// later request failing to acquire one. `try_clone` reads the base
+    /// connection without mutating it, so a panic elsewhere leaves nothing
+    /// half-written for it to observe.
     fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
-        self.base.lock().unwrap().try_clone()
+        self.base
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_clone()
     }
 
     fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
@@ -390,9 +398,8 @@ const REQUIRED_TABLES: &[&str] = &[
 /// The serving tables `/tiles` and `/package` read directly. Unlike
 /// `REQUIRED_TABLES` these always exist (created by `CREATE TABLE IF NOT
 /// EXISTS` in `db::create_schema` on every startup), so there is nothing to
-/// bail on -- only "empty" is worth flagging, since an in-place upgrade of an
-/// existing database gains these tables empty and would otherwise start
-/// serving zero features with no indication why (see README).
+/// bail on -- only "empty" is worth flagging: a database whose `compare` has
+/// not run yet serves zero features, with nothing else to say why.
 const UNMATCHED_TABLES: &[&str] = &["bdot10k_unmatched", "egib_unmatched", "prg_unmatched"];
 
 fn check_startup_conditions(pool: &DbPool) -> Result<()> {
@@ -441,35 +448,6 @@ fn check_startup_conditions(pool: &DbPool) -> Result<()> {
                 "serving table '{table}' is empty -- /tiles and /package will return no \
                  features for this source until an offline `compare full` populates it \
                  (see README)"
-            );
-        }
-    }
-
-    // osm_former_buildings backs compare::rule's suppression veto (see
-    // CLAUDE.md). Like the UNMATCHED_TABLES loop above, it always exists
-    // (CREATE TABLE IF NOT EXISTS in db::create_schema) so there is nothing
-    // to bail on, only "empty" to flag -- but unlike those tables, a freshly
-    // initialized, never-yet-imported database also has it empty, and that
-    // is not worth a warning. Gate on osm_buildings being non-empty instead:
-    // that is the real signal an operator cares about, "you upgraded to a
-    // binary that understands former buildings but have not re-run
-    // `import osm` yet", since only a full `import osm` populates this table.
-    let osm_buildings_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM osm_buildings", [], |row| row.get(0))
-        .context("Failed to count rows in table 'osm_buildings'")?;
-    if osm_buildings_rows > 0 {
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM osm_former_buildings", [], |row| {
-                row.get(0)
-            })
-            .context("Failed to count rows in table 'osm_former_buildings'")?;
-
-        info!("Table osm_former_buildings has {} rows.", rows);
-        if rows == 0 {
-            tracing::warn!(
-                "osm_former_buildings is empty even though osm_buildings is not -- this \
-                 database predates the former-building suppression veto; run `import osm` \
-                 to backfill it (see README)"
             );
         }
     }

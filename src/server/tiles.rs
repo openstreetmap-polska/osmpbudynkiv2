@@ -1239,11 +1239,10 @@ mod tests {
         assert_eq!(response.headers()["cache-control"], "public, max-age=86400");
     }
 
-    /// z10 sits inside Tier A (aggregated bins) and used to return 204 before
-    /// Tiers A/B existed (see `out_of_range_zoom_returns_no_content` above,
-    /// which used to cover z10 itself). An empty DB is enough here since
-    /// `ST_AsMVT` emits a layer header even with zero features, same as the
-    /// z14 `empty_tile_returns_ok_not_500` case below.
+    /// z10 sits inside Tier A (aggregated bins), so unlike the out-of-range
+    /// zooms above it must return a tile rather than 204. An empty DB is enough
+    /// here since `ST_AsMVT` emits a layer header even with zero features, same
+    /// as the z14 `empty_tile_returns_ok_not_500` case below.
     #[tokio::test]
     async fn z10_aggregated_tile_returns_ok_not_no_content() {
         let state = make_state("");

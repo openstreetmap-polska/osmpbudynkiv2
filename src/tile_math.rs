@@ -40,18 +40,16 @@ pub fn lonlat_to_tile(lon: f64, lat: f64, z: u32) -> (u32, u32) {
 // so the cell a row is tagged with and the cell a query looks for cannot
 // drift apart. Their Rust inverse is [`lonlat_to_tile`], and
 // `cell_sql_matches_lonlat_to_tile` pins the two together over a spread of
-// coordinates.
-//
-// (This note used to sit on `cell_x_sql` alone, which made it look like a
-// property of the X projection rather than of the pair.)
+// coordinates. This is a property of the pair, not of either projection
+// alone.
 //
 // The frac pair exists for `dataset::filter_oversized_geometry`, which needs
 // the *unfloored* fractional cell coordinate of a bbox edge (`ST_XMin`,
 // `ST_XMax`, ...), not the cell index a point falls in -- flooring first and
 // then subtracting indices would compare which cell each edge's index lands
 // in rather than how far apart the edges actually are. `cell_x_sql` /
-// `cell_y_sql` are now defined as `floor(...)` of the frac functions, so
-// there is still exactly one place the arithmetic is written.
+// `cell_y_sql` are defined as `floor(...)` of the frac functions, so there is
+// exactly one place the arithmetic is written.
 
 /// The `2^CHANGE_CELL_ZOOM` factor shared by both cell projections.
 fn cell_zoom_factor_sql() -> String {

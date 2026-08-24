@@ -50,22 +50,16 @@ END";
 
 /// Wrap `select_sql` (typically the output of
 /// `DatasetSpec::with_centroid_select`) so it also gains a `rodzaj_kod
-/// VARCHAR` column. Added OUTSIDE `hashed_select`'s projection, the same way
-/// `centroid` is (see `DatasetSpec::with_centroid_select`) -- but the reason
-/// it's safe to do so has changed. It's not that the column sits outside a
-/// hash expression; it's that `rodzaj_kod` is simply not one of the names in
-/// `EGIB.compared_columns`, so it cannot affect what `changed_predicate_sql`
-/// sees.
+/// VARCHAR` column. Derived, not raw, the same way `centroid` is: `rodzaj_kod`
+/// is not one of the names in `EGIB.compared_columns`, so it cannot affect
+/// what `changed_predicate_sql` sees.
 ///
-/// That has a consequence the old row-hash story didn't: because it's
-/// outside the compared set, `rodzaj_kod` on an *unmodified* record never
-/// self-heals. It is recomputed fresh for every row a refresh *stages*, so a
-/// record that gets rewritten for some other reason (its `WERSJA` bumped, an
-/// attribute changed) picks up a corrected expression for free -- but a
-/// record the diff never touches keeps whatever `rodzaj_kod` its last import
-/// or full rewrite gave it, forever. `ROW_HASH_VERSION` used to force a
-/// full-table rewrite on every bump, which fixed this as a side effect;
-/// nothing does that any more. Editing `RODZAJ_KOD_CASE_SQL` therefore
+/// The cost of sitting outside the compared set is that `rodzaj_kod` on an
+/// *unmodified* record never self-heals. It is recomputed fresh for every row
+/// a refresh *stages*, so a record rewritten for some other reason (its
+/// `WERSJA` bumped, an attribute changed) picks up a corrected expression for
+/// free -- but a record the diff never touches keeps whatever `rodzaj_kod` its
+/// last import gave it, forever. Editing `RODZAJ_KOD_CASE_SQL` therefore
 /// requires a re-import (`import egib`), not a refresh, to reach every row.
 pub fn with_rodzaj_kod_select(select_sql: &str) -> String {
     format!("SELECT *, ({RODZAJ_KOD_CASE_SQL}) AS rodzaj_kod FROM ({select_sql}) t")
@@ -144,9 +138,7 @@ mod tests {
     /// `EGIB.compared_columns`, so joining a wrapped and an unwrapped table
     /// on the key and running `EGIB.changed_predicate_sql` over them must
     /// report zero differing rows -- the same invariant
-    /// `dataset::with_centroid_select` carries for `centroid`, now pinned
-    /// against the diff predicate instead of a `_row_hash` column that no
-    /// longer exists.
+    /// `dataset::with_centroid_select` carries for `centroid`.
     #[test]
     fn does_not_change_what_the_diff_compares() {
         let c = conn();

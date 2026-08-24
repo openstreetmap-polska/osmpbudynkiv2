@@ -30,11 +30,10 @@ pub fn compare_egib(conn: &Connection) -> Result<()> {
     compare_buildings(conn, &EGIB, "id_budynku", "egib_unmatched", None)
 }
 
-/// `spec` replaces what used to be a separate `label`/`source_table` pair:
-/// `spec.name` is the label (identical to `match_dirty_cells.source`) and
-/// `spec.table` the live table, so the two can no longer be passed
-/// inconsistently, and the user-report veto gets the key columns it correlates
-/// on from the same place.
+/// Takes a whole `spec` rather than a label plus a source-table name: they
+/// cannot then be passed inconsistently (`spec.name` is the label, identical to
+/// `match_dirty_cells.source`; `spec.table` is the live table), and the
+/// user-report veto gets the key columns it correlates on from the same place.
 fn compare_buildings(
     conn: &Connection,
     spec: &DatasetSpec,

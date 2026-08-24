@@ -112,6 +112,17 @@ pub struct JobStatus {
     pub log_keys: Vec<&'static str>,
 }
 
+/// Take a job's status lock, recovering the guard if a previous holder
+/// panicked.
+///
+/// Never `unwrap`: a panic inside one job's status update would otherwise
+/// poison that entry for the life of the process, taking `/status` down with
+/// it. A `JobStatus` is a bag of independent scalars with no cross-field
+/// invariant to violate, so the recovered value is at worst one stale field.
+fn lock_status(entry: &StdMutex<JobStatus>) -> std::sync::MutexGuard<'_, JobStatus> {
+    entry.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// In-memory registry shared between supervisors and the `/status` handler.
 pub struct JobRegistry {
     order: Vec<&'static str>,
@@ -132,16 +143,29 @@ impl JobRegistry {
     }
 
     /// Snapshot the full registry in registration order. Stable JSON.
+    ///
+    /// Skips a name that somehow isn't registered rather than indexing into
+    /// `entries` directly: this runs on `/status`, and a status endpoint that
+    /// panics is worse than one reporting a job short. `order` and `entries`
+    /// are only ever written together by [`JobRegistry::insert`], so in
+    /// practice nothing is skipped.
     pub fn snapshot(&self) -> Vec<JobStatus> {
         self.order
             .iter()
-            .map(|name| self.entries[name].lock().unwrap().clone())
+            .filter_map(|name| self.entries.get(name))
+            .map(|entry| lock_status(entry).clone())
             .collect()
     }
 
     pub(crate) fn update<F: FnOnce(&mut JobStatus)>(&self, name: &'static str, f: F) {
-        let mut s = self.entries[name].lock().unwrap();
-        f(&mut s);
+        let Some(entry) = self.entries.get(name) else {
+            warn!(
+                job = name,
+                "status update for an unregistered job, ignoring"
+            );
+            return;
+        };
+        f(&mut lock_status(entry));
     }
 
     #[cfg(test)]
@@ -449,7 +473,6 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
 
     fn make_parts() -> (DbPool, Arc<RocksDB>, Arc<AppConfig>, tempfile::TempDir) {
@@ -906,10 +929,4 @@ mod tests {
     // just eventually) on a real multi-threaded runtime; it doesn't pin this
     // ordering specifically because its `sleep(200ms)` gives the supervisor
     // ample real time to register well before `notify_waiters()` runs.
-
-    // Silence "field is never read" if any test struct goes unused.
-    #[allow(dead_code)]
-    fn _check_path_used() -> &'static Path {
-        Path::new(".")
-    }
 }

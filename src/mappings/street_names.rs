@@ -16,10 +16,8 @@ use tracing::{info, warn};
 
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql};
 
-#[allow(dead_code)]
 pub const MAPPINGS_TABLE: &str = "street_name_mappings";
 
-#[allow(dead_code)]
 const STAGING_TABLE: &str = "street_name_mappings__staging";
 
 /// The two LEFT JOINs that resolve `{alias}.ulica` through
@@ -99,11 +97,11 @@ pub fn load_from_path(conn: &Connection, path: &Path) -> Result<LoadStats> {
 
 /// Enqueue the z14 `match_dirty_cells` rows a mapping swap invalidates.
 ///
-/// The PRG<->OSM address match rule now has a branch that compares PRG's
-/// street name *resolved through `street_name_mappings`* against OSM's
-/// `addr:street` at up to 150 m, so a mapping edit can flip an address
-/// between matched and unmatched -- this table is no longer serving-time
-/// only, and the drain needs to know which cells to recompute.
+/// **This table is a match input, not merely a serving-time lookup.** The
+/// PRG<->OSM address match rule has a branch comparing PRG's street name
+/// *resolved through `street_name_mappings`* against OSM's `addr:street` at up
+/// to 150 m, so a mapping edit can flip an address between matched and
+/// unmatched, and the drain needs to know which cells to recompute.
 ///
 /// Must be called before the caller deletes `{MAPPINGS_TABLE}`'s contents:
 /// this reads the live table's pre-swap rows, which are half the symmetric
@@ -188,7 +186,6 @@ fn enqueue_mapping_delta_cells(conn: &Connection) -> Result<i64> {
     Ok(n as i64)
 }
 
-#[allow(dead_code)]
 fn validate_and_swap(conn: &Connection, path_str: &str) -> Result<LoadStats> {
     let empty: i64 = conn
         .query_row(
@@ -270,10 +267,10 @@ fn validate_and_swap(conn: &Connection, path_str: &str) -> Result<LoadStats> {
 
     conn.execute_batch("BEGIN TRANSACTION")
         .context("Failed to begin mapping swap")?;
-    // The mapping is no longer serving-time only: the PRG<->OSM address
-    // match rule now has a branch that compares PRG's street name resolved
-    // through street_name_mappings against OSM's addr:street, so a mapping
-    // edit can flip an address between matched and unmatched (see CLAUDE.md's
+    // The mapping is a match input, not a serving-time lookup: the PRG<->OSM
+    // address match rule compares PRG's street name resolved through
+    // street_name_mappings against OSM's addr:street, so a mapping edit can
+    // flip an address between matched and unmatched (see CLAUDE.md's
     // street-name gotcha). enqueue_mapping_delta_cells must run first, before
     // the DELETE below discards the live rows it needs to diff against.
     // Chained via `.context().and_then(...)` (converting the duckdb::Error

@@ -444,10 +444,10 @@ pub fn reported_buildings_sql(
 ///
 /// **Rule B reads the street name resolved through `street_name_mappings`, not
 /// the raw PRG `ulica`.** That is why this predicate joins the mapping table at
-/// all, and it is what makes the mapping a *match* input rather than the
-/// serving-time-only lookup it used to be — see
-/// `mappings::street_names::validate_and_swap`, which now enqueues dirty cells
-/// for the addresses a mapping edit can flip. Measured nationally, the mapped
+/// all, and it is what makes the mapping a *match* input rather than a
+/// serving-time-only lookup — see `mappings::street_names::validate_and_swap`,
+/// which enqueues dirty cells for the addresses a mapping edit can flip.
+/// Measured nationally, the mapped
 /// name matches 20,980 addresses and the raw name 20,243; OR-ing both adds only
 /// 154 over mapped-only, which is not worth a third branch.
 ///
@@ -464,10 +464,10 @@ pub fn reported_buildings_sql(
 /// grid-key implementation in `compare::addresses` for this reason.
 ///
 /// The rule owns the whole `WITH` chain because it is *structurally* required:
-/// `compare::incremental` used to concatenate its own `WITH candidates AS ...`
-/// onto this output, and two `WITH` keywords is a syntax error — one side has
-/// to own it, and owning it here means the two bare-table test callers get the
-/// same shape production does. `MATERIALIZED` is insurance against the
+/// a caller wanting its own `WITH candidates AS ...` in front of this output
+/// would make two `WITH` keywords in one statement, which is a syntax error —
+/// one side has to own it, and owning it here means the two bare-table test
+/// callers get the same shape production does. `MATERIALIZED` is insurance against the
 /// `server::tiles` fold-back (a `LEFT JOIN` downstream of a filtered CTE can be
 /// re-planned into a `SEQ_SCAN` plus `FILTER`), **not** a measured index fix:
 /// both shapes were `EXPLAIN`ed against the real national tables and both keep

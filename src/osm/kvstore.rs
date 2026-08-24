@@ -37,15 +37,12 @@ const ALL_CFS: &[&str] = &[
 /// somewhere in the Gulf of Guinea. There is no in-place migration — the store
 /// is rebuilt wholesale by `import osm` — so the only job here is to make the
 /// mismatch loud.
-///
-/// Version 2: `i32` decimicrodegree node values (was two `f64`), big-endian
-/// keys (was little-endian), delta+varint way ref lists (was fixed-width).
-pub const KV_FORMAT_VERSION: u32 = 2;
+pub const KV_FORMAT_VERSION: u32 = 1;
 
 const FORMAT_VERSION_KEY: &[u8] = b"format_version";
 
-/// Message used when the store predates [`KV_FORMAT_VERSION`]. Named so tests
-/// can assert on it exactly rather than on a substring.
+/// Message used when the store's stamp disagrees with [`KV_FORMAT_VERSION`].
+/// Named so tests can assert on it exactly rather than on a substring.
 pub const FORMAT_MISMATCH_MESSAGE: &str = "RocksDB store was built by an incompatible version — re-run `import osm` \
      to rebuild it (there is no in-place migration)";
 
@@ -150,12 +147,11 @@ pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<Ro
     Ok(db)
 }
 
-/// Verify the store's format version, stamping it if the store is empty.
+/// Verify the store's format version, stamping it if it carries no stamp yet.
 ///
-/// An empty store (fresh directory, or one just cleared by [`clear`]) is
-/// stamped with the current version. A store carrying data but no stamp was
-/// built before versioning existed, so it is by definition an older layout and
-/// is rejected. See [`KV_FORMAT_VERSION`] for why silence here is dangerous.
+/// A fresh directory, or one just cleared by [`clear`], is stamped with the
+/// current version. A stamp that disagrees with [`KV_FORMAT_VERSION`] is
+/// rejected -- see that constant for why silence here is dangerous.
 fn check_or_stamp_format_version(db: &RocksDB) -> Result<()> {
     let stored = db
         .get_cf(&cf(db, CF_META), FORMAT_VERSION_KEY)
@@ -176,12 +172,7 @@ fn check_or_stamp_format_version(db: &RocksDB) -> Result<()> {
             }
             Ok(())
         }
-        None => {
-            if store_has_data(db) {
-                anyhow::bail!("{FORMAT_MISMATCH_MESSAGE} (found an unversioned store)");
-            }
-            stamp_format_version(db)
-        }
+        None => stamp_format_version(db),
     }
 }
 
@@ -197,12 +188,6 @@ fn stamp_format_version(db: &RocksDB) -> Result<()> {
 
 /// Cheap "is there anything in here" probe — the nodes CF is populated first
 /// by every import, so one key there is enough to call the store non-empty.
-fn store_has_data(db: &RocksDB) -> bool {
-    db.iterator_cf(&cf(db, CF_NODES), rocksdb::IteratorMode::Start)
-        .next()
-        .is_some()
-}
-
 /// Drop and recreate all column families, effectively clearing all data.
 pub fn clear(db: &RocksDB) -> Result<()> {
     for name in ALL_CFS {
@@ -238,7 +223,11 @@ pub fn put_node(db: &RocksDB, node_id: i64, lon_dm: i32, lat_dm: i32) -> Result<
 }
 
 /// Read a node's coordinates back, in decimicrodegrees.
-#[allow(dead_code)]
+///
+/// Test-only: production reads coordinates in bulk through
+/// [`multi_get_nodes_wkb_coords`], never one node at a time. Kept because it is
+/// the natural way for a test to assert on what a write actually stored.
+#[cfg(test)]
 pub fn get_node(db: &RocksDB, node_id: i64) -> Result<Option<(i32, i32)>> {
     if let Some(value) = db.get_cf(&cf(db, CF_NODES), encoding::encode_key(node_id))? {
         let coords = encoding::decode_node(&value);
@@ -253,9 +242,11 @@ pub fn get_node(db: &RocksDB, node_id: i64) -> Result<Option<(i32, i32)>> {
 /// Returns `Ok(None)` if *any* node is missing (callers treat missing refs
 /// as "cannot build geometry").
 ///
-/// Note this widens rather than copies: node values are stored as `i32`
-/// decimicrodegrees, which is half the bytes but no longer byte-identical to
-/// WKB's layout. See `encoding::push_wkb_coords`.
+/// **Widens, never copies.** Node values are stored as `i32` decimicrodegrees
+/// — half the bytes of WKB's `f64` pairs, and not byte-compatible with them —
+/// so there is no memcpy shortcut from stored bytes into a geometry buffer.
+/// The name says `wkb_coords` rather than anything shorter for that reason.
+/// See `encoding::push_wkb_coords`.
 pub fn multi_get_nodes_wkb_coords(db: &RocksDB, node_ids: &[i64]) -> Result<Option<Vec<u8>>> {
     let keys: Vec<[u8; 8]> = node_ids
         .iter()
@@ -409,25 +400,10 @@ pub fn remove_way_to_relations(db: &RocksDB, way_id: i64, relation_id: i64) -> R
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn merge_node_to_way(db: &RocksDB, node_id: i64, way_id: i64) -> Result<()> {
-    db.merge_cf(
-        &cf(db, CF_NODE_TO_WAYS),
-        encoding::encode_key(node_id),
-        way_id.to_le_bytes(),
-    )?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-pub fn merge_way_to_relation(db: &RocksDB, way_id: i64, relation_id: i64) -> Result<()> {
-    db.merge_cf(
-        &cf(db, CF_WAY_TO_RELATIONS),
-        encoding::encode_key(way_id),
-        relation_id.to_le_bytes(),
-    )?;
-    Ok(())
-}
+// The single-item `merge_*` counterparts of `batch_merge_node_to_way` /
+// `batch_merge_way_to_relation` are deliberately absent: nothing writes a
+// reverse-index entry outside a `WriteBatch`, so the batch pair is the whole
+// public surface and the merge operator has exactly one caller per CF.
 
 // --- WriteBatch for atomic operations ---
 
@@ -552,25 +528,6 @@ mod tests {
         assert!(res.is_none());
     }
 
-    /// A store carrying data but no version stamp predates versioning, so it
-    /// must be rejected rather than decoded as if it were the current layout.
-    #[test]
-    fn unversioned_store_with_data_is_rejected_on_open() {
-        let tmp = TempDir::new().unwrap();
-        {
-            let db = open(tmp.path(), 32, 4).unwrap();
-            put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
-            // Simulate a pre-versioning store: data present, stamp absent.
-            db.delete_cf(&cf(&db, CF_META), FORMAT_VERSION_KEY).unwrap();
-        }
-
-        let err = open(tmp.path(), 32, 4).unwrap_err();
-        assert!(
-            format!("{err:#}").contains(FORMAT_MISMATCH_MESSAGE),
-            "got: {err:#}"
-        );
-    }
-
     /// A store written by a *different* version must be rejected too — this is
     /// the case that would otherwise decode to plausible-looking garbage.
     #[test]
@@ -594,19 +551,22 @@ mod tests {
         );
     }
 
-    /// `clear` drops every CF including `meta`, so it must re-stamp — otherwise
-    /// the next open sees data without a stamp and refuses to start.
+    /// `clear` drops every CF including `meta`, so it must re-stamp. Asserted
+    /// on the stamp itself, not on a later `open` succeeding: `open` stamps an
+    /// unstamped store on its own, so a reopen would pass either way.
     #[test]
-    fn clear_restamps_the_format_version_so_reopen_succeeds() {
+    fn clear_restamps_the_format_version() {
         let tmp = TempDir::new().unwrap();
-        {
-            let db = open(tmp.path(), 32, 4).unwrap();
-            put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
-            clear(&db).unwrap();
-            put_node(&db, 2, dm(21.0), dm(51.0)).unwrap();
-        }
         let db = open(tmp.path(), 32, 4).unwrap();
-        assert_eq!(get_node(&db, 2).unwrap(), Some((dm(21.0), dm(51.0))));
+        put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
+        clear(&db).unwrap();
+
+        let stamp = db.get_cf(&cf(&db, CF_META), FORMAT_VERSION_KEY).unwrap();
+        assert_eq!(
+            stamp.as_deref(),
+            Some(&KV_FORMAT_VERSION.to_le_bytes()[..]),
+            "clear must leave the current format stamp in place"
+        );
     }
 
     #[test]
@@ -653,17 +613,21 @@ mod tests {
     #[test]
     fn test_merge_node_to_ways() {
         let (_tmp, db) = open_tmp_db();
-        merge_node_to_way(&db, 10, 100).unwrap();
-        merge_node_to_way(&db, 10, 101).unwrap();
-        merge_node_to_way(&db, 10, 102).unwrap();
+        let mut batch = new_batch();
+        batch_merge_node_to_way(&db, &mut batch, 10, 100);
+        batch_merge_node_to_way(&db, &mut batch, 10, 101);
+        batch_merge_node_to_way(&db, &mut batch, 10, 102);
+        write_batch(&db, &batch).unwrap();
         assert_eq!(get_node_to_ways(&db, 10).unwrap(), vec![100, 101, 102]);
     }
 
     #[test]
     fn test_merge_way_to_relation() {
         let (_tmp, db) = open_tmp_db();
-        merge_way_to_relation(&db, 20, 200).unwrap();
-        merge_way_to_relation(&db, 20, 201).unwrap();
+        let mut batch = new_batch();
+        batch_merge_way_to_relation(&db, &mut batch, 20, 200);
+        batch_merge_way_to_relation(&db, &mut batch, 20, 201);
+        write_batch(&db, &batch).unwrap();
         assert_eq!(get_way_to_relations(&db, 20).unwrap(), vec![200, 201]);
     }
 
@@ -671,8 +635,10 @@ mod tests {
     fn test_merge_on_top_of_existing_put() {
         let (_tmp, db) = open_tmp_db();
         put_node_to_ways(&db, 10, &[100, 101]).unwrap();
-        merge_node_to_way(&db, 10, 102).unwrap();
-        merge_node_to_way(&db, 10, 103).unwrap();
+        let mut batch = new_batch();
+        batch_merge_node_to_way(&db, &mut batch, 10, 102);
+        batch_merge_node_to_way(&db, &mut batch, 10, 103);
+        write_batch(&db, &batch).unwrap();
         assert_eq!(get_node_to_ways(&db, 10).unwrap(), vec![100, 101, 102, 103]);
     }
 }

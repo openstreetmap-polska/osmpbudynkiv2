@@ -220,11 +220,11 @@ mod full_vs_incremental_equivalence {
         }
     }
 
-    /// One comparable string per row (id/geometry-as-WKT/cell tags, plus
-    /// `extra_col` if given -- used to also pin a carried column between the
-    /// full-compare and incremental paths, closing the blind spot this
-    /// function otherwise has for anything beyond id/geom/cell tags),
-    /// deliberately excluding `computed_at` -- the two recompute paths run at
+    /// One comparable string per row: id, geometry-as-WKT and cell tags, plus
+    /// `extra_col` when given, which pins one carried column between the
+    /// full-compare and incremental paths and closes the blind spot this
+    /// function otherwise has for anything beyond id/geom/cell tags.
+    /// `computed_at` is deliberately excluded -- the two recompute paths run at
     /// different wall-clock times, so that column is expected to differ.
     fn snapshot(
         c: &Connection,

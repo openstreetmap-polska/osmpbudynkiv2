@@ -156,9 +156,9 @@ pub fn register_udfs(conn: &Connection, kv: Arc<RocksDB>) -> Result<()> {
 /// WKB LE LineString layout is identical: header + sequence of (f64 x, f64 y) pairs,
 /// so the buffer is appended verbatim after the header.
 ///
-/// Note the widening from the stored `i32` decimicrodegree form happens in
-/// `encoding::push_wkb_coords`, not here — this used to consume the stored
-/// bytes directly, back when node values were two `f64`.
+/// The widening from the stored `i32` decimicrodegree form happens in
+/// `encoding::push_wkb_coords`, not here: by the time bytes reach this
+/// function they are already WKB-shaped `f64` pairs.
 fn encode_wkb_linestring_raw(num_points: usize, raw_coords: &[u8]) -> Vec<u8> {
     debug_assert_eq!(raw_coords.len(), num_points * encoding::WKB_COORD_BYTE_LEN);
     let mut buf = Vec::with_capacity(9 + raw_coords.len());

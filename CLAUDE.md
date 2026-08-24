@@ -1,214 +1,1024 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) working in this repository.
+
+**How to read this file.** It is an index of invariants — the rules that are not
+recoverable by reading one file, and the traps whose failure mode is silent. The
+*reasoning* behind each lives in the doc comment at the named symbol, or in
+`docs/`. When they disagree, the code is right; fix this file.
 
 ## Project Overview
 
-Rewrite of [gugik2osm](https://github.com/openstreetmap-polska/gugik2osm) — a tool that compares Polish government registry data (addresses from PRG, buildings from BDOT10k and EGIB) with OpenStreetMap data and generates GeoJSON packages for import into JOSM.
+Rewrite of [gugik2osm](https://github.com/openstreetmap-polska/gugik2osm) — compares
+Polish government registry data (addresses from PRG, buildings from BDOT10k and
+EGIB) with OpenStreetMap and generates GeoJSON packages for import into JOSM.
 
 ## Build & Test Commands
 
 ```bash
-cargo build           # Build (first build is slow due to bundled DuckDB compilation)
-cargo test            # Run all tests
-cargo test <name>     # Run a single test by name
-cargo run             # Run the binary
-cargo clippy          # Lint
-cargo fmt             # Format code
-cargo fmt -- --check  # Check formatting without modifying
-cargo build --profile profiling   # Release build with debug symbols for samply/perf
+cargo build           # first build is slow: DuckDB + RocksDB compile from source
+cargo test            # run all tests
+cargo test <name>     # single test by name
+cargo clippy          # lint
+cargo fmt -- --check  # check formatting
+cargo build --profile profiling   # release + debug symbols for samply/perf
 ```
 
-Note: Both `duckdb` and `rocksdb` dependencies use bundled C++ compilation, so no external DuckDB/RocksDB installation is needed, but the build does need **CMake plus a generator (Ninja or GNU Make)** on `PATH` — see the jemalloc gotcha below — and the first build takes significant time.
+Needs **CMake plus Ninja or GNU Make** on `PATH`. No external DuckDB/RocksDB
+installation — both are bundled.
 
-**Gotcha — both storage engines are built against jemalloc, and each half is fragile in a different way.** They are two *separate* jemallocs in one process, which is fine only because their symbols don't collide: DuckDB's bundled copy (`duckdb-sources/third_party/jemalloc`) renames its public API to `duckdb_je_*` and serves DuckDB's internal allocations only, while `rust-rocksdb`'s `jemalloc` feature pulls `tikv-jemalloc-sys` with `unprefixed_malloc_on_supported_platforms` — an *unprefixed* build whose `malloc`/`free` override glibc's, so it backs RocksDB, Rust's own `alloc`, and every other non-DuckDB allocation in the process. Four things are load-bearing:
+**Gotcha — two separate jemallocs, each fragile in a different way.** DuckDB's
+bundled copy renames its API to `duckdb_je_*` and serves DuckDB only;
+`rust-rocksdb`'s `jemalloc` feature pulls an *unprefixed* build whose
+`malloc`/`free` override glibc's, backing RocksDB, Rust's `alloc`, and
+everything non-DuckDB. Four load-bearing points:
 
-1. **The `duckdb` dependency is a git dep on purpose, and reverting it to crates.io silently drops DuckDB's jemalloc.** DuckDB's jemalloc lives in the `duckdb-sources` submodule, which `libduckdb-sys`'s published crate sets `exclude = ["duckdb-sources"]` on; the `bundled` (amalgamation-via-`cc`) backend has no jemalloc sources at all and its `manifest.json` knows only `core_functions`/`json`/`parquet`. So jemalloc requires the `bundled-cmake` backend, and `bundled-cmake` *requires* a git checkout — against the crates.io release it panics outright with "requires a duckdb-rs checkout with DuckDB sources at …". The tag is pinned to the exact version the registry dep used before (`v1.10505.0`), so the git source buys the build backend and nothing else. Note `bundled-cmake` is marked experimental upstream.
-2. **The dev-dependency must name the same source as the normal dependency.** A registry `duckdb` alongside a git `duckdb` is two packages both declaring `links = "duckdb"`, which cargo rejects — so `[dev-dependencies]` carries the identical `git`/`tag`, not a version.
-3. **Neither flag errors on an unsupported platform; both go quiet.** DuckDB's CMake gates `ENABLE_JEMALLOC` (default `ON`) on 64-bit, non-musl, non-BSD, non-WASM Linux; `rust-librocksdb-sys`'s `NO_JEMALLOC_TARGETS` skips android/dragonfly/darwin/freebsd. On macOS a build succeeds with neither engine on jemalloc and says nothing about it. The check that actually proves the linkage is symbols in the built binary — `duckdb_je_malloc` for DuckDB, `_rjem_je_*` for RocksDB — not a config setting or a log line.
-4. **`bundled-cmake` statically links the parquet extension, which `bundled` did not.** The old feature set never enabled the `parquet` feature, so GeoParquet reads relied on DuckDB's runtime extension autoload/autoinstall; `bundled-cmake` implies `parquet` and builds it in. Autoloading stays enabled either way, so this only removes a runtime dependency rather than changing behaviour. `DUCKDB_DISABLE_JEMALLOC=1` is the escape hatch back to DuckDB's standard allocator; it does not affect the RocksDB side, which is a cargo feature.
+1. **The `duckdb` git dep is deliberate; reverting it to crates.io silently
+   drops DuckDB's jemalloc.** jemalloc lives in the `duckdb-sources` submodule,
+   which the published crate `exclude`s, and the `bundled` amalgamation backend
+   has no jemalloc sources at all. Only `bundled-cmake` has it, and it *requires*
+   a git checkout. The tag pins the exact version the registry dep used
+   (`v1.10505.0`) — the git source buys the build backend and nothing else.
+   `bundled-cmake` is marked experimental upstream.
+2. **The dev-dependency must name the same source as the normal dependency.**
+   Two packages both declaring `links = "duckdb"` is a hard cargo error.
+3. **Neither flag errors on an unsupported platform; both go quiet.** On macOS a
+   build succeeds with neither engine on jemalloc and says nothing. The only
+   proof is symbols in the built binary — `duckdb_je_malloc` (DuckDB),
+   `_rjem_je_*` (RocksDB) — never a config setting or a log line.
+4. **`bundled-cmake` statically links the parquet extension.** This removes a
+   runtime autoload dependency rather than changing behaviour.
+   `DUCKDB_DISABLE_JEMALLOC=1` is the escape hatch for the DuckDB side only.
 
-**Gotcha — the `bundled-cmake` build gets DuckDB's version from `git describe`, and cargo's checkout has no tags, so it must be forced.** This is the one thing that makes the CMake backend not a drop-in for the amalgamation. DuckDB's `CMakeLists.txt` runs `git describe --tags --long` inside `duckdb-sources`; cargo checks that submodule out at a bare commit with **zero tags fetched**, `describe` fails, and DuckDB continues with the dummy version **`v0.0.1`** — a `message(WARNING)` buried in build output, never an error. The version string *is* the extension repository path, so the damage is total and looks unrelated to versioning: `INSTALL spatial` resolves to `http://extensions.duckdb.org/v0.0.1/linux_amd64/spatial.duckdb_extension.gz` and 404s, and the already-installed `~/.duckdb/extensions/v1.5.5/` copies are invisible. Since `INSTALL spatial` is in the default `duckdb_init_commands`, *every* CLI command and **387 of 600 tests** fail from this one cause. Four things:
+**Gotcha — DuckDB's version comes from `git describe`, cargo's checkout has no
+tags, so it must be forced.** `describe` fails, DuckDB continues with the dummy
+version **`v0.0.1`** (a `message(WARNING)`, never an error), and since the
+version string *is* the extension repository path, `INSTALL spatial` 404s. That
+is in the default `duckdb_init_commands`, so *every* CLI command and hundreds of
+tests fail from this one cause.
 
-1. **The fix is a CMake toolchain file, because there is no other hole to inject through.** `libduckdb-sys`'s build script forwards a fixed list of env vars and has no generic `-D` passthrough, and `DUCKDB_EXTENSION_CONFIGS` is explicitly rejected. `cmake/duckdb_version.cmake` forces `OVERRIDE_GIT_DESCRIBE`, and `.cargo/config.toml`'s `[env]` points `CMAKE_TOOLCHAIN_FILE` at it with `relative = true` (which resolves against the directory holding `.cargo/`, i.e. the repo root — verified, not assumed). Side effect worth knowing: when a toolchain file is set, the `cmake` crate stops passing `-DCMAKE_C_COMPILER`/`CXX_COMPILER`, leaving CMake's own native detection to find them. Fine for a native build, load-bearing to remember for a cross-compile.
-2. **`cmake/duckdb_version.cmake` must be updated in lockstep with the `duckdb` tag in `Cargo.toml`** (`v1.10505.0` ⇒ DuckDB `v1.5.5`). Nothing links the two automatically. `db::tests::duckdb_reports_a_real_version_so_extensions_resolve` is the guard, and it exists to convert this from "hundreds of unrelated-looking failures" into one named assertion; it pins the *shape* (not `v0.0.1`, three dotted components) so a routine bump doesn't need a test edit.
-3. **Editing the toolchain file or the env var does not rebuild DuckDB, and `cargo clean -p libduckdb-sys` does not force it either.** `libduckdb-sys` declares `rerun-if-changed`/`rerun-if-env-changed` for its own knobs but not for `CMAKE_TOOLCHAIN_FILE`, and CMake additionally caches `OVERRIDE_GIT_DESCRIBE` in `OUT_DIR`. The `clean -p` spec silently matches nothing because the package comes from a git source rather than the registry — it exits 0 having done nothing, and the next build finishes in seconds looking like a success. Delete the cache by hand: `rm -rf target/*/build/libduckdb-sys-* target/*/.fingerprint/libduckdb-sys-*`, then rebuild (≈12 min). Confirm it took by grepping `OVERRIDE_GIT_DESCRIBE` out of `target/release/build/libduckdb-sys-*/out/cmake-ninja/build/CMakeCache.txt`.
-4. **`spatial` cannot be statically linked to sidestep any of this.** Only DuckDB's *in-tree* extensions (`parquet`, `json`, `icu`, `autocomplete`, `delta`, `tpch`, `tpcds`, `core_functions`) can be built in, via `libduckdb-sys` features. `spatial` is out-of-tree, and `bundled-cmake` panics on the `DUCKDB_EXTENSION_CONFIGS` mechanism that would pull it in. So spatial is always a runtime download, and a correct version stamp is non-negotiable rather than a nicety.
+1. **The fix is a CMake toolchain file** (`cmake/duckdb_version.cmake`, forcing
+   `OVERRIDE_GIT_DESCRIBE`), pointed at by `.cargo/config.toml`'s `[env]` with
+   `relative = true`. There is no other injection point: `libduckdb-sys` forwards
+   a fixed env list and rejects `DUCKDB_EXTENSION_CONFIGS`. Side effect: with a
+   toolchain file set, the `cmake` crate stops passing
+   `-DCMAKE_C_COMPILER`/`CXX_COMPILER`. Fine natively, load-bearing for a
+   cross-compile.
+2. **`cmake/duckdb_version.cmake` must move in lockstep with the `duckdb` tag in
+   `Cargo.toml`** (`v1.10505.0` ⇒ DuckDB `v1.5.5`). Nothing links them
+   automatically. `db::tests::duckdb_reports_a_real_version_so_extensions_resolve`
+   is the guard; it pins the *shape*, so a routine bump needs no test edit.
+3. **Editing the toolchain file does not rebuild DuckDB, and `cargo clean -p
+   libduckdb-sys` does not either** — the spec silently matches nothing for a git
+   source and exits 0. Delete by hand: `rm -rf target/*/build/libduckdb-sys-*
+   target/*/.fingerprint/libduckdb-sys-*`, then rebuild (≈12 min). Confirm by
+   grepping `OVERRIDE_GIT_DESCRIBE` out of the generated `CMakeCache.txt`.
+4. **`spatial` cannot be statically linked.** Only DuckDB's *in-tree* extensions
+   can be; `spatial` is out-of-tree and `bundled-cmake` panics on the mechanism
+   that would pull it in. So a correct version stamp is non-negotiable.
 
 ## Architecture
 
-**Tech stack:** Rust + DuckDB (embedded, file-based) + RocksDB (KV store). Goal is a single binary that's easy to deploy.
+**Tech stack:** Rust + DuckDB (embedded, file-based) + RocksDB (KV store). Single
+binary, easy to deploy.
 
 **CLI commands** (`cargo run -- <command>`):
-- `import <source>` — bulk-load data (OSM from PBF, PRG addresses from ZIP via `--file <ZIP> --terc-file <TERC>`, BDOT10k/EGIB buildings from GeoParquet)
-- `update <source>` — apply incremental updates (OSM minutely replication, re-download gov datasets)
-- `compare <target>` — compare government data against OSM, writing the precomputed `*_unmatched` serving tables. Targets: `buildings` (optionally `bdot10k`, `egib`, or `all` — default runs all), `addresses` (optionally `prg` or `all` — default runs all), `full` (runs every comparison)
-- `queue <action>` — operate on the `match_dirty_cells` incremental queue by hand, offline (requires exclusive DB access, same as any CLI command — do not run against a database a `run` server also has open). Actions: `reconcile` (re-enqueues every live cell — safety net for a dropped enqueue, or an offline rebuild path), `drain` (runs the same per-cell recompute the `match_refresh` background job does, in a loop until the queue is empty)
-- `reports <action>` — manage user reports (`POST /report`) offline. Actions: `list`, `revoke` (by id, or `--since <ts> [--source S]` — the only bulk-undo, since nothing identifying a submitter is stored), `reconcile` (retire reports whose record changed; also runs automatically inside every refresh and import), `export`/`import` (JSONL — `object_reports` is the one table no re-import can rebuild). A revoke/expire only reaches the serving tables after a drain
-- `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}` and `/package` serving `*_unmatched`, `/updates` recent export activity, `POST /report` accepting object reports) with background OSM/government-dataset updates, the `match_refresh` drain job and its `match_reconcile` safety-net job, the optional `reports_reconcile` job, and export log pruning
 
-**Storage:**
-- **DuckDB** — main analytical database for geospatial queries, stores processed OSM data and government datasets
-- **RocksDB** — KV store for raw OSM node coordinates and structural mappings (way node refs, relation members, reverse indexes)
+- `import <source>` — bulk-load (OSM from PBF, PRG from ZIP via `--file`/`--terc-file`,
+  BDOT10k/EGIB from GeoParquet)
+- `update <source>` — incremental (OSM minutely replication, re-download gov datasets)
+- `compare <target>` — write the precomputed `*_unmatched` serving tables.
+  Targets: `buildings`, `addresses`, `full`
+- `queue <action>` — operate on the `match_dirty_cells` queue offline (requires
+  exclusive DB access — never against a database a `run` server also has open).
+  `reconcile` re-enqueues every live cell; `drain` runs the per-cell recompute
+  until empty
+- `reports <action>` — manage user reports offline: `list`, `revoke`,
+  `reconcile`, `export`/`import` (JSONL). A revoke/expire only reaches the
+  serving tables after a drain
+- `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package`,
+  `/updates`, `POST /report`) plus background update, drain and reconcile jobs
 
-**Key design decisions (see `adr/`):**
-- DuckDB chosen for its geospatial support and file-based storage (ADR-002)
-- API returns GeoJSON, not OSM XML — JOSM can read GeoJSON (ADR-003)
-- Single process, multithreaded — DuckDB doesn't support multiple writer processes (docs/project_ideas.md)
+**Storage:** DuckDB for geospatial queries and processed data; RocksDB for raw
+OSM node coordinates and structural mappings (way node refs, relation members,
+reverse indexes).
 
-**Government-dataset updates** stage a fresh snapshot in `<table>__staging`, diff it against the live table by whole-row hash, and apply only the delta. The delta, the `dataset_refreshes` row and the per-tile `dataset_change_areas` rows all commit in one transaction; change areas are written *before* the delta, because they read the pre-update geometry of removed/modified rows out of the live table.
+**Key design decisions** (see `adr/`): DuckDB for geospatial + file-based storage
+(ADR-002); API returns GeoJSON, not OSM XML (ADR-003); single multithreaded
+process, since DuckDB has no multi-writer support.
 
-**Gotcha — change detection is configured per source, and each configuration is a measured choice.** A refresh decides "modified" by joining staging to live on the record key and comparing a *named list* of columns. It does not hash whole rows — `_row_hash`, `hashed_select` and `ROW_HASH_VERSION` are gone, and the reason is that hashing could not tell a record changing from its *serialization* changing: a routine EGIB or BDOT10k refresh rewrote the entire table and enqueued every z14 cell in Poland for changes affecting under 2% of records. Both halves of the replacement live on `DatasetSpec` in `src/dataset.rs` — `key_columns` for identity, `compared_columns` + `compare_geometry` for change — and one builder, `DatasetSpec::changed_predicate_sql`, is the single home for the comparison text, with `update::diff::compute` its only caller. The three configurations look inconsistent and each looks like an oversight from outside; they are not. Measurements in `docs/superpowers/plans/2026-08-14-key-based-diff.md`:
+### Government-dataset updates
 
-- **BDOT10k — `compare_geometry: false`.** BDOT10k periodically re-serializes every geometry wholesale: 0.94% of rows differed in one snapshot pair, 4.5% in another, **100% (16,344,762 of 16,344,762)** in the 2026-08-10 export. Re-serialized bytes are indistinguishable from real movement, so comparing geometry would mean one refresh per re-serialization event rewriting the whole table — the exact failure the key diff exists to remove. Accepted cost: a geometry-only edit carrying no `WERSJA` bump and no attribute change is missed until that record next changes for another reason. **The comparison is `IS DISTINCT FROM`, never `>` or `>=`**, for two reasons. The load-bearing one: attributes change *without* a `WERSJA` bump — 6,395 records in the 03-15 → 04-19 pair, including 64 `KATEGORIAISTNIENIA` transitions that `rule::BDOT10K_EKSPLOATOWANY_FILTER` gates on — so a `>` predicate would miss them entirely. The second: `WERSJA` can in principle move backwards, and a symmetric predicate mirrors that instead of freezing the row forever. (Measured 2026-08-15: after `deduplicate_by_key`, backwards movement is **0** across all three national pairs. The "~2 records per pair" figure in earlier notes was measured *before* dedup and is exactly the 2 duplicate-key groups per snapshot, where an arbitrary pick could land on the older row. Dedup's `WERSJA DESC` already removes that case — so this reason is now theoretical, and the first reason is the one that matters.)
-- **PRG — the version columns are excluded.** PRG bulk-republishes by gmina: `wersja_id` moved 34–147× more often than any content changed across four consecutive snapshot pairs (149,198 version bumps vs 1,012 real changes in the 4-day pair), which is 1,549 z14 dirty cells instead of 182. `poczatek_wersji_obiektu` moves in exact lockstep with `wersja_id` (0 disagreements in 8.6M records), so adding *it* silently reinstates version-only churn. `wersja_id` is still load-bearing for PRG — as `deduplicate_by_key`'s ordering column, nothing else. `teryt_miejscowosc` is in the compared set for a non-obvious reason, and it got stronger: it selects which `street_name_mappings` row applies, so a change to it rewrites the exported `addr:street` even when `ulica` is byte-identical — and since that mapping is now a *match* input (`rule`'s rule B), a change to it can also flip the address between matched and unmatched. `miejscowosc` joins it as a match input via rule C, the locality rule for streetless addresses.
-- **EGIB — `czas_pozyskania` (99.7% churn per export) and `pozostale_atrybuty` (32.8%, carries a per-export `gml_id`) are excluded**, and geometry is *not* optional: 617,207 EGIB records have all three compared attributes NULL, so geometry is their only possible signal. Compare it as `ST_AsWKB(...)`, never bare native `GEOMETRY` — 24.18s vs 2.50s on the real 17.5M-row table for the identical answer.
+A refresh stages a snapshot in `<table>__staging`, diffs it against the live
+table, and applies only the delta. The delta, the `dataset_refreshes` row and the
+per-tile `dataset_change_areas` rows all commit in one transaction; change areas
+are written **before** the delta, because they read the pre-update geometry of
+removed/modified rows out of the live table.
 
-**Gotcha — the key diff needs a non-null, unique key, and nothing at diff time can check that.** `update::diff::compute` joins staging to live with plain equality. A NULL key never matches itself, so a NULL-keyed record lands in *both* `diff_added` and `diff_removed`, and the apply's key join then deletes nothing and inserts nothing — silently, forever. This was a real bug: EGIB shipped 210,080 NULL `id_budynku` rows (1.2%). A duplicate key fans the join out instead. Both guarantees are established at load and only there: `dataset::non_null_key_sql` inside the load SELECT (with `null_key_sql`, its exact complement, for the skip count) and `dataset::deduplicate_by_key` after the table is built. All three loaders do both — PRG included, whose `lokalny_id` is unique in four of five national snapshots but not the fifth. A new source that skips either gets no error, just a diff that quietly does nothing for the affected records.
+**Gotcha — change detection is configured per source, and each configuration is
+a measured choice.** A refresh decides "modified" by joining on the record key
+and comparing a *named list* of columns — never a whole-row hash, which cannot
+tell a record changing from its *serialization* changing (a routine BDOT10k
+re-export rewrote all 16,344,762 rows). Both halves live on `DatasetSpec`
+(`src/dataset.rs`): `key_columns` for identity, `compared_columns` +
+`compare_geometry` for change. `DatasetSpec::changed_predicate_sql` is the single
+home for the comparison text. The three configurations look inconsistent from
+outside; each is deliberate. Measurements:
+`docs/superpowers/plans/2026-08-14-key-based-diff.md`.
 
-**Gotcha — a value derived outside `compared_columns` no longer self-heals.** `ROW_HASH_VERSION` used to force a full-table rewrite whenever a hashed expression changed, which fixed derived columns as a side effect. Nothing does that now. `centroid` (`DatasetSpec::with_centroid_select`), `rodzaj_kod` (`mappings::egib::RODZAJ_KOD_CASE_SQL`) and PRG's `ULICA_PREFIX_STRIP_SQL` are recomputed for every *staged* row, so a record modified for some other reason picks up the new expression — but an **unmodified record keeps its old value forever**. Editing any of those expressions requires a re-import, not a refresh. `ULICA_PREFIX_STRIP_SQL` is the mild case: `ulica` is in `PRG.compared_columns`, so an edit surfaces as an ordinary modification and self-heals per record. BDOT10k is the sharp one: with geometry excluded from its predicate, a future value-rewriting transform on a BDOT10k column outside `compared_columns` would never propagate to an unmodified record at all. The replacement for the old version stamp is a loud failure rather than a silent full rewrite: `update::dataset::check_column_shapes_match` compares the staging and live column lists (**ordered** — the apply's `INSERT ... SELECT s.*` is positional, so a reordering is as fatal as an addition) before the diff runs and bails with "re-run `import <source>`" if they differ.
+- **BDOT10k — `compare_geometry: false`.** BDOT10k periodically re-serializes
+  every geometry wholesale (0.94%, 4.5%, then **100%** of rows across measured
+  snapshot pairs). Re-serialized bytes are indistinguishable from real movement.
+  Accepted cost: a geometry-only edit with no `WERSJA` bump and no attribute
+  change is missed until that record next changes. **The comparison is `IS
+  DISTINCT FROM`, never `>`** — attributes change *without* a `WERSJA` bump
+  (6,395 records in one pair, including 64 `KATEGORIAISTNIENIA` transitions that
+  `rule::BDOT10K_EKSPLOATOWANY_FILTER` gates on), so `>` would miss them entirely.
+- **PRG — the version columns are excluded.** PRG bulk-republishes by gmina:
+  `wersja_id` moved 34–147× more often than any content changed (149,198 version
+  bumps vs 1,012 real changes in one pair). `poczatek_wersji_obiektu` moves in
+  exact lockstep with it (0 disagreements in 8.6M records), so adding *it*
+  silently reinstates the churn. `wersja_id` is still load-bearing as
+  `deduplicate_by_key`'s ordering column, nothing else. `teryt_miejscowosc` is
+  compared for a non-obvious reason: it selects which `street_name_mappings` row
+  applies, so a change to it rewrites the exported `addr:street` *and* can flip
+  the address between matched and unmatched. `miejscowosc` is a match input too,
+  via the locality rule for streetless addresses.
+- **EGIB — `czas_pozyskania` (99.7% churn per export) and `pozostale_atrybuty`
+  (32.8%, carries a per-export `gml_id`) are excluded**, and geometry is *not*
+  optional: 617,207 records have all three compared attributes NULL, so geometry
+  is their only signal. Compare it as `ST_AsWKB(...)`, never bare `GEOMETRY` —
+  24.18s vs 2.50s on the real 17.5M-row table for the identical answer.
 
-**Precomputed unmatched serving.** `compare` doesn't just log a comparison — it writes the unmatched government objects into `bdot10k_unmatched` / `egib_unmatched` / `prg_unmatched` serving tables, and `/tiles` + `/package` read those directly instead of comparing live. Between full `compare` runs, government refreshes and OSM updates keep the tables current incrementally: each producer enqueues the z14 cells it touched into `match_dirty_cells`, and the `match_refresh` background job drains that queue by recomputing just those cells (`compare::drain::drain_batch` → `compare::incremental::recompute_cell_in_txn`). `queue reconcile` re-enqueues every live cell as a safety net (a dropped enqueue) or an offline rebuild path.
+**Gotcha — the key diff needs a non-null, unique key, and nothing at diff time
+can check that.** `update::diff::compute` joins with plain equality. A NULL key
+never matches itself, so a NULL-keyed record lands in *both* `diff_added` and
+`diff_removed`, and the apply then deletes nothing and inserts nothing —
+silently, forever. This was real: EGIB shipped 210,080 NULL `id_budynku` rows
+(1.2%). A duplicate key fans the join out instead. Both guarantees are
+established **at load and only there**: `dataset::non_null_key_sql` inside the
+load SELECT (with `null_key_sql`, its exact complement, for the skip count) and
+`dataset::deduplicate_by_key` after the table is built. All three loaders do
+both — PRG included, whose `lokalny_id` is unique in four of five national
+snapshots but not the fifth.
 
-**Gotcha — the match rule has one home.** The predicate deciding whether a government object counts as "matched" lives in `src/compare/rule.rs`. The per-cell incremental recompute (`compare::incremental::recompute_cell_in_txn`) and the full **building** compare (`compare::buildings::compare_buildings`) both call `rule::unmatched_buildings_sql` directly, so they share the actual predicate text. The full **address** compare (`compare::addresses::compare_addresses`) uses its own grid-key SQL for performance instead (see the design doc: the iteration strategy legitimately differs by path) and so restates the predicate rather than calling it. What it *does* share, and must never re-derive: both distance constants (`rule::MATCH_DISTANCE_METERS` for the proximity rule, `rule::NAME_MATCH_DISTANCE_METERS` for the two name rules), `rule::normalized_name_sql`, and the street-resolution builders in `mappings::street_names`. `addresses::full_and_per_cell_paths_agree` pins that grid-key path against the shared per-cell rule — and its fixture must exercise every branch *and its negative*, since two paths that both dropped a rule would agree perfectly and pass; and `compare::full_vs_incremental_equivalence` (`src/compare/mod.rs`) pins full `compare` against reconcile+drain end-to-end for bdot10k and prg. Never re-derive the match *distance* or the containment condition anywhere else — a second copy would silently drift from what the serving tables actually contain. `osm_buildings` is not the rule's only OSM input, though: `unmatched_buildings_sql` also reads `osm_former_buildings` for the suppression veto — see the next gotcha.
+**Gotcha — a value derived outside `compared_columns` never self-heals.**
+`centroid` (`DatasetSpec::with_centroid_select`), `rodzaj_kod`
+(`mappings::egib::RODZAJ_KOD_CASE_SQL`) and PRG's `ULICA_PREFIX_STRIP_SQL` are
+recomputed for every *staged* row, so a record modified for some other reason
+picks up a new expression — but an **unmodified record keeps its old value
+forever**. Editing any of them requires a re-import, not a refresh.
+`ULICA_PREFIX_STRIP_SQL` is the mild case (`ulica` is compared, so an edit
+surfaces as an ordinary modification and self-heals per record); BDOT10k is the
+sharp one, since geometry is outside its predicate too.
+`update::dataset::check_column_shapes_match` compares staging and live column
+lists (**ordered** — the apply's `INSERT ... SELECT s.*` is positional, so a
+reordering is as fatal as an addition) and bails before the diff runs.
 
-**Gotcha — the former-building suppression veto has its own set of single-home rules, layered on top of the match rule above.** `osm_former_buildings` holds OSM ways/relations tagged with a lifecycle-prefixed building key (`demolished:building`, `ruins:building`, …) — not buildings, but OSM's record that a building here is gone — and `compare::rule::unmatched_buildings_sql` excludes a government building it substantially overlaps from ever being proposed. Five things about it are load-bearing:
+### The match rule and its three vetoes
 
-1. **The key list has one home**, `osm::lifecycle::LIFECYCLE_BUILDING_KEYS`. `import osm` reads it as a DuckDB list literal (`key_list_sql`/`has_any_key_sql`/`matched_key_sql`, evaluated with `lambda k:`, not the deprecated `->` arrow); `update osm` reads the same constant as plain Rust (`lifecycle::key_of`). `osm::lifecycle::tests::matched_key_sql_agrees_with_key_of` is the only thing pinning the SQL and Rust extraction together — without it the two producers could silently disagree on what a single object's `lifecycle_key` is. The array's order is priority order (24 Polish ways carry more than one key; the first key present in the array is the one recorded). The disjointness half of the rule — an object also carrying a live `building` key is a standing building, not a former one — has one home per language for the same reason: `is_former_building_sql` (both import passes' `WHERE`) and `key_of` returning `None`. Keep them composed, not split: the parity test pairs `CASE WHEN is_former_building_sql THEN matched_key_sql END` against `key_of`, so deleting the disjointness from the SQL side fails the test; inlining `element_at(tags, 'building')[1] IS NULL` at the two import call sites instead would spell the rule three times with nothing pinning them together, and the test would pass either way.
-2. **The veto lives only inside `unmatched_buildings_sql`** (via the shared `former_building_covers_sql` clause builder in `rule.rs`, whose sibling `osm_building_covers_sql` holds the live-`osm_buildings` half), so both `compare::buildings::compare_buildings` and `compare::incremental::recompute_cell_in_txn` inherit it automatically — same one-home property as the match rule itself, no separate call site to keep in sync. The two clause builders are what let `unmatched_buildings_sql` and `suppressed_buildings_sql` compose the same texts in *different orders* (see the whole-extent-suppressed-count gotcha below) without either retyping a predicate. It uses its own constant, `FORMER_BUILDING_MIN_OVERLAP_FRACTION`, deliberately kept separate from `MIN_OVERLAP_FRACTION` even though both are currently 0.10 — one answers "did OSM already map this", the other "is this veto trustworthy enough to suppress an import", and they must be free to move apart. The floor is not a rounding nicety: on the measured national data, 1,228 of 6,088 raw `ST_Intersects` hits between government buildings and former polygons (20%) are under 2% overlap — party-wall touches and digitization slivers against a *neighbouring* demolished building — so a bare `ST_Intersects` veto would wrongly suppress those (see `docs/former_buildings.md` and the `rule.rs` test `building_barely_touching_former_neighbor_stays_unmatched`, which exists specifically to catch that "simplification").
-3. **A suppressed building still counts in `cell_totals`, unlike a `KATEGORIAISTNIENIA`-filtered one.** `compare::totals`'s module doc spells out why: a suppressed row is comparable and OSM has effectively handled it, whereas an `extra_filter`-excluded row (e.g. `w budowie`) is excluded from comparison entirely. `compare_buildings` logs the two separately rather than folding suppression into `matched` — `suppressed_buildings_sql` (the mirror of the veto: it *requires* `former_building_covers_sql` where `unmatched_buildings_sql` negates it) returns exactly the rows the veto removes, so `matched + unmatched + suppressed = total` stays exact; without a separate `suppressed` count, every suppressed row would silently read as `matched`, which is precisely the number an operator would check to see whether the feature is doing anything. The count is gated on `SELECT COUNT(*) FROM osm_former_buildings > 0` so a database that hasn't re-imported (and every test fixture) pays nothing extra.
+**Gotcha — the match rule has one home.** The predicate deciding whether a
+government object is "matched" lives in `src/compare/rule.rs`. The per-cell
+incremental recompute (`compare::incremental::recompute_cell_in_txn`) and the
+full **building** compare (`compare::buildings::compare_buildings`) both call
+`rule::unmatched_buildings_sql`, sharing the actual predicate text. The full
+**address** compare (`compare::addresses::compare_addresses`) uses its own
+grid-key SQL for performance and so restates the predicate — but it must never
+re-derive what it *does* share: both distance constants
+(`MATCH_DISTANCE_METERS`, `NAME_MATCH_DISTANCE_METERS`), `normalized_name_sql`,
+and the street-resolution builders in `mappings::street_names`.
+`addresses::full_and_per_cell_paths_agree` pins the two paths, and its fixture
+must exercise every branch *and its negative* — two paths that both dropped a
+rule would agree perfectly and pass. `compare::full_vs_incremental_equivalence`
+pins full `compare` against reconcile+drain end-to-end. **Never re-derive the
+match distance or the containment condition anywhere else.**
 
-   **`suppressed_buildings_sql`'s clause *order* is load-bearing, and it is the reason it doesn't share `unmatched_buildings_sql`'s flat shape.** It is the one predicate in this codebase run **once over the whole source extent** instead of per grid cell, so the two clauses meet wildly different row counts: `former_building_covers_sql` is savagely selective (~6k of 16.35M BDOT10k rows overlap a former polygon at all, driven by a 15,412-row table), while `osm_building_covers_sql` anti-joins 17.99M `osm_buildings` rows. Written flat, DuckDB de-correlates both `EXISTS` clauses into nested `DELIM_JOIN`s and plans the **anti-join underneath the semi-join** — computing the unmatched set for all of Poland, then keeping the ~4k rows the veto covers — while the delim machinery deduplicates and materializes the correlated column, which is `b.geom`: **2.18 GB of WKB**. That is a real outage, not a slow path: it died with `Out of Memory Error: failed to pin block of size 256.0 KiB (3.7 GiB/3.7 GiB used)` after 71 s, having spilled ~15 GB to temp on the way, so `max_temp_directory_size` is not the lever either. Building the veto's candidates in a CTE first and anti-joining over *those* measures 4.7 s / 3.8 GB (bdot10k) and 4.9 s / 3.9 GB (egib). **The index is a red herring here and the trap is believing otherwise:** `osm_buildings` is an `RTREE_INDEX_SCAN` in *both* shapes, but its window is `Bounds: deferred (from join filter)` — derived at runtime from the probe side — so probing with all of Poland yields a whole-country bound that prunes nothing. No hint or `rtree_index_scan_ratio` change can fix that (forcing an R-tree walk over the full table measured 13.4 s vs 0.53 s for the sequential scan, and the ratio's default correctly rejects it); only shrinking the probe side works. As in the `compare::incremental` case below, **`MATERIALIZED` is insurance, not the active ingredient — the CTE is**: bare `WITH` plans identically apart from losing `CTE_SCAN` and runs in 5.4 s for the same answer, so don't read a test into the keyword. `rule::tests::suppressed_buildings_predicate_filters_by_the_veto_first` pins the order structurally (and says in its own comment why it isn't an `EXPLAIN` test); `suppressed_buildings_predicate_uses_the_centroid_rtree_index` pins that the CTE boundary didn't cost the source table its centroid index.
-4. **`update osm` must maintain `osm_former_buildings` at every site that maintains `osm_buildings`** — way/relation delete, and both the changeset and *inferred* tag-determination arms of `rebuild_way_geometry`/`rebuild_relation_geometry`. The inferred arm (no changeset entry for this object; tags are re-derived from what DuckDB already has) is the one to watch: its early return — `if !has_building && !has_address && former.is_none() { return Ok(()); }` — must consider the former key too, or a former-building way whose node moved would return before the delete/re-insert and keep a stale pre-move geometry forever. (The relation side reuses one `relation_multipolygon_geom_sql` helper for both the `osm_buildings` and `osm_former_buildings` inserts, so this is not three independent copies of the multipolygon-assembly SQL to keep in sync — two call sites, one shared builder.) `Layer::Buildings` is the correct dirty-cell layer for `osm_former_buildings` changes (its `flush` maps to `bdot10k` + `egib`, the serving tables the veto can change) and `dirty_cells.rs` needed no new layer. `prg_unmatched` is deliberately unreachable from this table — an address point is not a building, and "former building ⇒ nearby address is bogus too" is a tempting future change that needs its own design, not a drive-by wire-up here.
-5. **Same no-migration story as `centroid`/`rodzaj_kod`, with an extra trap.** `db::create_schema` (`CREATE TABLE IF NOT EXISTS`) and `import::osm::reset_osm_tables` (`DROP` + bare `CREATE`) both declare `osm_former_buildings` and must agree on its shape. On an existing database upgraded in place, `create_schema` creates the table empty *and without its RTREE index* — `create_spatial_indexes` only runs inside `import osm`. An empty, unindexed table is harmless to query, but it means the veto silently never fires until a re-import, which looks identical to "no former buildings happen to be nearby" — there is no error, warning-free behaviour either way, which is why `server::check_startup_conditions` adds an explicit warn-if-empty gated on `osm_buildings` being non-empty (the real signal: "you upgraded but haven't re-run `import osm`"), separate from the `UNMATCHED_TABLES` loop it's modelled on.
+**Gotcha — the former-building suppression veto, layered on the match rule.**
+`osm_former_buildings` holds OSM ways/relations tagged with a lifecycle-prefixed
+building key (`demolished:building`, `ruins:building`, …) — OSM's record that a
+building here is gone — and `rule::unmatched_buildings_sql` excludes a government
+building it substantially overlaps.
 
-**Gotcha — the user-report veto is a third layer on the same rule, and its single-home rules are not the former-building ones repeated.** `object_reports` holds user submissions (`POST /report`, `src/server/reports.rs`) saying a government object should not be proposed for import at all — bad source data, or OSM maps it in a way the rule cannot see. An `active` report vetoes its object out of `<source>_unmatched`. Seven things are load-bearing:
+1. **The key list has one home**, `osm::lifecycle::LIFECYCLE_BUILDING_KEYS`
+   (18 keys, in priority order — 24 Polish ways carry more than one).
+   `import osm` reads it as a DuckDB list literal, `update osm` as plain Rust
+   (`lifecycle::key_of`); `osm::lifecycle::tests::matched_key_sql_agrees_with_key_of`
+   is the only thing pinning the two extractions together. The disjointness half
+   — an object also carrying a live `building` key is a standing building, not a
+   former one — has one home per language for the same reason. **Keep them
+   composed, not split:** the parity test pairs
+   `CASE WHEN is_former_building_sql THEN matched_key_sql END` against `key_of`,
+   so inlining the disjointness at the call sites instead would spell the rule
+   three times with nothing pinning them together, and the test would pass either
+   way.
+2. **The veto lives only inside `unmatched_buildings_sql`** (via the shared
+   `former_building_covers_sql` builder, whose sibling `osm_building_covers_sql`
+   holds the live-`osm_buildings` half), so both compare paths inherit it. It
+   uses its own constant, `FORMER_BUILDING_MIN_OVERLAP_FRACTION`, deliberately
+   kept separate from `MIN_OVERLAP_FRACTION` even though both are 0.10 — one
+   answers "did OSM already map this", the other "is this veto trustworthy
+   enough to suppress an import", and they must be free to move apart. The floor
+   is not a rounding nicety: 1,228 of 6,088 raw `ST_Intersects` hits nationally
+   (20%) are under 2% overlap — party-wall touches and slivers against a
+   *neighbouring* demolished building — so a bare `ST_Intersects` veto would
+   wrongly suppress those. See `docs/former_buildings.md` and
+   `rule.rs`'s `building_barely_touching_former_neighbor_stays_unmatched`.
+3. **A suppressed building still counts in `cell_totals`**, unlike a
+   `KATEGORIAISTNIENIA`-filtered one: it is comparable and OSM has effectively
+   handled it, whereas an `extra_filter`-excluded row is out of comparison
+   entirely. `suppressed_buildings_sql` (the mirror of the veto) returns exactly
+   the rows the veto removes, so `matched + unmatched + suppressed = total` stays
+   exact. Without a separate count every suppressed row would read as `matched`,
+   which is precisely the number an operator checks to see whether the feature
+   works at all.
 
-1. **The clause has one home**, `compare::rule::reported_sql`, and it is `pub` unlike the former-building pair — `compare::addresses::compare_addresses_in_txn` legitimately restates the surrounding query (the grid-key path) and splices the same builder in, so the clause text still cannot drift. Four callers total: `unmatched_buildings_sql`, `unmatched_addresses_in_cell_sql`, `reported_buildings_sql` and the address full compare. Both rule entry points gained a `spec: &DatasetSpec` first parameter for it, because the source table string is `"candidates"` on the incremental path and the spec cannot be recovered from it.
-2. **`EXISTS`, never a `LEFT JOIN`.** The table has no UNIQUE constraint (nothing in `db::create_schema` does), and two reports on one object are an ordinary occurrence rather than an error — the same fan-out failure the street-name mapping gotcha describes, avoided here for free by the polarity. `reports::tests::two_reports_on_one_object_still_suppress_exactly_one_row` is the guard.
-3. **Precedence is OSM-covered → suppressed → reported → unmatched, and `suppressed_buildings_sql` was deliberately left alone.** A row that is both former-covered and reported counts as *suppressed*, which keeps that count's definition byte-identical and the four categories disjoint: `matched + suppressed + reported + unmatched = total`. `reported_buildings_sql` is the mirror, and it follows `suppressed_buildings_sql`'s **CTE-first** shape rather than `unmatched_buildings_sql`'s flat one for exactly the reason documented there — it runs once over the whole national extent, and the report table is savagely selective, so building the veto's candidates first and anti-joining `osm_buildings` over *those* is what avoids the `DELIM_JOIN`-materialises-`b.geom` OOM.
-4. **A reported object stays in `cell_totals`**, like a former-building-suppressed one and unlike a `BDOT10K_EKSPLOATOWANY_FILTER`-excluded one. It is comparable and someone has decided about it; the denominator is "objects that could be imported here", not "objects currently offered". `compare::totals` needed no change at all.
-5. **Expiry reuses the diff's own notion of change, and that is the whole design.** `DatasetSpec::content_signature_sql` is built from the same `compared_columns` + `compare_geometry` as `changed_predicate_sql`, so "has this record changed" has one answer for both the refresh diff and report expiry — and each source's measured column choices are inherited for free (PRG ignores its version churn, so a gmina bulk-republish expires nothing; BDOT10k includes `WERSJA` but not geometry, so a `WERSJA` bump does expire, which is precisely the "new version ⇒ importable again" behaviour the feature promises). `dataset::tests::signature_changes_exactly_when_the_diff_says_modified` pins the two together over both `compare_geometry` polarities; without it they drift silently. **This is not a return of `_row_hash`/`ROW_HASH_VERSION`** — that hashed every column of every row, which is why a BDOT10k re-serialization rewrote the whole table; this hashes the curated compared set for `O(active reports)` rows, never `O(source table)`.
-6. **`reconcile_source` has four call sites and the `import` one is not redundant.** `update::dataset::refresh` runs it inside the apply transaction (after the delta, before `bump_serving_epoch`); every `import` arm runs it because a re-import rebuilds the table wholesale with *no diff at all*, which is the one way a record can change with nothing else noticing; `reports reconcile` is the manual path; and `server::jobs::reports_reconcile` (off by default) is the safety net for a change applied while this process wasn't running. It enqueues its dirty cells **before** the status `UPDATE`s, the same read-before-write ordering `update::changeset::insert_change_areas` needs — the rows it must find are identified by a predicate that the UPDATE then makes false.
-7. **BDOT10k's key forced a serving-table change with the usual no-migration cost.** `bdot10k_unmatched` carried only `LOKALNYID`, which is *not* unique, so a client could not name a complete BDOT10k identity; `PRZESTRZENNAZW` is now carried through `compare::columns::classification_columns`, the `bdot10k_unmatched` schema and `BUILDINGS_MVT_SQL`, and `serving_version::TILE_FORMAT_VERSION` went 1 → 2 for the added MVT attribute. An existing database needs `bdot10k_unmatched` recreated and `compare bdot10k` re-run, or every BDOT10k tile fails outright on the missing column. The frontend reads it as key material only — `POPUP_HIDDEN_ATTRIBUTES` in `web/app.js` keeps it out of the displayed attribute list, since it is a namespace identifier and not information about the building.
+   **`suppressed_buildings_sql`'s clause *order* is load-bearing**, and it is why
+   it does not share `unmatched_buildings_sql`'s flat shape. It is the one
+   predicate run **once over the whole source extent**, so the two clauses meet
+   wildly different row counts: the veto is savagely selective (~6k of 16.35M
+   rows), while the `osm_buildings` anti-join covers 17.99M rows. Written flat,
+   DuckDB plans the anti-join *underneath* the semi-join and the delim machinery
+   materializes `b.geom`: **2.18 GB of WKB**, dying with
+   `Out of Memory Error` after 71 s having spilled ~15 GB. Building the veto's
+   candidates in a CTE first and anti-joining over *those* measures ~4.7 s.
+   **The index is a red herring and believing otherwise is the trap:**
+   `osm_buildings` is an `RTREE_INDEX_SCAN` in *both* shapes, but its window is
+   `Bounds: deferred (from join filter)`, so probing with all of Poland yields a
+   whole-country bound that prunes nothing. Only shrinking the probe side works.
+   **`MATERIALIZED` is insurance, not the active ingredient — the CTE is**: a
+   bare `WITH` plans identically apart from `CTE_SCAN`.
+   `rule::tests::suppressed_buildings_predicate_filters_by_the_veto_first` pins
+   the order structurally.
+4. **`update osm` must maintain `osm_former_buildings` at every site that
+   maintains `osm_buildings`** — way/relation delete, and both the changeset and
+   *inferred* tag-determination arms of `rebuild_way_geometry` /
+   `rebuild_relation_geometry`. The inferred arm is the one to watch: its early
+   return must consider the former key too, or a former-building way whose node
+   moved keeps a stale pre-move geometry forever. `Layer::Buildings` is the
+   correct dirty-cell layer (its `flush` maps to `bdot10k` + `egib`).
+   `prg_unmatched` is deliberately unreachable from this table — "former building
+   ⇒ nearby address is bogus too" needs its own design, not a drive-by wire-up.
+5. **`db::create_schema` and `import::osm::reset_osm_tables` both declare this
+   table and must agree on its shape.** `create_schema` creates it *without* its
+   RTREE index — `create_spatial_indexes` only runs inside `import osm`.
 
-8. **A vetoed object is still visible — on the `*_all` layers, and only there — and that is what `reported` is for.** The veto removes the object from `<source>_unmatched`, so it leaves the `buildings`/`addresses` tile layers entirely; the legend's "wszystkie" layers read the raw government tables and still draw it, where it was indistinguishable from a record OSM already has ("W rejestrze", with nothing saying why it stopped being offered). `ALL_ADDRESSES_MVT_SQL`/`ALL_BUILDINGS_MVT_SQL` therefore carry a `reported` attribute built from `rule::reported_sql` — the same builder the compare paths negate, so the popup's word and the serving table's contents cannot disagree — and `web/app.js`'s `featureStatus` turns it into a "Zgłoszony" chip with a hover explanation. Four things: it is `CASE WHEN … THEN TRUE END` so `ST_AsMVT` drops it on every unreported feature (but note the *key* still enters the layer dictionary, so a test that greps tile bytes for `"reported"` passes with nothing reported at all — `all_buildings_sql`/`all_addresses_sql` take a `projection` seam so the tests read the flag per row instead); the two source scans had to move into `MATERIALIZED` CTEs, since a correlated `EXISTS` alongside the spatial filter lets the optimizer re-plan the RTREE scan into a SEQ_SCAN exactly as a downstream `LEFT JOIN` does; `serving_version::TILE_FORMAT_VERSION` went 2 → 3, and it is doing real work here — a stale v2 tile is byte-indistinguishable from a v3 tile with nothing reported; and unlike every other carried-attribute change in this file this one needs **no migration at all** — it is computed at read time from `object_reports`, so no schema change, no re-`compare`, no reconcile. `POST /report` stays on the must-not-bump list: the flag becomes visible when the drain moves the object's cell version, i.e. in the same version change that removes it from the unmatched layer.
+**Gotcha — the user-report veto is a third layer, and its rules are not the
+former-building ones repeated.** `object_reports` holds user submissions
+(`POST /report`, `src/server/reports.rs`) saying a government object should not
+be proposed at all. An `active` report vetoes its object out of
+`<source>_unmatched`.
 
-Two things `object_reports` is alone in, both worth remembering before touching it. It is **the only table in this database that cannot be reconstructed from an external source** — everything else is derived from OSM, PRG, BDOT10k, EGIB or the mapping CSVs and is an `import full` away, so `reports export`/`import` (JSONL) is part of the feature rather than a follow-up; `import` reallocates ids from the current maximum so a restore into a non-empty database cannot collide, making a round trip faithful in content but not in id. And it is the only endpoint where an **anonymous client writes rows that change what every other user sees**, with — by explicit decision — no rate limit and **nothing identifying the submitter stored: no address, no hash of one, no `User-Agent`**. So `server::mod`'s `axum::serve(listener, app)` must stay as it is (no `into_make_service_with_connect_info`, no `X-Forwarded-For` handling), and cleanup after an abusive burst is time-scoped rather than actor-scoped: `reports revoke --since <ts> [--source S]`, with `reports.enabled = false` as the immediate stop. `POST /report` is also on `serving_version`'s **must-not-bump** list — the insert enqueues the object's cell, so per-cell `computed_at` already covers it, and bumping the epoch would flush every cached tile in the country once per report.
+1. **The clause has one home**, `compare::rule::reported_sql`, and unlike the
+   former-building pair it is `pub`, because the address full compare
+   legitimately restates the surrounding query and splices the same builder in.
+   To enumerate its callers, grep — do not trust a count written here:
+   `grep -rn 'reported_sql(' src/`. Both rule entry points take a
+   `spec: &DatasetSpec` for it, because the source table string is
+   `"candidates"` on the incremental path and the spec cannot be recovered from it.
+2. **`EXISTS`, never a `LEFT JOIN`.** The table has no UNIQUE constraint, and two
+   reports on one object are ordinary rather than an error. Guard:
+   `reports::tests::two_reports_on_one_object_still_suppress_exactly_one_row`.
+3. **Precedence is OSM-covered → suppressed → reported → unmatched**, and
+   `suppressed_buildings_sql` was deliberately left alone: a row that is both
+   former-covered and reported counts as *suppressed*, which keeps that count's
+   definition byte-identical and the four categories disjoint.
+   `reported_buildings_sql` follows the **CTE-first** shape for exactly the
+   reason documented above — it runs once over the national extent.
+4. **A reported object stays in `cell_totals`.** The denominator is "objects that
+   could be imported here", not "objects currently offered".
+5. **Expiry reuses the diff's own notion of change, and that is the whole
+   design.** `DatasetSpec::content_signature_sql` is built from the same
+   `compared_columns` + `compare_geometry` as `changed_predicate_sql`, so "has
+   this record changed" has one answer for both, and each source's measured
+   column choices are inherited for free (PRG ignores its version churn, so a
+   gmina bulk-republish expires nothing; BDOT10k includes `WERSJA` but not
+   geometry, so a bump does expire — precisely the "new version ⇒ importable
+   again" behaviour). `dataset::tests::signature_changes_exactly_when_the_diff_says_modified`
+   pins them together. It hashes the *curated* compared set for
+   `O(active reports)` rows, never `O(source table)` — do not widen it.
+6. **`reconcile_source` has four call sites and the `import` one is not
+   redundant**: `update::dataset::refresh` (inside the apply transaction), every
+   `import` arm (a re-import rebuilds the table with *no diff at all*), `reports
+   reconcile`, and `server::jobs::reports_reconcile` (off by default). It
+   enqueues dirty cells **before** the status `UPDATE`s — the same
+   read-before-write ordering `update::changeset::insert_change_areas` needs.
+7. **BDOT10k's key forced a serving-table change.** `bdot10k_unmatched` carried
+   only `LOKALNYID`, which is not guaranteed unique, so a client could not name a
+   complete identity; `PRZESTRZENNAZW` is now carried through
+   `compare::columns::classification_columns`, the schema and `BUILDINGS_MVT_SQL`.
+   The frontend reads it as key material only — `POPUP_HIDDEN_ATTRIBUTES` in
+   `web/app.js` keeps it out of the displayed attribute list.
+8. **A vetoed object is still visible — on the `*_all` layers, and only there.**
+   The veto removes it from `<source>_unmatched`, so it leaves the
+   `buildings`/`addresses` tile layers entirely; the "wszystkie" layers read the
+   raw government tables and still draw it, where it was indistinguishable from a
+   record OSM already has. `ALL_ADDRESSES_MVT_SQL`/`ALL_BUILDINGS_MVT_SQL`
+   therefore carry a `reported` attribute built from the same `reported_sql` the
+   compare paths negate, and `web/app.js`'s `featureStatus` turns it into a
+   "Zgłoszony" chip. Three traps: it is `CASE WHEN … THEN TRUE END` so `ST_AsMVT`
+   drops it on unreported features — but the *key* still enters the layer
+   dictionary, so a test grepping tile bytes for `"reported"` passes with nothing
+   reported (`all_buildings_sql`/`all_addresses_sql` take a `projection` seam so
+   tests read the flag per row); the two source scans had to move into
+   `MATERIALIZED` CTEs, since a correlated `EXISTS` alongside the spatial filter
+   lets the optimizer re-plan the RTREE scan into a SEQ_SCAN; and this needs **no
+   migration at all**, being computed at read time.
 
-**Gotcha — BDOT10k buildings are pre-filtered by `KATEGORIAISTNIENIA` inside the shared match rule, not at import.** `rule::unmatched_buildings_sql` takes an `extra_filter: Option<&str>`; both `compare::buildings::compare_bdot10k` and `compare::incremental::recompute_cell_in_txn`'s bdot10k branch pass `rule::BDOT10K_EKSPLOATOWANY_FILTER` (`"b.KATEGORIAISTNIENIA = 'eksploatowany'"`), so a BDOT10k row whose category is `w budowie` (under construction), `nieczynny` (inactive) or `zniszczony` (destroyed) never counts as matched *or* unmatched — it's excluded from comparison entirely, not just from the unmatched output. EGIB has no equivalent column and passes `None`. `compare_buildings`'s `total` count (used to log `matched = total - unmatched`) applies the same filter, so the invariant still holds for the filtered row set. The raw `bdot10k_buildings` table is untouched — this is a compare-time filter, unlike invalid-geometry filtering (see below), which deletes rows at import; other consumers of the live table (building-type mapping's adjacency join in `server/package.rs`) still see every category.
+Two things `object_reports` is alone in. It is **the only table that cannot be
+reconstructed from an external source** — everything else is an `import full`
+away — so `reports export`/`import` (JSONL) is part of the feature; `import`
+reallocates ids from the current maximum, so a round trip is faithful in content
+but not in id. And it is the only endpoint where an **anonymous client writes
+rows that change what every other user sees**, with — by explicit decision — no
+rate limit and **nothing identifying the submitter stored: no address, no hash of
+one, no `User-Agent`**. So `server::mod`'s `axum::serve(listener, app)` must stay
+as it is (no `into_make_service_with_connect_info`, no `X-Forwarded-For`), and
+cleanup after an abusive burst is time-scoped rather than actor-scoped:
+`reports revoke --since <ts> [--source S]`, with `reports.enabled = false` as the
+immediate stop.
 
-**Gotcha — bdot10k/egib's representative point is a stored column, not computed.** `bdot10k_buildings` and `egib_buildings` carry a `centroid GEOMETRY` column, populated by `import::bdot10k::load_into` / `import::egib::load_into` (shared by `import` and `update`'s staging load) and RTREE-indexed the same way `geom` is. `rule::unmatched_buildings_sql`, `compare::buildings`, `compare::incremental`, `compare::reconcile::enqueue_all`, and `update::changeset` (via `DatasetSpec::representative_point_sql`) all read this column instead of computing `ST_Centroid(geom)` inline — an RTREE index cannot be used through a function wrapped around the indexed column, which was the root cause of the full-table-scan bottleneck in `docs/per_cell_recompute_full_scan.md` (measured fix: `docs/centroid_index_measured.md`, ~10–100× faster per z14 cell on real data). The column is added by `DatasetSpec::with_centroid_select` and is deliberately *not* in `compared_columns`, so it can never affect what the diff sees — at the cost that its value on an unmodified record never self-heals (see the derived-column gotcha above: editing `with_centroid_select` needs a re-import, not a refresh). Scope is bdot10k/egib only — PRG's `geom` already is its representative point, and `bdot10k_unmatched`/`egib_unmatched` (the serving tables) and `osm_buildings` are untouched, so `server/package.rs` and `update/dirty_cells.rs` still compute `ST_Centroid` inline on those. **No migration path exists for databases built before this change** — `import bdot10k` / `import egib` must be re-run (which rebuilds the table wholesale) to gain the column; there is no `ALTER TABLE`/auto-backfill.
+**Gotcha — BDOT10k buildings are pre-filtered by `KATEGORIAISTNIENIA` inside the
+shared match rule, not at import.** `rule::unmatched_buildings_sql` takes an
+`extra_filter`; both bdot10k paths pass `rule::BDOT10K_EKSPLOATOWANY_FILTER`, so
+a row whose category is `w budowie`, `nieczynny` or `zniszczony` counts as
+neither matched *nor* unmatched — excluded from comparison entirely. EGIB has no
+equivalent column and passes `None`. The raw `bdot10k_buildings` table is
+untouched: this is a compare-time filter, unlike invalid-geometry filtering,
+which deletes rows at import.
 
-**Gotcha — `now()` is transaction-start-scoped.** DuckDB evaluates `now()` at the transaction's BEGIN, not at statement time. The government refresh enqueues its dirty cells *inside* the apply transaction, so every cell a 5-minute BDOT10k refresh touched is stamped with that transaction's start time. `/status`'s `oldest_enqueued_at` therefore reads ~5 minutes worse than reality right after a refresh. This is cosmetic — the drain's cutoff is snapshot-based and unaffected — but don't "fix" the metric by reaching for `now()` somewhere else in the drain (see the next gotcha).
+### Precomputed unmatched serving
 
-**Gotcha — the drain's cutoff is load-bearing.** `drain_batch` takes one `batch_start` timestamp and uses it for *both* the read (`enqueued_at <= batch_start`, selecting which dirty cells this tick owns) and the paired queue-delete after recomputing each cell. Both sides must use that same stored value, not `now()`: a cell re-dirtied after `batch_start` must survive the delete (its edit wasn't seen by this tick's recompute) and be picked up by the next one. Using `now()` on either side — or two different timestamps — either strands a cell dirty forever or deletes a queue row for a change the recompute never read.
+`compare` writes unmatched government objects into `bdot10k_unmatched` /
+`egib_unmatched` / `prg_unmatched`, and `/tiles` + `/package` read those directly
+instead of comparing live. Between full runs, each producer enqueues the z14
+cells it touched into `match_dirty_cells`, and the `match_refresh` job drains
+that queue by recomputing just those cells.
 
-**Gotcha — serving tables store rows, not id references.** `*_unmatched` tables copy the columns needed to render a feature (geometry, tags, `cell_x`/`cell_y`, `computed_at`) instead of pointing back at the source table by id or rowid. BDOT10k's identity is the composite `(PRZESTRZENNAZW, LOKALNYID)`, not `LOKALNYID` alone, and DuckDB rowids aren't stable across the DELETE+INSERT that every recompute (and every refresh) does — so id/rowid references would go stale silently. (Measured 2026-08-17 on the live national table: `LOKALNYID` alone happens to be unique across all 16,351,813 rows, 0 duplicate values, with 16 distinct `PRZESTRZENNAZW` namespaces. Earlier notes here asserted flatly that it *isn't* unique; that was never measured. What is true is the thing that matters — nothing in the schema or the export guarantees it, `DatasetSpec::key_columns` declares the composite, and the raw pre-`deduplicate_by_key` export does carry duplicate composite keys, so a snapshot that starts colliding on `LOKALNYID` alone would do so silently.) Recompute is always DELETE-then-INSERT for the affected cell, never an in-place UPDATE.
+**Gotcha — serving tables store rows, not id references.** They copy the columns
+needed to render a feature instead of pointing back at the source by id or
+rowid. BDOT10k's identity is the composite `(PRZESTRZENNAZW, LOKALNYID)`, and
+DuckDB rowids aren't stable across the DELETE+INSERT every recompute does — so id
+references would go stale silently. (Measured on the live national table:
+`LOKALNYID` alone happens to be unique across all 16,351,813 rows. Nothing in the
+schema or the export *guarantees* that, `key_columns` declares the composite, and
+the raw pre-dedup export does carry duplicate composite keys.) Recompute is always
+DELETE-then-INSERT for the affected cell, never an in-place UPDATE.
 
-**Gotcha — the street-name mapping is a match input, and that is why its loader enqueues dirty cells.** `street_name_mappings` (loaded from `mappings/street_names_mappings.csv`) used to be serving-time only; it is not any more, and every reflex built on the old claim is now wrong. The resolution chain has **one home** — `mappings::street_names::resolved_street_join_sql` + `resolved_street_expr_sql` — and **four** callers: `server::package::unmatched_addresses` (building `addr:street`), `server::tiles`'s `ADDRESSES_MVT_SQL` (the `resolved` CTE, previewing what `/package` would export), and now both compare paths — `compare::rule::unmatched_addresses_in_cell_sql` (the `addr_resolved` CTE) and `compare::addresses::compare_addresses_in_txn` (the `src_norm` CTE). Lookup is `lower(trim(...))` on both sides and priority is settlement row → global row (NULL `teryt_simc_code`) → raw name, so an empty table serves PRG names verbatim instead of failing. `ALL_ADDRESSES_MVT_SQL` (the `addresses_all` legend layer) still does not apply it — that layer shows every PRG address including matched ones, which is never tag-preview material. Five things follow from the mapping being a match input:
+**Gotcha — bdot10k/egib's representative point is a stored column, not
+computed.** Both tables carry a `centroid GEOMETRY`, populated by their
+`load_into` and RTREE-indexed like `geom`. Every consumer reads this column
+instead of computing `ST_Centroid(geom)` inline — **an RTREE index cannot be used
+through a function wrapped around the indexed column**, which was the root cause
+of the full-table-scan bottleneck (`docs/per_cell_recompute_full_scan.md`; fix
+measured in `docs/centroid_index_measured.md`, ~10–100× per z14 cell). The column
+is deliberately *not* in `compared_columns`, so it can never affect the diff — at
+the cost that it never self-heals. Scope is bdot10k/egib only: PRG's `geom`
+already is its representative point, and the `*_unmatched` and `osm_buildings`
+tables still compute `ST_Centroid` inline.
 
-1. **A mapping edit changes which addresses are unmatched**, via `rule`'s rule B (resolved street + housenumber within `NAME_MATCH_DISTANCE_METERS`). So `mappings::street_names::validate_and_swap` enqueues prg dirty cells for the addresses whose *resolved* name could have moved, and an offline `import street-mappings` now leaves queue work behind for the server's `match_refresh` job (or an explicit `queue drain`).
-2. **The delta is a symmetric difference over the full `(teryt_simc_code, lower(prg_street_name), osm_street_name)` triple**, computed *before* the swap's `DELETE` — the live table's pre-swap contents are half the difference and are gone a statement later, the same read-before-write ordering `update::changeset::insert_change_areas` needs. Each `EXCEPT` must be parenthesized (`EXCEPT` and `UNION` have equal precedence and are left-associative, so the bare form silently means `((A EXCEPT B) UNION B) EXCEPT A`), and `EXCEPT`'s NULL-as-equal semantics are what keep unchanged *global* rows out of the delta — a `NOT EXISTS ... AND teryt_simc_code = ...` rewrite would put every global row in the delta on every reload. Only the *name* is projected out of the changed triples, which is deliberately over-broad: a settlement-scoped edit dirties that name's addresses nationally, which is cheap and removes a class of "which addresses could this row have applied to" reasoning. Measured: a no-op reload enqueues **0** cells, a full 3,272-row replacement enqueues **8,964 of 112,264** prg cells.
-3. **The fan-out guarantee is borrowed, not local.** The two `LEFT JOIN`s can each match at most one row *only because* `validate_and_swap` rejects duplicate `(lower(prg_street_name), teryt_simc_code)` keys. The table carries no UNIQUE constraint (`db::create_schema`), so a hand-INSERTed duplicate now duplicates rows in `prg_unmatched`, not merely in a `/package` response. `rule::tests::a_global_and_a_settlement_mapping_for_the_same_name_emit_one_row_per_address` is the guard.
-4. **The epoch bump stays and is not superseded by the enqueue.** An undrained cell serves the old match decision with the new serve-time `addr:street`, and `addresses_all` plus z5–z13 are epoch-only regardless.
-5. Note `make_seeded_state` in `server/package.rs` builds its tables from a local `SEED` constant rather than `create_schema` — a new serving table has to be added there too (`server::tiles`'s own test fixture builds on `crate::db::init_db` instead, so it doesn't have this problem).
+**Gotcha — `now()` is transaction-start-scoped.** DuckDB evaluates it at BEGIN,
+not at statement time. The government refresh enqueues its dirty cells *inside*
+the apply transaction, so every cell a 5-minute refresh touched is stamped with
+that transaction's start time, and `/status`'s `oldest_enqueued_at` reads ~5
+minutes worse than reality right afterwards. Cosmetic — the drain's cutoff is
+snapshot-based — but don't "fix" the metric by reaching for `now()` in the drain.
 
-**Gotcha — building-type mapping is serving-time only, with adjacency computed live, not stored.** `bdot10k_building_types`/`egib_building_types` (loaded from `mappings/*_building_types.csv` via `mappings::building_types::load_from_path`) are applied by the same `LEFT JOIN LATERAL` shape in two places: `server::package::unmatched_bdot10k_buildings`/`unmatched_egib_buildings`, and `server::tiles`'s `BUILDINGS_MVT_SQL` (the `bdot10k_final`/`egib_final` CTEs, reusing the shared `ADJACENCY_READ_BUFFER_DEG`/`BDOT10K_ADJACENCY_KEY`/`EGIB_ADJACENCY_KEY` constants from `server::package` rather than re-typing them) — the tile's `tags` attribute previews the same mapping `/package` would apply, falling back to `COALESCE(..., 'building=yes')` in SQL since `/tiles` has no Rust-side post-processing step like `package::building_tags`. `ALL_BUILDINGS_MVT_SQL` (the `buildings_all` legend layer) does not resolve tags — same reasoning as `addresses_all` above. **Unlike** the street-name mapping (which became a match input — see its gotcha above), none of this can ever change which buildings are unmatched (`compare::rule::unmatched_buildings_sql` reads no classification column), so a building-type mapping edit needs no `compare`, reconcile or drain. Also unlike the street-name mapping, the classification *columns* themselves (`bdot10k_unmatched.funkcja_szczegolowa`/`funkcja_ogolna`/`liczba_kondygnacji`, `egib_unmatched.rodzaj_kod`/`kondygnacje_nadziemne`) are carried at compare time via `compare::columns::classification_columns` — a database predating this feature needs `compare` (or `queue reconcile` + drain) re-run before they populate, on top of the `create_schema` migration that adds the columns. `egib_buildings.rodzaj_kod` is a separate precomputed *source*-table column (see the next gotcha) — `egib_unmatched.rodzaj_kod` merely copies it. Same-class building adjacency (`budynek jednorodzinny` / `rodzaj_kod = 'm'`) is computed inline in the serve query against the live `bdot10k_buildings`/`egib_buildings` tables (buffered read, `ADJACENCY_READ_BUFFER_DEG = 0.0005°`) — this is a spatial bbox read, not an id lookup, so it does not violate the "serving tables store rows, not id references" invariant above. See `docs/superpowers/specs/2026-08-03-building-type-mappings-design.md` for the measurements behind these choices. As with street names, `make_seeded_state` in `server/package.rs` and `make_full_state` in `server/updates.rs` build their tables from local constants rather than `create_schema` — a schema change here has to land in both of them, plus `db.rs` (`server::tiles`'s own test fixture builds on `crate::db::init_db` instead).
+**Gotcha — the drain's cutoff is load-bearing.** `drain_batch` takes one
+`batch_start` and uses it for *both* the read (`enqueued_at <= batch_start`) and
+the paired queue-delete. Both sides must use that same stored value, never
+`now()`: a cell re-dirtied after `batch_start` must survive the delete (its edit
+wasn't seen by this tick) and be picked up by the next one. Using `now()` on
+either side — or two different timestamps — either strands a cell dirty forever
+or deletes a queue row for a change the recompute never read.
 
-**Gotcha — `egib_buildings.rodzaj_kod` is precomputed at import, unlike everything else about the mapping.** The EGIB `rodzaj` cascade (`mappings::egib::RODZAJ_KOD_CASE_SQL`, Appendix B of `docs/building_type_mappings.md`) runs once per import via `mappings::egib::with_rodzaj_kod_select`, wrapping `import::egib::load_into`'s select the same way `DatasetSpec::with_centroid_select` adds `centroid` — and, like it, `rodzaj_kod` is not in `EGIB.compared_columns`, so it never affects what the diff sees and never self-heals on an unmodified record (editing `RODZAJ_KOD_CASE_SQL` needs a re-import, not a refresh). This is the one piece of the feature that isn't purely serving-time: running the cascade over the adjacency `nb` CTE's bbox slice at serve time measured +1.0s (regexp cascade over ~96k candidate rows), so it moved to import. A database whose `egib_buildings` predates this must re-run `import egib` (full table rebuild, same as `centroid` — no `ALTER TABLE`/backfill path exists) before `rodzaj_kod` populates; until then it reads NULL and every EGIB building falls through to `building=yes`.
+**Gotcha — dirty-queue source strings must match everywhere.**
+`match_dirty_cells.source` is a plain string (`"bdot10k"` / `"egib"` / `"prg"`),
+not an enum, and every producer must spell it identically. To enumerate the
+producers, grep rather than trusting a list here:
+`grep -rn 'INSERT INTO match_dirty_cells' src/`. A mismatched string silently
+orphans that source's cells — enqueued but never drained.
 
-**Gotcha — PRG's `ulica` is normalized at import.** Warsaw's PRG records embed the street type in the name (`<prgad:TERYTNazwa1>ulica Wał Miedzeszyński</prgad:TERYTNazwa1>`) *while also* declaring `<prgad:rodzaj>1</prgad:rodzaj>` (= ulica); `prg_convert` only ever prepends a *missing* type word and never removes an embedded one, so it faithfully passes the duplicate through. `import::prg::ULICA_PREFIX_STRIP_SQL` strips it in `materialize_into` — the one funnel both `import prg` and `update prg`'s staging load pass through, so a single site covers both paths. See `docs/prg_ulica_prefix.md` for the diagnosis and scope (122,826 rows, all but 4 of them Warsaw). Three things about it are load-bearing. **(1)** Only `ulica`/`ul.` are stripped, never the other cecha words Warsaw spells out — `Aleja`, `Aleje`, `Trakt`, `Osiedle` are part of the correct name and OSM uses them verbatim ("Aleja Krakowska", "Aleje Jerozolimskie"), so generalizing the pattern would corrupt 70,574 rows. **(2)** Unlike `centroid` and `rodzaj_kod`, which derive *new* columns outside `compared_columns` and therefore never self-heal, this one rewrites a *stored* value that is itself compared — `ulica` is in `PRG.compared_columns`. So an edit to the expression surfaces as an ordinary modification on the next refresh and self-heals per record, rather than stranding rows with stale names. No version bump exists or is needed. **(3)** **It is now a match input, and used not to be.** Both compare paths resolve `ulica` through `street_name_mappings` and compare the result against OSM's `addr:street` (`rule`'s rule B), so an edit to this expression can flip an address between matched and unmatched — the old claim that it "reads `ulica` only in its final projection" is false. Blast radius is materially different from the derived-column cases but needs no new machinery: because `ulica` is in `PRG.compared_columns` (point 2 above), an edit surfaces as an ordinary per-record modification on the next refresh, and each modified record enqueues its own dirty cell through the normal government-refresh path. An existing database still needs `import prg` re-run and then `compare addresses` (or reconcile + drain) before the serving table and `/package` see clean names. `/tiles`' `addresses_all` layer reads `prg_addresses` directly and is clean the moment the import lands.
+**Gotcha — the OSM producer's enqueue reach is exact, derived from the match
+rule's OSM read envelope.** `update::dirty_cells::note_existing` takes the cell
+range of the edited row's bbox, widened by `layer_buffer_deg` — **`0.0` for
+`Layer::Buildings`, `rule::OSM_MATCH_BUFFER_DEG` for `Layer::Addresses`**. That
+asymmetry is not tuning: the building rule tests OSM against the cell's
+*unbuffered* envelope, the address rule reads `osm_addresses` from the buffered
+one. **If either rule's OSM read gains or loses a buffer, `layer_buffer_deg` must
+move with it** — that function is the one home for the coupling, and it imports
+the constant rather than restating the number. The value is coupled to the
+*widest* distance any branch uses (`NAME_MATCH_DISTANCE_METERS`), not the
+narrowest; `rule::tests::osm_match_buffer_covers_the_widest_match_distance`
+computes that requirement rather than trusting prose, because the failure mode is
+silent. Four further things:
 
-**Gotcha — invalid government geometry is dropped, not repaired.** A small number of BDOT10k/EGIB rows have topologically invalid geometry (`ST_IsValid = false`), which crashes `ST_AsMVTGeom` and takes down the whole tile (see `docs/invalid_geometry_tile_500s.md`). `dataset::filter_invalid_geometry` deletes those rows immediately after `import::bdot10k::load_into` / `import::egib::load_into` create their table — the one place both `import` and `update`'s staging load funnel through — so `compare::buildings` and `compare::incremental` never see them and need no changes of their own. Its sibling, `dataset::filter_oversized_geometry`, runs right after it in the same two `load_into` functions and drops a different kind of bad row: one whose bbox spans at least one full z14 cell (~1506 m at the equator, less at higher latitudes) in either axis — too wide to be a single real building, and in practice a corrupted merge of two unrelated features that each individually pass `ST_IsValid`. The threshold is expressed in **cell units**, never degrees or metres, because the latitude threshold is not constant in degrees (0.0135° at 52°N vs 0.0126° at 55°N under the Web-Mercator Y projection) — cell units keep it one constant tied to `tile_math::CHANGE_CELL_ZOOM`. Measured over the full source tables (BDOT10k 16,351,815 rows, EGIB 17,773,961 rows): 0 BDOT10k rows dropped (the longest genuine BDOT10k building measures 0.696 cells, ~1 km — ~50% headroom under the threshold) and 85 EGIB rows. The motivating record is EGIB `260208_5.0009.315.1_BUD`: a 2-part MULTIPOLYGON, 10 points total, whose two parts are real buildings ~44 km apart glued into one row — `ST_IsValid` accepts it because each part is individually a simple polygon. The filter must be built from `tile_math::cell_x_frac_sql`/`cell_y_frac_sql` (the **unfloored** fractional cell coordinate of each bbox edge) and never from `cell_x_sql`/`cell_y_sql` (floored to a cell index) — flooring first would compare which cell each edge's index lands in rather than how far apart the edges actually are, and would delete a legitimate ~10 m shed sitting on a cell boundary purely for its position; `tile_math::tests::cell_frac_is_unfloored_across_a_cell_boundary` and `dataset::tests::filter_oversized_geometry_keeps_small_building_straddling_cell_boundary` both pin this. The threshold also isn't arbitrary insurance: because a surviving row's bbox is strictly narrower than one cell in both axes, its reach from its own centroid's cell is `<= 1` by construction — an enforced invariant, not an empirical guess — which is exactly what makes the 3x3-cell ring in the serving-version gotcha below exact rather than approximate. Like `filter_invalid_geometry`, this runs after `load_into` has already built the table, and both are row *filters*: they change which rows exist, never the content of a surviving row, which is what makes them safe to reorder relative to the other load-time steps. The one ordering constraint that is real: both must run **before** `deduplicate_by_key`, so a duplicate pair whose newest member has bad geometry falls back to the older valid member instead of collapsing to a row a filter then deletes, losing the object entirely. Scope is bdot10k/egib only, same as the invalid-geometry filter — PRG points have no extent to measure. `LoadStats::merge_oversized` folds both filters' counts into the one `LoadStats` each loader returns, so `import()` and `update::dataset::refresh()` self-report both skip reasons together to `job_run_log` via the `job_log` module, under job names `import:<source>` / `update:<source>`; `/status` reads it back as `job_run_log`. `job_run_log` reporting has wider reach, though: PRG's `update_prg` shares the same `refresh()` that self-reports, so `update:prg` also appears in `job_run_log` (with no skip-count clause, since PRG performs no filtering). `import:prg` does not report, since PRG's import path never goes through `refresh()`. `import:osm` *does* report, but not via `refresh()` — `import::osm::import` self-reports directly, since OSM has no dataset-diff refresh path at all; its message carries the final building/address/former-building counts and elapsed time, plus — unlike the other three, whose clauses report rows *skipped* — a *repaired*-geometry clause when `osm::geometry::repair_invalid_geometry` actually fixed something (see the OSM-geometry gotcha two paragraphs below). A government refresh whose ETag is unchanged returns early via `record_noop_refresh` (`src/update/mod.rs:38`/`:63`/`:88`), before `dataset::refresh` — and its self-report — ever runs, so that job's `job_run_log` entry is left untouched from its last real run. Because no-op refreshes are the common case, `job_run_log["update:<source>"].ran_at` can be days older than the corresponding `jobs[].last_finished_at` for the same job without indicating anything is wrong. An existing database keeps its 85 bad EGIB rows until the next `import egib`, or the next EGIB refresh whose staging load passes through the same `load_into` funnel.
+1. A fixed 3x3 neighbourhood measured **5.6× amplification** on the live queue
+   for a margin 98.08% of real building footprints never needed.
+2. **Y is inverted** — higher latitude means a *smaller* `cell_y` — so `ST_YMax`
+   maps to the min index; getting this backwards yields an empty range and
+   silently enqueues nothing.
+3. None of the standing safety nets protect this: the equivalence and concurrency
+   tests seed the queue via `reconcile::enqueue_all`, which never goes through
+   `DirtyCells` at all. The tests that do are `dirty_cells`'s straddling/corner
+   cases and `update::osm::tests::osc_xml_straddling_cell_boundary_updates_the_neighbouring_cells_serving_table`.
+4. `MAX_ENQUEUE_CELLS_PER_ROW` (1024) skips the enqueue for a row demanding more
+   cells, with a warning. It guards an input class government exports don't have:
+   a node dragged to (0, 0) makes a Polish building way span **2,659,592** z14
+   cells from a single edit. The widest real `osm_buildings` row spans 0.7306
+   cells, leaving 256× headroom. `queue reconcile` is the backstop, so skipping
+   rather than clamping degrades to "stale until the next sweep".
 
-**Gotcha — *request* geometry is repaired, not dropped, and an unrepairable one is a 400.** The mirror image of the gotcha above, for the other direction of data flow. `/package`'s polygon body (`POST`, drawn in the browser by `web/app.js`'s area tool) is arbitrary client input: `parse_polygon_body` checks JSON shape, geometry type, coordinate ranges and a non-degenerate envelope, but never topological validity, so a self-intersecting "bowtie" ring reaches SQL intact. Two mechanisms handle that, doing different jobs. First, every SQL site consuming the request geometry wraps it as `ST_MakeValid(ST_GeomFromGeoJSON(?))` — `unmatched_addresses`, both building queries, *and* the `package_exports` INSERT in `log_export`, so the logged area is always the geometry actually queried; GEOS throws on an invalid argument to `ST_Intersects`, which would 500 exactly the way `ST_AsMVTGeom` did in `docs/invalid_geometry_tile_500s.md`. Second, `check_request_geometry` (called from `serve_package`) decides whether that repair is *meaningful*: already valid → proceed; invalid but repairing to a non-degenerate Polygon/MultiPolygon (a bowtie correctly becomes a MultiPolygon — that is the intended repair, not something to normalise away) → proceed; empty, zero-area or non-polygonal → 400, because a near-collinear freehand scribble repairs to a LineString and "everything intersecting a line" is not the package anyone asked for. A throw from `ST_GeomFromGeoJSON` itself folds into the same 400 rather than bubbling up as a 500. The check runs only when `RequestArea::is_user_supplied` — `parse_bbox` builds its rectangle from four range-checked floats and cannot produce invalid geometry, so `GET /package` must not pay for a pool acquisition and a GEOS round trip; don't "simplify" that flag away. Note the asymmetry across the three inputs: bad *government* rows are deleted at import, bad *request* geometry is repaired at query time, and bad *OSM* geometry is repaired at import/update time (next gotcha).
+Do not confuse this with the two unrelated "3x3" mechanisms: `compare::addresses`'
+grid-key neighbourhood (a different 0.005° grid) and
+`serving_version::z14_tile_version`'s read-time ring (exact by the
+`filter_oversized_geometry` invariant — **must not be narrowed**).
 
-**Gotcha — invalid OSM geometry is repaired, never deleted, and that direction is the whole point.** The third input's rule, and the one that is *not* a copy of the government one above. OSM enforces no validity and `import osm`/`update osm` build polygons with a bare `ST_MakePolygon` over raw node coordinates, so a self-intersecting building way lands intact — and `compare::rule::unmatched_buildings_sql`'s overlap fraction calls `ST_Intersection`, whose GEOS overlay throws `TopologyException: side location conflict` where the `ST_Intersects` in the clause above it (prepared geometry) tolerates the same input happily. One such way rolls back an entire national `compare full` (the grid runs in one clear-then-repopulate transaction) and, in the server, makes one z14 cell fail on every `match_refresh` tick forever, since `drain_batch` rolls the cell back and leaves it queued. Measured on the 2026-08 Poland extract: 3 invalid rows in 17,986,820 `osm_buildings`, 0 in `osm_former_buildings` — and only *one* of the three actually throws, so the count is a measure of exposure, not a bound on breakage. Five things are load-bearing. **(1) Repair, not delete — the opposite of `dataset::filter_invalid_geometry`, deliberately.** A government row is a *candidate* for import, so dropping a corrupt one is a safe false negative; an OSM row is *evidence* that something is already mapped, so dropping it makes the government building it covered look unmatched and get proposed — a duplicate added to OSM. `osm::geometry::tests::repair_fixes_the_overlay_crash_on_the_real_failing_pair` asserts that counterfactual directly (the real way covers 83.3% of the real government building; delete it and the building resurfaces as an import candidate). **(2) The repair expression has one home**, `osm::geometry::repaired_geom_sql`, and it is `ST_CollectionExtract(ST_MakeValid(g), 3)` — the extraction is not dressing: MakeValid preserves every vertex, so a zero-area spike comes back as a LINESTRING inside a GEOMETRYCOLLECTION (2 of the 3 real rows do exactly that), and storing a collection in `osm_buildings` would leave a geometry downstream functions handle inconsistently. **(3) The two paths apply it at different moments on purpose**: `import osm` runs `repair_invalid_geometry` as a post-pass once per polygon table (covering all four insert passes, including any fifth added later) while `update osm` wraps `repaired_geom_sql` inline at each of its four per-object INSERTs. Not a performance split — measured over 2,000,000 real rows the `ST_IsValid` scan costs 0.344 s and unconditional wrapping 0.466 s — but a "how many sites can forget" one. `post_pass_and_inline_wrapper_produce_the_same_geometry` pins that they agree. **(4) An inline wrapper must be paired with `has_polygon_sql` in the same statement's WHERE.** A fully degenerate ring repairs to a linestring and extracts to `MULTIPOLYGON EMPTY`; an empty geometry makes `ST_XMin` read NULL, which fails `update::dirty_cells::note_existing`'s `r.get::<_, i32>` on the next edit to that object. The import path needs no such guard because its post-pass deletes the same rows afterwards — the one case where OSM data *is* dropped, counted separately as `dropped_degenerate` so it stays visible. **(5) Same no-migration story as `centroid`/`rodzaj_kod`:** an existing database keeps its invalid rows until `import osm` is re-run. Nothing repairs them in place, and until then `compare` keeps failing on whichever cell holds one.
+### Mappings
 
-**Gotcha — `/package` membership is intersection, not centroid containment.** Both building queries (`unmatched_bdot10k_buildings`, `unmatched_egib_buildings`) select with `ST_Intersects(b.geom, <request polygon>)`, so a building the request area merely clips is exported. This is a deliberate reversal of the original centroid-containment predicate: the user picks the export area explicitly, so everything it touches is what they asked for, and a building landing in two separately-drawn exports is theirs to resolve rather than something the query drops at the edge. The tempting "optimization" back to a centroid test is wrong on both counts — it changes behaviour, and on the `*_unmatched` serving tables there is no stored `centroid` column to index anyway (that column exists only on the `bdot10k_buildings`/`egib_buildings` source tables, for the *match rule* — an unrelated use of centroids that is still correct). `unmatched_bdot10k_buildings_includes_building_clipped_by_edge` and its EGIB twin pin this, each asserting a building whose centroid falls outside the request polygon is still returned; both fail with `left: 0, right: 1` under the centroid predicate. Note the `nb` adjacency CTE's `ADJACENCY_READ_BUFFER_DEG` (~35 m) has slightly less headroom under intersection semantics — a selected building can now sit entirely at the area's edge, so its neighbour may be up to two footprints outside — which is still comfortable for the single-family class adjacency is restricted to, but is the number to revisit if adjacency counts ever look wrong at request boundaries.
+**Gotcha — the street-name mapping is a match input, and that is why its loader
+enqueues dirty cells.** The resolution chain has **one home** —
+`mappings::street_names::resolved_street_join_sql` + `resolved_street_expr_sql` —
+and four callers: `server::package::unmatched_addresses`, `server::tiles`'s
+`ADDRESSES_MVT_SQL`, and both compare paths. Lookup is `lower(trim(...))` on both
+sides; priority is settlement row → global row (NULL `teryt_simc_code`) → raw
+name, so an empty table serves PRG names verbatim instead of failing.
+`ALL_ADDRESSES_MVT_SQL` deliberately does not apply it — that layer shows every
+PRG address including matched ones, which is never tag-preview material.
 
-**Gotcha — dirty-queue source strings must match everywhere.** `match_dirty_cells.source` is a plain string (`"bdot10k"` / `"egib"` / `"prg"`), not an enum, and every producer must spell it identically: the government refresh's `spec.name` (defined in `src/dataset.rs`; enqueued at the call site in `update::changeset::insert_dirty_cells`, `src/update/changeset.rs`), the OSM update's flush (`src/update/dirty_cells.rs`), the street-name mapping swap (`mappings::street_names::validate_and_swap`, `src/mappings/street_names.rs`), `queue reconcile` (`src/compare/reconcile.rs`), and the drain's dispatch in `recompute_cell_in_txn` (`src/compare/incremental.rs`). A mismatched string silently orphans that source's dirty cells — enqueued but never drained.
+1. **A mapping edit changes which addresses are unmatched**, so
+   `validate_and_swap` enqueues prg dirty cells, and an offline
+   `import street-mappings` leaves queue work behind for `match_refresh` (or an
+   explicit `queue drain`).
+2. **The delta is a symmetric difference over the full
+   `(teryt_simc_code, lower(prg_street_name), osm_street_name)` triple**, computed
+   *before* the swap's `DELETE` — the live table's pre-swap contents are half the
+   difference and gone a statement later. Each `EXCEPT` must be parenthesized
+   (`EXCEPT` and `UNION` have equal precedence and are left-associative, so the
+   bare form silently means something else), and `EXCEPT`'s NULL-as-equal
+   semantics are what keep unchanged *global* rows out of the delta — a
+   `NOT EXISTS ... AND teryt_simc_code = ...` rewrite would put every global row
+   in the delta on every reload. Only the *name* is projected out, which is
+   deliberately over-broad: a settlement-scoped edit dirties that name's
+   addresses nationally, which is cheap and removes a class of reasoning.
+   Measured: a no-op reload enqueues **0** cells, a full 3,272-row replacement
+   enqueues **8,964 of 112,264**.
+3. **The fan-out guarantee is borrowed, not local.** The two `LEFT JOIN`s can
+   each match at most one row *only because* `validate_and_swap` rejects
+   duplicate `(lower(prg_street_name), teryt_simc_code)` keys. The table carries
+   no UNIQUE constraint, so a hand-INSERTed duplicate duplicates rows in
+   `prg_unmatched`. Guard:
+   `rule::tests::a_global_and_a_settlement_mapping_for_the_same_name_emit_one_row_per_address`.
+4. **The epoch bump stays and is not superseded by the enqueue.** An undrained
+   cell serves the old match decision with the new serve-time `addr:street`, and
+   `addresses_all` plus z5–z13 are epoch-only regardless.
+5. `make_seeded_state` in `server/package.rs` builds its tables from a local
+   `SEED` constant rather than `create_schema` — a new serving table has to be
+   added there too.
 
-**Gotcha — the OSM producer's enqueue reach is exact, and it is derived from the match rule's OSM read envelope.** `update::dirty_cells` used to expand every touched cell into a fixed 3x3 neighbourhood. It doesn't any more: `note_existing` takes the cell range of the edited row's `ST_XMin`/`ST_XMax`/`ST_YMin`/`ST_YMax` (and `note_point` the same via `lonlat_to_tile` at the buffered corners), widened by `layer_buffer_deg` — **`0.0` for `Layer::Buildings`, `rule::OSM_MATCH_BUFFER_DEG` for `Layer::Addresses`**. That asymmetry is not a tuning choice: `rule::unmatched_buildings_sql` tests `osm_buildings`/`osm_former_buildings` against the cell's *unbuffered* envelope, while `rule::unmatched_addresses_in_cell_sql` reads `osm_addresses` from the envelope buffered by `OSM_MATCH_BUFFER_DEG`. **If either rule's OSM read ever gains (or loses) a buffer, `layer_buffer_deg` must move with it** — that function is the one home for the coupling, and it imports the constant rather than restating its value. That value moved from `0.001` to **`0.003`** when the address rule gained its 150 m name branches: the buffer is coupled to the *widest* distance any branch uses (`NAME_MATCH_DISTANCE_METERS`), not the narrowest, and 0.003° preserves the same 1.28× east-west headroom at 54.84 °N that 0.001° gave 50 m. `rule::tests::osm_match_buffer_covers_the_widest_match_distance` computes that requirement rather than trusting prose, because the failure mode is silent — an OSM address just outside the buffered read simply stops matching. The cost is enqueue amplification on the address layer: expected prg cells per edited OSM address node goes from ~1.26 to ~1.83, about 45% more. Four further things: **(1)** the old 3x3 measured **5.6× amplification** on the live queue (~229 genuinely-edited cells → 1277 enqueued) for a margin 98.08% of real building footprints never needed — they touch exactly one z14 cell. **(2) Y is inverted** — higher latitude means a *smaller* `cell_y` — so `ST_YMax` maps to the min index; getting this backwards yields an empty range and silently enqueues nothing. **(3)** None of the four standing safety nets protect this: `compare::full_vs_incremental_equivalence` and `compare::drain_refresh_concurrency` seed the queue via `reconcile::enqueue_all`, which builds cells directly in SQL and never goes through `DirtyCells` at all. The tests that do are `dirty_cells`'s straddling/corner cases and `update::osm::tests::osc_xml_straddling_cell_boundary_updates_the_neighbouring_cells_serving_table` (an OSM building edit straddling a boundary whose matched government building sits in the *neighbouring* cell) — both verified to fail when the reach is narrowed back to a single cell. **(4)** Do not confuse any of this with the two unrelated "3x3" mechanisms: `compare::addresses`' grid-key neighbourhood (a different 0.005° grid, the full PRG compare's own strategy) and `serving_version::z14_tile_version`'s read-time ring (exact by the `filter_oversized_geometry` invariant — **must not be narrowed**). `queue reconcile` remains the backstop, so a subtly-too-narrow reach degrades to "stale until the next sweep", not "wrong forever". **(5)** The reach is exact but not unbounded: `MAX_ENQUEUE_CELLS_PER_ROW` (1024) skips the enqueue for a row demanding more cells than that, with a warning. It guards one input class government exports do not have — a node dragged to (0, 0), which makes a Polish building way span 955 × 2781 = **2,659,592** z14 cells from a single edit, days of drain backlog inside one update transaction. The widest real `osm_buildings` row spans 0.7306 cells (so every genuine building touches at most 2×2), leaving 256× headroom; skipping rather than clamping is safe for the same reconcile reason as above. `note_point` needs no such cap — its range is a fixed buffer around one point, at most 2×2 cells whatever the coordinates.
+**Gotcha — building-type mapping is serving-time only, with adjacency computed
+live, not stored.** `bdot10k_building_types`/`egib_building_types` are applied by
+the same `LEFT JOIN LATERAL` shape in `server::package` and `server::tiles`
+(reusing the shared `ADJACENCY_READ_BUFFER_DEG` / `*_ADJACENCY_KEY` constants
+rather than re-typing them). **Unlike** the street-name mapping, none of this can
+change which buildings are unmatched — `unmatched_buildings_sql` reads no
+classification column — so a building-type edit needs no `compare`, reconcile or
+drain. The classification *columns* themselves are carried at compare time via
+`compare::columns::classification_columns`. Same-class adjacency is computed
+inline against the live source tables (buffered read,
+`ADJACENCY_READ_BUFFER_DEG = 0.0005°`) — a spatial bbox read, not an id lookup, so
+it does not violate the "serving tables store rows, not id references" invariant.
+See `docs/superpowers/specs/2026-08-03-building-type-mappings-design.md`. As with
+street names, `make_seeded_state` (`server/package.rs`) and `make_full_state`
+(`server/updates.rs`) build tables from local constants — a schema change has to
+land in both, plus `db.rs`.
 
-**Gotcha — no migration path exists for `/tiles`'s carried attribute columns.** `bdot10k_unmatched` gained `KATEGORIAISTNIENIA`/`NAZWA`/`FSBUD`/`INFORMACJADODATKOWA`/`KODKST`/`ZRODLODANYCHGEOMETRYCZNYCH`, `egib_unmatched` gained `kondygnacje_podziemne`/`rodzaj`, and `prg_unmatched` gained `wazny_od_lub_data_nadania` — all carried at compare time (bdot10k/egib via `compare::columns::classification_columns`, prg hand-edited in `compare::addresses`/`compare::incremental` since a single column didn't justify a shared mechanism) purely so `/tiles` can display them (see `docs/vector_tile_attributes.md`). Same shape as the two `centroid`/`rodzaj_kod` gotchas above: every `*_unmatched` table is `CREATE TABLE IF NOT EXISTS`, no `ALTER TABLE` migrates an existing database's schema anywhere in this codebase (the one `ALTER TABLE` that does exist is narrower than that — see the next gotcha), so an existing database gains none of these columns merely by upgrading the binary — it needs the table dropped/recreated (or the whole database rebuilt), then `compare` (or `queue reconcile` + drain) re-run to populate them. Until then they read back NULL, same as any column added ahead of the compare that first populates it.
+**Gotcha — `egib_buildings.rodzaj_kod` is precomputed at import.** The EGIB
+`rodzaj` cascade (`mappings::egib::RODZAJ_KOD_CASE_SQL`, Appendix B of
+`docs/building_type_mappings.md`) runs once per import via
+`with_rodzaj_kod_select`. This is the one piece of the feature that isn't purely
+serving-time: running the cascade at serve time measured +1.0s (regexp cascade
+over ~96k candidate rows). Like `centroid`, it never self-heals.
 
-**Gotcha — the government loaders store only the columns anything reads, and the one `ALTER TABLE` in this codebase is not the migration path the sentence above rules out.** `import::bdot10k::load_into`, `import::egib::load_into` and `import::prg::materialize_into` project an explicit column list instead of `SELECT *`/`SELECT * EXCLUDE(...)`/`SELECT * REPLACE(...)` — a source publishing a column nothing reads no longer means storing it forever (`docs/superpowers/plans/2026-08-14-column-trimming.md` has the full audit and the storage measurements). Dropped PRG columns and their restore cost are catalogued in `docs/prg_dropped_columns.md`; `teryt_gmina`/`gmina` are kept there despite having no current reader, the same "kept but not compared" shape as `wazny_od_lub_data_nadania`. Two of the three loaders have one column that exists ONLY to feed `deduplicate_by_key`'s `ORDER BY` (EGIB's `czas_pozyskania`, PRG's `wersja_id`) and is otherwise unwanted: `deduplicate_by_key`'s `order_by` is interpolated into a window function that runs against the table *after* `CREATE TABLE AS SELECT` has already built it, so the ordering column has to be a real column at that point — it cannot be projected away by the same statement that creates the table, unlike e.g. PRG's `dlugosc_geograficzna`, which is consumed to build `geom` and simply never appears in the output column list. Both loaders keep the ordering column in the projection through the dedup, then call `dataset::drop_ordering_column` (`ALTER TABLE {table} DROP COLUMN {column}`) immediately after. This is the one place in the codebase that runs `ALTER TABLE` — but it is not a counterexample to "no `ALTER TABLE` migrates an existing database's schema" above: it runs against a table the *same load's own* `CREATE TABLE AS SELECT` built moments earlier, never against a pre-existing live database, so an existing database still needs a full re-import (`import full`) to pick up the trimmed column set — there is no in-place upgrade. Adding a consumer for a currently-dropped column means adding it back to the loader's explicit projection AND re-running `import <source>`.
+**Gotcha — PRG's `ulica` is normalized at import.** Warsaw's PRG records embed
+the street type in the name (`ulica Wał Miedzeszyński`) *while also* declaring
+`<prgad:rodzaj>1</prgad:rodzaj>` (= ulica); `prg_convert` only ever prepends a
+*missing* type word, so it passes the duplicate through.
+`import::prg::ULICA_PREFIX_STRIP_SQL` strips it in `materialize_into` — the one
+funnel both `import prg` and `update prg`'s staging load pass through. See
+`docs/prg_ulica_prefix.md` (122,826 rows, all but 4 of them Warsaw). Three
+load-bearing points: **(1)** Only `ulica`/`ul.` are stripped, never the other
+cecha words Warsaw spells out — `Aleja`, `Aleje`, `Trakt`, `Osiedle` are part of
+the correct name and OSM uses them verbatim, so generalizing the pattern would
+corrupt 70,574 rows. **(2)** Unlike `centroid` and `rodzaj_kod`, this rewrites a
+*stored* value that is itself compared, so an edit surfaces as an ordinary
+modification and self-heals per record. **(3)** **It is a match input**: both
+compare paths resolve `ulica` through `street_name_mappings` and compare the
+result against OSM's `addr:street`, so an edit can flip an address between
+matched and unmatched.
 
-**Gotcha — a `LEFT JOIN` downstream of a filtered CTE silently defeats the RTREE index unless the CTE is `MATERIALIZED`.** Discovered while adding `/tiles`'s resolved-tag CTEs: `WITH candidates AS (SELECT ... FROM t WHERE ST_Intersects(geom, ST_MakeEnvelope(...)))` followed by `candidates LEFT JOIN other_table` looks like it preserves the "constant-argument `ST_Intersects`" property this file has emphasized since the original `/tiles` fix (see the `duckdb_connection_visibility_investigation.md`-linked comment at the top of `src/server/tiles.rs`), but DuckDB's join-order optimizer can still re-plan the filtered CTE into a plain `SEQ_SCAN` plus a separate `FILTER` node once a join consumes it — verified empirically (`EXPLAIN`), not assumed. Writing `candidates AS MATERIALIZED (...)` forces DuckDB to compute and cache that CTE's result independently, before any downstream join gets a chance to fold it back into a joint plan, which reliably restores the `RTREE_INDEX_SCAN`. `ADDRESSES_MVT_SQL`'s `candidates` CTE and `BUILDINGS_MVT_SQL`'s `bdot10k_pkg`/`bdot10k_nb`/`egib_pkg`/`egib_nb` CTEs are all `MATERIALIZED` for exactly this reason — removing the keyword from any of them would silently reintroduce a full table scan while every functional test still passes (only `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`, which asserts on the `EXPLAIN` plan text itself, would catch it). Relatedly, that same test's `EXPLAIN` output truncates operator labels to fit box width in a wide multi-branch plan (`"RTREE_INDEX_SCAN"` renders as `"RTREE_IN..."`), so the test searches for the substring `"RTREE_IN"`, not the full name — don't "fix" it back to the full string.
+### Geometry: three inputs, three different rules
 
-**Gotcha — the same index loss has a second, unrelated trigger: an expression equality filter on the indexed column sitting alongside the `ST_Intersects`.** Second site, same remedy, different cause — and the cause matters, because the `LEFT JOIN` story above does not explain it. `compare::incremental::recompute_cell_in_txn` and `compare::totals::recompute_cell_in_txn` append a write-narrow guard (`AND cell_x_sql(b.centroid) = X AND cell_y_sql(b.centroid) = Y`, i.e. `floor(...)::INTEGER = <const>`) to the shared match rule, so a building straddling a cell boundary is written by exactly one cell's recompute. That guard is an expression filter on the *same column* the RTREE indexes, and it alone flips `RTREE_INDEX_SCAN` to `Sequential Scan`. Isolated clause by clause on real data: the envelope alone, a plain-column `extra_filter`, and both `NOT EXISTS` anti-joins all keep the index; only the guard loses it. Cost was therefore **independent of cell contents** — a rural cell measured 1.089 s, a dense Warsaw cell 1.091 s, and every drained cell paid it twice (the `*_unmatched` INSERT and the `cell_totals` INSERT). Both now wrap the source scan in a `candidates` CTE via a `build_sql` seam, so the envelope filter is computed through the index before the guard applies on top. Four things to know: **(1)** unlike the tiles.rs case above, **`MATERIALIZED` is not the active ingredient here — the CTE is.** Measured on the real 16.35 M-row table: flat = 2 RTREE + 1 `Sequential Scan` @ 0.974 s, bare `WITH` = 3 RTREE @ 0.098 s, `MATERIALIZED` = 3 RTREE @ 0.099 s; the fold-back was not reproducible without the keyword at 20k or 500k synthetic rows either. It is kept as insurance against a future re-plan, and both doc comments and `docs/per_cell_recompute_cell_guard_scan.md` say so plainly — don't let a later reader infer from the keyword's presence that a test is pinning it. **(2)** The envelope and `extra_filter` are deliberately applied **twice** (once building `candidates`, once inside the predicate on it): both are idempotent, and trimming the second copy would mean giving `rule.rs` a "skip the redundant filter" mode — two predicate texts, breaking "the match rule has one home". `rule.rs` needed no predicate change at all, since `unmatched_buildings_sql`/`unmatched_addresses_in_cell_sql` already emitted a bare `FROM {source_table} b`/`a`; its only addition is `envelope_sql`, so a CTE's envelope and its predicate's envelope cannot drift. **(3)** The `build_sql` seams exist so the `EXPLAIN` regression tests assert on the *real* generated SQL — `rule::tests::unmatched_buildings_predicate_uses_the_centroid_rtree_index` cannot catch this, because it asserts on `unmatched_buildings_sql`'s output *before* the guard is appended. **(4) Do not apply this to the full compare.** `compare::buildings::compare_buildings` and `totals::rebuild_all_in_txn` have a structurally identical guard (`ST_X(b.centroid) >= x AND < x_hi` over a 0.5° grid), and the same wrap measured **worse** there: 0.955 s → 1.097 s. A 0.5° cell is ~1/264 of the table — not selective enough for an RTREE walk to beat a sequential scan — whereas a z14 cell is ~1/340,000. Both full paths are correct as they stand and *want* their sequential scan.
+**Gotcha — invalid *government* geometry is dropped, not repaired.** A small
+number of BDOT10k/EGIB rows have topologically invalid geometry, which crashes
+`ST_AsMVTGeom` and takes down the whole tile
+(`docs/invalid_geometry_tile_500s.md`). `dataset::filter_invalid_geometry` deletes
+them immediately after `load_into` creates the table — the one place both
+`import` and `update`'s staging load funnel through — so the compare paths never
+see them.
 
-**Gotcha — the serving version has one home.** Mirrors the change-detection gotcha above, but for what `/tiles` reads rather than what a refresh compares. `serving_version::z14_tile_version` (`src/serving_version.rs`) folds a global `serving_epoch` counter (`metadata.serving_epoch`, moved by `serving_version::bump_serving_epoch`) together with the per-cell `*_unmatched` state actually visible from a tile. Bump rule: **bump wherever a table `/tiles` reads and no per-cell version tracks is rewritten.**
+Its sibling `dataset::filter_oversized_geometry` drops a different bad row: one
+whose bbox spans at least one full z14 cell in either axis — too wide to be a real
+building, and in practice a corrupted merge of two unrelated features that each
+individually pass `ST_IsValid`. The threshold is expressed in **cell units**,
+never degrees or metres, because the latitude threshold is not constant in
+degrees (0.0135° at 52°N vs 0.0126° at 55°N). Measured over the full tables: 0
+BDOT10k rows dropped (the longest genuine building measures 0.696 cells) and 85
+EGIB rows. The motivating record is a 2-part MULTIPOLYGON whose two parts are real
+buildings ~44 km apart. **Build it from `tile_math::cell_x_frac_sql`/`cell_y_frac_sql`
+(the *unfloored* fractional cell coordinate), never the floored pair** — flooring
+first would compare which cell each edge lands in rather than how far apart they
+are, deleting a legitimate ~10 m shed sitting on a cell boundary. The threshold
+also isn't insurance: because a surviving row's bbox is strictly narrower than one
+cell in both axes, its reach from its own centroid's cell is `<= 1` **by
+construction** — which is what makes the 3x3 serving-version ring exact rather
+than approximate.
 
-1. **Bump sites**: the `import` dispatch's `bdot10k`/`egib`/`prg`/`full` arms (`src/import/mod.rs`, at the end of each arm); `update::dataset::refresh`'s apply transaction (`src/update/dataset.rs`); `mappings::street_names::load_from_path` and `mappings::building_types::load_from_path`, each inside the loader itself, in the same swap transaction as its `DELETE`+`INSERT` rather than at either call site (the street-name loader now *also* enqueues prg dirty cells in that same transaction, since the mapping became a match input — the epoch bump is still required rather than superseded, because it covers the window before those cells drain, plus `addresses_all` and z5–z13 which no per-cell version reaches); and `compare::run`'s `Full` target (`src/compare/mod.rs`), pure insurance so a client's cached `ETag` can't survive an offline rebuild that never touched a dirty cell (e.g. restoring the DB from a snapshot and re-running `compare full` by hand).
-2. **Must-not-bump — this list matters more than the one above.** Bumping here would be silently "correct" (tiles would just look changed more often than they are) while quietly defeating the whole point of the `ETag`, which is to let a client skip re-fetching a tile that didn't change: `update::record_noop_refresh` (three call sites, `src/update/mod.rs`) — an ETag-unchanged poll against a government source rewrote nothing, so bumping there would flush the world's cached tiles daily, three times over, once per source, for changing nothing at all; the mapping jobs' own ETag-match early returns (`server::jobs::street_mappings_update`/`building_types_update`), which both `return` strictly *before* calling into the loader — this is also why putting the bump inside the loader rather than at the call sites gets the jobs' early return correct for free, with nothing extra to remember at the job level; `queue reconcile`, which only re-enqueues dirty cells for the drain to pick up later — the drain's own per-cell recompute is what actually moves `computed_at`, and that's already covered per-cell; `import osm`/`update osm`, since `/tiles` reads no `osm_*` table directly — an OSM edit reaches tiles exclusively via dirty cells → the `match_refresh` drain → the per-cell version, so bumping here would be redundant with per-cell coverage at best and would flush every tile in the country on every minutely OSM update at worst; and single-source `compare buildings`/`compare addresses`, which — unlike `compare full` — are the normal CLI-driven path for one source, and that source's `*_unmatched` rewrite already moves its own per-cell `computed_at`, so bumping would flush every tile in the country for a change local to one source.
-3. **The `*_all` legend layers and the adjacency `nb` CTEs are epoch-only, and that's sound rather than a gap.** They read the raw `prg_addresses`/`bdot10k_buildings`/`egib_buildings` tables directly, never the `*_unmatched` serving tables, so per-cell `computed_at` never moves for them; the `nb` CTEs specifically read a *neighbouring* cell's raw rows up to `ADJACENCY_READ_BUFFER_DEG`, and no cell-local version, however finely grained, could ever cover a write to a different cell's raw row even in principle. The only writers of those raw tables are `import` and `update::dataset::refresh` — both already bump sites above — so every write that matters for tiles and isn't covered by a per-cell version goes through one of the two paths that bump the epoch.
-4. **The version is a per-table `(count, max(computed_at))` pair per source, never one merged `max` across all three.** With a single merged max: a cell holding 3 bdot10k rows at T0 and 5 prg rows at T1 (T1 > T0) reads version `...T1...`. The drain then recomputes bdot10k down to zero rows in that cell — a real, common mutation (a building gets matched to OSM, or suppressed by the former-building veto) — and the merged max is *still* T1, because prg's `computed_at` never moved: same version, three buildings gone. The per-table pair is faithful by construction instead — a recompute either inserts >=1 row for a table (its `max(computed_at)` becomes the transaction's `now()`) or inserts 0 (its `count` drops) — one of the two always changes. `serving_version::tests::version_changes_when_a_cell_empties_out` pins exactly this failure mode.
-5. **The 3x3-cell ring is an invariant enforced by `dataset::filter_oversized_geometry`, not an empirical guess.** `*_unmatched` rows are *selected* for a tile by `ST_Intersects` against the tile envelope but *tagged* with the cell of their representative point, so a tile can render rows owned by a neighbouring cell. `filter_oversized_geometry` (see the gotcha above) makes a surviving building's bbox strictly narrower than one z14 cell in both axes, so its reach from its own centroid's cell is `<= 1` by construction — a 3x3 ring (radius 1) is exactly enough to cover that reach in every direction, not a margin picked by feel.
-6. **`serving_version::TILE_FORMAT_VERSION` must be bumped by hand whenever the MVT SQL changes shape** — a new attribute column, a renamed one, a different geometry simplification. Nothing about *rows* changed in that case, so neither the epoch nor any `computed_at` would move on its own; without this constant, a deployed binary that changes what a tile *contains* would keep producing the same version string for the same underlying rows, every client's cached `ETag` would keep matching, and every existing client would serve the stale shape forever, with no way to self-heal short of a manual cache-buster.
-7. **`update::dataset::refresh`'s placement is deliberate.** The epoch bump runs **inside** the apply transaction, so a rollback can't leave a bumped epoch describing a delta that never actually landed, and it is **unconditional** — it fires on every refresh that lands, including a "zero added/modified/removed" diff-of-nothing, because the raw columns `/tiles` reads that sit outside `compared_columns` (`centroid`, `rodzaj_kod`) are recomputed for every staged row and can have moved even when the delta is empty.
+Both filters are row *filters* — they change which rows exist, never the content
+of a surviving row. The one real ordering constraint: both must run **before**
+`deduplicate_by_key`, so a duplicate pair whose newest member has bad geometry
+falls back to the older valid member instead of collapsing to a row a filter then
+deletes, losing the object entirely. `LoadStats::merge_oversized` folds both
+counts into the one `LoadStats` each loader returns, self-reported to
+`job_run_log` under `import:<source>` / `update:<source>` and read back by
+`/status`. Note the reporting asymmetry: PRG's `update_prg` shares the same
+`refresh()` that self-reports, so `update:prg` appears (with no skip clause);
+`import:prg` does not, since PRG's import path never goes through `refresh()`;
+`import:osm` self-reports directly, and its message carries a *repaired*-geometry
+clause where the others report rows *skipped*. A refresh whose ETag is unchanged
+returns early via `record_noop_refresh` before `dataset::refresh` runs, so
+`job_run_log["update:<source>"].ran_at` can be days older than the corresponding
+`jobs[].last_finished_at` without indicating anything is wrong.
 
-**Gotcha — the HTTP cache layer has one home too.** `src/server/http_cache.rs` is the one place that builds every `Cache-Control` and `ETag` value this server ever sends — nothing else should format one by hand. The API default, `Cache-Control: no-store`, is applied by a single **outermost** `SetResponseHeaderLayer::if_not_present` in `build_router` (`src/server/mod.rs`), and it must stay the *last* call in that chain: `Router::layer` only wraps routes and fallbacks that already exist at the point it's called, so applying it before `.fallback_service(...)` would leave the static frontend and axum's own 404/405/extractor-rejection responses without a default, unwrapped. `/package` (both verbs) is `no-store` for a **correctness** reason, not freshness: a cached response never reaches `package::log_export`, so `package_exports` would under-count and `/updates` would silently under-report real exports. Tile 500s are deliberately left header-less rather than given an explicit `no-store` here, so the outer default layer is what stamps them — an errored tile cached for even a minute would turn a transient DB hiccup into an outage that outlives the hiccup itself, which is also why a 500 never carries an `ETag` either (see `tiles::finish_tile_response`). Only z14 gets an `ETag`: z5..=z13 are the aggregated/point tiers, and `serving_version`'s coverage is z14-cell-shaped — falling back to the epoch-only global signal alone for those tiers would pin them stale until the next epoch bump, strictly worse than the plain TTL they already get from `cache_header`. The static-asset middleware (`http_cache::static_router`, wrapping the one `ServeDir` that `build_router`'s fallback hangs off) classifies purely on **response status**, not a filename list: a 404 is left header-less and inherits the API-default `no-store`, while anything `ServeDir` actually served — including its own `304` to `If-Modified-Since` — gets at least `no-cache`, with the `/fonts/`/`/vendor/` prefixes upgraded to a long `max-age`. `TileCache::new(0)` (`src/server/tile_cache.rs`) is a genuine working no-op, not a special-cased `Option`: `max_bytes == 0` makes every `get` miss and every `insert` a no-op before either touches the lock, so `tile_cache_max_bytes = 0` in config reverts the whole feature via config alone, no redeploy. The cache is keyed on `(z, x, y)` with the version string that produced the entry stored **inside** the entry rather than folded into the key, so a recompute makes the next `get` at the new version a miss against the stale entry and the following `insert` *replaces* it in place — there is never a dead, superseded-version entry left sitting in the map, still counted against the byte budget, waiting for eviction to notice nobody wants it. `tiles::z14_tile_response` is the single response-shaping path for every successful z14 response, fresh *or* cached, precisely so a cache hit cannot differ from a miss on status, headers, or the **empty-tile 204** — a z14 tile over open country renders no features at all, the common case across most of Poland, not an edge case. `tiles::tests::z14_response_shaping_is_identical_for_empty_and_cached_empty_tiles`'s own comment records this as a real bug caught in review: an earlier draft returned a bare 200 with an empty body from the cached path, which would have made an open-country tile flip between 204 and 200 depending purely on whether it happened to be resident in the cache.
+**Gotcha — *request* geometry is repaired, and an unrepairable one is a 400.**
+`/package`'s polygon body is arbitrary client input: `parse_polygon_body` checks
+JSON shape, geometry type, coordinate ranges and a non-degenerate envelope, but
+never topological validity, so a self-intersecting "bowtie" reaches SQL intact.
+Two mechanisms handle that. First, every SQL site consuming the request geometry
+wraps it as `ST_MakeValid(ST_GeomFromGeoJSON(?))` — including the
+`package_exports` INSERT in `log_export`, so the logged area is always the
+geometry actually queried. Second, `check_request_geometry` decides whether that
+repair is *meaningful*: already valid → proceed; invalid but repairing to a
+non-degenerate Polygon/MultiPolygon (a bowtie correctly becomes a MultiPolygon —
+that is the intended repair, not something to normalise away) → proceed; empty,
+zero-area or non-polygonal → 400, because a near-collinear freehand scribble
+repairs to a LineString and "everything intersecting a line" is not the package
+anyone asked for. The check runs only when `RequestArea::is_user_supplied` —
+`parse_bbox` cannot produce invalid geometry, so `GET /package` must not pay for a
+pool acquisition and a GEOS round trip; don't "simplify" that flag away.
 
-**Gotcha — cancellation has two signals and one message, and whether it returns `Ok` or `Err` is per-path, never a style choice.** Ctrl+C/SIGTERM sets a process-global flag (`shutdown::is_requested`, installed by `ctrlc` with the `termination` feature, so SIGINT/SIGTERM/SIGHUP all land there). Separately, each background job carries a per-run cancel flag (`JobContext::is_cancelled`) that a supervisor timeout or `Scheduler::shutdown` sets. **Long-running work polls whichever of the two can reach it**, and the ones reachable from both take the injected `is_cancelled: &dyn Fn() -> bool` parameter used by `update::osm::update`, `compare::drain::drain_batch` and `update::dataset::refresh` — the CLI passes `&|| false` there, since it has no supervisor, and still gets Ctrl+C because those functions poll the global flag *as well*. Four things are load-bearing:
+**Gotcha — invalid *OSM* geometry is repaired, never deleted, and that direction
+is the whole point.** OSM enforces no validity and both OSM paths build polygons
+with a bare `ST_MakePolygon`, so a self-intersecting building way lands intact —
+and the overlap fraction calls `ST_Intersection`, whose GEOS overlay throws where
+the `ST_Intersects` above it tolerates the same input happily. One such way rolls
+back an entire national `compare full` and, in the server, makes one z14 cell fail
+on every drain tick forever. Measured on the 2026-08 Poland extract: 3 invalid
+rows in 17,986,820 — and only *one* actually throws, so the count measures
+exposure, not breakage. Five points:
 
-1. **`shutdown::check_requested()` is the one home for "stop, the user asked".** It bails with `shutdown::SHUTDOWN_BAIL_MESSAGE`, and every purely-global seam calls it rather than spelling out its own `if is_requested() { bail!("...") }` — `import`'s `Full` arm and its bdot10k/egib/prg loaders, `import::prg::stream_gml_into`'s entry and batch loops, `download`'s chunk and retry loops, `compare::run`'s between-sub-compares checks, `compare::reconcile`'s per-source sweep. The message being identical is the point: an operator reading `job_run_log` needs an interrupted run to look the same whichever seam happened to notice first. Two seams deliberately don't call it, and both are right — `compare::buildings::compare_buildings_with_cancel` and `update::dataset::check_cancelled` must consult their *injected* closure, not just the global, so they use `SHUTDOWN_BAIL_MESSAGE` directly instead.
-2. **`Ok(())` vs `Err` on cancellation is decided by whether the path has a durable checkpoint, and the two conventions must not be "made consistent".** `update::osm::update` returns **`Ok(())`**: it commits one replication batch at a time and resumes from the `metadata` stamp the last committed batch left, so stopping early is real partial progress — "less caught up, resume next run". Everything else returns **`Err`**, because it has no such checkpoint. `compare_buildings`'s grid loop is inside `in_transaction`'s clear-then-repopulate, so an early `Ok` would COMMIT a `dest` missing every cell after the interrupt — precisely the silent-outage failure mode (`/tiles`/`/package` answering zero features) that transaction exists to prevent. `update::dataset::refresh` lands nothing until its apply transaction commits, so an early `Ok` would make `job_log::record` write a **`Success`** row for a refresh that did nothing at all.
-3. **`refresh` checks at exactly three points, all outside the apply transaction** (`check_cancelled`, before `load`, before `diff::compute`, immediately before `BEGIN TRANSACTION`). Do not add a fourth inside it: that transaction is the atomic unit `readers_never_observe_a_partial_apply` and the `insert_change_areas`-ordering test depend on, and a check inside buys nothing over checking before `BEGIN` — it would roll back either way — while adding a rollback path to reason about.
-4. **A flag polled between statements cannot touch a statement already running**, which is most of the wall time for `import`/`compare`/`update`. `shutdown::register_interrupt_handle` (called once from `main.rs`) closes that gap: the ctrlc handler calls `InterruptHandle::interrupt()` on every registered handle, failing the in-flight DuckDB statement. **Scope is the CLI's single connection only** — `server::ClonedConnectionManager` hands out `try_clone()`s, and `try_clone` opens a brand-new `duckdb_connection` with its *own* independent handle, so registering the base connection's handle does not cover the server (which relies on its graceful-shutdown path and per-job cancel flags instead). `shutdown::tests::interrupting_a_running_statement_does_not_poison_the_connection` pins both that the interrupt lands and that the same connection still accepts statements afterwards — which is what makes `in_transaction`'s `ROLLBACK`-after-error and `dataset`'s `DROP TABLE IF EXISTS` cleanup work on the way out.
+1. **Repair, not delete — the opposite of the government rule, deliberately.** A
+   government row is a *candidate*, so dropping a corrupt one is a safe false
+   negative; an OSM row is *evidence* that something is already mapped, so
+   dropping it makes the government building it covered look unmatched and get
+   proposed — a duplicate added to OSM.
+   `osm::geometry::tests::repair_fixes_the_overlay_crash_on_the_real_failing_pair`
+   asserts that counterfactual directly.
+2. **The expression has one home**, `osm::geometry::repaired_geom_sql`, and it is
+   `ST_CollectionExtract(ST_MakeValid(g), 3)` — the extraction is not dressing:
+   MakeValid preserves every vertex, so a zero-area spike comes back as a
+   LINESTRING inside a GEOMETRYCOLLECTION (2 of the 3 real rows do exactly that).
+3. **The two paths apply it at different moments on purpose**: `import osm` runs
+   `repair_invalid_geometry` as a post-pass once per polygon table (covering all
+   insert passes, including any added later) while `update osm` wraps the
+   expression inline at each per-object INSERT. Not a performance split — over
+   2,000,000 real rows the `ST_IsValid` scan costs 0.344 s and unconditional
+   wrapping 0.466 s — but a "how many sites can forget" one.
+4. **An inline wrapper must be paired with `has_polygon_sql` in the same
+   statement's WHERE.** A fully degenerate ring repairs to a linestring and
+   extracts to `MULTIPOLYGON EMPTY`; an empty geometry makes `ST_XMin` read NULL,
+   failing `note_existing`'s `r.get::<_, i32>` on the next edit. The import path
+   needs no guard because its post-pass deletes those rows afterwards — the one
+   case where OSM data *is* dropped, counted separately as `dropped_degenerate`.
+5. An existing database keeps its invalid rows until `import osm` is re-run.
 
-**Gotcha — the prefetch thread's dedup has a floor, not just a ceiling.** `update::osm`'s prefetch thread (`spawn_prefetcher`) and the apply loop share `download_dir`/`osc_local_file_name(seq)`, so whichever side downloads a sequence first, the other's `download_file_as_quiet` finds it already on disk and skips the network call — but the apply loop deletes each `.osc.gz` (`decompress_and_remove`) right after decompressing it, before its batch even commits, and `apply_batch` fetches a whole batch synchronously before calling itself, so `last_applied` can jump by the batch's entire length in one stride once it commits. If that commit lands inside a single `PREFETCH_WINDOW_POLL_INTERVAL` (50ms) — easily possible under real thread contention — the prefetch thread wakes to a window that jumped past several `next` values it was sitting behind, and re-downloads every one of them for real, because their files are already gone. `spawn_prefetcher` skips `next` straight to `last_applied + 1` whenever `next <= last_applied` rather than attempting a download it knows is stale — a floor to match the window's existing ceiling. Reproduced empirically under sustained CPU load (all 10 sequences of a `batch_size=10` batch redundantly re-fetched, tripping `update_applies_in_batches_with_prefetch_and_stops_on_cancellation`'s request-count assertion); without the fix the same waste hits the real OSM replication server during a fast catch-up burst, not just the test.
+**Gotcha — `/package` membership is intersection, not centroid containment.**
+Both building queries select with `ST_Intersects(b.geom, <request polygon>)`, so a
+building the request area merely clips is exported. This is deliberate: the user
+picks the area explicitly, so everything it touches is what they asked for, and a
+building landing in two separately-drawn exports is theirs to resolve. The
+tempting "optimization" back to a centroid test is wrong on both counts — it
+changes behaviour, and the `*_unmatched` serving tables have no stored `centroid`
+column to index anyway. `unmatched_bdot10k_buildings_includes_building_clipped_by_edge`
+and its EGIB twin pin this. Note the `nb` adjacency CTE's buffer has slightly less
+headroom under intersection semantics — a selected building can sit entirely at the
+area's edge — which is still comfortable, but is the number to revisit if adjacency
+counts ever look wrong at request boundaries.
 
-**Gotcha — `import osm`'s replication stamp is written last, not first.** `metadata`'s `osm_replication_sequence`/`osm_replication_timestamp` are what `update osm`'s catch-up loop resumes from. `import::osm::import` reads the PBF header's replication info immediately, so a malformed header fails fast rather than after hours of work, but does not *write* it until every data-loading step has succeeded. An import interrupted partway must never leave the stamp visible: it would make a half-imported database (empty `osm_buildings`, partial RocksDB) look complete to a later `update osm` or `run`. Pinned by `failed_import_does_not_stamp_replication_metadata`.
+### Storage and schema
 
-**Gotcha — the RocksDB store's byte layout is versioned, because none of it is self-describing.** `kvstore::KV_FORMAT_VERSION` (stamped in a dedicated `meta` CF under `format_version`, checked by `check_or_stamp_format_version` on every `open`) exists for one reason: an old store read by a new binary decodes to *plausible* garbage rather than failing. An 8-byte `i32` coordinate pair read out of a 16-byte `f64` value yields real-looking numbers in the wrong place, so every building silently lands in the Gulf of Guinea — no error, no warning, and `/tiles` renders an empty Poland. There is no in-place migration and none is wanted (the store is rebuilt wholesale by `import osm`); the version's entire job is to make the mismatch loud, which is why the rejection message `FORMAT_MISMATCH_MESSAGE` names the fix (`re-run \`import osm\``). Two traps: an unversioned store carrying data is rejected too (it predates versioning, so it is by definition an older layout — `store_has_data` probes the nodes CF for this), and `clear` drops *every* CF including `meta`, so it must re-stamp or the next `open` sees data with no stamp and refuses to start (`clear_restamps_the_format_version_so_reopen_succeeds` pins exactly that). **Bump the version whenever any key or value layout changes.** The store is backed by the `rust-rocksdb` fork (bundling RocksDB 11.8.1) rather than the upstream `rocksdb` crate (bundling 10.4.2) — a *crate* swap, not a layout change, so it does not bump `KV_FORMAT_VERSION` by itself: RocksDB 11.8.1 reads 10.4.2's SST files, and nothing in `encoding.rs` changed. Three encoding decisions currently ride on version 2, each with its own reason:
+**Gotcha — no migration path exists, anywhere.** Every table is
+`CREATE TABLE IF NOT EXISTS`, and no `ALTER TABLE` migrates a live database. A
+new carried column, a new derived column, or a changed loader projection needs
+the table rebuilt and `compare` (or `queue reconcile` + drain) re-run; until then
+the column reads NULL. The one `ALTER TABLE` in the codebase
+(`dataset::drop_ordering_column`) runs against a table the *same load's own*
+`CREATE TABLE AS SELECT` built moments earlier, never a pre-existing database.
 
-1. **Node values are two `i32` decimicrodegrees, not two `f64`.** OSM coordinates live on an exact 1e-7 degree grid and `180 * 1e7` fits in `i32`, so this is lossless and halves the largest column family. The cost is a real one and worth knowing: the old `f64` layout was *byte-identical* to WKB's coordinate layout, so `multi_get_nodes_concat` could `memcpy` stored bytes straight into a geometry buffer. That zero-copy property is gone — the function is now `multi_get_nodes_wkb_coords` and widens through `encoding::push_wkb_coords`, and it was renamed precisely so nobody re-derives the old assumption from the name. **Convert back with `/ 1e7`, never `* 1e-7`**: `1e7` is exactly representable in `f64` so the division rounds once, correctly, while `1e-7` is not and multiplying rounds twice. In the other direction `f64_to_decimicro` **rounds rather than truncates**, because the `.osc` path parses decimal text whose nearest `f64` can land a hair below the true value, which truncation would turn into an off-by-one in the last digit.
-2. **Keys are big-endian.** RocksDB sorts keys lexicographically and delta-encodes them within a block, and a block is the unit of I/O; little-endian sorts by the *least* significant byte, scattering numerically-adjacent ids across the whole keyspace. A building's nodes are usually consecutive ids (drawn in one session), so big-endian co-locates them in one block — one block read per building instead of one per node, plus far better prefix compression. Nothing iterates the store in key order (only point lookups and full-range compaction), so this is invisible to correctness; `keys_sort_in_numeric_order_for_positive_ids` pins the property. Negative ids would sort above positives as unsigned bytes, which never happens in a PBF or a replication diff, so plain big-endian is used rather than a sign-flip.
-3. **There are two id-list encodings and they are not interchangeable.** Way node refs use `encode_delta_id_list` (delta + zigzag varint): a way's node ids are near-consecutive, so most deltas cost one byte instead of eight. It is order-preserving and **must never be sorted** — a way's ref order *is* its polygon vertex order. The reverse-index CFs keep the old fixed-width `encode_fixed_id_list` because they carry a RocksDB merge operator whose *partial* merge concatenates bare 8-byte operands without decoding them (`id_list_partial_merge`), which only works on a fixed-width format; converting them means reworking that operator for a much smaller payoff (average list length is close to 1).
+**Gotcha — the government loaders store only the columns anything reads.** They
+project an explicit column list, not `SELECT *`/`EXCLUDE`/`REPLACE` — a source
+publishing a column nothing reads no longer means storing it forever
+(`docs/superpowers/plans/2026-08-14-column-trimming.md`; dropped PRG columns and
+their restore cost in `docs/prg_dropped_columns.md`). Two loaders keep one column
+that exists ONLY to feed `deduplicate_by_key`'s `ORDER BY` (EGIB's
+`czas_pozyskania`, PRG's `wersja_id`): the dedup runs as a window function against
+the table *after* `CREATE TABLE AS SELECT` built it, so the ordering column has to
+be real at that point and cannot be projected away by the same statement. Both
+call `dataset::drop_ordering_column` immediately after. Adding a consumer for a
+dropped column means adding it back to the projection AND re-running
+`import <source>`.
 
-**Gotcha — `import osm` streams all three key spaces in one pass, and that is safe for a specific reason.** `stream_pbf_to_rocksdb` replaced three separate `ST_ReadOSM` scans (nodes, then ways, then relations) that each decompressed the whole 2.2 GB file. Collapsing them is legitimate because all three are **pure writes** — none reads anything back out of RocksDB — so they have no ordering dependency on each other and, importantly, this does *not* rely on the PBF being sorted by element type. The passes that do read (`resolve_node_coords` needs the nodes CF, `resolve_way_coords` the ways CF) all run after it returns, and that ordering is the one that matters. Four things to know: **(1) `BlobReader`, not `IndexedReader`** — `IndexedReader::create_index` reads only blob *headers* and skips the bodies, so it knows offsets but not contents, and the per-blob id ranges that would let it skip anything are filled in lazily only once a blob has been decompressed; skipping therefore never helps a first pass. Reading every blob exactly once beats any amount of skipping. Its `read_ways_and_deps` is lever-4-shaped (it accumulates needed node ids in an in-memory `BTreeSet`) and is a different feature, not this one. **(2) `way.refs()`, never `way.raw_refs()`** — the latter returns the *delta-coded* values straight out of the protobuf, so using it silently stores garbage node ids. **(3) The blob loop is deliberately sequential, and "parallelize it with rayon" is a measured dead end, not an oversight.** It is genuinely *safe* to parallelize — every write here is a blind put or a commutative merge, never a read-modify-write, so blobs may be decoded and committed in any order — and an earlier version did exactly that with `par_bridge`, one `WriteBatch` per blob. It was removed after measurement: 12 cores bought **41s on a 5m 00s pass** (4m 19s vs 5m 00s), because the pass is bound by RocksDB write throughput and the sequential blob read rather than decode CPU. Nearly all of the win over the old three-scan version comes from decompressing the file once instead of three times; threading is a rounding error on top, and not worth a `rayon` dependency plus nondeterministic `node_to_ways` ordering. **The same measurement covers the decompression backend, where the trap is subtler**: forcing `osmpbf`'s `zlib-ng` feature measured 4m 46s vs 5m 00s, and the reason the gain is that small is that the default build is *already* on a fast zlib — `flate2`'s backend priority is C zlib > `zlib-rs` > `rust_backend`(miniz_oxide), and `zip` (via `prg_convert`) enables `flate2/zlib-rs` for the whole graph, so `osmpbf`'s nominal `rust-zlib` default never actually selects miniz_oxide here. Anyone re-benchmarking a flate2 feature in this repo must check the *resolved* feature set (`cargo tree -f "{p} [{f}]"`), never the crate's declared default. **(4)** The shutdown flag is polled once per blob rather than per element — a blob is ~8k elements, frequent enough to stay responsive without hammering an atomic millions of times.
+**Gotcha — a `LEFT JOIN` downstream of a filtered CTE silently defeats the RTREE
+index unless the CTE is `MATERIALIZED`.** `WITH candidates AS (SELECT ... WHERE
+ST_Intersects(...))` followed by `candidates LEFT JOIN other` looks like it
+preserves the constant-argument `ST_Intersects` property, but DuckDB's join-order
+optimizer can re-plan the filtered CTE into a plain `SEQ_SCAN` plus a separate
+`FILTER` once a join consumes it — verified by `EXPLAIN`, not assumed.
+`MATERIALIZED` forces the CTE to be computed independently first, restoring the
+`RTREE_INDEX_SCAN`. `ADDRESSES_MVT_SQL`'s `candidates` and `BUILDINGS_MVT_SQL`'s
+four `*_pkg`/`*_nb` CTEs are all `MATERIALIZED` for this reason — removing the
+keyword reintroduces a full table scan while every functional test still passes.
+Only `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`, which asserts
+on `EXPLAIN` text, catches it; note that test searches for the substring
+`"RTREE_IN"` because wide plans truncate operator labels — don't "fix" it back to
+the full name.
 
-**Gotcha — two ordering rules in the server's shutdown path, each fixing a silent hang.** (1) `run` binds `axum::serve(...).await`'s result instead of `?`-ing it, always calls `scheduler.shutdown(...)`, and only then propagates: a serve error is exactly the moment the scheduler most needs to be told to stop, and `?`-ing it away left supervisors running until `Runtime::drop`. (2) `supervise` constructs its `Notify` waiter and calls `notified.as_mut().enable()` **before** checking `stop`, not inside the `select!`. `notify_waiters()` only wakes waiters already registered when it runs — it is not a latch — so a supervisor that read `stop == false` a moment before `shutdown()` set it would register too late and sleep until its next tick, up to `interval_seconds` (86400 for the dataset jobs), turning the 30s grace into a de facto 24-hour one. Moving the `notified()`/`enable()` pair back inside the `select!` silently reintroduces that race, and no test catches it (a deterministic one needs tokio's `test-util` feature, which this repo does not enable).
+**Gotcha — the same index loss has a second, unrelated trigger: an expression
+equality filter on the indexed column alongside the `ST_Intersects`.** Both
+per-cell recomputes append a write-narrow guard
+(`cell_x_sql(b.centroid) = X AND cell_y_sql(b.centroid) = Y`) to the shared rule.
+That guard is an expression filter on the *same column* the RTREE indexes, and it
+alone flips `RTREE_INDEX_SCAN` to `Sequential Scan`. Isolated clause by clause on
+real data, only the guard loses the index — so cost was **independent of cell
+contents** (a rural cell measured 1.089 s, a dense Warsaw cell 1.091 s), paid
+twice per drained cell. Both now wrap the source scan in a `candidates` CTE via a
+`build_sql` seam. Four things:
+
+1. Unlike the tiles.rs case, **`MATERIALIZED` is not the active ingredient here —
+   the CTE is.** Measured on the real 16.35M-row table: flat = 2 RTREE + 1
+   `Sequential Scan` @ 0.974 s, bare `WITH` = 3 RTREE @ 0.098 s, `MATERIALIZED` =
+   3 RTREE @ 0.099 s. It is kept as insurance against a future re-plan — don't
+   infer from its presence that a test pins it.
+2. The envelope and `extra_filter` are applied **twice** (once building
+   `candidates`, once inside the predicate) deliberately: both are idempotent,
+   and trimming the second copy would mean giving `rule.rs` a "skip the redundant
+   filter" mode — two predicate texts, breaking "the match rule has one home".
+3. The `build_sql` seams exist so the `EXPLAIN` regression tests assert on the
+   *real* generated SQL — `rule.rs`'s own index test cannot catch this, because it
+   asserts before the guard is appended.
+4. **Do not apply this to the full compare.** The full paths have a structurally
+   identical guard over a 0.5° grid, and the same wrap measured **worse**
+   (0.955 s → 1.097 s). A 0.5° cell is ~1/264 of the table — not selective enough
+   for an RTREE walk to beat a sequential scan — whereas a z14 cell is
+   ~1/340,000. Both full paths *want* their sequential scan.
+
+**Gotcha — the RocksDB store's byte layout is versioned, because none of it is
+self-describing.** `kvstore::KV_FORMAT_VERSION` exists for one reason: an old
+store read by a new binary decodes to *plausible* garbage rather than failing. An
+8-byte `i32` coordinate pair read out of a 16-byte `f64` value yields real-looking
+numbers in the wrong place, so every building silently lands in the Gulf of Guinea
+— no error, no warning, and `/tiles` renders an empty Poland. There is no in-place
+migration and none is wanted; the version's entire job is to make the mismatch
+loud. **Bump it whenever any key or value layout changes.** Note `clear` drops
+*every* CF including `meta`, so it must re-stamp
+(`clear_restamps_the_format_version` pins that). The store is backed by the
+`rust-rocksdb` fork (RocksDB 11.8.1) rather than the upstream crate — a *crate*
+swap, not a layout change. Three encoding decisions, each with its own reason:
+
+1. **Node values are two `i32` decimicrodegrees, not two `f64`.** OSM coordinates
+   live on an exact 1e-7 degree grid and `180 * 1e7` fits in `i32`, so this is
+   lossless and halves the largest column family. The cost: there is no memcpy
+   shortcut from stored bytes into a WKB geometry buffer —
+   `multi_get_nodes_wkb_coords` widens through `encoding::push_wkb_coords`, and it
+   is named that way so nobody re-derives the opposite. **Convert back with
+   `/ 1e7`, never `* 1e-7`**: `1e7` is exactly representable so the division
+   rounds once, correctly. In the other direction `f64_to_decimicro` **rounds
+   rather than truncates**, because the `.osc` path parses decimal text whose
+   nearest `f64` can land a hair below the true value.
+2. **Keys are big-endian.** RocksDB sorts lexicographically and delta-encodes
+   within a block, and a block is the unit of I/O; little-endian sorts by the
+   *least* significant byte, scattering numerically-adjacent ids across the
+   keyspace. A building's nodes are usually consecutive ids, so big-endian
+   co-locates them in one block. Negative ids would sort above positives as
+   unsigned bytes, which never happens in a PBF or a replication diff.
+3. **There are two id-list encodings and they are not interchangeable.** Way node
+   refs use `encode_delta_id_list` (delta + zigzag varint): near-consecutive ids
+   cost one byte instead of eight. It is order-preserving and **must never be
+   sorted** — a way's ref order *is* its polygon vertex order. The reverse-index
+   CFs keep the fixed-width `encode_fixed_id_list` because they carry a merge
+   operator whose *partial* merge concatenates bare 8-byte operands without
+   decoding them, which only works on a fixed-width format.
+
+**Gotcha — `import osm` streams all three key spaces in one pass, and that is
+safe for a specific reason.** All three are **pure writes** — none reads back out
+of RocksDB — so they have no ordering dependency and this does *not* rely on the
+PBF being sorted by element type. The passes that do read run after it returns.
+Four things:
+
+1. **`BlobReader`, not `IndexedReader`** — `create_index` reads only blob
+   *headers*, so it knows offsets but not contents, and the per-blob id ranges
+   that would let it skip anything are filled in lazily only once a blob has been
+   decompressed. Reading every blob exactly once beats any amount of skipping.
+2. **`way.refs()`, never `way.raw_refs()`** — the latter returns *delta-coded*
+   values straight out of the protobuf, so using it silently stores garbage ids.
+3. **The sequential blob loop is a measured decision, not an oversight.** It is
+   genuinely *safe* to parallelize (every write is a blind put or a commutative
+   merge), and an earlier version did with `par_bridge`. Removed after
+   measurement: 12 cores bought **41s on a 5m 00s pass**, because the pass is
+   bound by RocksDB write throughput and the sequential blob read, not decode CPU.
+   Nearly all of the win over three scans comes from decompressing once.
+   **The same measurement covers the decompression backend, where the trap is
+   subtler**: forcing `zlib-ng` measured 4m 46s vs 5m 00s, because the default
+   build is *already* on a fast zlib — `zip` (via `prg_convert`) enables
+   `flate2/zlib-rs` for the whole graph, so `osmpbf`'s nominal `rust-zlib` default
+   never selects miniz_oxide here. Anyone re-benchmarking a flate2 feature must
+   check the *resolved* feature set (`cargo tree -f "{p} [{f}]"`).
+4. The shutdown flag is polled once per blob (~8k elements), frequent enough to
+   stay responsive without hammering an atomic millions of times.
+
+**Gotcha — `import osm`'s replication stamp is written last, not first.**
+`import::osm::import` reads the PBF header's replication info immediately so a
+malformed header fails fast, but does not *write* it until every data-loading step
+has succeeded. An interrupted import must never leave the stamp visible: it would
+make a half-imported database look complete to a later `update osm` or `run`.
+Pinned by `failed_import_does_not_stamp_replication_metadata`.
+
+### Serving, caching and the HTTP layer
+
+**Gotcha — the serving version has one home.** `serving_version::z14_tile_version`
+folds a global `serving_epoch` counter together with the per-cell `*_unmatched`
+state visible from a tile. Bump rule: **bump wherever a table `/tiles` reads and
+no per-cell version tracks is rewritten.**
+
+1. **Bump sites**: the `import` dispatch's bdot10k/egib/prg/full arms;
+   `update::dataset::refresh`'s apply transaction; both mapping loaders, each
+   inside the loader itself in the same swap transaction as its `DELETE`+`INSERT`
+   rather than at either call site; and `compare::run`'s `Full` target (pure
+   insurance so a cached `ETag` can't survive an offline rebuild).
+2. **Must-not-bump — this list matters more than the one above.** Bumping here
+   would be silently "correct" while defeating the whole point of the `ETag`:
+   `update::record_noop_refresh` (an ETag-unchanged poll rewrote nothing, so
+   bumping would flush the world's cached tiles daily, three times over, for
+   nothing); the mapping jobs' own ETag-match early returns, which `return`
+   strictly *before* calling into the loader — which is also why putting the bump
+   inside the loader gets this right for free; `queue reconcile`, which only
+   enqueues for a drain whose per-cell recompute already moves `computed_at`;
+   `import osm`/`update osm`, since `/tiles` reads no `osm_*` table directly —
+   bumping would flush every tile in the country on every minutely update; and
+   single-source `compare buildings`/`compare addresses`, whose `*_unmatched`
+   rewrite already moves its own per-cell `computed_at`. `POST /report` is on this
+   list too — the insert enqueues the object's cell, so per-cell `computed_at`
+   covers it, and bumping would flush every tile once per report.
+3. **The `*_all` legend layers and the adjacency `nb` CTEs are epoch-only, and
+   that's sound rather than a gap.** They read the raw source tables, never the
+   serving tables, so per-cell `computed_at` never moves for them; the `nb` CTEs
+   specifically read a *neighbouring* cell's raw rows, which no cell-local version
+   could cover even in principle. The only writers of those raw tables are
+   `import` and `refresh` — both already bump sites.
+4. **The version is a per-table `(count, max(computed_at))` pair per source, never
+   one merged `max`.** With a single merged max: a cell holding 3 bdot10k rows at
+   T0 and 5 prg rows at T1 reads version `...T1...`; the drain then recomputes
+   bdot10k down to zero rows — a real, common mutation — and the merged max is
+   *still* T1, because prg's never moved. Same version, three buildings gone. The
+   per-table pair is faithful by construction: a recompute either inserts ≥1 row
+   (its max moves) or 0 (its count drops). Pinned by
+   `version_changes_when_a_cell_empties_out`.
+5. **The 3x3-cell ring is an invariant enforced by
+   `dataset::filter_oversized_geometry`, not a guess.** Rows are *selected* for a
+   tile by `ST_Intersects` but *tagged* with the cell of their representative
+   point, so a tile can render rows owned by a neighbour. The oversize filter makes
+   a surviving building's reach `<= 1` by construction, so radius 1 is exactly
+   enough.
+6. **`serving_version::TILE_FORMAT_VERSION` must be bumped by hand whenever the
+   MVT SQL changes shape** — a new attribute, a renamed one, a different
+   simplification. Nothing about *rows* changed, so neither the epoch nor any
+   `computed_at` moves on its own; without this, a binary that changes what a tile
+   *contains* keeps producing the same version string, every cached `ETag` keeps
+   matching, and every existing client serves the stale shape forever with no way
+   to self-heal.
+7. **`refresh`'s placement is deliberate.** The bump runs **inside** the apply
+   transaction, so a rollback can't leave a bumped epoch describing a delta that
+   never landed, and it is **unconditional** — it fires even on a zero-delta
+   refresh, because the raw columns `/tiles` reads that sit outside
+   `compared_columns` are recomputed for every staged row and can have moved.
+
+**Gotcha — the HTTP cache layer has one home too.** `src/server/http_cache.rs`
+builds every `Cache-Control` and `ETag` this server sends — nothing else should
+format one by hand. The API default, `Cache-Control: no-store`, is applied by a
+single **outermost** `SetResponseHeaderLayer::if_not_present` in `build_router`,
+and it must stay the *last* call in that chain: `Router::layer` only wraps routes
+that already exist when it is called, so applying it before `.fallback_service(...)`
+would leave the static frontend and axum's own 404/405/rejection responses
+unwrapped. `/package` (both verbs) is `no-store` for a **correctness** reason, not
+freshness: a cached response never reaches `package::log_export`, so
+`package_exports` would under-count and `/updates` would under-report. Tile 500s
+are deliberately left header-less so the outer default stamps them — an errored
+tile cached for even a minute turns a transient DB hiccup into an outage that
+outlives it, which is also why a 500 never carries an `ETag`. Only z14 gets an
+`ETag`: z5..=z13 are the aggregated/point tiers and `serving_version`'s coverage
+is z14-cell-shaped, so falling back to the epoch alone would pin them stale until
+the next bump — strictly worse than the plain TTL they already get. The
+static-asset middleware classifies purely on **response status**, not a filename
+list: a 404 is left header-less and inherits `no-store`, while anything `ServeDir`
+actually served — including its own `304` — gets at least `no-cache`, with
+`/fonts/` and `/vendor/` upgraded to a long `max-age`.
+
+`TileCache::new(0)` is a genuine working no-op, not a special-cased `Option`:
+`max_bytes == 0` makes every `get` miss and every `insert` a no-op before either
+touches the lock, so `tile_cache_max_bytes = 0` reverts the feature via config
+alone. The cache is keyed on `(z, x, y)` with the version stored **inside** the
+entry rather than folded into the key, so a recompute makes the next `get` a miss
+and the following `insert` *replaces* it in place — there is never a dead,
+superseded-version entry counted against the budget waiting for eviction.
+`tiles::z14_tile_response` is the single response-shaping path for every
+successful z14 response, fresh *or* cached, precisely so a cache hit cannot differ
+from a miss on status, headers, or the **empty-tile 204** — a z14 tile over open
+country renders no features at all, the common case across most of Poland.
+`z14_response_shaping_is_identical_for_empty_and_cached_empty_tiles` records a
+real bug caught in review: an earlier draft returned a bare 200 from the cached
+path, making an open-country tile flip between 204 and 200 depending purely on
+cache residency.
+
+**Gotcha — cancellation has two signals and one message, and `Ok` vs `Err` is
+per-path, never a style choice.** Ctrl+C/SIGTERM sets a process-global flag
+(`shutdown::is_requested`, installed by `ctrlc` with `termination`, so
+SIGINT/SIGTERM/SIGHUP all land there). Separately, each background job carries a
+per-run cancel flag (`JobContext::is_cancelled`) set by a supervisor timeout or
+`Scheduler::shutdown`. Long-running work polls whichever can reach it; the ones
+reachable from both take the injected `is_cancelled: &dyn Fn() -> bool`. The CLI
+passes `&|| false` there and still gets Ctrl+C, because those functions poll the
+global flag as well.
+
+1. **`shutdown::check_requested()` is the one home for "stop, the user asked".**
+   It bails with `shutdown::SHUTDOWN_BAIL_MESSAGE`, and every purely-global seam
+   calls it rather than spelling out its own check. The message being identical is
+   the point: an operator reading `job_run_log` needs an interrupted run to look
+   the same whichever seam noticed first. Two seams deliberately don't call it —
+   `compare_buildings_with_cancel` and `update::dataset::check_cancelled` must
+   consult their *injected* closure, so they use the constant directly.
+2. **`Ok(())` vs `Err` is decided by whether the path has a durable checkpoint,
+   and the two conventions must not be "made consistent".** `update::osm::update`
+   returns **`Ok(())`**: it commits one batch at a time and resumes from the
+   `metadata` stamp, so stopping early is real partial progress. Everything else
+   returns **`Err`**, having no such checkpoint. `compare_buildings`'s grid loop is
+   inside a clear-then-repopulate transaction, so an early `Ok` would COMMIT a
+   `dest` missing every cell after the interrupt — the silent-outage failure mode
+   that transaction exists to prevent. `refresh` lands nothing until its apply
+   commits, so an early `Ok` would write a **`Success`** row for a refresh that
+   did nothing.
+3. **`refresh` checks at exactly three points, all outside the apply
+   transaction.** Do not add a fourth inside it: that transaction is the atomic
+   unit two tests depend on, and a check inside buys nothing over checking before
+   `BEGIN` while adding a rollback path to reason about.
+4. **A flag polled between statements cannot touch a statement already running**,
+   which is most of the wall time. `shutdown::register_interrupt_handle` closes
+   that gap by failing the in-flight DuckDB statement. **Scope is the CLI's single
+   connection only** — `try_clone` opens a brand-new connection with its own
+   handle, so the server relies on graceful shutdown and per-job cancel flags
+   instead. `interrupting_a_running_statement_does_not_poison_the_connection` pins
+   both that the interrupt lands and that the connection still works afterwards,
+   which is what makes `in_transaction`'s `ROLLBACK`-after-error work on the way
+   out.
+
+**Gotcha — the prefetch thread's dedup has a floor, not just a ceiling.**
+`update::osm`'s prefetcher and the apply loop share a download directory, so
+whichever downloads a sequence first, the other finds it on disk and skips the
+network call — but the apply loop *deletes* each `.osc.gz` right after
+decompressing it, and `apply_batch` fetches a whole batch before recursing, so
+`last_applied` can jump by an entire batch in one stride. If that commit lands
+inside a single 50 ms poll interval, the prefetcher wakes to a window that jumped
+past several `next` values it was sitting behind and re-downloads every one for
+real, because their files are gone. `spawn_prefetcher` skips `next` straight to
+`last_applied + 1` whenever `next <= last_applied`. Reproduced empirically under
+sustained CPU load; without it the same waste hits the real OSM replication server
+during a fast catch-up burst.
+
+**Gotcha — two ordering rules in the server's shutdown path, each fixing a silent
+hang.** (1) `run` binds `axum::serve(...).await`'s result instead of `?`-ing it,
+always calls `scheduler.shutdown(...)`, and only then propagates: a serve error is
+exactly when the scheduler most needs telling to stop. (2) `supervise` constructs
+its `Notify` waiter and calls `notified.as_mut().enable()` **before** checking
+`stop`, not inside the `select!`. `notify_waiters()` only wakes waiters already
+registered — it is not a latch — so a supervisor that read `stop == false` a moment
+before `shutdown()` set it would register too late and sleep until its next tick,
+up to `interval_seconds` (86400 for the dataset jobs), turning a 30s grace into a
+de facto 24-hour one. Moving the pair back inside the `select!` silently
+reintroduces that race, and **no test catches it** (a deterministic one needs
+tokio's `test-util` feature, which this repo does not enable).
 
 ## Data Sources
 
 - **OSM:** Poland PBF extract from OSM France, minutely replication feed
-- **PRG:** Government address registry (ZIP, parsed via [prg_convert](https://github.com/ttomasz/prg_convert/) library)
-- **BDOT10k:** Government building registry (GeoParquet)
-- **EGIB:** Government building registry (GeoParquet)
+- **PRG:** Government address registry (ZIP, parsed via
+  [prg_convert](https://github.com/ttomasz/prg_convert/))
+- **BDOT10k / EGIB:** Government building registries (GeoParquet)
 
 ## Configuration
 
-The binary accepts `--config <path>` pointing to a TOML file (see `example_config.toml`). Without it, defaults are used. The `RUST_LOG` env var overrides the config's `log_level`.
+`--config <path>` points at a TOML file (see `example_config.toml`). Without it,
+defaults are used. `RUST_LOG` overrides the config's `log_level`.
 
-**Gotcha:** The `duckdb_init_commands` config replaces the entire default list — if you override it, include everything you need (spatial extension, memory limits, etc.).
+**Gotcha:** `duckdb_init_commands` replaces the entire default list — if you
+override it, include everything you need (spatial extension, memory limits, etc.).
 
 ## Testing
 
-- **Unit tests:** Inline `#[cfg(test)]` modules within source files
-- **Integration tests:** `tests/` directory, using `assert_cmd` to test CLI behavior with `tempfile` for isolated DB instances
-- Run a single integration test: `cargo test --test cli_import_osm`
-- **Fixtures:** Regenerate with `fixtures/scripts/prepare_fixtures.sh` (uses local OSM PBF + GeoParquet inputs)
-- **Gotcha — hand-written geometry fixtures need exact binary fractions.** Ordinary decimals aren't exactly representable in `f64`, so a ring written to be collinear (`21.0`/`21.005`/`21.01`) rounds to a point ~1e-18 off the line, and GEOS reports the result as a *valid* sliver polygon rather than the degenerate geometry the test was meant to exercise — the test then passes for the wrong reason. Use eighths (`21.0`/`21.0625`/`21.125`) when a test needs genuine collinearity or degeneracy. Related: assert on the *exact* error string (via the named constant) rather than a substring, since several guards in `server::package` reject with messages that share words like "degenerate" — a substring assertion can silently end up pinning a different, earlier guard than the one under test.
-- **Gotcha — reproducing a CPU-load-dependent flaky test.** Run the whole test module (the compiled `target/release/deps/osmpbudynkiv2-*` binary, filtered e.g. `update::osm::tests`), not an isolated `--exact` single test, under synthetic CPU load (background `while true; do :; done` loops). An isolated single-test run rarely reproduces contention-dependent races: the shared `download_runtime`/`download_client` statics (`src/download.rs`) and real OS thread scheduling only get stressed when sibling tests are genuinely competing for CPU in the same process.
+- **Unit tests:** inline `#[cfg(test)]` modules. **Integration tests:** `tests/`,
+  using `assert_cmd` with `tempfile` for isolated DBs.
+- Run one: `cargo test --test cli_import_osm`
+- **Fixtures:** regenerate with `fixtures/scripts/prepare_fixtures.sh`
+- **Gotcha — hand-written geometry fixtures need exact binary fractions.**
+  Ordinary decimals aren't exactly representable in `f64`, so a ring written to be
+  collinear (`21.0`/`21.005`/`21.01`) rounds to a point ~1e-18 off the line, and
+  GEOS reports the result as a *valid* sliver polygon rather than the degenerate
+  geometry the test meant to exercise — the test then passes for the wrong reason.
+  Use eighths (`21.0`/`21.0625`/`21.125`) when a test needs genuine collinearity.
+  Related: assert on the *exact* error string (via the named constant) rather than
+  a substring, since several guards reject with messages sharing words like
+  "degenerate", and a substring assertion can silently pin a different guard.
+- **Gotcha — reproducing a CPU-load-dependent flaky test.** Run the whole test
+  module (the compiled binary, filtered e.g. `update::osm::tests`), not an isolated
+  `--exact` single test, under synthetic CPU load (background `while true; do :;
+  done` loops). An isolated run rarely reproduces contention-dependent races: the
+  shared `download_runtime`/`download_client` statics and real OS thread scheduling
+  only get stressed when sibling tests genuinely compete for CPU in the same process.
 
 ## Web frontend (`web/`) & browser testing
 
-`web/index.html` / `web/app.js` / `web/style.css` is a static MapLibre GL JS frontend served from a config-set disk directory (not embedded in the binary). It reads `/tiles/{z}/{x}/{y}` and `/status` from the running server.
+`web/index.html` / `app.js` / `style.css` is a static MapLibre GL JS frontend
+served from a config-set disk directory (not embedded in the binary). It reads
+`/tiles/{z}/{x}/{y}` and `/status` from the running server.
 
-To manually verify a frontend change in a real browser (required for anything touching MapLibre style/paint — type-checking and unit tests don't catch rendering bugs):
+To verify a frontend change in a real browser (required for anything touching
+MapLibre style/paint — type-checking and unit tests don't catch rendering bugs):
 
-1. Run the server: `cargo run -- --config example_config.toml run` — **redirect output to a file** (`> server.log 2>&1`), don't pipe through `tail -N` without `-f`. A non-follow `tail` buffers all output until the process exits, which looks identical to a hung server; poll the log file with `grep` instead.
-2. Drive a browser with `npx playwright cli <command>` (open/goto/click/check/screenshot/eval/run-code, session-based). This needs no install — it reuses the already-`npx`-cached `playwright-core` package. The `mcp__playwright__*` MCP tool is an alternative but has failed in this environment before (missing system Chrome, no sudo to install it) — reach for the CLI first. **`npx playwright cli open` bare (or `--browser=chrome`) fails the same way** — it defaults to the `chrome` channel, which also isn't installed here. Pass `--browser=chromium` explicitly; a plain Chromium build is already cached under `~/.cache/ms-playwright` and needs no install step.
-3. **After editing `app.js`, close and reopen the CLI browser session rather than reloading the same page.** The browser caches the script over plain HTTP, so a same-session reload can silently re-run the stale pre-edit version.
-4. Check console output for errors before trusting a visual screenshot — a layer can fail to parse and simply not render, with no visible symptom except a console error.
-5. **This environment has no outbound network**, so `tile.openstreetmap.org` 404s and the raster basemap renders blank. Vector-tile data layers and overlays still draw normally — a blank basemap is expected here, not a failed verification. Note the corollary: a color chosen to read well *against the basemap* can't be judged here, only against white.
+1. Run the server: `cargo run -- --config example_config.toml run` — **redirect
+   output to a file** (`> server.log 2>&1`), don't pipe through `tail -N` without
+   `-f`. A non-follow `tail` buffers everything until the process exits, which
+   looks identical to a hung server; poll the log with `grep` instead.
+2. Drive a browser with `npx playwright cli <command>`. Needs no install — it
+   reuses the already-cached `playwright-core`. The `mcp__playwright__*` MCP tool
+   has failed in this environment before (missing system Chrome, no sudo). **`npx
+   playwright cli open` bare (or `--browser=chrome`) fails the same way** — pass
+   `--browser=chromium` explicitly; a plain Chromium build is already cached.
+3. **After editing `app.js`, close and reopen the CLI browser session rather than
+   reloading the page.** The browser caches the script over plain HTTP, so a
+   same-session reload can silently re-run the stale pre-edit version.
+4. Check console output before trusting a screenshot — a layer can fail to parse
+   and simply not render, with no symptom except a console error.
+5. **This environment has no outbound network**, so `tile.openstreetmap.org` 404s
+   and the raster basemap renders blank. Vector-tile layers still draw normally — a
+   blank basemap is expected, not a failed verification. Corollary: a color chosen
+   to read well *against the basemap* can't be judged here, only against white.
 
-**Gotcha — map interaction handlers must respect `appDrawState`.** `app.js`'s area-drawing tool (rectangle / "Punkty" / freehand, feeding `POST /package`) is a modal state machine — `appDrawState` is `"idle"`, `"drawing"` or `"selected"` — layered over map handlers registered once at startup that know nothing about it. Any handler reacting to click or hover needs an `if (appDrawState === "drawing") return;` guard, or it fires *during* drawing: the feature-popup open and dismiss handlers on `CLICKABLE_LAYERS` opened a popup on every vertex click landing on a building (it then followed each subsequent click, covering the area being drawn), and the `mouseenter`/`mouseleave` pair fought the crosshair cursor `enterDrawingMode` sets, `mouseleave` handing back `""`. All four are guarded now. Nothing catches a missing guard automatically — a popup is not a console error and no test covers it — so a new interaction handler that forgets one only shows up by drawing over real features at z14+. In the other direction, `teardownDrawMode` is the single place undoing everything drawing mode changed (`dragPan`, `doubleClickZoom`, the cursor, the mode's own listeners), unconditionally and without needing to know which mode was active; every exit path — commit, cancel, Escape, mode switch — goes through it, which is what keeps "no path leaves the map stuck" true by construction rather than by enumeration.
+**Gotcha — map interaction handlers must respect `appDrawState`.** The
+area-drawing tool (rectangle / "Punkty" / freehand, feeding `POST /package`) is a
+modal state machine — `"idle"` / `"drawing"` / `"selected"` — layered over map
+handlers registered once at startup that know nothing about it. Any handler
+reacting to click or hover needs an `if (appDrawState === "drawing") return;`
+guard, or it fires *during* drawing: the feature-popup handlers on
+`CLICKABLE_LAYERS` opened a popup on every vertex click landing on a building, and
+the `mouseenter`/`mouseleave` pair fought the crosshair cursor. All four are
+guarded now, and **nothing catches a missing guard automatically** — a popup is not
+a console error and no test covers it. In the other direction, `teardownDrawMode`
+is the single place undoing everything drawing mode changed (`dragPan`,
+`doubleClickZoom`, the cursor, the mode's own listeners), unconditionally and
+without needing to know which mode was active; every exit path goes through it,
+which keeps "no path leaves the map stuck" true by construction.
 
-**Gotcha — the `hidden` attribute loses to any class that sets `display`.** `.source-toggle` and `.ratio-legend` set `display: flex`, which ties the UA stylesheet's `[hidden] { display: none }` on specificity (one class vs one attribute selector) and wins because author CSS beats the UA sheet — so toggling `hidden` from JS silently does nothing and the element stays visible. `style.css` carries an explicit `[hidden]` override per affected element (`#draw-mode-picker[hidden]`, `.ratio-legend[hidden]`); a new class-styled element that JS shows/hides via the attribute needs its own.
+**Gotcha — the `hidden` attribute loses to any class that sets `display`.**
+`.source-toggle` and `.ratio-legend` set `display: flex`, which ties the UA
+stylesheet's `[hidden] { display: none }` on specificity and wins because author
+CSS beats the UA sheet — so toggling `hidden` from JS silently does nothing.
+`style.css` carries an explicit `[hidden]` override per affected element; a new
+class-styled element that JS shows/hides via the attribute needs its own.
 
-**Gotcha — MapLibre paint properties don't resolve CSS `var(...)`.** They're MapLibre's own expression language, evaluated against the style JSON at construction time, not CSS. Baking a `var(--x)` string into a paint property (e.g. `"fill-color": "var(--bdot10k)"`) fails style validation immediately — the layer never renders, and patching it after the fact via `setPaintProperty` in a `load` handler is too late, since construction already threw. Instead resolve real values from `getComputedStyle(document.documentElement)` *before* building the style object (see `app.js`'s `sourceColor`/`addressColor`), so `style.css` stays the single source of truth for colors without needing CSS variables inside the style spec itself.
+**Gotcha — MapLibre paint properties don't resolve CSS `var(...)`.** They're
+MapLibre's own expression language, evaluated against the style JSON at
+construction time. Baking `var(--x)` into a paint property fails style validation
+immediately — the layer never renders, and patching it later via
+`setPaintProperty` in a `load` handler is too late, since construction already
+threw. Resolve real values from `getComputedStyle(document.documentElement)`
+*before* building the style object — `app.js` reads them into a block of
+`const …Color` bindings (`buildingAccentColor`, `addressUnmatchedColor`, …) at
+the top of its IIFE — so `style.css` stays the single source of truth for colors,
+light and dark included.

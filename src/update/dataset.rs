@@ -106,13 +106,11 @@ pub fn refresh(
             );
         }
 
-        // Replaces the automatic "shape changed, recompare everything"
-        // self-heal that ROW_HASH_VERSION used to provide. Without it, a
-        // loader whose output shape silently changed (a column added,
-        // dropped, or reordered) would fail deep inside the apply's
-        // `INSERT INTO {live} SELECT s.* ...` with an opaque arity/type
-        // error instead of a named one — or, worse, would appear to work if
-        // the accidental new shape happened to still typecheck positionally.
+        // Nothing else notices a loader whose output shape silently changed (a
+        // column added, dropped, or reordered): it would fail deep inside the
+        // apply's `INSERT INTO {live} SELECT s.* ...` with an opaque arity/type
+        // error instead of a named one — or, worse, appear to work if the
+        // accidental new shape happened to still typecheck positionally.
         check_column_shapes_match(conn, spec)?;
 
         // --- diff ---
@@ -413,16 +411,13 @@ fn ordered_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
 /// Bail loudly if `spec.table` (live) and `spec.staging_table()` (staging)
 /// don't have the exact same columns in the exact same order.
 ///
-/// This is what replaces the automatic "shape changed, recompare everything"
-/// self-heal `ROW_HASH_VERSION` used to provide. There is no row-hash
-/// expression left to version, so a loader whose output shape silently
-/// changed (a column added, dropped, renamed, or reordered) previously would
-/// either be papered over — the old version-mismatch path forced a full
-/// rewrite that happened to fix the shape mismatch too, as a side effect —
-/// or, with that gone, fail deep inside the apply's `INSERT INTO {live}
-/// SELECT s.* ...` with an opaque arity/type error that does not name the
-/// actual cause. This check turns that into one loud, named failure instead,
-/// strictly better than either of the old outcomes.
+/// The apply is positional (`INSERT INTO {live} SELECT s.* ...`), so a loader
+/// whose output shape changed — a column added, dropped, renamed, or
+/// reordered — would otherwise fail deep inside it with an opaque arity/type
+/// error that does not name the actual cause, or silently write columns into
+/// the wrong places if the new shape happened to still typecheck positionally.
+/// A reorder is therefore as fatal as an addition, and this check turns both
+/// into one loud, named failure.
 ///
 /// Called once, early in [`refresh`], after the staging table exists and the
 /// empty-snapshot guard has passed, but before the diff runs — there is no
@@ -959,11 +954,9 @@ mod tests {
 
     // --- column-shape guard ----------------------------------------------
     //
-    // Replaces the ROW_HASH_VERSION self-heal: with no row-hash expression
-    // left to version, a loader whose output shape silently changed would
-    // otherwise fail deep inside the apply's `INSERT INTO {live} SELECT
-    // s.* ...` with an opaque arity/type error. These pin the loud, named
-    // failure instead.
+    // A loader whose output shape silently changed would otherwise fail deep
+    // inside the apply's `INSERT INTO {live} SELECT s.* ...` with an opaque
+    // arity/type error. These pin the loud, named failure instead.
 
     #[test]
     fn matching_column_shapes_proceed() {

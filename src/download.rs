@@ -679,11 +679,10 @@ mod tests {
     #[test]
     fn existing_file_skips_download_entirely() {
         // Direct test of `download_file_as_impl`'s "already exists, skip"
-        // branch, which was previously untested. A later prefetch step
-        // leans on this branch entirely (a prefetched file must not be
-        // re-downloaded when the sequential loop reaches it), so it needs
-        // its own coverage regardless of the runtime/client sharing work
-        // in this change.
+        // branch. `update::osm`'s prefetcher leans on it entirely -- a
+        // prefetched file must not be re-downloaded when the sequential loop
+        // reaches it -- so it needs coverage here rather than only implicitly
+        // through that path.
         let request_count = Arc::new(AtomicUsize::new(0));
         let body: &'static [u8] = b"stable body, fetched at most once";
         let addr = spawn_counting_test_server(body, request_count.clone());

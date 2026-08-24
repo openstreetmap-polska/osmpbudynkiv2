@@ -136,22 +136,7 @@ pub const SERVING_EPOCH_KEY: &str = "serving_epoch";
 /// the data changed, only how it's rendered), so a client's cached `ETag`
 /// would keep matching and every existing client would serve the stale shape
 /// forever, with no way to self-heal short of a manual cache-buster.
-///
-/// History:
-/// - 1: initial.
-/// - 2: the `buildings` layer gained `PRZESTRZENNAZW`, the carried half of
-///   BDOT10k's composite record key, so `POST /report` can be given a complete
-///   identity for a building. Without this bump a client holding a v1 tile
-///   would keep an `ETag` that still matches and would never see the new
-///   attribute, leaving its report action permanently unable to build a key.
-/// - 3: the `addresses_all`/`buildings_all` layers gained `reported`, set only
-///   on objects an active user report vetoes out of `*_unmatched`, so the
-///   frontend can say "Zgłoszony" instead of "W rejestrze" for the one status
-///   those layers previously could not distinguish. Present only on reported
-///   features (`ST_AsMVT` drops NULLs), so a stale v2 tile looks exactly like
-///   a v3 tile with nothing reported -- indistinguishable without this bump,
-///   and permanently so for any client already holding one.
-pub const TILE_FORMAT_VERSION: u32 = 3;
+pub const TILE_FORMAT_VERSION: u32 = 1;
 
 /// Record that the live serving state moved in a way no per-cell version
 /// tracks. A **counter**, not a timestamp -- deliberately, so a backwards

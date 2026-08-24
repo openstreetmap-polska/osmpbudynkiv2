@@ -87,9 +87,6 @@ mod tests {
     ///   del      - only in live                 -> removed
     ///   add      - only in staging              -> added
     ///   nullgeom - NULL geometry, unchanged     -> unchanged
-    ///
-    /// Built with plain `CREATE TABLE ... AS SELECT`, not `hashed_select` --
-    /// the key-based diff no longer reads `_row_hash` at all.
     fn setup() -> Connection {
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();

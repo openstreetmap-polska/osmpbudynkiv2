@@ -42,8 +42,8 @@ pub const OSM_UPDATE_JOB_LOG_KEY: &str = "update:osm";
 /// `is_cancelled` is polled between batches, never mid-batch -- mirrors
 /// `compare::drain::drain_batch`'s "never mid-transaction" rule, since a
 /// batch's DuckDB transaction (`apply_batch`) is already its own atomic unit
-/// (this used to be one sequence per transaction; see `apply_batch`'s doc
-/// comment for the batching added on top). On cancellation this returns
+/// -- see `apply_batch`'s doc comment for why a batch, rather than a single
+/// sequence, is what one transaction covers. On cancellation this returns
 /// `Ok(())` early: the remaining sequences are simply resumed on the next
 /// call, from the `metadata` stamp the last committed batch left behind. The
 /// background job (`server::jobs::osm_update`) passes `&|| ctx.is_cancelled()`
@@ -418,10 +418,9 @@ struct FetchedSequence {
     changes: OsmChange,
 }
 
-/// Download and parse one replication sequence. No DB access -- this is the
-/// network+parsing half of what used to be `apply_sequence` in one function;
-/// see [`apply_batch`] for why the two are now split and what the split
-/// buys.
+/// Download and parse one replication sequence. No DB access -- deliberately
+/// the network+parsing half only, so a whole batch can be fetched before any
+/// of it is applied; see [`apply_batch`] for what that split buys.
 fn fetch_and_parse_sequence(
     seq: u64,
     replication_base_url: &str,
@@ -498,9 +497,9 @@ fn fetch_and_parse_sequence(
 /// (this file's test module) pins the resulting convergence directly against
 /// `apply_changes`, not a description of it.
 ///
-/// **Concurrency risk.** A longer-held write transaction here overlaps the
-/// `match_refresh` drain for longer than the old one-sequence-per-commit
-/// path did. `match_dirty_cells` is the only table both sides write, and
+/// **Concurrency risk.** Committing a whole batch at once holds the write
+/// transaction long enough to overlap the `match_refresh` drain.
+/// `match_dirty_cells` is the only table both sides write, and
 /// append-vs-delete-of-different-rows is what
 /// `compare::drain_refresh_concurrency` already establishes as safe under
 /// DuckDB's optimistic concurrency control -- but that test exercises a

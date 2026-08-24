@@ -205,9 +205,9 @@ impl DirtyCells {
         Ok(())
     }
 
-    /// One multi-row INSERT for `source` (skipped entirely when `cells` is
-    /// empty), replacing what used to be one `stmt.execute` per cell (6083
-    /// statements for the current live queue's pre-expansion size). `now()`
+    /// One multi-row INSERT for `source`, skipped entirely when `cells` is
+    /// empty. One `stmt.execute` per cell instead would be thousands of
+    /// statements per flush on a real queue. `now()`
     /// is written as literal SQL text, not a bound parameter, so every row in
     /// the statement gets the identical transaction-start timestamp -- see
     /// CLAUDE.md's "`now()` is transaction-start-scoped" gotcha. An

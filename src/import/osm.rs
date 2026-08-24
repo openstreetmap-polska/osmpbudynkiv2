@@ -240,10 +240,11 @@ pub fn import(
     })();
 
     // bdot10k/egib/prg all self-report via job_run_log (see their `import`
-    // functions and `update::dataset::refresh`); OSM previously did not, so
-    // `/status` showed nothing for it either way an import went. A failure to
-    // write the log must never fail the job itself -- see
-    // `job_log::record`'s own doc comment, which is why this is `let _ =`.
+    // functions and `update::dataset::refresh`); OSM reports here rather than
+    // through `refresh()`, since it has no dataset-diff refresh path at all.
+    // Without this `/status` would show nothing for an OSM import either way
+    // it went. A failure to write the log must never fail the job itself --
+    // see `job_log::record`'s own doc comment, which is why this is `let _ =`.
     match &outcome {
         Ok(msg) => {
             let _ = crate::job_log::record(conn, "import:osm", "Success", Some(msg));
@@ -300,13 +301,13 @@ struct PbfCounts {
 ///
 /// # Why one pass and not three
 ///
-/// This replaces what used to be three separate `ST_ReadOSM` scans (nodes,
-/// then ways, then relations), each of which decompressed the entire 2.2 GB
-/// file. Collapsing them is safe because all three are **pure writes** — none
-/// reads anything back out of RocksDB — so they have no ordering dependency on
-/// each other, and in particular this does *not* rely on the PBF being sorted
-/// by element type. The passes that do read (`resolve_node_coords` needs the
-/// nodes CF, `resolve_way_coords` the ways CF) all run after this returns.
+/// Three separate scans (nodes, then ways, then relations) would decompress
+/// the entire 2.2 GB file three times. One pass is safe because all three key
+/// spaces are **pure writes** — none reads anything back out of RocksDB — so
+/// they have no ordering dependency on each other, and in particular this does
+/// *not* rely on the PBF being sorted by element type. The passes that do read
+/// (`resolve_node_coords` needs the nodes CF, `resolve_way_coords` the ways
+/// CF) all run after this returns; that ordering is the one that matters.
 ///
 /// # Why `BlobReader` rather than `IndexedReader`
 ///
@@ -985,9 +986,9 @@ mod tests {
     /// The load-bearing ordering change: the replication stamp must not
     /// exist for an import that failed partway through, even though the PBF
     /// header itself was read successfully and has valid replication info.
-    /// This is the Gap 3 hazard -- stamping up front used to leave a
-    /// half-imported database indistinguishable from a complete one to a
-    /// later `update osm` or `run`.
+    /// Stamping up front would leave a half-imported database (empty
+    /// `osm_buildings`, partial RocksDB) indistinguishable from a complete one
+    /// to a later `update osm` or `run`.
     ///
     /// There is no way to reach into the process-wide shutdown flag from a
     /// unit test (it has no public setter, by design -- see

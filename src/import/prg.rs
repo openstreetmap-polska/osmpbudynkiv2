@@ -395,12 +395,10 @@ const ULICA_PREFIX_STRIP_SQL: &str = r"CASE
 /// Contrast that with values derived *outside* `compared_columns` --
 /// `centroid` (`DatasetSpec::with_centroid_select`) and EGIB's `rodzaj_kod`
 /// (`mappings::egib::RODZAJ_KOD_CASE_SQL`). Those are recomputed for every
-/// *staged* row on every refresh, so a record that happens to be modified
-/// for some unrelated reason picks up the new expression -- but a record
-/// that stays unmodified keeps its old, stale value forever. Under the old
-/// whole-row-hash diff a version bump forced a full rewrite that fixed such
-/// columns as a side effect; nothing does that any more, so editing one of
-/// those expressions now requires a re-import, not merely a refresh.
+/// *staged* row on every refresh, so a record that happens to be modified for
+/// some unrelated reason picks up the new expression -- but a record that
+/// stays unmodified keeps its old, stale value forever. Editing one of those
+/// expressions requires a re-import, not merely a refresh.
 pub fn materialize_into(
     conn: &Connection,
     target_table: &str,
@@ -810,17 +808,15 @@ mod tests {
         );
     }
 
-    /// Moved here from `tests/cli_import_prg.rs`, which used to assert on
-    /// `SELECT DISTINCT wojewodztwo FROM prg_addresses` to verify the TERC
-    /// mapping was applied. `wojewodztwo` is one of the columns
-    /// `materialize_into` now drops (see
+    /// Asserts against the raw table `stream_gml_into` produces, deliberately,
+    /// rather than against `prg_addresses`: the obvious check
+    /// (`SELECT DISTINCT wojewodztwo FROM prg_addresses`) is impossible because
+    /// `wojewodztwo` is one of the columns `materialize_into` drops (see
     /// `docs/superpowers/plans/2026-08-14-column-trimming.md`,
-    /// recommendation (1) under "One real coverage loss to resolve"), so
-    /// that coverage has to move to the raw table `stream_gml_into`
-    /// produces, before `materialize_into` ever runs. TERC is consumed
-    /// inside `prg_convert`'s parser regardless of what this loader stores
-    /// afterward, so `--terc-file` stays required either way -- this test
-    /// pins that the mapping actually landed, not that the flag is merely
+    /// recommendation (1) under "One real coverage loss to resolve"). TERC is
+    /// consumed inside `prg_convert`'s parser regardless of what this loader
+    /// stores afterward, so `--terc-file` stays required either way -- this
+    /// test pins that the mapping actually landed, not that the flag is merely
     /// accepted.
     #[test]
     fn stream_gml_into_applies_the_terc_mapping_before_materialize_projects_it_away() {

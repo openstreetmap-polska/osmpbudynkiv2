@@ -181,15 +181,13 @@ impl DatasetSpec {
     /// `dataset::tests::signature_changes_exactly_when_the_diff_says_modified`
     /// pins them together.
     ///
-    /// **This is not the old `_row_hash`/`ROW_HASH_VERSION`, and the difference
-    /// is the entire reason that mechanism was removed.** `_row_hash` hashed
-    /// *every* column of *every* row, so it could not tell a record changing
-    /// from its serialization changing -- one BDOT10k re-export rewrote all
-    /// 16,344,762 rows and enqueued every z14 cell in Poland. This hashes only
-    /// the curated compared set (BDOT10k's excludes geometry for exactly that
-    /// reason), and it is only ever evaluated for rows that carry a report:
-    /// `O(active reports)`, never `O(source table)`. It cannot cause a
-    /// full-table rewrite because nothing rewrites a table on its account.
+    /// **Do not widen this to hash every column.** Hashing a whole row cannot
+    /// tell a record changing from its *serialization* changing: one BDOT10k
+    /// re-export rewrote all 16,344,762 rows byte-for-byte and would enqueue
+    /// every z14 cell in Poland. Hashing only the curated compared set
+    /// (BDOT10k's excludes geometry for exactly that reason) is what keeps that
+    /// from happening. Evaluated only for rows that carry a report --
+    /// `O(active reports)`, never `O(source table)`.
     ///
     /// NULL handling is explicit because DuckDB's `concat` *skips* NULL inputs
     /// rather than propagating them, which would make `(NULL, 'x')` and

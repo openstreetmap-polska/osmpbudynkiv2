@@ -42,7 +42,10 @@ pub fn encode_key(id: i64) -> [u8; 8] {
 }
 
 /// Decode a big-endian key back to i64.
-#[allow(dead_code)]
+///
+/// Test-only: nothing iterates the store in key order, so production never
+/// reads a key back. Kept as [`encode_key`]'s round-trip partner.
+#[cfg(test)]
 pub fn decode_key(bytes: &[u8]) -> i64 {
     i64::from_be_bytes(bytes.try_into().expect("key must be 8 bytes"))
 }
@@ -215,7 +218,9 @@ pub fn encode_member_type(t: &str) -> u8 {
     }
 }
 
-#[allow(dead_code)]
+/// Test-only round-trip partner of [`encode_member_type`]: member types are
+/// decoded by `decode_relation`, which maps the byte itself.
+#[cfg(test)]
 pub fn decode_member_type(b: u8) -> &'static str {
     match b {
         0 => "node",
@@ -303,7 +308,8 @@ mod tests {
         assert!((decimicro_to_f64(dec_lat) - lat).abs() < 1e-9);
     }
 
-    /// A node value must be exactly half what the old two-`f64` layout cost.
+    /// A node value is two `i32`s, not two `f64`s -- 8 bytes, not 16. This is
+    /// the largest column family in the store, so the width is load-bearing.
     #[test]
     fn node_value_is_eight_bytes() {
         assert_eq!(NODE_BYTE_LEN, 8);

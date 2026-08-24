@@ -88,8 +88,8 @@
 //! tile that can run several hundred KB.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use axum::body::Bytes;
 
@@ -141,6 +141,17 @@ impl TileCache {
         }
     }
 
+    /// Take the state lock, recovering the guard if a previous holder panicked.
+    ///
+    /// Never `unwrap`: this mutex is taken on the request path, so propagating
+    /// poison would turn one panicking request into a permanently 500ing tile
+    /// endpoint. Nothing here can be left half-updated in a way the next caller
+    /// misreads -- the worst a poisoned guard carries is a byte total that
+    /// over- or under-counts one entry, which eviction corrects on its own.
+    fn state(&self) -> MutexGuard<'_, Generations> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A hit requires both the key and the stored version to match -- see
     /// the module doc's "Key and invalidation" section. A version mismatch
     /// is a miss, exactly like the key being absent; the stale entry is left
@@ -151,7 +162,7 @@ impl TileCache {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
 
         if let Some(entry) = state.hot.get(&key)
             && entry.version == version
@@ -191,7 +202,7 @@ impl TileCache {
         if entry.size() > self.max_bytes / 4 {
             return;
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         place_in_hot(&mut state, self.max_bytes, key, entry);
     }
 
@@ -242,7 +253,7 @@ impl TileCache {
     /// tests can pin the "peak resident never exceeds `max_bytes`" invariant
     /// directly instead of inferring it indirectly from behaviour.
     fn resident_bytes(&self) -> u64 {
-        let state = self.state.lock().unwrap();
+        let state = self.state();
         let cold_bytes: u64 = state.cold.values().map(Entry::size).sum();
         state.hot_bytes + cold_bytes
     }
