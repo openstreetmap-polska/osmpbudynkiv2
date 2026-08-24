@@ -27,6 +27,20 @@
     </div>
   </header>
 
+  <!-- Fixed to the bottom-center of the viewport, deliberately not folded
+       into .masthead: the legend/download panels already anchor the bottom
+       corners at bottom:16px/44px and the masthead already sits within ~2px
+       of the legend panel's top edge at a 720px viewport height, so adding a
+       row to the masthead pushed it into a real overlap there. Bottom-center
+       is clear of both corner panels and of the AttributionControl (which
+       MapLibre docks bottom-right in app.js). -->
+  <p class="sponsor-credit">
+    <span>Hosting dzięki:</span>
+    <a href="https://cloudferro.com" target="_blank" rel="noopener noreferrer">
+      <img src="cloudferro_logo.png" alt="CloudFerro" class="sponsor-credit-logo" />
+    </a>
+  </p>
+
   <section class="panel panel-legend" aria-label="Legenda">
     <button
       id="legend-toggle"

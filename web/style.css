@@ -263,6 +263,59 @@ body {
   color: var(--paper);
 }
 
+/* Sponsor credit, fixed bottom-center -- see the placement comment on its
+   markup in index.html for why it isn't part of .masthead. Same visual
+   language as .panel (paper background, hairline border, soft shadow) so it
+   reads as part of this app's UI rather than a stray overlay, but kept out
+   of .panel itself since it needs centering transform/positioning none of
+   the corner panels use. */
+.sponsor-credit {
+  position: fixed;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+  font-size: 13px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+/* The <a> wraps only the image -- `line-height: 0` kills the few px of
+   inline-baseline gap a bare `<img>` inside an inline `<a>` otherwise leaves
+   underneath itself, which would throw off the flex row's vertical
+   centering. */
+.sponsor-credit a {
+  display: flex;
+  line-height: 0;
+}
+/* The logo file is a white "Cloud" + orange "Ferro" wordmark on a
+   transparent background -- the white half is invisible on --paper, which
+   is near-white in light mode -- so it sits on a fixed dark plate rather
+   than the theme-flipping panel background behind it. Not redefined for
+   dark mode, same reasoning as --draw-outline/--ratio-0.._4 above: the plate
+   only exists to give the logo's own fixed colours something to sit on, so
+   it has to stay put regardless of theme. */
+.sponsor-credit-logo {
+  height: 30px;
+  width: auto;
+  padding: 5px 9px;
+  background: #17324d;
+  border-radius: 4px;
+}
+
+@media (max-width: 640px) {
+  .sponsor-credit {
+    display: none;
+  }
+}
+
 .panel {
   padding: 12px 16px 14px;
   font-size: 12px;
