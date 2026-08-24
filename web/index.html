@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>osmpbudynkiv2 — status danych</title>
+  <title>OSM Polska budynki/adresy v2</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml" />
   <link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32" />
   <link rel="icon" href="favicon-16.png" type="image/png" sizes="16x16" />
@@ -17,7 +17,13 @@
   <header class="masthead">
     <div>
       <h1>osmpbudynkiv2</h1>
-      <p>Rejestry publiczne a OpenStreetMap &mdash; niedopasowane budynki i adresy</p>
+      <p>Aplikacja dla edytorów <a href="https://www.openstreetmap.org" target="_blank" rel="noopener noreferrer">OpenStreetMap (OSM)</a>.</p>
+      <p>Rejestry publiczne porównywane są z OSM, a niedopasowane budynki i adresy można pobrac w celu dodania z użyciem edytora JOSM.</p>
+      <hr>
+      <p class="masthead-warning">
+        <span class="masthead-warning-icon" aria-hidden="true"></span>
+        <span><strong>Uwaga:</strong> przed wysłaniem danych do OSM zweryfikuj, czy obiekty istnieją w rzeczywistości i czy nie dublują już istniejących w bazie OSM.</span>
+      </p>
     </div>
   </header>
 
@@ -81,7 +87,7 @@
       </div>
       <div class="legend-row">
         <span class="swatch" data-swatch="updates"></span>
-        Obszar eksportu (/package)
+        Obszar eksportu
       </div>
     </div>
 
@@ -180,6 +186,8 @@
     <h2 id="report-modal-title">Zgłoś problem z obiektem</h2>
     <dl class="feedback-modal-details">
       <div>
+        <p>Wybrany obiekt zostanie usunięty z podpowiadanych obiektów do importu.</p>
+        <p>Aplikacja przechowuje identyfikator i wersję obiektu, więc jeżeli obiekt zostanie zaktualizowany w rejestrze źródłowym to może znowu pojawić się na mapie.</p>
         <dt>Obiekt</dt>
         <dd id="report-modal-object"></dd>
       </div>
