@@ -24,16 +24,32 @@
         <span class="masthead-warning-icon" aria-hidden="true"></span>
         <span><strong>Uwaga:</strong> przed wysłaniem danych do OSM zweryfikuj, czy obiekty istnieją w rzeczywistości i czy nie dublują już istniejących w bazie OSM.</span>
       </p>
+      <!-- Mobile-only twin of #sponsor-credit below -- hidden on desktop by
+           style.css's base `.masthead-sponsor { display: none }`, shown only
+           inside the `max-width: 640px` query. At phone width the legend
+           panel runs the full viewport width (see .panel-legend), leaving no
+           side gap for a bottom-center pill the way desktop has one between
+           the legend and download panels -- the masthead is the one surface
+           still free. Safe to fold in here now (an earlier attempt at this
+           was reverted for overlapping the legend) because
+           updateLegendMaxHeight in app.js measures the masthead's *actual*
+           rendered height every time, so a taller masthead just shrinks the
+           legend's cap instead of the two colliding. -->
+      <p class="masthead-sponsor">
+        <span>Hosting dzięki:</span>
+        <a href="https://cloudferro.com" target="_blank" rel="noopener noreferrer">
+          <img src="cloudferro_logo.png" alt="CloudFerro" class="sponsor-credit-logo" />
+        </a>
+      </p>
     </div>
   </header>
 
   <!-- Fixed to the bottom-center of the viewport, deliberately not folded
-       into .masthead: the legend/download panels already anchor the bottom
-       corners at bottom:16px/44px and the masthead already sits within ~2px
-       of the legend panel's top edge at a 720px viewport height, so adding a
-       row to the masthead pushed it into a real overlap there. Bottom-center
-       is clear of both corner panels and of the AttributionControl (which
-       MapLibre docks bottom-right in app.js). -->
+       into .masthead on desktop: the legend/download panels anchor the
+       bottom corners at bottom:16px/44px there, and this sits in the gap
+       between them. Hidden below 640px in favor of .masthead-sponsor above,
+       since the legend panel goes full-width on mobile and leaves no such
+       gap. -->
   <p class="sponsor-credit">
     <span>Hosting dzięki:</span>
     <a href="https://cloudferro.com" target="_blank" rel="noopener noreferrer">

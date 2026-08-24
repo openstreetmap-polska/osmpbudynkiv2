@@ -287,11 +287,20 @@ body {
   color: var(--ink-soft);
   white-space: nowrap;
 }
+/* Mobile twin of .sponsor-credit -- see the markup comment in index.html.
+   Hidden here (desktop default); shown by the `max-width: 640px` query
+   below, which also gives it its actual layout since it isn't a fixed
+   overlay like .sponsor-credit -- it flows as an ordinary masthead row. */
+.masthead-sponsor {
+  display: none;
+}
 /* The <a> wraps only the image -- `line-height: 0` kills the few px of
    inline-baseline gap a bare `<img>` inside an inline `<a>` otherwise leaves
    underneath itself, which would throw off the flex row's vertical
-   centering. */
-.sponsor-credit a {
+   centering. Shared with .masthead-sponsor, which wraps its logo the same
+   way. */
+.sponsor-credit a,
+.masthead-sponsor a {
   display: flex;
   line-height: 0;
 }
@@ -900,27 +909,89 @@ button {
 }
 
 @media (max-width: 640px) {
+  /* Same right:50px the desktop .panel-status already uses to clear the
+     NavigationControl zoom buttons (see that rule's own comment) -- at
+     phone width the masthead's text wraps tall enough to reach that high,
+     where the old calc(100vw - 32px) (sized for sitting *above* the zoom
+     control, not beside it) let it run underneath the buttons. width is
+     intentionally unset: with left and right both given, an absolutely
+     positioned box with no explicit width stretches to fill the gap between
+     them. */
   .masthead {
-    max-width: calc(100vw - 32px);
+    left: 16px;
+    right: 50px;
+    max-width: none;
   }
-  .panel-status,
-  .panel-download,
+  /* Shown here -- see the base `display: none` above and the markup comment
+     in index.html for why this is a separate element from .sponsor-credit
+     rather than that one reflowed into place. font-size/gap echo
+     .masthead p's own 12px/1.3 line-height rather than .sponsor-credit's
+     13px, since this one is a masthead row among masthead rows, not a
+     standalone pill.
+     Selector is `.masthead .masthead-sponsor`, not the bare class: this is
+     itself a `<p>`, so the plain class (0,1,0) loses its `margin` to
+     `.masthead p`'s (0,1,1) above -- the exact trap the attribution-control
+     rule elsewhere in this file already warns about. Two classes (0,2,0)
+     beats it outright instead of relying on source order. */
+  .masthead .masthead-sponsor {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 0 0;
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+  /* max-height + the flex/overflow pair below cap the panel instead of
+     letting it grow upward off-content like the desktop version does: at
+     phone height, an uncapped expanded legend grows tall enough to run
+     under the masthead, since both are independently-positioned overlays
+     with no shared layout that would otherwise keep them apart. The 60vh
+     fallback is a rough guess for the instant before app.js's resize
+     listener computes the real figure (--legend-max-height, set from the
+     masthead's actual measured height -- a fixed vh guess undershot on a
+     narrow phone, where wrapped masthead text runs tall enough to eat past
+     any fraction that still leaves useful legend height on a *short*
+     phone) -- see updateLegendMaxHeight in app.js. The toggle button stays
+     outside the scroll region (only #legend-body scrolls) so it remains
+     reachable to re-collapse the panel however far the content is
+     scrolled. */
   .panel-legend {
     width: calc(100vw - 32px);
+    /* 16px (the desktop/other-panel inset) plus 8px: at phone width the
+       AttributionControl's compact:false text bar (always-on, see app.js)
+       runs the full width of the map and can sit tall enough to overlap a
+       plain 16px-inset panel bottom-left. Must move in lockstep with
+       updateLegendMaxHeight's own bottomOffset in app.js, which this same
+       number feeds into the max-height budget. */
+    bottom: 24px;
+    max-height: var(--legend-max-height, 60vh);
+    display: flex;
+    flex-direction: column;
   }
-  .panel-legend {
-    bottom: 16px;
+  /* flex: none pins the toggle to its natural size -- without it, a flex
+     item's default flex-shrink:1 lets the column squash it once content
+     forces the container against its max-height, same failure mode as
+     #legend-body's min-height:0 below guards against. */
+  .panel-legend #legend-toggle {
+    flex: none;
   }
-  .panel-status {
-    /* Full-width at this size, so the right:50px desktop clearance would push
-       its left edge off-screen -- back to a plain 16px inset like the other
-       panels. */
-    right: 16px;
+  /* min-height: 0 overrides a flex item's default min-height:auto, which
+     would otherwise size #legend-body to its content and defeat the parent's
+     max-height instead of scrolling within it. flex: 1 1 auto lets it claim
+     whatever space #legend-toggle doesn't. */
+  .panel-legend #legend-body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    min-height: 0;
   }
+  /* Neither is useful on a phone: /package assumes a JOSM desktop workflow,
+     and the status table's six columns don't fit a phone-width screen.
+     Hidden outright, unlike the legend -- which stays reachable, just
+     folded by default at load (see the matchMedia check in app.js) -- since
+     there's no useful folded state for either of these to fall back to. */
+  .panel-status,
   .panel-download {
-    left: 16px;
-    right: 16px;
-    bottom: calc(16px + 15px + 96px);
+    display: none;
   }
 }
 

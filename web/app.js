@@ -1427,8 +1427,45 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
 
   wirePanelToggle(statusToggle, statusBody);
-  wirePanelToggle(document.getElementById("legend-toggle"), document.getElementById("legend-body"));
+  const legendToggle = document.getElementById("legend-toggle");
+  const legendBody = document.getElementById("legend-body");
+  wirePanelToggle(legendToggle, legendBody);
   wirePanelToggle(document.getElementById("download-toggle"), document.getElementById("download-body"));
+
+  // On a phone-width screen the legend starts folded -- expanded is right on
+  // desktop, where there's vertical room to spare, but at phone height an
+  // expanded legend covers most of the map on first load. Breakpoint must
+  // match style.css's own `@media (max-width: 640px)`; only the initial
+  // state is width-driven, a manual toggle afterwards behaves like every
+  // other panel and just stays as the user left it.
+  if (window.matchMedia("(max-width: 640px)").matches) {
+    legendToggle.setAttribute("aria-expanded", "false");
+    legendBody.hidden = true;
+  }
+
+  // Keeps the mobile legend panel's cap (--legend-max-height, read by
+  // style.css's .panel-legend) pinned to the actual gap below the masthead
+  // instead of a guessed vh fraction -- the masthead's height is both
+  // viewport-width-dependent (its text wraps differently per phone) and
+  // content-driven, so no fixed fraction of viewport height stays safe
+  // across real phone sizes (measured: 60vh still let the expanded legend
+  // run under the masthead on a 320x568 screen). Math.max floors it well
+  // above zero so a pathologically short/landscape phone still leaves the
+  // toggle itself reachable rather than clipping the panel out entirely.
+  const mastheadEl = document.querySelector(".masthead");
+  const legendPanel = document.querySelector(".panel-legend");
+  function updateLegendMaxHeight() {
+    if (!window.matchMedia("(max-width: 640px)").matches) {
+      legendPanel.style.removeProperty("--legend-max-height");
+      return;
+    }
+    const gapBelowMasthead = 8;
+    const bottomOffset = 24; // matches .panel-legend's own `bottom: 24px`
+    const available = window.innerHeight - mastheadEl.getBoundingClientRect().bottom - gapBelowMasthead - bottomOffset;
+    legendPanel.style.setProperty("--legend-max-height", `${Math.max(available, 80)}px`);
+  }
+  updateLegendMaxHeight();
+  window.addEventListener("resize", updateLegendMaxHeight);
 
   // /status carries timestamps in two shapes: the in-memory job registry
   // emits plain RFC3339 UTC ("...Z"), while job_run_log's ran_at and
