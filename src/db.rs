@@ -326,7 +326,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
             source VARCHAR,
             record_key VARCHAR[],
             signature VARCHAR,
-            note VARCHAR,
             reported_at TIMESTAMP WITH TIME ZONE,
             cell_x INTEGER,
             cell_y INTEGER,

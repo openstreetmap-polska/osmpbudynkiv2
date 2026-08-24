@@ -294,10 +294,10 @@ mod full_vs_incremental_equivalence {
                  ('reported', ST_MakeEnvelope(24.0,54.5,24.001,54.501));
              UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
              INSERT INTO object_reports
-                 (report_id, source, record_key, signature, note,
+                 (report_id, source, record_key, signature,
                   reported_at, cell_x, cell_y, status, resolved_at)
              VALUES (1, 'bdot10k', [NULL, 'reported'], 'sig',
-                     NULL, now(), NULL, NULL, 'active', NULL);",
+                     now(), NULL, NULL, 'active', NULL);",
         )
         .unwrap();
 

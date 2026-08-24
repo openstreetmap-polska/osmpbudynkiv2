@@ -133,7 +133,6 @@ mod tests {
                     spec: &crate::dataset::BDOT10K,
                     key: vec!["04".to_string(), "bud-1".to_string()],
                 }],
-                None,
             )
             .unwrap();
             // WERSJA is in BDOT10K.compared_columns, so this is a content

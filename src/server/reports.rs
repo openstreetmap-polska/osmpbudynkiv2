@@ -38,8 +38,6 @@ struct ObjectBody {
 
 #[derive(Debug, Deserialize)]
 struct ReportBody {
-    #[serde(default)]
-    note: Option<String>,
     objects: Vec<ObjectBody>,
 }
 
@@ -69,7 +67,6 @@ struct ReportResponse {
 #[derive(Debug)]
 struct ValidRequest {
     targets: Vec<ReportTarget>,
-    note: Option<String>,
 }
 
 pub const UNKNOWN_RECORD_MESSAGE: &str = "no such record in the current dataset";
@@ -83,11 +80,6 @@ pub const UNKNOWN_RECORD_MESSAGE: &str = "no such record in the current dataset"
 fn parse_report_body(body: &str, max_objects: usize) -> Result<ValidRequest, String> {
     let parsed: ReportBody =
         serde_json::from_str(body).map_err(|e| format!("invalid JSON body: {e}"))?;
-
-    let note = parsed
-        .note
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty());
 
     if parsed.objects.is_empty() {
         return Err("objects must not be empty".to_string());
@@ -131,7 +123,7 @@ fn parse_report_body(body: &str, max_objects: usize) -> Result<ValidRequest, Str
         targets.push(ReportTarget { spec, key });
     }
 
-    Ok(ValidRequest { targets, note })
+    Ok(ValidRequest { targets })
 }
 
 pub async fn post_report(State(state): State<AppState>, body: String) -> Response {
@@ -155,7 +147,7 @@ pub async fn post_report(State(state): State<AppState>, body: String) -> Respons
             .iter()
             .map(|t| t.spec.name.to_string())
             .collect();
-        let (outcomes, stats) = reports::insert(&conn, &request.targets, request.note.as_deref())?;
+        let (outcomes, stats) = reports::insert(&conn, &request.targets)?;
 
         let mut accepted = Vec::new();
         let mut rejected = Vec::new();
@@ -472,17 +464,6 @@ mod tests {
         )
         .expect_err("arity alone must not be enough");
         assert!(err.contains("missing key column"), "got '{err}'");
-    }
-
-    #[test]
-    fn note_is_trimmed() {
-        let ok = parse_report_body(
-            r#"{"note":" wrong shape ","objects":[
-                 {"source":"prg","key":{"lokalny_id":"a"}}]}"#,
-            MAX,
-        )
-        .unwrap();
-        assert_eq!(ok.note.as_deref(), Some("wrong shape"), "note is trimmed");
     }
 
     #[test]

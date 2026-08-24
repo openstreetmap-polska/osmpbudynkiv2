@@ -1686,12 +1686,12 @@ mod tests {
     async fn an_active_report_flags_its_own_object_and_only_that_one() {
         let state = make_state(&seed_with_reports(
             "INSERT INTO object_reports
-                 (report_id, source, record_key, signature, note, reported_at,
+                 (report_id, source, record_key, signature, reported_at,
                   cell_x, cell_y, status, resolved_at)
              VALUES
-                 (1, 'bdot10k', ['PL.PZGiK.BDOT10k.1234', 'b1'], NULL, NULL, now(),
+                 (1, 'bdot10k', ['PL.PZGiK.BDOT10k.1234', 'b1'], NULL, now(),
                   8000, 4900, 'active', NULL),
-                 (2, 'prg', ['a1'], NULL, NULL, now(), 8000, 4900, 'active', NULL);",
+                 (2, 'prg', ['a1'], NULL, now(), 8000, 4900, 'active', NULL);",
         ));
         assert_eq!(
             building_flags(&state),
@@ -1732,14 +1732,14 @@ mod tests {
     async fn a_revoked_report_a_partial_key_or_another_registry_flags_nothing() {
         let state = make_state(&seed_with_reports(
             "INSERT INTO object_reports
-                 (report_id, source, record_key, signature, note, reported_at,
+                 (report_id, source, record_key, signature, reported_at,
                   cell_x, cell_y, status, resolved_at)
              VALUES
-                 (1, 'bdot10k', ['PL.PZGiK.BDOT10k.1234', 'b1'], NULL, NULL, now(),
+                 (1, 'bdot10k', ['PL.PZGiK.BDOT10k.1234', 'b1'], NULL, now(),
                   8000, 4900, 'revoked', now()),
-                 (2, 'bdot10k', ['PL.PZGiK.BDOT10k.9999', 'b2'], NULL, NULL, now(),
+                 (2, 'bdot10k', ['PL.PZGiK.BDOT10k.9999', 'b2'], NULL, now(),
                   8000, 4900, 'active', NULL),
-                 (3, 'egib', ['b1'], NULL, NULL, now(), 8000, 4900, 'active', NULL);",
+                 (3, 'egib', ['b1'], NULL, now(), 8000, 4900, 'active', NULL);",
         ));
         assert!(
             building_flags(&state).iter().all(|(_, r)| !r),

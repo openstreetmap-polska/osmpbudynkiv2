@@ -1001,7 +1001,6 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const reportModal = document.getElementById("report-modal");
   const reportModalObject = document.getElementById("report-modal-object");
   const reportModalText = document.getElementById("report-modal-text");
-  const reportNote = document.getElementById("report-note");
   const reportSubmit = document.getElementById("report-submit");
   const reportCancel = document.getElementById("report-cancel");
 
@@ -1050,7 +1049,6 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     if (!popupReport) return;
     reportTarget = popupReport.target;
     reportModalObject.textContent = popupReport.label;
-    reportNote.value = "";
     setReportFeedback("", null);
     reportSubmit.disabled = false;
     if (!reportModal.open) reportModal.showModal();
@@ -1068,7 +1066,6 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   reportSubmit.addEventListener("click", async () => {
     if (!reportTarget) return;
-    const note = reportNote.value.trim();
 
     reportSubmit.disabled = true;
     setReportFeedback("Wysyłanie…", null);
@@ -1076,7 +1073,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       const res = await fetch("/report", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ note: note || null, objects: [reportTarget] }),
+        body: JSON.stringify({ objects: [reportTarget] }),
       });
       if (!res.ok) {
         const detail = await readErrorDetail(res);

@@ -87,11 +87,7 @@ pub struct InsertStats {
 ///
 /// Returns one [`Outcome`] per target, positionally, so a caller can tell which
 /// of a batch's ids were stale without re-querying.
-pub fn insert(
-    conn: &Connection,
-    targets: &[ReportTarget],
-    note: Option<&str>,
-) -> Result<(Vec<Outcome>, InsertStats)> {
+pub fn insert(conn: &Connection, targets: &[ReportTarget]) -> Result<(Vec<Outcome>, InsertStats)> {
     if targets.is_empty() {
         return Ok((Vec::new(), InsertStats::default()));
     }
@@ -116,7 +112,7 @@ pub fn insert(
         let mut stats = InsertStats::default();
 
         for target in targets {
-            let inserted = insert_one(conn, target, next_id, note)?;
+            let inserted = insert_one(conn, target, next_id)?;
             if inserted {
                 outcomes.push(Outcome::Accepted { report_id: next_id });
                 stats.accepted += 1;
@@ -148,12 +144,7 @@ pub fn insert(
 
 /// Insert one report by resolving its key against the live source table.
 /// Returns whether a row was written — `false` means the key matched nothing.
-fn insert_one(
-    conn: &Connection,
-    target: &ReportTarget,
-    report_id: i64,
-    note: Option<&str>,
-) -> Result<bool> {
+fn insert_one(conn: &Connection, target: &ReportTarget, report_id: i64) -> Result<bool> {
     let spec = target.spec;
     let point = spec.representative_point_sql("b");
     let cx = crate::tile_math::cell_x_sql(&point);
@@ -168,9 +159,9 @@ fn insert_one(
 
     let sql = format!(
         "INSERT INTO object_reports
-             (report_id, source, record_key, signature, note,
+             (report_id, source, record_key, signature,
               reported_at, cell_x, cell_y, status, resolved_at)
-         SELECT {report_id}, '{source}', {key_list}, {signature}, ?,
+         SELECT {report_id}, '{source}', {key_list}, {signature},
                 now(), {cx}, {cy}, '{STATUS_ACTIVE}', NULL
          FROM {table} b
          WHERE {key_list} = list_value({placeholders})
@@ -180,7 +171,6 @@ fn insert_one(
     );
 
     let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
-    params.push(Box::new(note.map(str::to_string)));
     for value in &target.key {
         params.push(Box::new(value.clone()));
     }
@@ -459,7 +449,6 @@ pub struct ReportRow {
     pub source: String,
     pub record_key: Vec<String>,
     pub signature: Option<String>,
-    pub note: Option<String>,
     pub reported_at: String,
     pub cell_x: Option<i32>,
     pub cell_y: Option<i32>,
@@ -524,7 +513,7 @@ pub fn list(
         None => String::new(),
     };
     let sql = format!(
-        "SELECT report_id, source, to_json(record_key)::VARCHAR, signature, note,
+        "SELECT report_id, source, to_json(record_key)::VARCHAR, signature,
                 reported_at::VARCHAR, cell_x, cell_y, status, resolved_at::VARCHAR
          FROM object_reports {filter}
          ORDER BY report_id DESC{limit_sql}"
@@ -548,12 +537,11 @@ pub fn list(
                     })?
                 },
                 signature: r.get(3)?,
-                note: r.get(4)?,
-                reported_at: r.get(5)?,
-                cell_x: r.get(6)?,
-                cell_y: r.get(7)?,
-                status: r.get(8)?,
-                resolved_at: r.get(9)?,
+                reported_at: r.get(4)?,
+                cell_x: r.get(5)?,
+                cell_y: r.get(6)?,
+                status: r.get(7)?,
+                resolved_at: r.get(8)?,
             })
         })
         .context("Failed to read object_reports")?;
@@ -589,16 +577,15 @@ pub fn import_rows(conn: &Connection, rows: &[ReportRow]) -> Result<i64> {
         for row in rows {
             conn.execute(
                 "INSERT INTO object_reports
-                     (report_id, source, record_key, signature, note,
+                     (report_id, source, record_key, signature,
                       reported_at, cell_x, cell_y, status, resolved_at)
-                 VALUES (?, ?, CAST(? AS VARCHAR[]), ?, ?, ?::TIMESTAMPTZ, ?, ?, ?,
+                 VALUES (?, ?, CAST(? AS VARCHAR[]), ?, ?::TIMESTAMPTZ, ?, ?, ?,
                          ?::TIMESTAMPTZ)",
                 duckdb::params![
                     next_id,
                     row.source,
                     serde_json::to_string(&row.record_key)?,
                     row.signature,
-                    row.note,
                     row.reported_at,
                     row.cell_x,
                     row.cell_y,
@@ -662,16 +649,8 @@ pub fn run(conn: &Connection, action: crate::cli::ReportsAction) -> Result<()> {
             }
             for r in &rows {
                 println!(
-                    "{:>6}  {:<8} {:<9} {}  key={:?}{}",
-                    r.report_id,
-                    r.source,
-                    r.status,
-                    r.reported_at,
-                    r.record_key,
-                    r.note
-                        .as_deref()
-                        .map(|n| format!("  note={n}"))
-                        .unwrap_or_default(),
+                    "{:>6}  {:<8} {:<9} {}  key={:?}",
+                    r.report_id, r.source, r.status, r.reported_at, r.record_key,
                 );
             }
             Ok(())
@@ -826,7 +805,7 @@ mod tests {
             "precondition: the building is unmatched before anyone reports it"
         );
 
-        let (outcomes, stats) = insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        let (outcomes, stats) = insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
         assert!(matches!(outcomes[0], Outcome::Accepted { .. }));
         assert_eq!(stats.accepted, 1);
         assert_eq!(
@@ -864,7 +843,6 @@ mod tests {
                 // keyed on LOKALNYID alone.
                 bdot_target(&["99", "bud-1"]),
             ],
-            None,
         )
         .unwrap();
         assert!(matches!(outcomes[0], Outcome::Accepted { .. }));
@@ -883,8 +861,8 @@ mod tests {
     fn two_reports_on_one_object_still_suppress_exactly_one_row() {
         let c = conn();
         let (cx, cy) = seed_building(&c);
-        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
-        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
         assert_eq!(count(&c, "SELECT COUNT(*) FROM object_reports"), 2);
 
         recompute_cell(&c, "bdot10k", cx, cy).unwrap();
@@ -906,7 +884,7 @@ mod tests {
     fn an_expired_or_revoked_report_does_not_suppress() {
         let c = conn();
         let (cx, cy) = seed_building(&c);
-        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
         for status in [STATUS_EXPIRED, STATUS_REVOKED] {
             c.execute(
                 "UPDATE object_reports SET status = ?",
@@ -926,7 +904,7 @@ mod tests {
     fn reconcile_expires_a_report_whose_record_changed_and_enqueues_its_cell() {
         let c = conn();
         let (cx, cy) = seed_building(&c);
-        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
         c.execute_batch("DELETE FROM match_dirty_cells;").unwrap();
 
         // WERSJA is in BDOT10k's compared_columns, so bumping it is exactly
@@ -957,7 +935,7 @@ mod tests {
     fn reconcile_expires_a_report_whose_record_was_removed() {
         let c = conn();
         seed_building(&c);
-        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
         c.execute_batch("DELETE FROM bdot10k_buildings;").unwrap();
         let stats = reconcile_source(&c, &BDOT10K).unwrap();
         assert_eq!(stats.expired_removed, 1);
@@ -968,7 +946,7 @@ mod tests {
     fn reconcile_leaves_an_unchanged_report_alone() {
         let c = conn();
         seed_building(&c);
-        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
         c.execute_batch("DELETE FROM match_dirty_cells;").unwrap();
         let stats = reconcile_source(&c, &BDOT10K).unwrap();
         assert_eq!(stats, ReconcileStats::default(), "nothing changed upstream");
@@ -1000,7 +978,6 @@ mod tests {
                 spec: &PRG,
                 key: vec!["adr-1".to_string()],
             }],
-            None,
         )
         .unwrap();
 
@@ -1024,7 +1001,7 @@ mod tests {
     fn revoke_since_unwinds_a_burst_and_restores_the_objects() {
         let c = conn();
         let (cx, cy) = seed_building(&c);
-        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
         recompute_cell(&c, "bdot10k", cx, cy).unwrap();
         assert_eq!(count(&c, "SELECT COUNT(*) FROM bdot10k_unmatched"), 0);
 
@@ -1047,7 +1024,7 @@ mod tests {
     fn counts_reports_by_status() {
         let c = conn();
         seed_building(&c);
-        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
         assert_eq!(
             counts(&c).unwrap(),
             ReportCounts {
@@ -1067,16 +1044,17 @@ mod tests {
         );
     }
 
-    /// `reports export` asks for every row, which is `limit: None`. That path
-    /// used to stand in `usize::MAX` and fail the statement outright ("Type
-    /// INT128 with value 18446744073709551615 can't be cast"), because DuckDB
-    /// casts a LIMIT to INT64 — an unlimited list is the one shape no other
-    /// caller exercises, and the whole suite passed with export broken.
+    /// `reports export` asks for every row, which is `limit: None`. Standing in
+    /// `usize::MAX` for that fails the statement outright ("Type INT128 with
+    /// value 18446744073709551615 can't be cast"), because DuckDB casts a LIMIT
+    /// to INT64 — so `None` must omit the clause, not substitute a maximum.
+    /// This is the one shape no other caller exercises, which is exactly why it
+    /// needs its own test: the whole suite passes with export broken.
     #[test]
     fn listing_without_a_limit_returns_every_report() {
         let c = conn();
         seed_building(&c);
-        insert(&c, &[bdot_target(&["04", "bud-1"])], None).unwrap();
+        insert(&c, &[bdot_target(&["04", "bud-1"])]).unwrap();
 
         let all = list(&c, None, None, None, None).unwrap();
         assert_eq!(all.len(), 1);

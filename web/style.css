@@ -565,31 +565,6 @@ button {
 /* ---- report modal (#report-modal) ----
    Shares .feedback-modal's box, backdrop and data-state colouring with
    #download-feedback; only the form inside it is new. */
-.report-note-label {
-  display: block;
-  margin-bottom: 4px;
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--ink-soft);
-}
-#report-note {
-  display: block;
-  width: 100%;
-  box-sizing: border-box;
-  margin-bottom: 12px;
-  padding: 6px 8px;
-  background: var(--paper);
-  color: var(--ink);
-  border: 1px solid var(--line);
-  border-radius: 3px;
-  font-family: var(--font-data);
-  font-size: 12px;
-  /* Vertical only: a horizontal drag would push the textarea past the
-     dialog's max-width and the whole modal would grow with it. */
-  resize: vertical;
-}
 /* #report-submit reuses .download-btn, whose width:100%/margin-top are meant
    for a stacked panel button -- neutralised here so the two actions share one
    row evenly instead of the submit button claiming the whole width. */
