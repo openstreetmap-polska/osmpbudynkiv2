@@ -1,139 +1,56 @@
 # osmpbudynkiv2
 
-_ENG: Tool that prepares packages for JOSM (OpenStreetMap data editor) for easy imports of data from Polish government registries (addresses, buildings). Rewrite of: https://github.com/openstreetmap-polska/gugik2osm_
+_ENG: Tool that prepares packages for JOSM (OpenStreetMap data editor) for easy imports of data from Polish government registries (addresses, buildings). AI rewrite of: https://github.com/openstreetmap-polska/gugik2osm_
 
-Narzędzie do porównywania uwolnionych danych państwowych (adresy, budynki) do danych OpenStreetMap (OSM) i przygotowywania paczek danych ułatwiających dodawanie i aktualizację danych w OSM. Kontynuacja (przepisanie na nowo) poprzedniej wersji: https://github.com/openstreetmap-polska/gugik2osm
+Narzędzie do porównywania uwolnionych danych państwowych (adresy, budynki) do danych OpenStreetMap (OSM) i przygotowywania paczek danych ułatwiających dodawanie i aktualizację danych w OSM. Kontynuacja (przepisanie na nowo z użyciem AI) poprzedniej wersji: https://github.com/openstreetmap-polska/gugik2osm
 
-# Feature roadmap
+## Uruchomienie
 
-Current implementation status against the planned scope (see [`docs/project_ideas.md`](docs/project_ideas.md)):
+_Na tę chwilę plik wykonywalny jest budowany dla systemu Linux x86-64._
 
-## Implemented
+Pobierz spakowaną paczkę z githuba i rozpakuj.
 
-- [x] CLI with TOML configuration (`--config`), built-in defaults, `RUST_LOG` override
-- [x] Storage layer: embedded DuckDB (geospatial/analytical queries) + RocksDB (raw OSM node coordinates and way/relation structure)
-- [x] `import full` — running all imports (OSM, BDOT10k, EGIB, PRG, street-name and building-type mappings) in one command
-- [x] `import osm` — Poland PBF extract (auto-download or local file)
-- [x] `import prg` — address registry ZIP parsed via [prg_convert](https://github.com/ttomasz/prg_convert/), with TERC dictionary support
-- [x] `import bdot10k` / `import egib` — building registries from GeoParquet (auto-download or local file)
-- [x] `update osm` — incremental updates from the minutely OSM replication feed
-- [x] `update prg` / `update bdot10k` / `update egib` — re-download a government dataset and apply only the delta, skipping the refresh entirely when the source ETag is unchanged
-- [x] `compare buildings` (BDOT10k, EGIB) / `compare addresses` (PRG) — spatial matching of government objects against OSM, writing precomputed `*_unmatched` serving tables (`bdot10k_unmatched`, `egib_unmatched`, `prg_unmatched`) that `/tiles` and `/package` read directly
-- [x] Incremental freshness for `*_unmatched` between full compares — government refreshes and OSM updates enqueue the z14 cells they touched into `match_dirty_cells`; the `match_refresh` background job drains that queue by recomputing just those cells; `queue reconcile` re-enqueues every live cell as a safety net or offline rebuild path; `/status` reports queue staleness
-- [x] `run` HTTP server basics: `/health`, `/status` (background job status + match-queue staleness), startup checks, graceful shutdown, read-only connection pool + single writer
-- [x] Background job scheduler (no overlapping runs, timeout handling) with periodic OSM refresh, government-dataset refresh, `match_refresh`/`match_reconcile`, mapping-file refresh and export-log pruning jobs
-- [x] Per-tile change tracking — every refresh records which z14 cells changed (`dataset_change_areas`) alongside a refresh log (`dataset_refreshes`)
-- [x] Vector tile endpoint `/tiles/{z}/{x}/{y}` (MVT) — serves the precomputed `*_unmatched` tables (unmatched government objects, not raw datasets) at every zoom from 5 to 14: aggregated bins at z5–z11, individual points at z12–z13, full geometry with attributes and resolved OSM tags at z14
-- [x] GeoJSON data package endpoint `GET/POST /package` — reads the precomputed `*_unmatched` tables, OSM-ready tags for direct JOSM import (bbox in GET, polygon in POST)
-- [x] `GET /updates` — recent `/package` export activity as a GeoJSON `FeatureCollection`, browser-cacheable for 60 seconds (`?minutes=`, default 60, capped at 1440)
-- [x] Street name corrections for addresses to match the osm conventions (`import street-mappings`)
-- [x] Mappings of building types in egib/bdot10k to osm tags (`import building-types`)
-- [x] Web map frontend (MapLibre GL JS, `web/`) — layer legend, per-feature popups showing source attributes and the tags an import would write, status panel, and package download for either the visible area or a drawn one (rectangle, polygon or freehand)
-- [x] Ignore buildings that are mapped as no longer existing or ruins — OSM ways/relations tagged with a lifecycle-prefixed key (`demolished:building`, `destroyed:building`, `abandoned:building`, `was:building`, `razed:building`, `removed:building`, `disused:building`, `ruins:building`) are imported into `osm_former_buildings` and suppress the government building they overlap from `compare buildings`, instead of proposing it for import. Requires an `import osm` re-run to populate on a database from before this feature (see [`docs/former_buildings.md`](docs/former_buildings.md))
-- [x] Tile caching
-- [x] Endpoint for reporting records to exclude (bad source data, comparison mismatches) — `POST /report` marks a government object as one that should not be proposed for import, keyed on its registry identity. An active report vetoes the object out of the `*_unmatched` serving tables (so out of `/tiles`, `/package` and JOSM) until the underlying record changes, at which point the report is retired automatically and the object becomes importable again. Reported from the map's feature popup, where a reported object stays visible on the "Wszystkie" layer with a "Zgłoszony" status explaining why it is no longer being proposed; managed offline with `reports list|revoke|reconcile|export|import`. Nothing identifying the submitter is stored — see the `[reports]` section of `example_config.toml` for what that means for abuse control
+Dostosuj plik konfiguracyjny.
 
-## Not yet implemented
+Jeżeli chcesz dodać aplikację jako usługę systemową dostosuj też plik usługi systemd.
 
-- [ ] Random location endpoint (jump to an area with data to review)
+Jeżeli chcesz by pobieranie PRG automatycznie pobierało też słowniki TERYT (przydatne jeżeli aplikacja ma działac w trybie ciągłym na serwerze) to skonfiguruj też plik .env lub zmienne środowiskowe.
 
-## Building
+Uruchom plik wykonywalny z parametrem `init`, żeby pobrać wszystkie dane i utworzyć bazę danych (ścieżki do bazy są określone w pliku konfiguracyjnym).
 
-Requires:
+```bash
+osmpbudynkiv2 --config example_config.toml init
+```
 
-- Rust toolchain (install via [rustup](https://rustup.rs/)) — the exact version is pinned in `rust-toolchain.toml` and rustup installs it automatically on the first cargo command
-- A C/C++ compiler
-- **CMake** and a generator it can drive (**Ninja**, or GNU Make) — DuckDB is built through CMake rather than from the single-file amalgamation, so that its bundled jemalloc allocator is compiled in
+Gdy import się zakończy można uruchomić serwer aplikacyjny komendą:
+```bash
+osmpbudynkiv2 --config example_config.toml run
+```
 
-No external DuckDB or RocksDB installation is needed — both are compiled from source as part of the build (first build takes a while due to C++ compilation). DuckDB comes from a git dependency pinned to a tag, so the first build also clones the DuckDB source tree.
+Lub ustawić usługę systemową i uruchamiać ją tak jak inne usługi w danym systemie.
 
+Plik wykonywalny można uruchomić z flagą `--help` żeby zobaczyć wszystkie dostepne komendy.
+
+## Kompilacja
+
+Wymagane komponenty:
+- [rustup](https://rustup.rs/) - pobierze odpowiednią wersję Rust
+- Kompilator C/C++, potrzebny do skompilowania RocksDB i DuckDB
+- CMake, Ninja (lub GNU Make)
+
+Komendy do rozpoczęcia kompilacji całego projektu:
 ```bash
 cargo build             # debug build
 cargo build --release   # optimized release build
 ```
 
+Pierwsza kompilacja będzie trwać dość długo ze względu na konieczność skompilowania wszystkie od zera, a RocksDB i DuckDB to spore projekty, ale kolejne kompilacje przebiegają dość szybko, bo zależności są już zbudowane i przekompilowywany jest sam kod aplikacji.
+
+### Notatki dla AI:
+
 The build reads `.cargo/config.toml`, which points CMake at `cmake/duckdb_version.cmake` to stamp DuckDB's version. Building from outside the repo root, or with `CMAKE_TOOLCHAIN_FILE` already set in the environment, skips that and produces a DuckDB that reports `v0.0.1` and cannot install the `spatial` extension it needs. When bumping the pinned `duckdb` tag, update `cmake/duckdb_version.cmake` to match and force a DuckDB rebuild with `rm -rf target/*/build/libduckdb-sys-* target/*/.fingerprint/libduckdb-sys-*` (`cargo clean -p libduckdb-sys` does not work on a git-sourced package).
 
 Both storage engines are built against jemalloc: DuckDB uses its own bundled, `duckdb_je_`-prefixed copy, while RocksDB pulls in `tikv-jemalloc-sys`, which also replaces the process-wide `malloc`. Set `DUCKDB_DISABLE_JEMALLOC=1` to build DuckDB with its standard allocator instead. On platforms where either build does not support jemalloc (macOS, musl, 32-bit, BSD) the respective flag is a silent no-op and the standard allocator is used.
-
-## Running
-
-```bash
-# Run directly with cargo
-cargo run -- <command>
-
-# Or use the compiled binary
-./target/release/osmpbudynkiv2 <command>
-```
-
-## Setting up a working instance
-
-The `init` command bootstraps a fresh database in one shot: `import full`
-(OSM, BDOT10k, EGIB, PRG, then both mapping CSVs), `update osm` (catches OSM
-up to the current replication sequence, since the bulk PBF extract is
-already somewhat stale by the time it downloads), `compare full` (populates
-the `*_unmatched` serving tables), then `queue drain` (a safety net for
-anything the OSM catch-up enqueued — normally a no-op right after a full
-compare).
-
-```bash
-# 1. Bootstrap everything in one command
-#    (accepts the same --osm-file/--bdot10k-file/--egib-file/--prg-file/
-#    --terc-file/--street-mappings-file/--bdot10k-building-types-file/
-#    --egib-building-types-file flags as `import full`, to use local files
-#    instead of downloading; slowest step by far)
-cargo run --release -- --config config.toml init
-
-# 2. Start the HTTP service (API + web frontend)
-cargo run --release -- --config config.toml run
-```
-
-The mapping CSVs in [`mappings/`](mappings/) are the same files `init`/
-`import full` download by default, so pass them directly (as shown in the
-`import full` example below) to skip the download. Individual `import
-street-mappings` / `import building-types` commands still exist for
-reloading just one mapping later (e.g. after editing a CSV) without
-re-running the whole bulk import — as do standalone `import full` / `update
-osm` / `compare full` / `queue drain`, if you'd rather run (or retry) the
-steps `init` bundles one at a time. Step 1 writes to the database and DuckDB
-allows only one writer process, so **stop the server before re-running it**.
-
-### What happens if you skip a step
-
-| Skipped | Symptom |
-| --- | --- |
-| `import full` (or a single dataset import) | The server refuses to start: `Required table '<name>' is missing`. |
-| `import street-mappings` (or its part of `import full`) | Everything works, but `addr:street` is served exactly as PRG publishes it (`gen. Kruka` instead of `Generała Kruka`). |
-| `import building-types` (or its part of `import full`) | Everything works, but **every** building is exported and previewed as plain `building=yes`, no matter what its BDOT10k/EGIB classification says. There is no warning — the mapping tables are created empty by the schema and the tag resolution simply falls through to its default. |
-| `compare full` | The server starts and logs `serving table '<name>' is empty`; `/tiles` and `/package` return zero features. |
-
-To check what a given database has actually had run against it, read
-`job_run_log` from `/status` — every import records itself there under
-`import:<source>`:
-
-```bash
-curl -s http://127.0.0.1:3000/status | jq '.job_run_log | keys'
-# a fully set-up database lists, at minimum:
-# ["import:bdot10k", "import:building-types", "import:egib", "import:street-mappings", ...]
-```
-
-### Keeping it current
-
-Once set up, the `run` service can keep itself current — enable the background
-jobs in the config (`[jobs.osm_update]`, `[jobs.bdot10k_update]`,
-`[jobs.egib_update]`, `[jobs.prg_update]` to refresh the data,
-`[jobs.match_refresh]` to drain the dirty-cell queue into the serving tables,
-`[jobs.match_reconcile]` as a periodic safety net, and
-`[jobs.street_mappings_update]` / `[jobs.building_types_update]` to re-fetch
-the mapping CSVs). They are all `enabled = false` in
-[`example_config.toml`](example_config.toml), so a config copied from it
-updates nothing until you turn them on. The equivalent offline commands are
-`update osm` / `update bdot10k` / `update egib` / `update prg` followed by
-`compare full` (or `queue reconcile`).
-
-Editing a mapping CSV needs only its `import` command re-run — both mappings
-are applied when a response is built, so they never change *which* objects are
-unmatched and require no `compare`, reconcile or drain.
 
 ### Configuration
 
