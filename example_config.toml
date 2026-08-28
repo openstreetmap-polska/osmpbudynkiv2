@@ -154,13 +154,16 @@ timeout_seconds = 600
 run_on_start = true
 
 # Prunes old rows from the /package export log (see [updates] and the
-# GET /updates endpoint below).
-[jobs.export_log_prune]
+# GET /updates endpoint below) and from the dataset-change-area log.
+[jobs.retention_prune]
 enabled = true
 interval_seconds = 86400
-# How long package_exports rows are kept before being deleted.
-retention_days = 365
 run_on_start = false
+# How long package_exports rows are kept (feeds GET /updates).
+package_exports_days = 365
+# How long dataset_change_areas rows are kept. Must stay comfortably above
+# [changes].max_age_days -- rows older than that are never served anyway.
+change_areas_days = 90
 
 # Government dataset refreshes. Each downloads the current snapshot, diffs it
 # against the live table, and applies only the difference in a single
@@ -319,6 +322,26 @@ max_objects_per_request = 100
 default_minutes = 60
 # Largest ?minutes= value accepted; larger requests get a 400.
 max_minutes = 1440
+
+# The "recently updated" grid overlay: z5-z11 tiles carry, per bin and per
+# source, the most recent time a government refresh reported a change there
+# (from dataset_change_areas). The frontend picks its own window inside this
+# one and evaluates it client-side, so narrowing "last 24 h" costs no refetch.
+[changes]
+# Outer bound on how far back a tile may look. Must be at least as long as the
+# longest window the frontend offers (CHANGES_WINDOW_HOURS in web/app.js,
+# currently 24 h).
+#
+# Beyond that floor, keep it tight rather than generous: every z5-z11 tile
+# scans every change row inside this window nationwide -- the table has no
+# index and no useful cell ordering, so a detected_at bound is the only
+# pruning available -- which makes per-tile cost linear in this value and
+# independent of the tile. Widening it slows the existing grid, not just the
+# overlay.
+#
+# Unrelated to [jobs.retention_prune] change_areas_days, which decides how
+# long the rows are kept; rows older than this are simply never served.
+max_age_days = 7
 
 # Cache-Control policy for every response the `run` HTTP server sends -- see
 # server::http_cache for the one place these turn into actual header bytes

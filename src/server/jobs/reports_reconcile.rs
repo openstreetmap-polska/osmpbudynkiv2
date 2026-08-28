@@ -73,7 +73,7 @@ mod tests {
     use crate::config::Config as AppConfig;
     use crate::db::init_db;
 
-    /// Same shape as `export_log_prune`'s fixture, plus the three source tables
+    /// Same shape as `retention_prune`'s fixture, plus the three source tables
     /// the reconcile reads. They are built by their importers rather than by
     /// `create_schema`, so a test has to declare them — and all three, not just
     /// the one this test reports against: `reconcile_all` sweeps every spec, so
@@ -162,7 +162,7 @@ mod tests {
 
         ReportsReconcileJob.run(&ctx).unwrap();
 
-        // Same reasoning as export_log_prune's no-op test: a zero is a fact
+        // Same reasoning as retention_prune's no-op test: a zero is a fact
         // worth showing in /status, not silence indistinguishable from "this
         // job never ran".
         let conn = ctx.pool.get().unwrap();

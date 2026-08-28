@@ -38,6 +38,17 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // Recently-downloaded /package export areas, fed by GET /updates -- see the
   // updates-fill/updates-outline layers and pollUpdates below.
   const updatesColor = rootStyle.getPropertyValue("--updates").trim();
+  // Grid cells a government registry changed recently -- see the
+  // changes-outline layer and applyChangesVisibility below.
+  const changesColor = rootStyle.getPropertyValue("--changes").trim();
+
+  // How far back "recently" reaches for the changes-outline overlay. Purely a
+  // frontend number: the tile carries a raw Unix-seconds timestamp per source
+  // per bin (ts_bdot10k/ts_egib/ts_prg), and the window is applied here, so
+  // narrowing or widening it costs no refetch. Must stay within the server's
+  // [changes] max_age_days, which bounds what the tile carries at all --
+  // anything older reads as 0 and can never light up however long this is.
+  const CHANGES_WINDOW_HOURS = 24;
 
   // agg_cells carries integer count attributes, but what a given
   // count *means* changes sharply across z5-11: bz = min(z + 5, 14) caps at
@@ -281,9 +292,9 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   // Tiers A (z5..11, aggregated bins) and B (z12..13, individual points) --
   // see src/server/tiles.rs. Both source-layers carry n_bdot10k/n_egib/
-  // n_prg/n_total. Tier A also emits an agg_points source-layer (point per
-  // bin, same aggregate as agg_cells); it fed circle and heatmap styles that
-  // this frontend no longer offers, and nothing here reads it now.
+  // n_prg/n_total; agg_cells also carries the ratio denominators and, per
+  // source, the most recent government change in the bin (ts_bdot10k/
+  // ts_egib/ts_prg, Unix seconds, 0 for "nothing recent").
   //
   // The A/B handoff sits at z11/z12, not z10/z11: at z11 individual unmatched
   // points are still packed close enough (bz caps at 14, so an 8x8-bin z11
@@ -305,6 +316,27 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         "fill-opacity": countOpacityExpr("n_total"),
         "fill-outline-color": paperRaisedColor,
       },
+    },
+    {
+      // Recently-changed bins, as a border over the grid and nothing else:
+      // the fill underneath already spends hue on the ratio and opacity on
+      // the count, so anything data-driven here would compete with both.
+      //
+      // Reads the same source-layer as agg-grid-fill, so it costs no extra
+      // request. Starts hidden and fully transparent: applyChangesVisibility
+      // installs the real line-opacity expression, which is where the window
+      // test lives. It has to be *paint* rather than a layer filter -- a
+      // filter referencing ["global-state", ...] is layout-affecting, so
+      // MapLibre re-parses every visible tile each time the cutoff is
+      // re-stamped, while a paint reference just re-evaluates the property.
+      id: "changes-outline",
+      type: "line",
+      source: "unmatched",
+      "source-layer": "agg_cells",
+      minzoom: 5,
+      maxzoom: 12,
+      layout: { visibility: "none" },
+      paint: { "line-color": changesColor, "line-width": 1.5, "line-opacity": 0 },
     },
     {
       id: "points-dots",
@@ -1170,9 +1202,19 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const legendBuildingsGroup = document.querySelector(".legend-group[data-building-source]");
   const legendAddressesGroup = document.querySelector(".legend-group[data-address-source]");
   const legendUpdatesGroup = document.querySelector(".legend-group[data-updates-source]");
+  const legendChangesGroup = document.querySelector(".legend-group[data-changes-source]");
   const buildingSourceButtons = legendBuildingsGroup.querySelectorAll(".source-btn");
   const addressSourceButtons = legendAddressesGroup.querySelectorAll(".source-btn");
   const updatesSourceButtons = legendUpdatesGroup.querySelectorAll(".source-btn");
+  const changesSourceButtons = legendChangesGroup.querySelectorAll(".source-btn");
+  // The legend restates the window in words; derive it from the constant the
+  // map actually applies, so editing CHANGES_WINDOW_HOURS can't leave the
+  // panel confidently describing a window nothing uses. The HTML carries the
+  // default value so the row reads correctly before this runs.
+  const changesWindowLabel = document.getElementById("changes-window-label");
+  if (changesWindowLabel) {
+    changesWindowLabel.textContent = `Zmiany z ostatnich ${CHANGES_WINDOW_HOURS} h`;
+  }
 
   // "off"/"bdot10k"/"egib" and "off"/"prg": one mutually-exclusive control per
   // category replaces the old pair of "all"/"unmatched" checkboxes -- picking
@@ -1201,6 +1243,16 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   let updatesVisible = legendUpdatesGroup.dataset.updatesSource !== "off";
   for (const b of updatesSourceButtons) {
     b.setAttribute("aria-pressed", String(b.dataset.updatesSource === (updatesVisible ? "on" : "off")));
+  }
+
+  // Same "on"/"off" shape as the updates overlay, and not restored from the
+  // URL hash for the same reason. Defaults *off*, unlike updates: right after
+  // a registry republishes, this lights up a large share of the country at
+  // once, which is useful when you go looking for it and noise when you
+  // don't.
+  let changesVisible = legendChangesGroup.dataset.changesSource !== "off";
+  for (const b of changesSourceButtons) {
+    b.setAttribute("aria-pressed", String(b.dataset.changesSource === (changesVisible ? "on" : "off")));
   }
 
   function setLayerVisible(layerId, visible) {
@@ -1233,6 +1285,57 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   function applyUpdatesVisibility() {
     setLayerVisible("updates-fill", updatesVisible);
     setLayerVisible("updates-outline", updatesVisible);
+  }
+
+  // MapLibre has no `now` expression, so "the last CHANGES_WINDOW_HOURS" has
+  // to be a value someone puts into the style. Stamp it as global state and
+  // re-stamp on a timer, otherwise the window freezes at page load and a tab
+  // left open overnight keeps highlighting yesterday's changes.
+  //
+  // Cheap by construction: changes-outline references the cutoff from paint
+  // only (see the layer above), so a re-stamp re-evaluates one property
+  // instead of re-parsing tiles.
+  const CHANGES_CUTOFF_STATE_KEY = "changesCutoff";
+  const CHANGES_RESTAMP_MS = 60_000;
+
+  function stampChangesCutoff() {
+    map.setGlobalStateProperty(
+      CHANGES_CUTOFF_STATE_KEY,
+      Date.now() / 1000 - CHANGES_WINDOW_HOURS * 3600,
+    );
+  }
+
+  // Per-source, reusing the same activeAggSources() the grid does, so picking
+  // EGiB switches the overlay to EGiB and "Wyłącz" on Budynki leaves only
+  // PRG's borders. Per-source is a *filter*, never a colour: one overlay
+  // colour, whatever it is showing.
+  //
+  // coalesce guards a tile served before ts_* existed (the agg tier is
+  // cached, so one can outlive a deploy by its max-age): `>` against null
+  // throws at evaluation and takes the whole layer down, where 0 just reads
+  // as "nothing recent".
+  function changesRecentExpr(sources) {
+    return [
+      "any",
+      ...sources.map((s) => [
+        ">",
+        ["coalesce", ["get", `ts_${s}`], 0],
+        ["global-state", CHANGES_CUTOFF_STATE_KEY],
+      ]),
+    ];
+  }
+
+  function applyChangesVisibility() {
+    const sources = activeAggSources();
+    const visible = changesVisible && sources.length > 0;
+    setLayerVisible("changes-outline", visible);
+    if (!visible) return;
+    map.setPaintProperty("changes-outline", "line-opacity", [
+      "case",
+      changesRecentExpr(sources),
+      1,
+      0,
+    ]);
   }
 
   function wireLegend() {
@@ -1272,6 +1375,16 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         applyUpdatesVisibility();
       });
     }
+    for (const btn of changesSourceButtons) {
+      btn.addEventListener("click", () => {
+        changesVisible = btn.dataset.changesSource === "on";
+        legendChangesGroup.dataset.changesSource = btn.dataset.changesSource;
+        for (const b of changesSourceButtons) {
+          b.setAttribute("aria-pressed", String(b === btn));
+        }
+        applyChangesVisibility();
+      });
+    }
     // Layer visibility starts as "none" in the style spec above; derive the
     // real initial state from the buttons' own aria-pressed default here
     // instead of duplicating it. updates-fill/-outline have no such default
@@ -1281,6 +1394,11 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     applyBuildingVisibility();
     applyAddressVisibility();
     applyUpdatesVisibility();
+    // changes-outline is driven by applyAggMetric too (it mirrors the same
+    // Budynki/Adresy sources the grid does), but that runs from
+    // wireAggLegend; call it here as well so the overlay is in its correct
+    // state whichever of the two wires first.
+    applyChangesVisibility();
   }
 
   // ---- low-zoom aggregate controls (z5-13) ----
@@ -1325,6 +1443,9 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     }
     if (ratioLegend) ratioLegend.hidden = !visible || aggColor !== "ratio";
     if (countLegend) countLegend.hidden = !visible || aggColor !== "count";
+    // Before the early return: the overlay mirrors the same source set, so
+    // it has to follow "Wyłącz" on both toggles down as well as back up.
+    applyChangesVisibility();
     if (!visible) return;
 
     const ratioMode = aggColor === "ratio";
@@ -1363,12 +1484,23 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     applyAggMetric();
   }
 
+  // Must run before wireLegend/wireAggLegend: both reach applyChangesVisibility,
+  // which builds an expression around the cutoff, and an unstamped
+  // ["global-state", ...] evaluates to null -- which `>` rejects at runtime,
+  // dropping the layer rather than just hiding it.
+  function startChangesCutoffClock() {
+    stampChangesCutoff();
+    setInterval(stampChangesCutoff, CHANGES_RESTAMP_MS);
+  }
+
   if (map.isStyleLoaded()) {
+    startChangesCutoffClock();
     wireLegend();
     wireAggLegend();
     pollUpdates();
   } else {
     map.once("load", () => {
+      startChangesCutoffClock();
       wireLegend();
       wireAggLegend();
       pollUpdates();

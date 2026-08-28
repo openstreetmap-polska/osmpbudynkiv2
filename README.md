@@ -161,7 +161,7 @@ The config file controls:
 - **`[package]`** — `/package` endpoint limits (`max_area_sq_deg`, default 0.04)
 - **`[updates]`** — `/updates` time window limits (`default_minutes`, `max_minutes`)
 - **`[reports]`** — `POST /report` (`enabled`, default true — false makes the route a 404; `max_objects_per_request`, default 100)
-- **`[jobs.*]`** — background jobs, each with `enabled`, `interval_seconds` and a per-run timeout: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, `match_refresh` (drains the dirty-cell queue to keep `*_unmatched` serving tables current; also takes `batch_size`), `match_reconcile` (periodically re-enqueues every live cell as a safety net), `reports_reconcile` (retires reports whose government record changed while this process wasn't the one applying the change), `street_mappings_update` and `building_types_update` (re-fetch the mapping CSVs from `download_urls`), and `export_log_prune` (`retention_days`, default 365). Only one dataset refresh runs at a time, regardless of how the schedules line up.
+- **`[jobs.*]`** — background jobs, each with `enabled`, `interval_seconds` and a per-run timeout: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, `match_refresh` (drains the dirty-cell queue to keep `*_unmatched` serving tables current; also takes `batch_size`), `match_reconcile` (periodically re-enqueues every live cell as a safety net), `reports_reconcile` (retires reports whose government record changed while this process wasn't the one applying the change), `street_mappings_update` and `building_types_update` (re-fetch the mapping CSVs from `download_urls`), and `retention_prune` (prunes both `package_exports` — `package_exports_days`, default 365 — and `dataset_change_areas` — `change_areas_days`, default 90). Only one dataset refresh runs at a time, regardless of how the schedules line up.
 
 All fields are optional — only specify what you want to override. Note that `duckdb_init_commands` is fully replaced if specified (not merged with defaults).
 
@@ -395,13 +395,13 @@ Serves:
 - the web frontend from `web_dir` (default `./web`) — open `http://127.0.0.1:3000/` in a browser
 - `/health` — liveness check
 - `/status` — background job status as JSON, including match-queue staleness (`match_staleness`: pending cell count overall and per source, oldest enqueued timestamp) and per-job last-run outcome (`job_run_log`, keyed by job name — imports appear there as `import:<source>`)
-- `/tiles/{z}/{x}/{y}` — Mapbox Vector Tiles reading the precomputed `*_unmatched` serving tables, in three zoom tiers: z5–z11 aggregated bins (layers `agg_cells`/`agg_points`, same aggregate rendered two ways), z12–z13 one point per unmatched object (layer `points`), z14 full geometry with source attributes and the resolved OSM tags an import would write (layers `buildings`/`addresses`, plus `buildings_all`/`addresses_all` showing every government object, matched or not). Any other zoom returns `204 No Content`
+- `/tiles/{z}/{x}/{y}` — Mapbox Vector Tiles reading the precomputed `*_unmatched` serving tables, in three zoom tiers: z5–z11 aggregated bins (layer `agg_cells`, carrying unmatched counts, their denominators and each source's most recent government change in the bin), z12–z13 one point per unmatched object (layer `points`), z14 full geometry with source attributes and the resolved OSM tags an import would write (layers `buildings`/`addresses`, plus `buildings_all`/`addresses_all` showing every government object, matched or not). Any other zoom returns `204 No Content`
 - `/package` — GeoJSON `FeatureCollection` of government-registry records missing
   from OSM in the requested area, tagged for direct JOSM import. Reads the same
   precomputed `*_unmatched` serving tables as `/tiles` (no live comparison per
   request). The request area (bounding box) is capped by the
   `[package] max_area_sq_deg` config setting (default 0.04 sq deg).
-- `/updates` — recent `/package` export activity (timestamp, area, datasets, feature counts) as GeoJSON, `Cache-Control: public, max-age=60`. A background job prunes entries older than `[jobs.export_log_prune] retention_days` (default 365).
+- `/updates` — recent `/package` export activity (timestamp, area, datasets, feature counts) as GeoJSON, `Cache-Control: public, max-age=60`. A background job prunes entries older than `[jobs.retention_prune] package_exports_days` (default 365).
 - `POST /report` — mark government objects as ones that should not be proposed
   for import. Body is `{"note": ..., "objects": [{"source": ...,
   "key": {...}}]}`, where `key` names exactly the source's key columns
@@ -472,6 +472,11 @@ curl -X POST 'http://127.0.0.1:3000/report' -H 'content-type: application/json' 
 Background jobs (OSM and government-dataset refreshes, the dirty-cell drain,
 mapping refreshes, export-log pruning) run on the schedules in `[jobs.*]` —
 all of them ship disabled in `example_config.toml`.
+
+**Running as a systemd service:** [`deploy/osmpbudynkiv2.service`](deploy/osmpbudynkiv2.service)
+is an example unit for `run`, with install steps and layout assumptions in
+its own comments. It does not run `init`/`import`/`compare` for you — do that
+by hand first, since `run` expects an already-populated database.
 
 ### Street name mappings
 

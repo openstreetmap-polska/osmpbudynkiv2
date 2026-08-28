@@ -157,11 +157,11 @@ pub async fn run(
         timeout: std::time::Duration::from_secs(config.jobs.osm_update.timeout_seconds),
         run_on_start: config.jobs.osm_update.run_on_start,
     };
-    let export_prune_cfg = jobs::JobConfigResolved {
-        enabled: config.jobs.export_log_prune.enabled,
-        interval: std::time::Duration::from_secs(config.jobs.export_log_prune.interval_seconds),
-        timeout: std::time::Duration::from_secs(config.jobs.export_log_prune.timeout_seconds),
-        run_on_start: config.jobs.export_log_prune.run_on_start,
+    let retention_prune_cfg = jobs::JobConfigResolved {
+        enabled: config.jobs.retention_prune.enabled,
+        interval: std::time::Duration::from_secs(config.jobs.retention_prune.interval_seconds),
+        timeout: std::time::Duration::from_secs(config.jobs.retention_prune.timeout_seconds),
+        run_on_start: config.jobs.retention_prune.run_on_start,
     };
     let job_list: Vec<(Arc<dyn jobs::Job>, jobs::JobConfigResolved)> = vec![
         (
@@ -169,8 +169,8 @@ pub async fn run(
             osm_cfg,
         ),
         (
-            Arc::new(jobs::export_log_prune::ExportLogPruneJob) as Arc<dyn jobs::Job>,
-            export_prune_cfg,
+            Arc::new(jobs::retention_prune::RetentionPruneJob) as Arc<dyn jobs::Job>,
+            retention_prune_cfg,
         ),
         (
             Arc::new(jobs::dataset_update::DatasetUpdateJob::new(

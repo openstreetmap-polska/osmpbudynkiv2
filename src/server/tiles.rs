@@ -403,11 +403,17 @@ fn all_buildings_sql(projection: &str) -> String {
 // into the SQL text is safe; the four cell-range bounds stay bound `?`
 // parameters.
 //
-// agg_cells and agg_points are two different final SELECTs over the *same*
-// bins/geo CTEs (`agg_bin_ctes`, shared by both), so the frontend can switch
-// visual styles (grid vs circles vs heatmap) with no backend change -- both
-// layers always describe the same aggregate.
-fn agg_bin_ctes(shift: u32, n: u32) -> String {
+// `agg_bin_ctes` builds the bins/geo CTE chain and `agg_cells_sql` is its only
+// consumer. It once fed a second `agg_points` layer -- the same aggregate as
+// one point per bin -- kept so the frontend could switch between grid, circle
+// and heatmap styles with no backend change. The frontend settled on the grid
+// and stopped reading it, at which point every z5..z11 tile was evaluating this
+// whole chain twice and throwing half the result away, so the layer is gone.
+//
+// `geo` also carries a per-source "last changed at" timestamp, LEFT JOINed in
+// from `dataset_change_areas` -- see the `changes` CTE for why it is a join
+// rather than a fifth union branch.
+fn agg_bin_ctes(shift: u32, n: u32, max_age_days: u64) -> String {
     format!(
         "WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
         bins AS (
@@ -449,17 +455,68 @@ fn agg_bin_ctes(shift: u32, n: u32) -> String {
             ) src
             GROUP BY 1, 2
         ),
+        -- Per-bin \"when did this source last publish a change here\", as Unix
+        -- seconds, for the frontend's recently-updated overlay. LEFT JOINed
+        -- below rather than unioned into `bins`, for two reasons.
+        --
+        -- A union branch *creates* bins. A cell present here and in none of the
+        -- four branches above would become an agg_cells feature with n_* = 0
+        -- and t_* = 0, so `ratio_sql` returns RATIO_UNKNOWN and the frontend
+        -- paints a cell that was not in the grid a moment ago in the \"no
+        -- denominator\" colour. cell_totals gets to be a union branch precisely
+        -- because a totals row *is* a denominator; a change area is not, and
+        -- the mismatch is real rather than hypothetical -- compare::totals
+        -- deletes and re-inserts per cell, so a cell that just lost its last
+        -- object has a change area and no totals row, as does any cell between
+        -- a refresh committing its change areas and the drain recomputing
+        -- totals. And the union is positional (`count(*), 0, 0, 0, 0, 0`), so
+        -- three more columns would mean editing all four branches in lockstep
+        -- and switching these two from sum() to max().
+        --
+        -- The detected_at bound is the only pruning available: the table has no
+        -- index, and insert_change_areas writes via GROUP BY cell_x, cell_y
+        -- under preserve_insertion_order = false, so cell order is arbitrary.
+        -- detected_at *is* non-decreasing in physical order (rows appended per
+        -- refresh, now() being transaction-start-scoped), so row-group zonemaps
+        -- prune on it and nothing else. Consequence to design around: every
+        -- z5..z11 tile scans every change row inside the window nationwide, so
+        -- per-tile cost is linear in changes.max_age_days and independent of
+        -- the tile -- keep that value tight. Drop the bound and every tile
+        -- full-scans a table that only grows, slowing the *existing* grid
+        -- rather than just the overlay. Interpolated, not bound: it comes from
+        -- config, never from the request.
+        changes AS MATERIALIZED (
+            SELECT cell_x >> {shift} AS bin_x, cell_y >> {shift} AS bin_y,
+                   max(CASE WHEN source = 'bdot10k' THEN epoch(detected_at) END)::BIGINT AS ts_bdot10k,
+                   max(CASE WHEN source = 'egib' THEN epoch(detected_at) END)::BIGINT AS ts_egib,
+                   max(CASE WHEN source = 'prg' THEN epoch(detected_at) END)::BIGINT AS ts_prg
+              FROM dataset_change_areas
+             WHERE detected_at >= (now() - INTERVAL '{max_age_days} days')
+               AND cell_x BETWEEN ? AND ? AND cell_y BETWEEN ? AND ?
+             GROUP BY 1, 2
+        ),
         geo AS (
             SELECT bin_x, bin_y, n_bdot10k, n_egib, n_prg,
                    (n_bdot10k + n_egib + n_prg)::INTEGER AS n_total,
                    t_bdot10k, t_egib, t_prg,
                    (t_bdot10k + t_egib + t_prg)::INTEGER AS t_total,
                    {r_bdot10k}, {r_egib}, {r_prg}, {r_total},
+                   -- COALESCE, not a bare column: ST_AsMVT drops NULL
+                   -- attributes entirely, so an unmatched join would leave the
+                   -- key absent and the frontend's `[\"get\", \"ts_egib\"]`
+                   -- comparison silently null instead of false. 0 can never
+                   -- collide with a real value, which is Unix seconds.
+                   --
+                   -- The prefix is ts_, not t_: t_bdot10k/t_egib/t_prg above
+                   -- already mean the ratio *denominators*.
+                   COALESCE(c.ts_bdot10k, 0) AS ts_bdot10k,
+                   COALESCE(c.ts_egib, 0) AS ts_egib,
+                   COALESCE(c.ts_prg, 0) AS ts_prg,
                    bin_x / {n}.0 * 360 - 180 AS lon0,
                    (bin_x + 1) / {n}.0 * 360 - 180 AS lon1,
                    degrees(atan(sinh(pi() * (1 - 2 * bin_y / {n}.0)))) AS lat_north,
                    degrees(atan(sinh(pi() * (1 - 2 * (bin_y + 1) / {n}.0)))) AS lat_south
-            FROM bins
+            FROM bins b LEFT JOIN changes c USING (bin_x, bin_y)
         )
         ",
         r_bdot10k = ratio_sql("n_bdot10k", "t_bdot10k", "r_bdot10k"),
@@ -504,7 +561,7 @@ const RATIO_UNKNOWN: f64 = -1.0;
 /// extent. Latitude decreases as bin_y increases, so `lat_south` (derived
 /// from `bin_y + 1`) is the envelope's min and `lat_north` (from `bin_y`) is
 /// its max -- `ST_MakeEnvelope` wants (min_lon, min_lat, max_lon, max_lat).
-fn agg_cells_sql(shift: u32, n: u32) -> String {
+fn agg_cells_sql(shift: u32, n: u32, max_age_days: u64) -> String {
     format!(
         "{}
         SELECT ST_AsMVT(t, 'agg_cells', 4096, 'geom') AS mvt
@@ -514,33 +571,12 @@ fn agg_cells_sql(shift: u32, n: u32) -> String {
                        bbox.geom, 4096, 256, true) AS geom,
                    geo.n_bdot10k, geo.n_egib, geo.n_prg, geo.n_total,
                    geo.t_bdot10k, geo.t_egib, geo.t_prg, geo.t_total,
-                   geo.r_bdot10k, geo.r_egib, geo.r_prg, geo.r_total
+                   geo.r_bdot10k, geo.r_egib, geo.r_prg, geo.r_total,
+                   geo.ts_bdot10k, geo.ts_egib, geo.ts_prg
             FROM geo, bbox
         ) t
         WHERE t.geom IS NOT NULL",
-        agg_bin_ctes(shift, n)
-    )
-}
-
-/// `agg_points`: each bin's centre as a point, same attributes as
-/// `agg_cells` -- the frontend picks between the two layers purely by
-/// toggling layer visibility client-side, no query difference beyond
-/// geometry shape.
-fn agg_points_sql(shift: u32, n: u32) -> String {
-    format!(
-        "{}
-        SELECT ST_AsMVT(t, 'agg_points', 4096, 'geom') AS mvt
-        FROM (
-            SELECT ST_AsMVTGeom(
-                       ST_Point((geo.lon0 + geo.lon1) / 2, (geo.lat_north + geo.lat_south) / 2),
-                       bbox.geom, 4096, 256, true) AS geom,
-                   geo.n_bdot10k, geo.n_egib, geo.n_prg, geo.n_total,
-                   geo.t_bdot10k, geo.t_egib, geo.t_prg, geo.t_total,
-                   geo.r_bdot10k, geo.r_egib, geo.r_prg, geo.r_total
-            FROM geo, bbox
-        ) t
-        WHERE t.geom IS NOT NULL",
-        agg_bin_ctes(shift, n)
+        agg_bin_ctes(shift, n, max_age_days)
     )
 }
 
@@ -829,10 +865,12 @@ fn query_mvt_layer(
     }
 }
 
-/// Tier A dispatch (z5..=z11): two layers (`agg_cells`/`agg_points`), one
-/// shared aggregate. See `agg_bin_ctes` above for the design rationale.
+/// Tier A dispatch (z5..=z11): one layer (`agg_cells`) -- binned unmatched
+/// counts, their denominators, and each source's most recent government
+/// change in the bin. See `agg_bin_ctes` above for the design rationale.
 async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
     let cache_header = state.cache_headers.agg_tile.clone();
+    let max_age_days = state.config.changes.max_age_days;
     let bz = (z + 5).min(14);
     let shift = 14 - bz;
     let n: u32 = 1u32 << bz;
@@ -846,18 +884,17 @@ async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
     let hi_y = (((y + 1) << cell_shift) - 1) as i32;
 
     let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
-    let cells_sql = agg_cells_sql(shift, n);
-    let points_sql = agg_points_sql(shift, n);
+    let cells_sql = agg_cells_sql(shift, n, max_age_days);
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = state
             .pool
             .get()
             .context("Failed to acquire pool connection")?;
-        // Same four-bound-group shape as every other query in this file: the
-        // bbox CTE, then one (lo_x, hi_x, lo_y, hi_y) group per unioned
-        // source table.
-        let cells = query_mvt_layer(
+        // Same bound-group shape as every other query in this file: the bbox
+        // CTE, then one (lo_x, hi_x, lo_y, hi_y) group per source table, in
+        // the order the CTEs spell them out.
+        query_mvt_layer(
             &conn,
             &cells_sql,
             duckdb::params![
@@ -866,20 +903,9 @@ async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
                 lo_x, hi_x, lo_y, hi_y, // egib_unmatched filter
                 lo_x, hi_x, lo_y, hi_y, // prg_unmatched filter
                 lo_x, hi_x, lo_y, hi_y, // cell_totals filter (denominators)
+                lo_x, hi_x, lo_y, hi_y, // dataset_change_areas filter
             ],
-        )?;
-        let points = query_mvt_layer(
-            &conn,
-            &points_sql,
-            duckdb::params![
-                min_lon, min_lat, max_lon, max_lat, // bbox CTE
-                lo_x, hi_x, lo_y, hi_y, // bdot10k_unmatched filter
-                lo_x, hi_x, lo_y, hi_y, // egib_unmatched filter
-                lo_x, hi_x, lo_y, hi_y, // prg_unmatched filter
-                lo_x, hi_x, lo_y, hi_y, // cell_totals filter (denominators)
-            ],
-        )?;
-        Ok::<Vec<u8>, anyhow::Error>([cells, points].concat())
+        )
     })
     .await;
 
@@ -1159,6 +1185,13 @@ mod tests {
         let init = vec![
             "INSTALL spatial".to_string(),
             "LOAD spatial".to_string(),
+            // icu, like every other fixture in this crate and like
+            // `Config::default`'s own init list: without it DuckDB has no
+            // `TIMESTAMP WITH TIME ZONE - INTERVAL` overload, so the Tier A
+            // query's `detected_at >= (now() - INTERVAL ...)` bound fails to
+            // bind and every z5..z11 tile 500s.
+            "INSTALL icu".to_string(),
+            "LOAD icu".to_string(),
             "SET geometry_always_xy = true".to_string(),
         ];
         let conn = crate::db::init_db(Path::new(":memory:"), &init, None).unwrap();
@@ -1267,11 +1300,15 @@ mod tests {
     /// Tier A (z5..=z11): seeds one row per source table at z14 cell
     /// (8000, 4900) and requests the z6 tile that bit-shift-contains it
     /// (31, 19 -- verified: 8000 >> 8 = 31, 4900 >> 8 = 19, matching
-    /// shift = 14 - 6 = 8). Asserts both MVT layers this tier emits are
-    /// present, sharing the one aggregate (`agg_bin_ctes`), plus at least
-    /// one of the integer count attributes they both carry.
+    /// shift = 14 - 6 = 8). Asserts the one MVT layer this tier emits, plus
+    /// every attribute it carries.
+    ///
+    /// `agg_points` -- a second layer with the same attributes, one point per
+    /// bin -- is asserted *absent*: nothing reads it, and emitting it meant
+    /// evaluating `agg_bin_ctes` twice per tile. Without the negative
+    /// assertion it could quietly come back.
     #[tokio::test]
-    async fn aggregated_tile_exposes_agg_cells_and_agg_points_layers() {
+    async fn aggregated_tile_exposes_the_agg_cells_layer_and_not_agg_points() {
         let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
         let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
         let seed = format!(
@@ -1288,7 +1325,10 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let body = String::from_utf8_lossy(&bytes);
         assert!(body.contains("agg_cells"), "missing agg_cells layer");
-        assert!(body.contains("agg_points"), "missing agg_points layer");
+        assert!(
+            !body.contains("agg_points"),
+            "agg_points layer is unused and must not be emitted"
+        );
         for attr in ["n_bdot10k", "n_egib", "n_prg", "n_total"] {
             assert!(body.contains(attr), "missing {attr} count attribute");
         }
@@ -1298,6 +1338,250 @@ mod tests {
         for attr in ["r_bdot10k", "r_egib", "r_prg", "r_total"] {
             assert!(body.contains(attr), "missing {attr} ratio attribute");
         }
+        // Key presence only -- ST_AsMVT leaves an attribute's *key* in the
+        // layer dictionary even when it drops every value, so the values
+        // themselves are pinned by the agg_bins tests below instead.
+        for attr in ["ts_bdot10k", "ts_egib", "ts_prg"] {
+            assert!(body.contains(attr), "missing {attr} change-time attribute");
+        }
+    }
+
+    /// One `geo` row as `agg_bin_ctes` computes it.
+    ///
+    /// `ts_*` are `Option<i64>` on purpose: the whole point of the `COALESCE`
+    /// in `geo` is that an unmatched LEFT JOIN must read 0 rather than NULL,
+    /// and `None` here is exactly the state that would make `ST_AsMVT` drop
+    /// the attribute and leave the frontend's `["get", "ts_egib"]` comparison
+    /// silently null instead of false.
+    #[derive(Debug, PartialEq)]
+    struct AggBin {
+        bin_x: i32,
+        bin_y: i32,
+        n_total: i32,
+        t_total: i32,
+        r_total: f64,
+        ts_bdot10k: Option<i64>,
+        ts_egib: Option<i64>,
+        ts_prg: Option<i64>,
+    }
+
+    /// Reads the bins for a tile straight out of `geo`, with the same bound
+    /// parameters `serve_tile_agg` passes.
+    ///
+    /// Grepping a rendered tile proves an attribute *key* exists but says
+    /// nothing about its values -- `ST_AsMVT` writes the key into the layer
+    /// dictionary even when it drops every value it was given. These tests are
+    /// about values, so they go around the MVT encoding rather than through it.
+    fn agg_bins(state: &AppState, z: u32, x: u32, y: u32) -> Vec<AggBin> {
+        let bz = (z + 5).min(14);
+        let shift = 14 - bz;
+        let n: u32 = 1u32 << bz;
+        let cell_shift = 14 - z;
+        let lo_x = (x << cell_shift) as i32;
+        let hi_x = (((x + 1) << cell_shift) - 1) as i32;
+        let lo_y = (y << cell_shift) as i32;
+        let hi_y = (((y + 1) << cell_shift) - 1) as i32;
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
+
+        let sql = format!(
+            "{}
+             SELECT bin_x, bin_y, n_total, t_total, r_total,
+                    ts_bdot10k, ts_egib, ts_prg
+             FROM geo ORDER BY bin_x, bin_y",
+            agg_bin_ctes(shift, n, state.config.changes.max_age_days)
+        );
+        let conn = state.pool.get().unwrap();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows = stmt
+            .query_map(
+                duckdb::params![
+                    min_lon, min_lat, max_lon, max_lat, // bbox CTE
+                    lo_x, hi_x, lo_y, hi_y, // bdot10k_unmatched
+                    lo_x, hi_x, lo_y, hi_y, // egib_unmatched
+                    lo_x, hi_x, lo_y, hi_y, // prg_unmatched
+                    lo_x, hi_x, lo_y, hi_y, // cell_totals
+                    lo_x, hi_x, lo_y, hi_y, // dataset_change_areas
+                ],
+                |r| {
+                    Ok(AggBin {
+                        bin_x: r.get(0)?,
+                        bin_y: r.get(1)?,
+                        n_total: r.get(2)?,
+                        t_total: r.get(3)?,
+                        r_total: r.get(4)?,
+                        ts_bdot10k: r.get(5)?,
+                        ts_egib: r.get(6)?,
+                        ts_prg: r.get(7)?,
+                    })
+                },
+            )
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn exec(state: &AppState, sql: &str) {
+        state.pool.get().unwrap().execute_batch(sql).unwrap();
+    }
+
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// A `dataset_change_areas` row inside the tile's cell range, `age_days`
+    /// old. `cell_z` is `tile_math::CHANGE_CELL_ZOOM` (14), matching what
+    /// `update::changeset::insert_change_areas` writes.
+    fn change_area(source: &str, cell_x: i32, cell_y: i32, age_days: f64) -> String {
+        format!(
+            "INSERT INTO dataset_change_areas
+                 (snapshot_id, source, cell_z, cell_x, cell_y, added, modified, removed, detected_at)
+             VALUES (1, '{source}', 14, {cell_x}, {cell_y}, 1, 0, 0,
+                     now() - INTERVAL '{age_days} days');"
+        )
+    }
+
+    /// One unmatched building and its denominator in z14 cell (8000, 4900),
+    /// so the change-area tests below have a bin to decorate. Requested as
+    /// z6/31/19, whose cell range is 7936..8191 x 4864..5119 (cell_shift = 8);
+    /// binning is a *different* shift (bz = 11, shift = 3), so cell 8000 lands
+    /// in bin 8000 >> 3 = 1000 and cell 4900 in bin 4900 >> 3 = 612.
+    fn changes_seed() -> String {
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+        format!(
+            "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at) VALUES
+                 ('b1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());
+             INSERT INTO cell_totals (source, cell_x, cell_y, total) VALUES
+                 ('bdot10k', 8000, 4900, 4);"
+        )
+    }
+
+    /// Each source's `ts_*` is the *most recent* change anywhere in the bin --
+    /// several z14 cells collapse into one bin at every zoom below 9, so the
+    /// aggregate has to be `max`, not "whichever row the join happened to see".
+    /// A source with no change rows at all reads `Some(0)`, never `None`.
+    #[test]
+    fn agg_cells_carry_each_sources_most_recent_change_time() {
+        let mut seed = changes_seed();
+        // Two bdot10k changes in the same bin (8000 >> 3 == 8005 >> 3 == 1000),
+        // the newer one second, so a max() regression shows up as the older.
+        seed.push_str(&change_area("bdot10k", 8000, 4900, 3.0));
+        seed.push_str(&change_area("bdot10k", 8005, 4900, 0.0));
+        seed.push_str(&change_area("prg", 8000, 4900, 2.0));
+        let state = make_state(&seed);
+
+        let bins = agg_bins(&state, 6, 31, 19);
+        assert_eq!(bins.len(), 1, "expected exactly one bin, got {bins:?}");
+        let bin = &bins[0];
+        assert_eq!((bin.bin_x, bin.bin_y), (1000, 612));
+
+        let now = unix_now();
+        let ts_bdot10k = bin.ts_bdot10k.expect("ts_bdot10k must never be NULL");
+        assert!(
+            (ts_bdot10k - now).abs() < 300,
+            "ts_bdot10k should be the newest of the two bdot10k changes \
+             (~{now}), got {ts_bdot10k}"
+        );
+        let ts_prg = bin.ts_prg.expect("ts_prg must never be NULL");
+        assert!(
+            (ts_prg - (now - 2 * 86_400)).abs() < 300,
+            "ts_prg should be ~2 days old, got {ts_prg}"
+        );
+        // The COALESCE: egib has no change rows here, and the difference
+        // between 0 and NULL is the difference between a frontend filter that
+        // evaluates to false and one that evaluates to null.
+        assert_eq!(bin.ts_egib, Some(0));
+    }
+
+    /// The `detected_at` bound is what keeps every z5..z11 tile from scanning
+    /// the whole change table, so a row beyond `changes.max_age_days` must not
+    /// reach the tile at all -- it reads as "never changed", exactly like a
+    /// source with no rows.
+    #[test]
+    fn a_change_older_than_max_age_days_reads_as_zero() {
+        let mut seed = changes_seed();
+        seed.push_str(&change_area("egib", 8000, 4900, 60.0));
+        let state = make_state(&seed);
+        assert_eq!(state.config.changes.max_age_days, 7);
+
+        let bins = agg_bins(&state, 6, 31, 19);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].ts_egib, Some(0));
+    }
+
+    /// The cell-range bounds are bound parameters on the change CTE too, not
+    /// just on the four source scans -- without them a change anywhere in the
+    /// country would decorate every tile whose bin coordinates happened to
+    /// collide.
+    #[test]
+    fn a_change_outside_the_tiles_cell_range_is_ignored() {
+        let mut seed = changes_seed();
+        // Cell range for z6/31/19 is 7936..8191; 9000 is well outside it.
+        seed.push_str(&change_area("bdot10k", 9000, 4900, 0.0));
+        let state = make_state(&seed);
+
+        let bins = agg_bins(&state, 6, 31, 19);
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].ts_bdot10k, Some(0));
+    }
+
+    /// Why the change data is LEFT JOINed rather than unioned into `bins`: a
+    /// union branch *creates* bins, and a bin standing on change data alone
+    /// has no denominator, so `ratio_sql` gives it RATIO_UNKNOWN and the
+    /// frontend paints a cell that was not in the grid a moment ago in the
+    /// "no denominator" colour. The situation is ordinary -- a cell whose last
+    /// object was just matched away has a change area and no totals row.
+    #[test]
+    fn change_rows_in_a_cell_with_no_grid_data_add_no_bin() {
+        let state = make_state(&changes_seed());
+        let before = agg_bins(&state, 6, 31, 19);
+        assert_eq!(before.len(), 1);
+
+        // Same tile, a different bin: 8008 >> 3 = 1001, not 1000.
+        exec(&state, &change_area("bdot10k", 8008, 4900, 0.0));
+
+        let after = agg_bins(&state, 6, 31, 19);
+        assert_eq!(
+            after, before,
+            "a change area with no grid cell to decorate must draw nothing"
+        );
+    }
+
+    /// The join must decorate the grid, never alter it. A regression here --
+    /// a fan-out duplicating a bin's counts, say -- would repaint the map
+    /// while every "does the overlay work" test still passed.
+    #[test]
+    fn the_change_join_does_not_perturb_the_counts() {
+        let state = make_state(&changes_seed());
+        let before = agg_bins(&state, 6, 31, 19);
+        assert_eq!(before.len(), 1);
+        assert_eq!((before[0].n_total, before[0].t_total), (1, 4));
+
+        // Three change rows landing in this one bin, from two sources.
+        let mut more = change_area("bdot10k", 8000, 4900, 0.0);
+        more.push_str(&change_area("bdot10k", 8001, 4900, 1.0));
+        more.push_str(&change_area("prg", 8002, 4900, 0.5));
+        exec(&state, &more);
+
+        let after = agg_bins(&state, 6, 31, 19);
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            (
+                after[0].bin_x,
+                after[0].bin_y,
+                after[0].n_total,
+                after[0].t_total
+            ),
+            (
+                before[0].bin_x,
+                before[0].bin_y,
+                before[0].n_total,
+                before[0].t_total
+            )
+        );
+        assert_eq!(after[0].r_total, before[0].r_total);
     }
 
     /// The payoff of carrying denominators at all: a cell whose government

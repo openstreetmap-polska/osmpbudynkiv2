@@ -87,6 +87,7 @@ pub struct Config {
     pub jobs: JobsConfig,
     pub package: PackageConfig,
     pub updates: UpdatesConfig,
+    pub changes: ChangesConfig,
     pub cache: CacheConfig,
     pub reports: ReportsConfig,
 }
@@ -166,24 +167,29 @@ impl Default for OsmUpdateConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
-pub struct ExportLogPruneConfig {
+pub struct RetentionPruneConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub timeout_seconds: u64,
     /// See `JobConfig::run_on_start`.
     pub run_on_start: bool,
-    /// How long package_exports rows are kept before being pruned.
-    pub retention_days: u64,
+    /// How long `package_exports` rows are kept (feeds `GET /updates`).
+    pub package_exports_days: u64,
+    /// How long `dataset_change_areas` rows are kept. Must stay comfortably
+    /// above `[changes].max_age_days` -- rows older than that are never
+    /// served anyway.
+    pub change_areas_days: u64,
 }
 
-impl Default for ExportLogPruneConfig {
+impl Default for RetentionPruneConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             interval_seconds: 86400,
             timeout_seconds: 60,
             run_on_start: true,
-            retention_days: 365,
+            package_exports_days: 365,
+            change_areas_days: 90,
         }
     }
 }
@@ -303,6 +309,36 @@ impl Default for UpdatesConfig {
     }
 }
 
+/// The recently-updated grid overlay: how far back a z5..z11 tile may carry
+/// `dataset_change_areas` timestamps. See `server::tiles::agg_bin_ctes`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct ChangesConfig {
+    /// Outer bound on the overlay's reach. The frontend picks its own,
+    /// shorter window inside this one and evaluates it client-side, so this
+    /// must be at least as long as the longest window the frontend offers
+    /// (`CHANGES_WINDOW_HOURS` in `web/app.js`, currently 24 h).
+    ///
+    /// Beyond that floor, keep it tight rather than generous. Every z5..z11
+    /// tile scans every change row inside this window nationwide -- that is
+    /// the only pruning `dataset_change_areas` supports, having no index and
+    /// no useful cell ordering -- so per-tile cost is linear in this value and
+    /// independent of the tile. 7 days is 7x headroom over the only window
+    /// that exists, survives a week-long stall of the daily refresh jobs, and
+    /// leaves room for a "last week" preset with no server change.
+    ///
+    /// Unrelated to `jobs.retention_prune.change_areas_days`, which decides
+    /// how long the rows are *kept*; rows older than this are simply never
+    /// served.
+    pub max_age_days: u64,
+}
+
+impl Default for ChangesConfig {
+    fn default() -> Self {
+        Self { max_age_days: 7 }
+    }
+}
+
 /// `Cache-Control` policy for every response the `run` HTTP server sends --
 /// see `server::http_cache` for the one place these values turn into actual
 /// header bytes and the full per-endpoint policy table.
@@ -353,7 +389,7 @@ impl Default for CacheConfig {
 #[serde(default)]
 pub struct JobsConfig {
     pub osm_update: OsmUpdateConfig,
-    pub export_log_prune: ExportLogPruneConfig,
+    pub retention_prune: RetentionPruneConfig,
     pub bdot10k_update: JobConfig,
     pub egib_update: JobConfig,
     pub prg_update: JobConfig,
@@ -376,7 +412,7 @@ impl Default for JobsConfig {
         };
         Self {
             osm_update: OsmUpdateConfig::default(),
-            export_log_prune: ExportLogPruneConfig::default(),
+            retention_prune: RetentionPruneConfig::default(),
             bdot10k_update: daily(3600),
             egib_update: daily(3600),
             // PRG streams ~16 GML files out of a ~1.7GB zip, so it needs longer.
@@ -500,6 +536,7 @@ impl Default for Config {
             jobs: JobsConfig::default(),
             package: PackageConfig::default(),
             updates: UpdatesConfig::default(),
+            changes: ChangesConfig::default(),
             cache: CacheConfig::default(),
             reports: ReportsConfig::default(),
         }
@@ -864,34 +901,37 @@ max_area_sq_deg = 0.1
     }
 
     #[test]
-    fn test_export_log_prune_config_defaults() {
+    fn test_retention_prune_config_defaults() {
         let config = load_config(None).unwrap();
-        assert!(config.jobs.export_log_prune.enabled);
-        assert_eq!(config.jobs.export_log_prune.interval_seconds, 86400);
-        assert_eq!(config.jobs.export_log_prune.timeout_seconds, 60);
-        assert_eq!(config.jobs.export_log_prune.retention_days, 365);
+        assert!(config.jobs.retention_prune.enabled);
+        assert_eq!(config.jobs.retention_prune.interval_seconds, 86400);
+        assert_eq!(config.jobs.retention_prune.timeout_seconds, 60);
+        assert_eq!(config.jobs.retention_prune.package_exports_days, 365);
+        assert_eq!(config.jobs.retention_prune.change_areas_days, 90);
     }
 
     #[test]
-    fn test_export_log_prune_config_override() {
+    fn test_retention_prune_config_override() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         write!(
             tmp,
             r#"
-[jobs.export_log_prune]
+[jobs.retention_prune]
 enabled = false
 interval_seconds = 3600
 timeout_seconds = 30
-retention_days = 30
+package_exports_days = 30
+change_areas_days = 14
 "#
         )
         .unwrap();
 
         let config = load_config(Some(tmp.path())).unwrap();
-        assert!(!config.jobs.export_log_prune.enabled);
-        assert_eq!(config.jobs.export_log_prune.interval_seconds, 3600);
-        assert_eq!(config.jobs.export_log_prune.timeout_seconds, 30);
-        assert_eq!(config.jobs.export_log_prune.retention_days, 30);
+        assert!(!config.jobs.retention_prune.enabled);
+        assert_eq!(config.jobs.retention_prune.interval_seconds, 3600);
+        assert_eq!(config.jobs.retention_prune.timeout_seconds, 30);
+        assert_eq!(config.jobs.retention_prune.package_exports_days, 30);
+        assert_eq!(config.jobs.retention_prune.change_areas_days, 14);
     }
 
     #[test]
@@ -917,6 +957,28 @@ max_minutes = 720
         let config = load_config(Some(tmp.path())).unwrap();
         assert_eq!(config.updates.default_minutes, 30);
         assert_eq!(config.updates.max_minutes, 720);
+    }
+
+    #[test]
+    fn test_changes_config_defaults() {
+        let config = load_config(None).unwrap();
+        assert_eq!(config.changes.max_age_days, 7);
+    }
+
+    #[test]
+    fn test_changes_config_override() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+[changes]
+max_age_days = 2
+"#
+        )
+        .unwrap();
+
+        let config = load_config(Some(tmp.path())).unwrap();
+        assert_eq!(config.changes.max_age_days, 2);
     }
 
     #[test]

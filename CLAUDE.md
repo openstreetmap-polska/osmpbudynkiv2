@@ -115,6 +115,30 @@ per-tile `dataset_change_areas` rows all commit in one transaction; change areas
 are written **before** the delta, because they read the pre-update geometry of
 removed/modified rows out of the live table.
 
+**Gotcha — `dataset_change_areas` is read by `/tiles`, and three numbers in
+three files have to stay ordered.** `server::tiles::agg_bin_ctes` LEFT JOINs it
+into every z5–z11 tile as a per-bin, per-source `ts_*` timestamp, which the
+frontend compares against its own window. So: `web/app.js`'s
+`CHANGES_WINDOW_HOURS` (24) ≤ `[changes] max_age_days` (7) ≤
+`[jobs.retention_prune] change_areas_days` (90). Violate either inequality and
+nothing errors — the overlay just goes blind for the tail of the window it
+still advertises. Two further consequences:
+
+- **Per-tile cost is linear in `max_age_days` and independent of the tile.**
+  The table has no index and no useful cell ordering (`insert_change_areas`
+  writes via `GROUP BY cell_x, cell_y` under `preserve_insertion_order =
+  false`), so the `detected_at` bound is the only pruning there is — zonemaps
+  work on it because rows are appended per refresh. Widening `max_age_days`
+  slows the **existing grid**, not just the overlay, because the read sits
+  inside the main aggregate query. Measured on a 90-day, 3.6M-row table: the
+  7-day bound scans 280k rows.
+- **`LEFT JOIN`, never a fifth `UNION ALL` branch into `bins`.** A union branch
+  *creates* bins, and a bin standing on change data alone has no denominator,
+  so `ratio_sql` gives it `RATIO_UNKNOWN` and the frontend paints a cell that
+  was not in the grid before. `cell_totals` gets to be a union branch precisely
+  because a totals row *is* a denominator. Pinned by
+  `tiles::tests::change_rows_in_a_cell_with_no_grid_data_add_no_bin`.
+
 **Gotcha — change detection is configured per source, and each configuration is
 a measured choice.** A refresh decides "modified" by joining on the record key
 and comparing a *named list* of columns — never a whole-row hash, which cannot
@@ -836,7 +860,12 @@ tile cached for even a minute turns a transient DB hiccup into an outage that
 outlives it, which is also why a 500 never carries an `ETag`. Only z14 gets an
 `ETag`: z5..=z13 are the aggregated/point tiers and `serving_version`'s coverage
 is z14-cell-shaped, so falling back to the epoch alone would pin them stale until
-the next bump — strictly worse than the plain TTL they already get. The
+the next bump — strictly worse than the plain TTL they already get. **A second
+reason has since attached itself to that:** the z5–z11 tile's `ts_*` attributes
+are bounded by `now() - [changes] max_age_days`, so its *content* moves with
+wall-clock time while nothing in `serving_version` does. Giving that tier an
+`ETag` — or a `TileCache` entry — would freeze the recently-updated overlay at
+whatever the first request happened to compute. The
 static-asset middleware classifies purely on **response status**, not a filename
 list: a 404 is left header-less and inherits `no-store`, while anything `ServeDir`
 actually served — including its own `304` — gets at least `no-cache`, with

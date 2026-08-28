@@ -98,6 +98,18 @@
      always-light OSM raster specifically) since this also has to read
      clearly as a legend swatch against the panel's own dark background. */
   --updates: #d97706;
+  /* Grid cells a government registry published a change in recently
+     (changes-outline in app.js, driven by agg_cells' ts_bdot10k/ts_egib/
+     ts_prg). Green is what's left: red is unmatched buildings, blue unmatched
+     addresses, purple the ratio ramp this outline draws directly on top of,
+     yellow-to-magenta the count ramp, orange --updates. --draw-outline's teal
+     is the near miss, and it's tolerable because the draw overlay is a
+     transient interaction the user is deliberately looking at rather than a
+     standing data layer. Redefined for dark mode for the same reason
+     --updates is: it also has to read as a legend swatch against the panel's
+     dark background, even though the map under it is always the light
+     raster. */
+  --changes: #1f9d55;
   --font-label: ui-sans-serif, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --font-data: ui-monospace, "SFMono-Regular", "IBM Plex Mono", Menlo, Consolas, monospace;
 }
@@ -122,6 +134,7 @@
     --ramp-4: #ef5b6b;
     --ramp-5: #b8496f;
     --updates: #f0a03c;
+    --changes: #4ade80;
     /* --ratio-0.._4 are intentionally absent -- see their definition above:
        they paint onto a basemap that is light in both themes. Only the
        sentinel is re-tuned, since it also has to hold up in the legend. */
@@ -563,6 +576,15 @@ body {
 .swatch[data-swatch="updates"] {
   background: color-mix(in srgb, var(--updates) 20%, transparent);
   border-left-color: var(--updates);
+}
+
+/* changes-outline paints a border and no fill, so its swatch is an outlined
+   square rather than the tinted-fill recipe above -- a filled swatch would
+   claim the layer covers an area it never covers. `border` (not just
+   border-left) overrides .swatch's 3px left edge on all four sides. */
+.swatch[data-swatch="changes"] {
+  background: transparent;
+  border: 2px solid var(--changes);
 }
 
 .hint {
