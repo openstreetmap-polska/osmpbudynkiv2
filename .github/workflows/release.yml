@@ -36,16 +36,28 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
-    # `libduckdb-sys` autodetects Ninja and silently falls back to CMake's
-    # default generator when it is absent. The two write to *different*
-    # output directories (`out/cmake-ninja` vs the default), so a runner image
-    # that gains or loses Ninja later would invalidate the cached DuckDB build
-    # without anything in this repo changing. Installing it explicitly makes
-    # the choice ours rather than the image's.
-    - name: Install Ninja
+    # Two separate reasons, both about not inheriting the runner image's
+    # choices:
+    #
+    # `ninja-build` — `libduckdb-sys` autodetects Ninja and silently falls
+    # back to CMake's default generator when it is absent. The two write to
+    # *different* output directories (`out/cmake-ninja` vs the default), so a
+    # runner image that gains or loses Ninja later would invalidate the cached
+    # DuckDB build without anything in this repo changing.
+    #
+    # `clang libclang-dev` — `rust-librocksdb-sys` runs `bindgen`, which loads
+    # `libclang.so` at build-script time via `clang-sys`. The image is not
+    # guaranteed to carry one: without it the build dies in `clang-sys`'s
+    # build script with "couldn't find any valid shared libraries matching:
+    # ['libclang.so', 'libclang-*.so']", long before any of our own code
+    # compiles. `libclang-dev` is the package that actually provides the
+    # shared library `clang-sys` dlopens; the `llvm-config` line in that error
+    # is only its fallback search path, so installing `llvm-dev` instead would
+    # not fix it.
+    - name: Install build tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y ninja-build
+        sudo apt-get install -y ninja-build clang libclang-dev
 
     # CMake itself comes from the runner image. Logging the versions makes a
     # future "it broke and nothing changed" traceable to an image bump.
@@ -54,6 +66,7 @@ jobs:
         cmake --version | head -1
         ninja --version
         cc --version | head -1
+        clang --version | head -1
 
     # The Rust version is not restated here on purpose: rustup reads
     # rust-toolchain.toml, so the pin keeps the single home it has in the repo
