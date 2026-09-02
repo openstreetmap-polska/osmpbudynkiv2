@@ -46,431 +46,122 @@ cargo build --release   # optimized release build
 
 Pierwsza kompilacja będzie trwać dość długo ze względu na konieczność skompilowania wszystkie od zera, a RocksDB i DuckDB to spore projekty, ale kolejne kompilacje przebiegają dość szybko, bo zależności są już zbudowane i przekompilowywany jest sam kod aplikacji.
 
-### Notatki dla AI:
+### Notatki o wersji DuckDB oraz o użyciu alokatora Jemalloc (przydatne przy aktualizacjach dependencji):
 
-The build reads `.cargo/config.toml`, which points CMake at `cmake/duckdb_version.cmake` to stamp DuckDB's version. Building from outside the repo root, or with `CMAKE_TOOLCHAIN_FILE` already set in the environment, skips that and produces a DuckDB that reports `v0.0.1` and cannot install the `spatial` extension it needs. When bumping the pinned `duckdb` tag, update `cmake/duckdb_version.cmake` to match and force a DuckDB rebuild with `rm -rf target/*/build/libduckdb-sys-* target/*/.fingerprint/libduckdb-sys-*` (`cargo clean -p libduckdb-sys` does not work on a git-sourced package).
+Proces budowania czyta plik `.cargo/config.toml`, który wskazuje CMake na `cmake/duckdb_version.cmake`, żeby ustawić wersję DuckDB. Kompilowanie spoza katalogu głównego repozytorium albo z już ustawioną zmienną środowiskową `CMAKE_TOOLCHAIN_FILE` pomija ten krok i daje w efekcie DuckDB, który raportuje wersję `v0.0.1` i nie potrafi zainstalować potrzebnego rozszerzenia `spatial`. Przy podnoszeniu przypiętego tagu `duckdb` trzeba zaktualizować `cmake/duckdb_version.cmake`, tak by pasował, i wymusić ponowną kompilację DuckDB poleceniem `rm -rf target/*/build/libduckdb-sys-* target/*/.fingerprint/libduckdb-sys-*` (`cargo clean -p libduckdb-sys` nie zadziała dla paczki pobranej z gita).
 
-Both storage engines are built against jemalloc: DuckDB uses its own bundled, `duckdb_je_`-prefixed copy, while RocksDB pulls in `tikv-jemalloc-sys`, which also replaces the process-wide `malloc`. Set `DUCKDB_DISABLE_JEMALLOC=1` to build DuckDB with its standard allocator instead. On platforms where either build does not support jemalloc (macOS, musl, 32-bit, BSD) the respective flag is a silent no-op and the standard allocator is used.
+Oba silniki bazodanowe są budowane z jemalloc: DuckDB używa własnej, dołączonej kopii z prefiksem `duckdb_je_`, natomiast RocksDB pociąga za sobą `tikv-jemalloc-sys`, który dodatkowo podmienia `malloc` w całym procesie. Ustawienie `DUCKDB_DISABLE_JEMALLOC=1` powoduje zbudowanie DuckDB ze standardowym alokatorem. Na platformach, gdzie któraś z tych kompilacji nie obsługuje jemalloc (macOS, musl, 32-bit, BSD), odpowiednia flaga po cichu nic nie robi i używany jest standardowy alokator.
 
-### Configuration
+## Konfiguracja
 
-The app can be configured via a TOML config file. Pass its path with `--config`:
+Aplikację można skonfigurować plikiem TOML. Ścieżkę do niego podaje się flagą `--config`:
 
 ```bash
 cargo run -- --config config.toml import osm
 ```
 
-If no `--config` is provided, built-in defaults are used (database at `./osmpbudynkiv2.duckdb`, log level `info`, etc.). See [`example_config.toml`](example_config.toml) for all available settings and their defaults.
+Jeżeli `--config` nie zostanie podane, użyte zostaną wbudowane wartości domyślne (baza w `./osmpbudynkiv2.duckdb`, poziom logowania `info` itd.). Wszystkie dostępne ustawienia wraz z wartościami domyślnymi znajdziesz w [`example_config.toml`](example_config.toml).
 
-The config file controls:
-- **`db_path`** — location of the DuckDB database file
-- **`rocksdb_path`** — location of the RocksDB directory (stores raw OSM node coordinates and structural mappings used to build geometries)
-- **`rocksdb_block_cache_mb`** — RocksDB block cache size in MB (default: 512)
-- **`rocksdb_write_buffer_mb`** — RocksDB write buffer size in MB per column family (default: 64)
-- **`log_level`** — log verbosity (`trace`, `debug`, `info`, `warn`, `error`)
-- **`http_listen_addr`** — address and port the `run` server listens on (default `127.0.0.1:3000`)
-- **`web_dir`** — directory the `run` server serves the static frontend from (default `./web`). Mounted as a fallback route, so it never shadows an API path; a missing directory is not a startup error
-- **`download_dir`** — directory for downloaded files (default: system temp directory)
-- **`cleanup_downloaded_files`** — delete files the app downloaded itself once they are consumed (default `true`)
-- **`duckdb_init_commands`** — SQL statements run on database initialization
-- **`download_urls`** — URLs for downloading data sources, including the two mapping CSVs (`street_mappings`, `bdot10k_building_types`, `egib_building_types`)
-- **`[teryt]`** — TERYT/TERC dictionary settings for the PRG import (download vs. local `file_path`)
-- **`[package]`** — `/package` endpoint limits (`max_area_sq_deg`, default 0.04)
-- **`[updates]`** — `/updates` time window limits (`default_minutes`, `max_minutes`)
-- **`[reports]`** — `POST /report` (`enabled`, default true — false makes the route a 404; `max_objects_per_request`, default 100)
-- **`[jobs.*]`** — background jobs, each with `enabled`, `interval_seconds` and a per-run timeout: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, `match_refresh` (drains the dirty-cell queue to keep `*_unmatched` serving tables current; also takes `batch_size`), `match_reconcile` (periodically re-enqueues every live cell as a safety net), `reports_reconcile` (retires reports whose government record changed while this process wasn't the one applying the change), `street_mappings_update` and `building_types_update` (re-fetch the mapping CSVs from `download_urls`), and `retention_prune` (prunes both `package_exports` — `package_exports_days`, default 365 — and `dataset_change_areas` — `change_areas_days`, default 90). Only one dataset refresh runs at a time, regardless of how the schedules line up.
+Plik konfiguracyjny steruje:
+- **`db_path`** — położenie pliku bazy danych DuckDB
+- **`rocksdb_path`** — położenie katalogu RocksDB (przechowuje surowe współrzędne węzłów OSM oraz powiązania strukturalne używane do budowania geometrii)
+- **`rocksdb_block_cache_mb`** — rozmiar cache bloków RocksDB w MB (domyślnie: 512)
+- **`rocksdb_write_buffer_mb`** — rozmiar bufora zapisu RocksDB w MB na rodzinę kolumn (domyślnie: 64)
+- **`log_level`** — szczegółowość logów (`trace`, `debug`, `info`, `warn`, `error`)
+- **`http_listen_addr`** — adres i port, na którym nasłuchuje serwer `run` (domyślnie `127.0.0.1:3000`)
+- **`web_dir`** — katalog, z którego serwer `run` serwuje statyczny frontend (domyślnie `./web`). Podpięty jako trasa awaryjna (fallback), więc nigdy nie przesłania ścieżek API; brak katalogu nie jest błędem uniemożliwiającym start
+- **`download_dir`** — katalog na pobierane pliki (domyślnie: systemowy katalog tymczasowy)
+- **`cleanup_downloaded_files`** — usuwanie plików pobranych przez aplikację po ich przetworzeniu (domyślnie `true`)
+- **`duckdb_init_commands`** — polecenia SQL wykonywane przy inicjalizacji bazy danych
+- **`download_urls`** — adresy URL do pobierania źródeł danych, w tym trzech plików CSV z mapowaniami (`street_mappings`, `bdot10k_building_types`, `egib_building_types`)
+- **`[teryt]`** — ustawienia słowników TERYT/TERC dla importu PRG (pobieranie albo lokalny `file_path`)
+- **`[package]`** — limity endpointu `/package` (`max_area_sq_deg`, domyślnie 0.04)
+- **`[updates]`** — limity okna czasowego `/updates` (`default_minutes`, `max_minutes`)
+- **`[reports]`** — `POST /report` (`enabled`, domyślnie true — ustawienie false sprawia, że trasa zwraca 404; `max_objects_per_request`, domyślnie 100)
+- **`[jobs.*]`** — zadania działające w tle, każde z `enabled`, `interval_seconds` oraz limitem czasu pojedynczego uruchomienia: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, `match_refresh` (opróżnia kolejkę „brudnych” komórek, żeby tabele serwujące `*_unmatched` były aktualne; przyjmuje też `batch_size`), `match_reconcile` (okresowo dodaje do kolejki wszystkie istniejące komórki jako zabezpieczenie), `reports_reconcile` (wycofuje zgłoszenia, których rekord państwowy zmienił się, gdy zmiany nie nakładał ten proces), `street_mappings_update` i `building_types_update` (ponownie pobierają pliki CSV z mapowaniami spod `download_urls`) oraz `retention_prune` (czyści zarówno `package_exports` — `package_exports_days`, domyślnie 365 — jak i `dataset_change_areas` — `change_areas_days`, domyślnie 90). Niezależnie od tego, jak ułożą się harmonogramy, w danej chwili odświeżany jest tylko jeden zbiór danych.
 
-All fields are optional — only specify what you want to override. Note that `duckdb_init_commands` is fully replaced if specified (not merged with defaults).
+Wszystkie pola są opcjonalne — wystarczy podać to, co chcesz nadpisać. Uwaga: `duckdb_init_commands` jest w całości zastępowane, jeżeli zostanie podane (nie jest scalane z wartościami domyślnymi).
 
-## CLI commands
+### Mapowania nazw ulic
 
-### init — bootstrap a fresh database
+PRG publikuje skrócone nazwy ulic (`gen. Kruka`); polski OSM używa nazw
+rozwiniętych (`Generała Kruka`). Plik `mappings/street_names_mappings.csv`
+mapuje jedne na drugie i jest stosowany do `addr:street` przy budowaniu
+odpowiedzi `/package` (oraz do podglądu tagów pokazywanego na `/tiles`
+i w dymkach frontendu), dzięki czemu pobrane dane nadają się do importu bez
+ręcznych poprawek.
 
-```bash
-# Everything needed to get started: import full, update osm, compare full,
-# queue drain
-cargo run -- init
-
-# Same, using local files instead of downloading (any subset of flags works;
-# omitted ones still download) -- takes the same flags as `import full`
-cargo run -- init \
-  --osm-file poland-latest.osm.pbf \
-  --bdot10k-file bdot10k.parquet \
-  --egib-file egib.parquet \
-  --prg-file prg.zip \
-  --terc-file terc.zip \
-  --street-mappings-file mappings/street_names_mappings.csv \
-  --bdot10k-building-types-file mappings/bdot10k_building_types.csv \
-  --egib-building-types-file mappings/egib_building_types.csv
-```
-
-Each step still stops the whole command on the first failure. `update osm`
-needs network access to the replication feed regardless of which `--*-file`
-flags are given (there's no local-file equivalent for it, unlike the bulk
-imports); if you don't want that, run `import full` and `compare full`
-individually instead (see below).
-
-### import — bulk-load data
-
-```bash
-# Import everything (OSM, BDOT10k, EGIB, PRG, then the street-name and
-# building-type mappings) in sequence
-cargo run -- import full
-
-# Import everything from local files instead of downloading (any subset of flags works;
-# omitted sources still download)
-cargo run -- import full \
-  --osm-file poland-latest.osm.pbf \
-  --bdot10k-file bdot10k.parquet \
-  --egib-file egib.parquet \
-  --prg-file prg.zip \
-  --terc-file terc.zip \
-  --street-mappings-file mappings/street_names_mappings.csv \
-  --bdot10k-building-types-file mappings/bdot10k_building_types.csv \
-  --egib-building-types-file mappings/egib_building_types.csv
-
-# Import OpenStreetMap data (downloads Poland PBF extract automatically)
-cargo run -- import osm
-
-# Import from a local PBF file instead of downloading
-cargo run -- import osm --file example_data/OSM/poland-latest.osm.pbf
-
-# Import BDOT10k building data (downloads GeoParquet automatically)
-cargo run -- import bdot10k
-
-# Import from a local file
-cargo run -- import bdot10k --file bdot10k.parquet
-
-# Import EGIB building data
-cargo run -- import egib
-cargo run -- import egib --file egib.parquet
-
-# Import PRG address data
-cargo run -- import prg
-cargo run -- import prg --file prg.zip
-
-# Load just one mapping file later (e.g. after editing a CSV), without
-# re-running the whole bulk import. Both download from this repository
-# when no file is given.
-cargo run -- import street-mappings --file mappings/street_names_mappings.csv
-cargo run -- import building-types \
-  --bdot10k-file mappings/bdot10k_building_types.csv \
-  --egib-file mappings/egib_building_types.csv
-```
-
-### update — apply incremental updates
-
-```bash
-# Update OSM data from minutely replication feed
-cargo run -- update osm
-
-# Update government datasets (re-downloads unless --file is given)
-cargo run -- update bdot10k
-cargo run -- update egib
-cargo run -- update prg
-
-# Update from a local snapshot instead of downloading
-cargo run -- update bdot10k --file bdot10k.parquet
-cargo run -- update egib --file egib.parquet
-cargo run -- update prg --file prg.zip --terc-file terc.csv
-```
-
-A government-dataset update stages the new snapshot alongside the live table,
-diffs it by whole-row hash, and applies only the delta — so an unchanged row is
-never rewritten and the spatial index stays intact. The delta, the refresh
-record and the per-tile change areas all commit in one transaction, so readers
-never observe a partially-applied update.
-
-When the source is downloaded rather than passed with `--file`, a `HEAD` request
-compares the remote `ETag` against the last one recorded; an unchanged source
-skips the refresh entirely and records a zero-count row, so "ran and found
-nothing" stays distinguishable from "never ran".
-
-These refreshes also run on a schedule in the background under `run` — see the
-`[jobs]` config section.
-
-#### Row-hash version
-
-The diff works by comparing a whole-row hash, so an import and a later update
-must compute that hash identically. The expression lives in exactly one place,
-`hashed_select` in `src/dataset.rs`, and the version it was built with is
-stamped into the `metadata` table under the key `row_hash_version`.
-
-**If you change the hashed row content in a way that alters its output, bump
-the `ROW_HASH_VERSION` constant next to it.** Nothing else needs changing —
-every import and every update reads that one constant.
-
-That means `hashed_select` itself, but also anything feeding *into* it: a
-source's inner select is part of the hash input, so a change there moves the
-stored hashes just as surely. Version 2 is exactly that case — PRG's import
-gained a street-name normalization inside its inner select
-(`import::prg::ULICA_PREFIX_STRIP_SQL`). Transformations deliberately wrapped
-*outside* `hashed_select` — `DatasetSpec::with_centroid_select`,
-`mappings::egib::with_rodzaj_kod_select` — do not count.
-
-What happens after a bump: the stamp in an existing database still names the
-old version, so the next update logs a `row hash version mismatch` warning and
-every row compares as modified. That refresh is effectively a full rewrite —
-correct, just slower than usual, and it reports a changeset the size of the
-whole dataset. On success it re-stamps the new version, so the warning appears
-once per bump, not on every run afterwards. A refresh that fails leaves the old
-stamp alone, so the warning survives until a rewrite actually lands. The stamp
-is global, so a bump made for one source also costs the others one full-rewrite
-refresh apiece.
-
-The check only detects changes you make and declare. It is not derived from the
-DuckDB version, so a DuckDB upgrade that silently changed `hash()` output would
-produce the same full rewrite without the explanatory warning.
-
-### compare — compare government data against OSM
-
-```bash
-# Run every comparison
-cargo run -- compare full
-
-# Compare buildings (all sources, or just one)
-cargo run -- compare buildings
-cargo run -- compare buildings bdot10k
-cargo run -- compare buildings egib
-
-# Compare addresses
-cargo run -- compare addresses
-cargo run -- compare addresses prg
-```
-
-`compare` recomputes the `*_unmatched` serving tables (`bdot10k_unmatched`,
-`egib_unmatched`, `prg_unmatched`) from scratch — the tables `/tiles` and
-`/package` read. Between full re-compares, government refreshes and OSM
-updates keep them current incrementally: each producer enqueues the z14 cells
-it touched into `match_dirty_cells`, and the `match_refresh` background job
-(see `run` below) drains that queue by recomputing just those cells.
-
-### queue — operate on the match_dirty_cells queue by hand
-
-```bash
-# Re-enqueue every cell containing a government object, so the next drain
-# rebuilds it (safety net for a dropped enqueue, an offline rebuild path, or
-# a scheduled sweep)
-cargo run -- queue reconcile
-
-# Drain the queue: recompute *_unmatched for every dirty cell, oldest first,
-# until none remain
-cargo run -- queue drain
-cargo run -- queue drain --batch-size 1000
-```
-
-Both actions require exclusive access to the database (like any CLI command)
-— do not run them against a database a `run` server also has open; the
-server drains the same queue itself via its `match_refresh`/`match_reconcile`
-background jobs. `queue reconcile` re-enqueues every live cell instead of
-comparing directly, for when the queue can't be trusted or a full serving
-rebuild is wanted without redoing the whole comparison. `queue drain` is the
-manual, one-shot equivalent of what `match_refresh` does on a schedule inside
-`run`.
-
-### reports — manage user reports offline
-
-```bash
-# What has been reported, newest first
-cargo run -- reports list
-cargo run -- reports list --source bdot10k --status active --limit 200
-cargo run -- reports list --since '2026-08-16 14:00:00'
-
-# Retire one report so its object is proposed for import again
-cargo run -- reports revoke 41
-# ...or every active report submitted in a window. Because nothing identifying
-# the submitter is stored, this is the only way to unwind an abusive burst
-cargo run -- reports revoke --since '2026-08-16 14:00:00' --source prg
-
-# Retire reports whose government record has changed or disappeared. Runs
-# automatically inside every dataset refresh and after every import; this is
-# the manual safety net (also available as the reports_reconcile job)
-cargo run -- reports reconcile
-
-# Back up and restore. object_reports is the only table in this database that
-# cannot be rebuilt from an external source -- `import full` restores
-# everything else and starts with no reports at all
-cargo run -- reports export reports.jsonl
-cargo run -- reports import reports.jsonl
-```
-
-A revoked, expired or imported report only changes what is served once the
-affected cells are recomputed, so follow any of these with `queue drain` (or
-let a running server's `match_refresh` job get to it).
-
-`reports import` reallocates ids from the current maximum rather than
-preserving them, so importing into a database that already has reports cannot
-collide; a round trip is faithful in content, not in id.
-
-### run — HTTP service
-
-```bash
-cargo run -- run
-```
-
-Serves:
-- the web frontend from `web_dir` (default `./web`) — open `http://127.0.0.1:3000/` in a browser
-- `/health` — liveness check
-- `/status` — background job status as JSON, including match-queue staleness (`match_staleness`: pending cell count overall and per source, oldest enqueued timestamp) and per-job last-run outcome (`job_run_log`, keyed by job name — imports appear there as `import:<source>`)
-- `/tiles/{z}/{x}/{y}` — Mapbox Vector Tiles reading the precomputed `*_unmatched` serving tables, in three zoom tiers: z5–z11 aggregated bins (layer `agg_cells`, carrying unmatched counts, their denominators and each source's most recent government change in the bin), z12–z13 one point per unmatched object (layer `points`), z14 full geometry with source attributes and the resolved OSM tags an import would write (layers `buildings`/`addresses`, plus `buildings_all`/`addresses_all` showing every government object, matched or not). Any other zoom returns `204 No Content`
-- `/package` — GeoJSON `FeatureCollection` of government-registry records missing
-  from OSM in the requested area, tagged for direct JOSM import. Reads the same
-  precomputed `*_unmatched` serving tables as `/tiles` (no live comparison per
-  request). The request area (bounding box) is capped by the
-  `[package] max_area_sq_deg` config setting (default 0.04 sq deg).
-- `/updates` — recent `/package` export activity (timestamp, area, datasets, feature counts) as GeoJSON, `Cache-Control: public, max-age=60`. A background job prunes entries older than `[jobs.retention_prune] package_exports_days` (default 365).
-- `POST /report` — mark government objects as ones that should not be proposed
-  for import. Body is `{"note": ..., "objects": [{"source": ...,
-  "key": {...}}]}`, where `key` names exactly the source's key columns
-  (`PRZESTRZENNAZW` + `LOKALNYID` for bdot10k, `id_budynku` for egib,
-  `lokalny_id` for prg). A key that matches no live record is rejected per
-  object rather than failing the request. Each accepted report enqueues its
-  z14 cell, so the object leaves `*_unmatched` on the next drain — from then
-  on it appears only on `/tiles`' `addresses_all`/`buildings_all` layers,
-  carrying a `reported` attribute the frontend renders as "Zgłoszony". Capped at
-  `[reports] max_objects_per_request` objects; `[reports] enabled = false`
-  turns the route into a 404 with no redeploy. Nothing about the submitter is
-  captured or stored — see the `[reports]` comment in `example_config.toml`
-  for what that means for abuse control, and the `reports` CLI above for the
-  time-scoped cleanup path it leaves.
-
-The `match_refresh` background job keeps `/tiles` and `/package` fresh between
-full `compare` runs, by draining `match_dirty_cells` on a schedule (see
-`[jobs.match_refresh]`).
-
-**Upgrading an existing database in place:** the `*_unmatched` serving tables
-are created with `CREATE TABLE IF NOT EXISTS`, so starting the server against
-an older database that predates them leaves all three empty — `/tiles` and
-`/package` will start up cleanly but serve zero features (a startup warning
-names each empty table). Run an offline `compare full` before restarting the
-server against that database. `queue reconcile` is **not** an equivalent
-fast path here: it only re-enqueues every live cell for the incremental
-drain, so populating a fully empty database through it means draining the
-entire country cell-by-cell, which is orders of magnitude slower than a
-direct full `compare`.
-
-The same applies to columns added by a later version. Every table is created
-with `CREATE TABLE IF NOT EXISTS` and there is no `ALTER TABLE`/backfill path
-anywhere in this codebase, so an existing table gains no new column merely by
-running a newer binary — the table has to be rebuilt by the command that
-creates it. Columns carried on the `*_unmatched` serving tables (the
-classification and display attributes `/tiles` and the popups show) come from
-`compare`; columns precomputed on the source tables
-(`bdot10k_buildings.centroid`, `egib_buildings.centroid`,
-`egib_buildings.rodzaj_kod`) come from `import bdot10k` / `import egib`, which
-rebuild those tables wholesale. Re-running the whole setup sequence above is
-the reliable way to bring an old database forward.
-
-`POST /report` in particular needs `bdot10k_unmatched.PRZESTRZENNAZW`, which is
-the other half of BDOT10k's composite key and was added with the feature — a
-database predating it needs `bdot10k_unmatched` recreated and `compare bdot10k`
-re-run, or every BDOT10k tile fails to render. With one exception, everything
-here is a rebuild-and-recompute story: `object_reports` is the only table in
-this database that **cannot** be reconstructed from an external source, so run
-`reports export` before rebuilding a database that has any.
-
-```bash
-# bbox: minLon,minLat,maxLon,maxLat; datasets: prg, bdot10k, egib, or all (default)
-curl 'http://127.0.0.1:3000/package?bbox=20.99,52.19,21.02,52.22&datasets=prg,bdot10k'
-
-# Or POST a GeoJSON Polygon/MultiPolygon for an exact area
-curl -X POST 'http://127.0.0.1:3000/package?datasets=all' \
-  -d '{"type":"Polygon","coordinates":[[[20.99,52.19],[21.02,52.19],[21.02,52.22],[20.99,52.19]]]}'
-
-# Recent export activity (default: last 60 minutes)
-curl 'http://127.0.0.1:3000/updates'
-curl 'http://127.0.0.1:3000/updates?minutes=1440'
-
-# Report an object as one that should not be proposed for import
-curl -X POST 'http://127.0.0.1:3000/report' -H 'content-type: application/json' \
-  -d '{"objects":[{"source":"egib","key":{"id_budynku":"146509_8.0001.120.1_BUD"}}]}'
-```
-
-Background jobs (OSM and government-dataset refreshes, the dirty-cell drain,
-mapping refreshes, export-log pruning) run on the schedules in `[jobs.*]` —
-all of them ship disabled in `example_config.toml`.
-
-**Running as a systemd service:** [`deploy/osmpbudynkiv2.service`](deploy/osmpbudynkiv2.service)
-is an example unit for `run`, with install steps and layout assumptions in
-its own comments. It does not run `init`/`import`/`compare` for you — do that
-by hand first, since `run` expects an already-populated database.
-
-### Street name mappings
-
-PRG publishes abbreviated street names (`gen. Kruka`); OSM Poland uses expanded
-ones (`Generała Kruka`). `mappings/street_names_mappings.csv` maps between them
-and is applied to `addr:street` when `/package` builds its response (and to the
-tag preview shown on `/tiles` and in the frontend's popups), so downloaded data
-is importable without hand-editing.
-
-Load it with:
+Wczytanie:
 
     cargo run -- import street-mappings --file mappings/street_names_mappings.csv
 
-A row with an empty `teryt_simc_code` applies nationwide; one with a code
-applies only to that settlement and overrides the nationwide row. Lookup is
-case-insensitive. The file is optional — without it, names are served exactly
-as PRG publishes them.
+Wiersz z pustym `teryt_simc_code` obowiązuje w całym kraju; wiersz z kodem
+dotyczy tylko danej miejscowości i ma pierwszeństwo przed wierszem ogólnokrajowym.
+Wyszukiwanie nie rozróżnia wielkości liter. Plik jest opcjonalny — bez niego
+nazwy są serwowane dokładnie w takiej postaci, w jakiej publikuje je PRG.
 
-To propose a change, edit the CSV and open a PR; `cargo test --test
-street_mappings_file` checks its structure.
+Żeby zaproponować zmianę, edytuj plik CSV i otwórz PR; `cargo test --test
+street_mappings_file` sprawdza jego strukturę.
 
-### Building type mappings
+### Mapowania typów budynków
 
-BDOT10k and EGIB classify buildings in their own schemes
-(`budynek jednorodzinny`, `rodzaj = m`, …); `mappings/bdot10k_building_types.csv`
-and `mappings/egib_building_types.csv` translate those into OSM tags
-(`building=house`, `building=detached`, …). Like the street names, they are
-applied when a response is built — on `/package`, on `/tiles`, and in the
-frontend's feature popups.
+BDOT10k i EGIB klasyfikują budynki według własnych schematów
+(`budynek jednorodzinny`, `rodzaj = m`, …); pliki `mappings/bdot10k_building_types.csv`
+i `mappings/egib_building_types.csv` tłumaczą je na tagi OSM
+(`building=house`, `building=detached`, …). Podobnie jak mapowania nazw ulic,
+stosowane są przy budowaniu odpowiedzi — na `/package`, na `/tiles`
+i w dymkach obiektów we frontendzie.
 
-Load them with:
+Wczytanie:
 
     cargo run -- import building-types \
       --bdot10k-file mappings/bdot10k_building_types.csv \
       --egib-file mappings/egib_building_types.csv
 
-Each row is `tier,key,min_levels,max_levels,max_neighbours,tags` (the EGIB file
-adds a free-text `note`). Tier 1 matches the detailed function (BDOT10k
-`PRZEWAZAJACAFUNKCJABUDYNKU`, EGIB `rodzaj_kod` — a single-letter class derived
-from `rodzaj` when EGIB is imported), tier 2 the general one (BDOT10k
-`FUNKCJAOGOLNABUDYNKU`; EGIB has no second tier); tier 1 wins, and among rows
-of the same tier the most constrained one wins. The optional level and neighbour constraints let one key resolve
-differently by context — an isolated one-to-two-storey single-family building
-becomes `building=detached`, one touching another becomes `building=house`.
-Adjacency is counted at serve time against the full building tables.
+Każdy wiersz ma postać `tier,key,min_levels,max_levels,max_neighbours,tags`
+(plik EGIB dodaje jeszcze opisowe pole `note`). Poziom (tier) 1 dopasowuje
+funkcję szczegółową (BDOT10k `PRZEWAZAJACAFUNKCJABUDYNKU`, EGIB `rodzaj_kod` —
+jednoliterowa klasa wyliczana z `rodzaj` przy imporcie EGIB), poziom 2 — funkcję
+ogólną (BDOT10k `FUNKCJAOGOLNABUDYNKU`; EGIB nie ma drugiego poziomu). Poziom 1
+wygrywa z poziomem 2, a wśród wierszy tego samego poziomu wygrywa ten najbardziej
+szczegółowy. Opcjonalne ograniczenia liczby kondygnacji i sąsiadów pozwalają
+jednemu kluczowi rozstrzygać się różnie zależnie od kontekstu — wolnostojący
+jedno- lub dwukondygnacyjny budynek jednorodzinny dostaje `building=detached`,
+a stykający się z innym — `building=house`. Sąsiedztwo liczone jest w momencie
+serwowania odpowiedzi, na podstawie pełnych tabel budynków.
 
-**These files are not optional in practice:** with the mapping tables empty,
-every building resolves to plain `building=yes` and nothing warns about it.
+**W praktyce te pliki nie są opcjonalne:** przy pustych tabelach mapowań każdy
+budynek dostanie zwykłe `building=yes` i nic o tym nie ostrzeże.
 
-To propose a change, edit the CSV and open a PR; `cargo test --test
-building_types_files` checks its structure. See
-[`docs/building_type_mappings.md`](docs/building_type_mappings.md) for how the
-mappings were derived.
+Żeby zaproponować zmianę, edytuj plik CSV i otwórz PR; `cargo test --test
+building_types_files` sprawdza jego strukturę. Opis tego, jak powstały te
+mapowania, znajduje się w
+[`docs/building_type_mappings.md`](docs/building_type_mappings.md).
 
-## Development
+## Rozwój projektu
 
-The frontend in [`web/`](web/) (`index.html`, `app.js`, `style.css`, MapLibre
-GL JS) is plain static files served from `web_dir` at runtime, not embedded in
-the binary — editing them needs no rebuild, just a reload (a hard one: the
-browser caches `app.js` over plain HTTP). It talks to `/tiles`, `/status`,
-`/package` and `/updates` on the same origin.
+Frontend w katalogu [`web/`](web/) (`index.html`, `app.js`, `style.css`, MapLibre
+GL JS) to zwykłe pliki statyczne serwowane w czasie działania z `web_dir`, nie
+wkompilowane w plik wykonywalny — ich edycja nie wymaga rekompilacji, wystarczy
+przeładować stronę (twardym odświeżeniem: przeglądarka cache'uje `app.js` po
+zwykłym HTTP). Frontend korzysta z `/tiles`, `/status`, `/package` i `/updates`
+w obrębie tego samego origin.
 
 ```bash
-cargo test              # run all tests
-cargo test <name>       # run a single test by name
+cargo test              # uruchom wszystkie testy
+cargo test <name>       # uruchom pojedynczy test po nazwie
 cargo clippy            # lint
-cargo fmt               # format code
+cargo fmt               # formatowanie kodu
 ```
 
-Log level can be set via the `RUST_LOG` environment variable (takes precedence) or the config file's `log_level` setting:
+Poziom logowania można ustawić zmienną środowiskową `RUST_LOG` (ma pierwszeństwo) albo ustawieniem `log_level` w pliku konfiguracyjnym:
 
 ```bash
 RUST_LOG=debug cargo run -- import osm
-cargo run -- --config config.toml import osm  # uses log_level from config
+cargo run -- --config config.toml import osm  # używa log_level z konfiguracji
 ```
 
-### Profiling
+### Profilowanie
 ```bash
 samply record --save-only -o osm_import_before.json.gz \
   ./target/profiling/osmpbudynkiv2 \
@@ -478,4 +169,4 @@ samply record --save-only -o osm_import_before.json.gz \
   import osm --file ./example_data/OSM/poland-latest.osm.pbf
 ```
 
-Then `samply load osm_import_before.json.gz` to inspect.
+Następnie `samply load osm_import_before.json.gz`, żeby przejrzeć wyniki.
