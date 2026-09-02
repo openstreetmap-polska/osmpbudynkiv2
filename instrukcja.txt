@@ -1,0 +1,50 @@
+Dostosuj plik konfiguracyjny.
+
+Jeżeli chcesz dodać aplikację jako usługę systemową dostosuj też plik usługi systemd.
+
+Jeżeli chcesz by pobieranie PRG automatycznie pobierało też słowniki TERYT (przydatne jeżeli aplikacja ma działac w trybie ciągłym na serwerze) to skonfiguruj też plik .env lub zmienne środowiskowe.
+
+Uruchom plik wykonywalny z parametrem `init`, żeby pobrać wszystkie dane i utworzyć bazę danych (ścieżki do bazy są określone w pliku konfiguracyjnym).
+
+```bash
+osmpbudynkiv2 --config example_config.toml init
+```
+
+Gdy import się zakończy można uruchomić serwer aplikacyjny komendą:
+```bash
+osmpbudynkiv2 --config example_config.toml run
+```
+
+Lub ustawić usługę systemową i uruchamiać ją tak jak inne usługi w danym systemie.
+
+Plik wykonywalny można uruchomić z flagą `--help` żeby zobaczyć wszystkie dostepne komendy.
+
+---
+
+Aplikację można skonfigurować plikiem TOML. Ścieżkę do niego podaje się flagą `--config`:
+
+```bash
+cargo run -- --config config.toml import osm
+```
+
+Jeżeli `--config` nie zostanie podane, użyte zostaną wbudowane wartości domyślne (baza w `./osmpbudynkiv2.duckdb`, poziom logowania `info` itd.). Wszystkie dostępne ustawienia wraz z wartościami domyślnymi znajdziesz w [`example_config.toml`](example_config.toml).
+
+Plik konfiguracyjny steruje:
+- **`db_path`** — położenie pliku bazy danych DuckDB
+- **`rocksdb_path`** — położenie katalogu RocksDB (przechowuje surowe współrzędne węzłów OSM oraz powiązania strukturalne używane do budowania geometrii)
+- **`rocksdb_block_cache_mb`** — rozmiar cache bloków RocksDB w MB (domyślnie: 512)
+- **`rocksdb_write_buffer_mb`** — rozmiar bufora zapisu RocksDB w MB na rodzinę kolumn (domyślnie: 64)
+- **`log_level`** — szczegółowość logów (`trace`, `debug`, `info`, `warn`, `error`)
+- **`http_listen_addr`** — adres i port, na którym nasłuchuje serwer `run` (domyślnie `127.0.0.1:3000`)
+- **`web_dir`** — katalog, z którego serwer `run` serwuje statyczny frontend (domyślnie `./web`). Podpięty jako trasa awaryjna (fallback), więc nigdy nie przesłania ścieżek API; brak katalogu nie jest błędem uniemożliwiającym start
+- **`download_dir`** — katalog na pobierane pliki (domyślnie: systemowy katalog tymczasowy)
+- **`cleanup_downloaded_files`** — usuwanie plików pobranych przez aplikację po ich przetworzeniu (domyślnie `true`)
+- **`duckdb_init_commands`** — polecenia SQL wykonywane przy inicjalizacji bazy danych
+- **`download_urls`** — adresy URL do pobierania źródeł danych, w tym trzech plików CSV z mapowaniami (`street_mappings`, `bdot10k_building_types`, `egib_building_types`)
+- **`[teryt]`** — ustawienia słowników TERYT/TERC dla importu PRG (pobieranie albo lokalny `file_path`)
+- **`[package]`** — limity endpointu `/package` (`max_area_sq_deg`, domyślnie 0.04)
+- **`[updates]`** — limity okna czasowego `/updates` (`default_minutes`, `max_minutes`)
+- **`[reports]`** — `POST /report` (`enabled`, domyślnie true — ustawienie false sprawia, że trasa zwraca 404; `max_objects_per_request`, domyślnie 100)
+- **`[jobs.*]`** — zadania działające w tle, każde z `enabled`, `interval_seconds` oraz limitem czasu pojedynczego uruchomienia: `osm_update`, `bdot10k_update`, `egib_update`, `prg_update`, `match_refresh` (opróżnia kolejkę „brudnych” komórek, żeby tabele serwujące `*_unmatched` były aktualne; przyjmuje też `batch_size`), `match_reconcile` (okresowo dodaje do kolejki wszystkie istniejące komórki jako zabezpieczenie), `reports_reconcile` (wycofuje zgłoszenia, których rekord państwowy zmienił się, gdy zmiany nie nakładał ten proces), `street_mappings_update` i `building_types_update` (ponownie pobierają pliki CSV z mapowaniami spod `download_urls`) oraz `retention_prune` (czyści zarówno `package_exports` — `package_exports_days`, domyślnie 365 — jak i `dataset_change_areas` — `change_areas_days`, domyślnie 90). Niezależnie od tego, jak ułożą się harmonogramy, w danej chwili odświeżany jest tylko jeden zbiór danych.
+
+Wszystkie pola są opcjonalne — wystarczy podać to, co chcesz nadpisać. Uwaga: `duckdb_init_commands` jest w całości zastępowane, jeżeli zostanie podane (nie jest scalane z wartościami domyślnymi).
