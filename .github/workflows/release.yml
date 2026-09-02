@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+# A cold build compiles DuckDB and RocksDB from source and takes the better part
+# of an hour, so superseded runs are cancelled instead of left to finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+
+    # Deliberately uncached and separate from `build`: rustfmt reads the
+    # sources directly and compiles nothing, so this reports a formatting
+    # problem in about a minute rather than after the C++ dependencies.
+    - name: Check formatting
+      run: cargo fmt -- --check
+
+  build:
+    name: cargo build & test (release)
+    runs-on: ubuntu-latest
+    # Cold, this job is dominated by DuckDB's CMake build on a 4-vCPU runner.
+    # Warm, it is a few minutes. The ceiling is here so a hung build fails
+    # instead of running into GitHub's 6-hour default.
+    timeout-minutes: 90
+    steps:
+    - uses: actions/checkout@v7
+
+    # `libduckdb-sys` autodetects Ninja and silently falls back to CMake's
+    # default generator when it is absent. The two write to *different*
+    # output directories (`out/cmake-ninja` vs the default), so a runner image
+    # that gains or loses Ninja later would invalidate the cached DuckDB build
+    # without anything in this repo changing. Installing it explicitly makes
+    # the choice ours rather than the image's.
+    - name: Install Ninja
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build
+
+    # CMake itself comes from the runner image. Logging the versions makes a
+    # future "it broke and nothing changed" traceable to an image bump.
+    - name: Show build tool versions
+      run: |
+        cmake --version | head -1
+        ninja --version
+        cc --version | head -1
+
+    # The Rust version is not restated here on purpose: rustup reads
+    # rust-toolchain.toml, so the pin keeps the single home it has in the repo
+    # instead of gaining a second copy that can drift.
+    - name: Show toolchain
+      run: |
+        rustc --version
+        cargo --version
+
+    # Caches ~/.cargo plus the dependency half of target/. The DuckDB CMake
+    # tree alone is ~600 MB uncompressed (RocksDB adds ~77 MB), which is both
+    # the reason this job needs a cache and the reason to keep an eye on the
+    # repo's 10 GB Actions cache budget.
+    - name: Cache Rust build
+      uses: Swatinem/rust-cache@v2
+      with:
+        # Cargo.lock, the rustc version and the cargo config are folded into
+        # the computed key already. `cmake/duckdb_version.cmake` is not, and it
+        # decides the version DuckDB stamps into itself — a wrong stamp makes
+        # every `INSTALL <extension>` 404 (see CLAUDE.md). It is exactly the
+        # file that does not trigger a rebuild locally either, so without this
+        # a bumped DuckDB version would keep restoring the old build.
+        key: ${{ hashFiles('cmake/duckdb_version.cmake', '.cargo/config.toml') }}
+        # A cold run that fails in our own crate still leaves half an hour of
+        # compiled C++ behind. Keeping it turns the retry into a short job.
+        cache-on-failure: true
+
+    # `--locked` so a Cargo.lock that no longer matches Cargo.toml fails here
+    # rather than being silently updated, which would also mean building
+    # different dependency versions than anyone else.
+    - name: Build
+      run: cargo build --locked --release
+
+    # `--release` here too, deliberately: it shares the dependency
+    # compilation (and the cache above) with the Build step instead of
+    # triggering a second, separate debug compile of DuckDB/RocksDB.
+    - name: Run tests
+      run: cargo test --locked --release
+
+    # Handed to the `release` job below rather than rebuilding: that job runs
+    # on a fresh runner with none of the compiled DuckDB/RocksDB tree, and
+    # rebuilding there would pay the whole cold-build cost again just to
+    # package a binary this job already produced.
+    - name: Upload release binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-binary
+        path: target/release/osmpbudynkiv2
+        retention-days: 1
+        if-no-files-found: error
+
+  release:
+    name: Package & publish release
+    # Gated on both: fmt catches nothing `cargo test` would, but a release cut
+    # while it's red would ship code the pipeline considers broken.
+    needs: [fmt, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Download release binary
+      uses: actions/download-artifact@v4
+      with:
+        name: release-binary
+        path: dist-bin
+
+    # Version comes from Cargo.toml (the single source of truth for it) and
+    # is paired with the short commit hash so every dispatch of this
+    # workflow — even with an unchanged Cargo.toml version — produces a
+    # distinct, non-colliding tag.
+    - name: Determine release metadata
+      id: meta
+      run: |
+        VERSION=$(awk -F'"' '/^\[package\]/{f=1} f && /^version/{print $2; exit}' Cargo.toml)
+        SHORT_SHA=$(git rev-parse --short=7 HEAD)
+        PKG_NAME="osmpbudynkiv2-${VERSION}-${SHORT_SHA}"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+        echo "pkg_name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+        echo "tag=v${VERSION}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+    # Everything a self-hosted deploy needs and nothing else: the compiled
+    # binary, the static frontend, the systemd unit and env templates, the
+    # setup instructions and an example config to copy and edit.
+    #
+    # `web/.playwright-cli` (the `npx playwright cli` scratch state — see
+    # CLAUDE.md's browser-testing procedure) is `.gitignore`d, so `checkout`
+    # never materializes it and the `rm -rf` below is normally a no-op; it's
+    # kept only as insurance against someone un-ignoring the directory later.
+    - name: Assemble release package
+      run: |
+        STAGE="${{ steps.meta.outputs.pkg_name }}"
+        mkdir -p "$STAGE"
+        install -m 755 dist-bin/osmpbudynkiv2 "$STAGE/osmpbudynkiv2"
+        cp -a web "$STAGE/web"
+        rm -rf "$STAGE/web/.playwright-cli"
+        cp example.service example.env instrukcja.txt example_config.toml "$STAGE/"
+        tar -czf "${STAGE}.tar.gz" "$STAGE"
+
+    # `--target` pins the tag to the commit this workflow actually built.
+    # Without it, `gh release create` points the tag at the repository's
+    # default branch tip instead — wrong whenever this is dispatched off a
+    # non-default branch, or whenever the default branch moves during the
+    # ~90-minute build.
+    - name: Create GitHub Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "${{ steps.meta.outputs.tag }}" \
+          "${{ steps.meta.outputs.pkg_name }}.tar.gz" \
+          --target "${{ github.sha }}" \
+          --title "osmpbudynkiv2 ${{ steps.meta.outputs.version }} (${{ steps.meta.outputs.short_sha }})" \
+          --notes "Automated release build from commit ${{ github.sha }}."
