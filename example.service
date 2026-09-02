@@ -1,0 +1,95 @@
+# Example systemd unit for the `run` HTTP service.
+#
+# Install:
+#   sudo cp deploy/osmpbudynkiv2.service /etc/systemd/system/
+#   sudo useradd --system --home /opt/osmpbudynkiv2 --shell /usr/sbin/nologin osmpbudynkiv2
+#   sudo chown -R osmpbudynkiv2:osmpbudynkiv2 /opt/osmpbudynkiv2
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now osmpbudynkiv2
+#
+# Edit the paths below (User/Group, WorkingDirectory, ExecStart) to match
+# your deployment layout first. This file assumes a layout of:
+#   /opt/osmpbudynkiv2/
+#     osmpbudynkiv2              # release binary (built with `cargo build --release`)
+#     config.toml                # copy of example_config.toml with paths made absolute
+#     web/                       # copy of the web/ frontend directory
+#     osmpbudynkiv2.duckdb       # created by `init`/`import`, run once *before* first start
+#     osmpbudynkiv2.rocksdb/
+#
+# db_path/rocksdb_path/web_dir in example_config.toml are relative -- they
+# resolve against the process's current working directory, which is why
+# WorkingDirectory below must match wherever the database and web/ directory
+# actually live. Simplest to just make them absolute in config.toml instead.
+#
+# This unit does not run `init`/`import`/`compare` for you -- run those by
+# hand (or from a oneshot unit/timer) as this same user before the first
+# `systemctl start`, since `run` expects an already-populated database. Only
+# one instance may ever have the database open at a time: DuckDB has no
+# multi-writer support, so never run an offline `import`/`update`/`compare`/
+# `queue`/`reports` command against the same db_path while this service is
+# running -- stop it first.
+
+[Unit]
+Description=osmpbudynkiv2 HTTP service (API + web frontend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=osmpbudynkiv2
+Group=osmpbudynkiv2
+WorkingDirectory=/opt/osmpbudynkiv2
+ExecStart=/opt/osmpbudynkiv2/osmpbudynkiv2 --config /opt/osmpbudynkiv2/config.toml run
+
+# Loads plain KEY=VALUE lines (like this repo's root .env) into the unit's
+# environment -- no `export`, quoting, or shell expansion, unlike
+# scripts/run_release.sh's `source .env`. Leading `-` makes a missing file
+# non-fatal. `run` itself doesn't need this repo's TERYT_API_* vars (only
+# `import prg`'s TERC download does, an offline step this unit doesn't run)
+# -- keep this only if you have other secrets config.toml should pick up,
+# e.g. api_username/api_password under [teryt] via their env fallback.
+EnvironmentFile=-/opt/osmpbudynkiv2/.env
+
+# RUST_LOG overrides config.toml's log_level if set -- omit to use the
+# config value.
+# Environment=RUST_LOG=info
+
+# Ctrl+C/SIGTERM is handled by the process itself (a signal handler flips a
+# shutdown flag that in-flight background jobs and the HTTP server poll),
+# so plain SIGTERM is enough -- no need for SIGKILL or a custom KillSignal.
+# Give it real time to finish an in-flight DuckDB statement and drain
+# in-flight requests before systemd escalates to SIGKILL.
+TimeoutStopSec=60
+
+# Crash recovery. Not concurrent-writer risk: systemd only starts the new
+# process after the old one has fully exited.
+Restart=on-failure
+RestartSec=5
+
+# Basic hardening. Tighten/extend ReadWritePaths if you move the database,
+# RocksDB directory, or `download_dir` outside WorkingDirectory.
+#
+# Downloaded files (OSM/BDOT10k/EGIB/PRG snapshots fetched by the
+# jobs.*_update background jobs) need no entry here even though
+# `download_dir` defaults to unset: PrivateTmp already gives this unit its
+# own writable /tmp regardless of ProtectSystem=strict, and that's what an
+# unset download_dir falls back to. Only add a path if you set download_dir
+# explicitly to somewhere outside WorkingDirectory.
+#
+# DuckDB extensions (INSTALL spatial/icu, run on every startup via
+# duckdb_init_commands) install to $HOME/.duckdb/extensions, not
+# WorkingDirectory. HOME is pinned below to keep that inside
+# ReadWritePaths -- without it, HOME would come from this user's passwd
+# entry, so a differently-created system user (e.g. one whose home is `/`
+# or `/nonexistent`, common for auto-generated system accounts) would fail
+# `INSTALL spatial` with a permission error on every startup, since spatial
+# can't be statically linked into the binary (see CLAUDE.md).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+Environment=HOME=/opt/osmpbudynkiv2
+ReadWritePaths=/opt/osmpbudynkiv2
+
+[Install]
+WantedBy=multi-user.target
