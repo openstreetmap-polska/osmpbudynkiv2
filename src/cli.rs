@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "osmpbudynkiv2",
+    version,
     about = "Compare Polish government data with OpenStreetMap"
 )]
 pub struct Cli {
