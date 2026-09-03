@@ -7,7 +7,7 @@ pub mod reconcile;
 pub mod rule;
 pub mod totals;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use duckdb::Connection;
 use tracing::info;
 
@@ -78,6 +78,24 @@ pub fn run_queue(conn: &Connection, action: QueueAction) -> Result<()> {
             info!(enqueued, "reconcile sweep complete");
         }
         QueueAction::Drain { batch_size } => {
+            // A one-shot estimate of the work ahead, logged as the denominator
+            // of the per-batch progress line below. Only an estimate: cells
+            // re-dirtied mid-drain push the real total up, and a batch that
+            // drains only failing cells ends the loop early -- so
+            // `total_drained` can finish under, over, or (usually) at this
+            // number. `drain_batch` selects the same distinct
+            // (source, cell_x, cell_y) grouping.
+            let queued_cells: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM (
+                         SELECT 1 FROM match_dirty_cells GROUP BY source, cell_x, cell_y
+                     )",
+                    [],
+                    |r| r.get::<_, i64>(0).map(|n| n as u64),
+                )
+                .context("drain: count queued cells")?;
+            info!(cells = queued_cells, "drain starting");
+
             let mut total_drained = 0u64;
             let mut total_failed = 0u64;
             loop {
@@ -88,6 +106,11 @@ pub fn run_queue(conn: &Connection, action: QueueAction) -> Result<()> {
                 if stats.cells == 0 {
                     break;
                 }
+                info!(
+                    progress = format!("{total_drained}/{queued_cells}"),
+                    failed = total_failed,
+                    "drain progress"
+                );
             }
             if total_failed > 0 {
                 tracing::warn!(
@@ -135,8 +158,6 @@ pub fn in_transaction<T>(
     label: &str,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    use anyhow::Context;
-
     conn.execute_batch("BEGIN TRANSACTION")
         .with_context(|| format!("{label}: failed to begin transaction"))?;
     match f() {
