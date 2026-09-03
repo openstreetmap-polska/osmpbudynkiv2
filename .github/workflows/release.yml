@@ -28,7 +28,16 @@ jobs:
 
   build:
     name: cargo build & test (release)
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: glibc and libstdc++ are backward- but not
+    # forward-compatible, so the shipped binary runs only on a distro at least
+    # as new as the one that built it. `ubuntu-latest` is 24.04 (glibc 2.39,
+    # GLIBCXX_3.4.33) and produced a binary that would not start on the 22.04
+    # deployment target (glibc 2.35, GLIBCXX_3.4.30) -- it failed at exec with
+    # "version `GLIBC_2.38' not found", before `--version` could even print.
+    # DuckDB and RocksDB are what pull in libstdc++: both are compiled into the
+    # binary but link the system C++ runtime dynamically. Move this pin only to
+    # match the oldest distro actually deployed on, never to `latest`.
+    runs-on: ubuntu-22.04
     # Cold, this job is dominated by DuckDB's CMake build on a 4-vCPU runner.
     # Warm, it is a few minutes. The ceiling is here so a hung build fails
     # instead of running into GitHub's 6-hour default.
@@ -89,7 +98,15 @@ jobs:
         # every `INSTALL <extension>` 404 (see CLAUDE.md). It is exactly the
         # file that does not trigger a rebuild locally either, so without this
         # a bumped DuckDB version would keep restoring the old build.
-        key: ${{ hashFiles('cmake/duckdb_version.cmake', '.cargo/config.toml') }}
+        #
+        # `ImageOS` (`ubuntu22`/`ubuntu24`, set by the GitHub-hosted runner) is
+        # folded in because rust-cache's own key uses `runner.os`, which is
+        # `Linux` for every Ubuntu alike. Without it, a cache populated on a
+        # different image restores compiled DuckDB/RocksDB objects whose cargo
+        # fingerprints still match, so they are linked rather than rebuilt --
+        # silently undoing the `runs-on` pin above and reproducing the exact
+        # glibc/libstdc++ failure it exists to prevent, after a green build.
+        key: ${{ env.ImageOS }}-${{ hashFiles('cmake/duckdb_version.cmake', '.cargo/config.toml') }}
         # A cold run that fails in our own crate still leaves half an hour of
         # compiled C++ behind. Keeping it turns the retry into a short job.
         cache-on-failure: true
