@@ -21,6 +21,26 @@ Plik wykonywalny można uruchomić z flagą `--help` żeby zobaczyć wszystkie 
 
 ---
 
+Aktualizacja do nowszej wersji
+
+Dołączony do paczki skrypt `download_release_and_update.sh` pobiera najnowsze wydanie z GitHuba i podmienia plik wykonywalny, katalog `web/` oraz sam skrypt aktualizujący (nowa wersja skryptu zadziała przy kolejnym uruchomieniu, nie przy bieżącym). Pliki `config.toml`, `.env` i definicja usługi systemd nie są ruszane — to konfiguracja wdrożenia, a nie część wydania.
+
+```bash
+sudo bash download_release_and_update.sh
+```
+
+Skrypt sprawdza nowy plik wykonywalny (`--version`) zanim podmieni stary, więc wydanie zbudowane na nowszej dystrybucji niż serwer zostanie odrzucone, zamiast zepsuć działającą instalację. Przed podmianą zatrzymuje usługę (DuckDB nie obsługuje wielu procesów zapisujących naraz) i uruchamia ją ponownie tylko wtedy, gdy działała wcześniej.
+
+Flaga `--no-start` zostawia usługę zatrzymaną. Przydaje się przy pierwszym wdrożeniu, zanim `init` zaimportuje dane, oraz zawsze wtedy, gdy po aktualizacji trzeba uruchomić komendę offline (`import`, `compare`, `queue`, `reports`) — żadna z nich nie może działać, gdy serwer trzyma otwartą bazę danych.
+
+```bash
+sudo bash download_release_and_update.sh --no-start
+```
+
+Domyślne ścieżki i nazwy (`/opt/osmpbudynkiv2`, użytkownik `osmpbudynkiv2`, usługa `osmpbudynkiv2`) można nadpisać zmiennymi środowiskowymi `APP_DIR`, `OWNER`, `SERVICE` i `REPO` — pamiętając o `sudo -E`, które przekazuje je do skryptu.
+
+---
+
 Aplikację można skonfigurować plikiem TOML. Ścieżkę do niego podaje się flagą `--config`:
 
 ```bash

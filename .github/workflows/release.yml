@@ -170,7 +170,9 @@ jobs:
 
     # Everything a self-hosted deploy needs and nothing else: the compiled
     # binary, the static frontend, the systemd unit and env templates, the
-    # setup instructions and an example config to copy and edit.
+    # setup instructions, an example config to copy and edit, and the
+    # self-update script -- which ships here rather than only in the repo
+    # precisely so a server can upgrade itself without a checkout.
     #
     # `web/.playwright-cli` (the `npx playwright cli` scratch state — see
     # CLAUDE.md's browser-testing procedure) is `.gitignore`d, so `checkout`
@@ -184,6 +186,7 @@ jobs:
         cp -a web "$STAGE/web"
         rm -rf "$STAGE/web/.playwright-cli"
         cp example.service example.env instrukcja.txt example_config.toml "$STAGE/"
+        install -m 755 scripts/download_release_and_update.sh "$STAGE/"
         tar -czf "${STAGE}.tar.gz" "$STAGE"
 
     # `--target` pins the tag to the commit this workflow actually built.
