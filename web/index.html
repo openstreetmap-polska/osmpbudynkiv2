@@ -24,6 +24,25 @@
         <span class="masthead-warning-icon" aria-hidden="true"></span>
         <span><strong>Uwaga:</strong> przed wysłaniem danych do OSM zweryfikuj, czy obiekty istnieją w rzeczywistości i czy nie dublują już istniejących w bazie OSM.</span>
       </p>
+      <!-- Actions row. Deliberately below the warning rather than above it:
+           the warning is a precondition for editing, so it has to be read
+           before the button that starts an edit. Hidden below 640px together
+           with .panel-download and .panel-status (see the media query in
+           style.css) -- all three assume a JOSM desktop workflow.
+           Text-only by choice: the JOSM wordmark would be a vendored
+           third-party raster needing its own colour plate the way
+           .sponsor-credit-logo does (it is fixed-colour art over a
+           theme-flipping panel), and "JOSM" is already the most legible thing
+           about the label to this app's audience. -->
+      <div class="masthead-actions">
+        <button
+          id="josm-edit-btn"
+          type="button"
+          class="masthead-btn"
+          title="Wczytuje w JOSM dane OSM dla widocznego obszaru. Wymaga uruchomionego JOSM ze zdalnym sterowaniem (Ustawienia → Zdalne sterowanie)."
+        >Edytuj w JOSM</button>
+      </div>
+      <p id="josm-edit-hint" class="masthead-hint" role="status" aria-live="polite" hidden></p>
       <!-- Mobile-only twin of #sponsor-credit below -- hidden on desktop by
            style.css's base `.masthead-sponsor { display: none }`, shown only
            inside the `max-width: 640px` query. At phone width the legend
@@ -259,7 +278,19 @@
       </div>
     </dl>
     <p id="download-feedback-text" role="status" aria-live="polite"></p>
-    <button id="download-feedback-close" type="button" class="feedback-modal-close">Zamknij</button>
+    <!-- Shown only after a successful download (see runDownload in app.js):
+         load the same area's OSM data into JOSM so the just-downloaded package
+         has something to be pasted onto. Remote control carries a bbox, never
+         a file, so the drawn-polygon path sends the committed polygon's
+         envelope -- which is also the area /package itself was capped on. -->
+    <p id="josm-package-hint" class="hint" hidden>
+      Wczytaj dane OSM dla pobranego obszaru, a następnie przeciągnij pobrany plik do okna JOSM.
+    </p>
+    <p id="josm-package-status" class="hint" role="status" aria-live="polite" hidden></p>
+    <div class="feedback-modal-actions">
+      <button id="josm-package-btn" type="button" class="download-btn" hidden>Edytuj w JOSM</button>
+      <button id="download-feedback-close" type="button" class="feedback-modal-close">Zamknij</button>
+    </div>
   </dialog>
 
   <!-- Reporting objects that should not be proposed for import. Serves both

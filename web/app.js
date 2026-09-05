@@ -3234,6 +3234,164 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   applyAreaPanelState();
 
+  // ---- JOSM remote control ----
+  //
+  // Two entry points, one mechanism: the masthead's "Edytuj w JOSM" (the
+  // current viewport) and the download modal's (the area a package was just
+  // exported for). Both send /load_and_zoom, which makes JOSM download OSM
+  // data for a bbox. Remote control cannot be handed a file, so the package
+  // itself is still dragged into JOSM by hand -- see #josm-package-hint in
+  // index.html; what this buys is that the OSM data it will be merged against
+  // is already open, framed on the same area.
+  //
+  // Plain http://127.0.0.1:8111 only, from an https page too, and that is
+  // deliberate rather than an oversight: 127.0.0.1 is a *potentially
+  // trustworthy* origin (Secure Contexts), so mixed-content blocking exempts
+  // it -- which is how osm.org's own "Edit with JOSM" reaches this same port
+  // from an https page. JOSM's https listener on 8112 is off by default and
+  // needs a certificate installed by hand, so falling back to it buys almost
+  // nothing while costing a second failing request and a second console error
+  // on every failed click. If it ever comes back, note that the browser which
+  // would refuse the http port is generally the same one that refuses a
+  // self-signed cert unmoderated, so the fallback does not rescue the case it
+  // looks like it rescues.
+  //
+  // Remote control answers with `Access-Control-Allow-Origin: *`, which is
+  // what makes this a real CORS fetch whose failure is observable, rather than
+  // a fire-and-forget no-cors ping that can only ever look like success.
+  const JOSM_BASE = "http://127.0.0.1:8111";
+
+  // The OSM API refuses a download whose bbox exceeds 0.25 square degrees, so
+  // JOSM rejects /load_and_zoom before it ever reaches the network. Mirrored
+  // here for exactly the reason MAX_AREA_SQ_DEG mirrors /package's own cap:
+  // only to avoid firing a request that is guaranteed to fail, with the far
+  // side staying authoritative -- an area JOSM refuses for some other reason
+  // (its 50k-node ceiling, which is not an area at all) still surfaces
+  // through the same status line.
+  const JOSM_MAX_AREA_SQ_DEG = 0.25;
+
+  // Above that limit the button sends /zoom instead of going dead, because
+  // framing JOSM on the area is still the useful half and for some users it
+  // is the whole of it: the Continuous Download plugin fetches whatever the
+  // view lands on, and there is no way to detect it from here (remote
+  // control's /version and /features report protocol commands, not installed
+  // plugins). Without the plugin, JOSM's own download dialog opens on the
+  // current view -- one keystroke from where the user asked to be.
+  //
+  // /load_and_zoom stays the default deliberately: this app's entire point is
+  // not re-adding what OSM already has, and judging that needs the OSM data
+  // actually loaded under the package. A plugin user pays one duplicate fetch
+  // of a bbox JOSM merges by object id, which costs nothing.
+  //
+  // The status line always reports which of the two ran, so one button never
+  // silently means two different things.
+  function josmCommandFor(areaSqDeg) {
+    return areaSqDeg > JOSM_MAX_AREA_SQ_DEG ? "zoom" : "load_and_zoom";
+  }
+
+  const JOSM_UNREACHABLE =
+    "Nie udało się połączyć z JOSM. Uruchom JOSM i włącz zdalne sterowanie (Ustawienia → Zdalne sterowanie).";
+
+  const josmEditBtn = document.getElementById("josm-edit-btn");
+  const josmEditHint = document.getElementById("josm-edit-hint");
+  const josmPackageBtn = document.getElementById("josm-package-btn");
+  const josmPackageHint = document.getElementById("josm-package-hint");
+  const josmPackageStatus = document.getElementById("josm-package-status");
+
+  // The area the last successful /package response covered, so the modal's
+  // button sends the exported area rather than wherever the map has been
+  // panned to since. Null until a download succeeds.
+  let josmPackageEnvelope = null;
+  let josmSendInFlight = false;
+
+  function boundsEnvelope(b) {
+    return { minLng: b.getWest(), minLat: b.getSouth(), maxLng: b.getEast(), maxLat: b.getNorth() };
+  }
+
+  function setJosmStatus(el, text, state) {
+    el.textContent = text;
+    el.hidden = !text;
+    if (state) el.dataset.state = state;
+    else delete el.dataset.state;
+  }
+
+  async function josmSend(command, env) {
+    const params = {
+      left: env.minLng,
+      right: env.maxLng,
+      top: env.maxLat,
+      bottom: env.minLat,
+    };
+    // Merge into the layer the user is already editing instead of stacking a
+    // fresh one per click -- a second press for a neighbouring area is the
+    // normal way this button gets used. Meaningless to /zoom, which downloads
+    // nothing, so it is not sent there.
+    if (command === "load_and_zoom") params.new_layer = "false";
+    const qs = new URLSearchParams(params);
+    let res;
+    try {
+      res = await fetch(`${JOSM_BASE}/${command}?${qs}`, { cache: "no-store" });
+    } catch {
+      // JOSM not running, remote control switched off, or the browser refused
+      // the localhost request outright (Chrome's Local Network Access prompt)
+      // -- none of which distinguishes itself from here, so one message covers
+      // all three and names the two the user can act on.
+      throw new Error(JOSM_UNREACHABLE);
+    }
+    // JOSM answered and refused -- report its own status rather than the
+    // "is it running" message above, which would be actively misleading.
+    if (!res.ok) throw new Error(`JOSM odrzucił żądanie (HTTP ${res.status}).`);
+  }
+
+  // Shared by both buttons -- area check, in-flight disabling, and reporting
+  // into whichever status line belongs to that entry point.
+  async function sendToJosm(env, statusEl) {
+    const area = env ? envelopeAreaSqDeg(env) : 0;
+    if (!(area > 0)) {
+      setJosmStatus(statusEl, "Brak obszaru do wczytania w JOSM.", "error");
+      return;
+    }
+    const command = josmCommandFor(area);
+    josmSendInFlight = true;
+    josmPackageBtn.disabled = true;
+    josmEditBtn.disabled = true;
+    setJosmStatus(statusEl, "Wysyłanie do JOSM…", null);
+    try {
+      await josmSend(command, env);
+      // The zoom-only outcome is reported without a state colour rather than
+      // as "ok": it succeeded, but it did less than the button's label
+      // promises, and the user has to finish the download in JOSM.
+      if (command === "zoom") {
+        setJosmStatus(
+          statusEl,
+          `Obszar jest za duży, aby JOSM pobrał dane (${areaText(area)}, limit ${areaText(JOSM_MAX_AREA_SQ_DEG)}) — mapa w JOSM została wycentrowana na tym obszarze.`,
+          null,
+        );
+      } else {
+        setJosmStatus(statusEl, "Wysłano do JOSM.", "ok");
+      }
+    } catch (err) {
+      setJosmStatus(statusEl, err.message || String(err), "error");
+      console.error("JOSM remote control failed", err);
+    } finally {
+      josmSendInFlight = false;
+      josmPackageBtn.disabled = false;
+      josmEditBtn.disabled = false;
+    }
+  }
+
+  // No zoom or area gating on the button itself, unlike "Pobierz widoczny
+  // obszar": every area is sendable now that an oversized one degrades to
+  // /zoom, so there is nothing to disable it for and no per-move listener to
+  // keep a gate in sync with the map.
+  josmEditBtn.addEventListener("click", () => {
+    sendToJosm(boundsEnvelope(map.getBounds()), josmEditHint);
+  });
+
+  josmPackageBtn.addEventListener("click", () => {
+    sendToJosm(josmPackageEnvelope, josmPackageStatus);
+  });
+
   // Keys match the `datasets` values /package accepts (src/server/package.rs
   // parse_datasets) and what activeAggSources() above returns.
   const DATASET_LABELS = {
@@ -3275,7 +3433,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
 
   function formatBbox(b) {
-    return formatEnvelope({ minLng: b.getWest(), minLat: b.getSouth(), maxLng: b.getEast(), maxLat: b.getNorth() });
+    return formatEnvelope(boundsEnvelope(b));
   }
 
   // Shared by both the GET-bbox (viewport) and POST-polygon (drawn area)
@@ -3284,9 +3442,17 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // modal's rows) is identical between them, so `request` is the only thing
   // that varies: a plain URL for GET, or {url, init} with a POST body for the
   // drawn-polygon path.
-  async function runDownload(request, datasets, areaLabel) {
+  async function runDownload(request, datasets, areaLabel, areaEnvelope) {
     downloadFeedbackBbox.textContent = areaLabel;
     downloadFeedbackLayers.textContent = formatLayers(datasets);
+
+    // The JOSM row belongs to a *successful* export only, so every entry into
+    // this function retracts it -- otherwise a failed second download would
+    // leave the previous one's button offering the previous one's area.
+    josmPackageEnvelope = null;
+    josmPackageBtn.hidden = true;
+    josmPackageHint.hidden = true;
+    setJosmStatus(josmPackageStatus, "", null);
 
     if (datasets.length === 0) {
       setFeedback("Włącz co najmniej jedną warstwę (Budynki lub Adresy) w legendzie, aby pobrać paczkę.", "error");
@@ -3328,6 +3494,9 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       const sizeKb = (blob.size / 1024).toFixed(1);
       const countPart = featureCount !== null ? `${featureCount} obiektów, ` : "";
       setFeedback(`Pobrano ${filename} (${countPart}${sizeKb} KB)`, "ok");
+      josmPackageEnvelope = areaEnvelope;
+      josmPackageBtn.hidden = false;
+      josmPackageHint.hidden = false;
     } catch (err) {
       setFeedback(`Błąd sieci: ${err.message || err}`, "error");
       console.error("package download failed", err);
@@ -3354,6 +3523,9 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         },
         datasets,
         `${formatEnvelope(committedEnvelope)} (narysowany, ${committedVertexCount} pkt.)`,
+        // Remote control takes a bbox, never a polygon -- the committed
+        // envelope is what /package itself was area-capped on anyway.
+        committedEnvelope,
       );
     } else {
       const b = map.getBounds();
@@ -3362,6 +3534,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         { url: `/package?bbox=${encodeURIComponent(bbox)}&datasets=${datasets.join(",")}` },
         datasets,
         formatBbox(b),
+        boundsEnvelope(b),
       );
     }
   });

@@ -289,6 +289,62 @@ body {
   color: var(--paper);
 }
 
+/* Masthead action row ("Edytuj w JOSM", see .masthead-actions in index.html).
+   Its own button recipe rather than .download-btn's: that class is a
+   full-width stacked panel button, whereas this one sits inline in a text
+   block and has to hug its label. Filled accent (not .report-btn's outlined
+   secondary) because it is the one action this block offers. */
+.masthead-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.masthead-btn {
+  padding: 6px 12px;
+  background: var(--accent);
+  color: var(--paper-raised);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  font-size: 11px;
+  transition: background-color 0.15s ease;
+}
+.masthead-btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+.masthead-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Status line under the actions row (remote-control failures, "za duży
+   obszar"). Two classes, not the bare one: this is a <p> inside .masthead, so
+   a single-class selector (0,1,0) loses margin/font-size to `.masthead p`
+   (0,1,1) above -- the same specificity trap .masthead-sponsor documents. */
+.masthead .masthead-hint {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+.masthead .masthead-hint[data-state="error"] {
+  color: var(--danger);
+}
+.masthead .masthead-hint[data-state="ok"] {
+  color: var(--ok);
+}
+
+/* The download modal's JOSM status line. Scoped by id rather than given
+   .feedback-modal's own [data-state] treatment: that attribute lives on the
+   <dialog> and colours #download-feedback-text, which reports the *download*
+   -- a JOSM failure must not repaint the "Pobrano ..." line above it. */
+#josm-package-status[data-state="error"] {
+  color: var(--danger);
+}
+#josm-package-status[data-state="ok"] {
+  color: var(--ok);
+}
+
 /* Sponsor credit, fixed bottom-center -- see the placement comment on its
    markup in index.html for why it isn't part of .masthead. Same visual
    language as .panel (paper background, hairline border, soft shadow) so it
@@ -754,6 +810,44 @@ button {
   background: var(--accent-soft);
 }
 
+/* #download-feedback's button row -- one button until "Edytuj w JOSM" joined
+   it. Same recipe as .report-modal-actions below (neutralising
+   .download-btn's width:100%/margin-top so the two share the row evenly);
+   kept as a separate class because the report modal's own row sizes its
+   buttons up a step and this one keeps the smaller default. */
+.feedback-modal-actions {
+  display: flex;
+  gap: 8px;
+}
+.feedback-modal-actions > * {
+  flex: 1;
+  margin-top: 0;
+}
+/* Same trap as .source-toggle[hidden] above: this class sets `display: flex`,
+   which ties the UA sheet's `[hidden] { display: none }` on specificity and
+   wins on origin -- so #josm-package-btn's [hidden] would silently do nothing
+   if it were ever given this class. Guarded here for the next element that
+   lands in this row. */
+.feedback-modal-actions > [hidden] {
+  display: none;
+}
+
+/* Demoted from .feedback-modal-close's filled accent for the same reason
+   #report-cancel is: it now shares a row with "Edytuj w JOSM", and two filled
+   buttons read as two equally-likely actions. Kept demoted in the states
+   where the JOSM button is hidden too -- a lone button labelled "Zamknij"
+   reads as a dismiss with or without an accent fill. */
+#download-feedback-close {
+  background: var(--paper);
+  color: var(--ink-soft);
+  border-color: var(--line);
+}
+#download-feedback-close:hover {
+  background: var(--paper);
+  border-color: var(--ink-soft);
+  color: var(--ink);
+}
+
 /* ---- report modal (#report-modal) ----
    Shares .feedback-modal's box, backdrop and data-state colouring with
    #download-feedback; only the form inside it is new. Sized up a step from
@@ -1136,8 +1230,12 @@ button {
      Hidden outright, unlike the legend -- which stays reachable, just
      folded by default at load (see the matchMedia check in app.js) -- since
      there's no useful folded state for either of these to fall back to. */
+  /* .masthead-actions joins these two for the same reason: "Edytuj w JOSM"
+     talks to a desktop JOSM over local remote control, which no phone
+     browser has anything to reach. */
   .panel-status,
-  .panel-download {
+  .panel-download,
+  .masthead-actions {
     display: none;
   }
 }
