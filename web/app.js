@@ -929,15 +929,34 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     return `<h4 class="feature-popup-section">${escapeHtml(heading)}</h4><dl>${rowsHtml}</dl>`;
   }
 
+  // The OSM-tags section renders as one selectable block of `key=value` lines
+  // rather than the attributes section's <dl>, because its whole purpose is to
+  // be pasted into iD's tag text view, which parses exactly this format: one
+  // tag per line, `key=value`, no quoting or escaping. A <dl> copies as a
+  // label/value jumble that iD rejects, and its `—` placeholder for an empty
+  // value would paste as a literal em dash -- so a value-less tag is written
+  // here as a bare `key=`, which is what it is.
+  function tagsText(tags) {
+    return tags.map(([key, value]) => `${key}=${value}`).join("\n");
+  }
+
+  const COPY_BTN_LABEL = "Kopiuj";
+
   function popupHtml({ title, status, statusHint, attributes, tags, report }) {
     // Each present only when it has rows -- a feature with no OSM-tag preview
     // (or, in principle, no plain attributes) shows a single section rather
     // than an empty one with nothing under its heading.
     const attributesHtml = popupSection("Atrybuty", attributes);
-    const tagsHtml = popupSection(
-      "Tagi OSM",
-      tags.map(([key, value]) => [key, key, value === "" ? "—" : value])
-    );
+    // The copy button carries no data of its own: the delegated listener reads
+    // the text straight back out of the <pre> next to it, so there is nothing
+    // to keep in sync with what is on screen (and nothing needing an
+    // attribute-safe escaper, which escapeHtml is not -- see below).
+    const tagsHtml = tags.length
+      ? `<h4 class="feature-popup-section feature-popup-section-action">` +
+        `<span>Tagi OSM</span>` +
+        `<button type="button" class="tag-copy-btn">${COPY_BTN_LABEL}</button></h4>` +
+        `<pre class="feature-tags">${escapeHtml(tagsText(tags))}</pre>`
+      : "";
     // The button carries no identity of its own: the object it refers to lives
     // in popupReport, set by the same handler that built this HTML. Encoding
     // the key into a data- attribute instead would need an attribute-safe
@@ -1148,6 +1167,60 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     reportSubmit.disabled = false;
     showReportPreSendActions();
     if (!reportModal.open) reportModal.showModal();
+  });
+
+  // The textarea fallback is load-bearing, not belt-and-braces:
+  // navigator.clipboard exists only in a secure context, and this app is
+  // routinely served over plain HTTP on a LAN address, where it is simply
+  // undefined -- the exact deployment where a user is most likely to be
+  // copying tags into iD. The textarea must stay in the layout (off-screen,
+  // not display:none/visibility:hidden) or execCommand("copy") silently
+  // copies nothing.
+  function copyText(text) {
+    if (window.isSecureContext && navigator.clipboard) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise((resolve, reject) => {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try {
+        ok = document.execCommand("copy");
+      } catch (_) {
+        ok = false;
+      }
+      ta.remove();
+      if (ok) resolve();
+      else reject(new Error("copy failed"));
+    });
+  }
+
+  // Delegated for the same reason the .report-btn listener above is: MapLibre
+  // replaces the popup's inner HTML on every setHTML, taking any directly
+  // bound listener with it. The timeout is keyed to the button element, so a
+  // popup closed mid-flash just leaves a detached node to be collected.
+  function flashCopyButton(btn, message) {
+    btn.textContent = message;
+    window.setTimeout(() => {
+      btn.textContent = COPY_BTN_LABEL;
+    }, 1500);
+  }
+
+  map.getContainer().addEventListener("click", (e) => {
+    if (appDrawState === "drawing") return;
+    const btn = e.target.closest && e.target.closest(".tag-copy-btn");
+    if (!btn) return;
+    const block = btn.closest(".feature-popup").querySelector(".feature-tags");
+    if (!block) return;
+    copyText(block.textContent).then(
+      () => flashCopyButton(btn, "Skopiowano"),
+      () => flashCopyButton(btn, "Nie udało się")
+    );
   });
 
   reportCancel.addEventListener("click", () => reportModal.close());

@@ -1186,6 +1186,69 @@ button {
   padding-top: 10px;
   border-top: 1px solid var(--line);
 }
+/* The OSM-tags section's heading carries the copy button, so it stops being a
+   plain text line and becomes a row -- .feature-popup-section keeps its
+   spacing/divider/typography, this only adds the layout. The <span> around the
+   heading text is what stops the button inheriting the heading's uppercase
+   letter-spacing. */
+.feature-popup-section-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* Secondary-action styling, deliberately the same recipe as .report-btn below
+   (paper fill, hairline border, --ink-soft text) rather than .download-btn's
+   filled accent: the popup's primary job is showing information, and a filled
+   button here would outrank the report action sitting under it. Sized down to
+   sit inside a 10px heading without making the row taller than the divider
+   spacing above it. min-width holds the box steady while the label swaps to
+   "Skopiowano"/"Nie udało się" (see flashCopyButton in app.js), so the heading
+   row doesn't jump on click. */
+.tag-copy-btn {
+  flex: none;
+  min-width: 74px;
+  padding: 3px 8px;
+  background: var(--paper);
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-family: var(--font-label);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+.tag-copy-btn:hover {
+  color: var(--ink);
+  border-color: var(--ink-soft);
+}
+
+/* The tags themselves, as one `key=value` block instead of the attributes
+   section's two-column <dl> -- this is what gets pasted into iD's tag text
+   view, so a drag-select across it (or the copy button above) has to yield
+   exactly those lines and nothing else. Hence no <dl>: its label column would
+   copy interleaved with the values, and its `text-align: right` on <dd> would
+   put the line breaks in visually misleading places.
+   `white-space: pre-wrap` keeps the newlines that make the format parseable
+   while still wrapping a long value inside the popup's 320px max-width; the
+   wrap is soft, so a wrapped line still copies as one line. */
+.feature-tags {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-family: var(--font-data);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 /* "Zgłoś problem", shown only on the two unmatched layers (see reportKeyFor
    in app.js). Sits outside .feature-popup-body so it stays put while the
    attribute list scrolls, and reads as a secondary action -- outlined rather
