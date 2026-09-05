@@ -52,13 +52,29 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // changes-outline layer and applyChangesVisibility below.
   const changesColor = rootStyle.getPropertyValue("--changes").trim();
 
-  // How far back "recently" reaches for the changes-outline overlay. Purely a
-  // frontend number: the tile carries a raw Unix-seconds timestamp per source
-  // per bin (ts_bdot10k/ts_egib/ts_prg), and the window is applied here, so
-  // narrowing or widening it costs no refetch. Must stay within the server's
-  // [changes] max_age_days, which bounds what the tile carries at all --
-  // anything older reads as 0 and can never light up however long this is.
-  const CHANGES_WINDOW_HOURS = 24;
+  // How far back "recently" reaches for the changes-outline overlay, as the
+  // options the legend offers. Purely frontend numbers: the tile carries a
+  // raw Unix-seconds timestamp per source per bin (ts_bdot10k/ts_egib/
+  // ts_prg) and the window is applied here as a paint-time comparison, so
+  // switching windows -- or widening one -- costs no refetch and no restyle.
+  //
+  // The ceiling is the server's [changes] max_age_days (7 days by default),
+  // which bounds what the tile carries at all: a change older than that
+  // reads as 0 and can never light up however long a window is offered here.
+  // "7d" therefore sits exactly *on* that bound rather than under it, which
+  // is the intended maximum (see ChangesConfig in src/config.rs) -- a longer
+  // preset needs max_age_days raised first, and that costs every z5-z11
+  // tile, not just this overlay.
+  //
+  // `key` is what the URL hash and localStorage carry, so the keys are part
+  // of a shared link's contract: renaming one silently drops the restored
+  // setting back to the default.
+  const CHANGES_WINDOWS = [
+    { key: "off", hours: 0, label: null },
+    { key: "24h", hours: 24, label: "Zmiany z ostatnich 24 h" },
+    { key: "7d", hours: 24 * 7, label: "Zmiany z ostatnich 7 dni" },
+  ];
+  const DEFAULT_CHANGES_WINDOW = "24h";
 
   // agg_cells carries integer count attributes, but what a given
   // count *means* changes sharply across z5-11: bz = min(z + 5, 14) caps at
@@ -1481,16 +1497,50 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const VALID_BUILDING_SOURCES = ["off", "bdot10k", "egib"];
   const VALID_ADDRESS_SOURCES = ["off", "prg"];
   const VALID_AGG_COLORS = ["ratio", "count"];
+  const VALID_CHANGES_WINDOWS = CHANGES_WINDOWS.map((w) => w.key);
 
+  // The changes window is the one setting that also survives a *new* visit,
+  // not just a shared link: it is a standing preference ("I watch registry
+  // updates") rather than a description of one view, and the alternative is
+  // re-picking it on every visit. Everything else in the hash stays
+  // session-scoped, so a bare visit still opens on the documented defaults.
+  //
+  // localStorage can throw outright (Chrome with third-party/site data
+  // blocked, Safari private mode), not merely return null, so every access
+  // is guarded -- an unavailable store must degrade to "no remembered
+  // preference", never take the legend down with it.
+  const CHANGES_WINDOW_STORAGE_KEY = "osmpbudynkiv2.changesWindow";
+
+  function readStoredChangesWindow() {
+    try {
+      const stored = localStorage.getItem(CHANGES_WINDOW_STORAGE_KEY);
+      return VALID_CHANGES_WINDOWS.includes(stored) ? stored : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function storeChangesWindow(value) {
+    try {
+      localStorage.setItem(CHANGES_WINDOW_STORAGE_KEY, value);
+    } catch {
+      /* Preference is not persisted; the session still works. */
+    }
+  }
+
+  // Trailing fields are optional on read: a link shared before the changes
+  // window joined this entry carries only three, and must keep restoring the
+  // three it does carry rather than being rejected wholesale.
   function readStateHash() {
     const raw = location.hash.replace(/^#/, "");
     const entry = raw.split("&").find((part) => part.split("=")[0] === STATE_HASH_KEY);
     const value = entry ? entry.slice(entry.indexOf("=") + 1) : "";
-    const [buildingSource, addressSource, aggColor] = value.split(",");
+    const [buildingSource, addressSource, aggColor, changesWindow] = value.split(",");
     return {
       buildingSource: VALID_BUILDING_SOURCES.includes(buildingSource) ? buildingSource : null,
       addressSource: VALID_ADDRESS_SOURCES.includes(addressSource) ? addressSource : null,
       aggColor: VALID_AGG_COLORS.includes(aggColor) ? aggColor : null,
+      changesWindow: VALID_CHANGES_WINDOWS.includes(changesWindow) ? changesWindow : null,
     };
   }
 
@@ -1498,7 +1548,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // entry, preserving `map=...` (and anything else already in the hash)
   // exactly as MapLibre's own getHashString does for its own entry.
   function writeStateHash() {
-    const value = `${STATE_HASH_KEY}=${buildingSource},${addressSource},${aggColor}`;
+    const value = `${STATE_HASH_KEY}=${buildingSource},${addressSource},${aggColor},${changesWindow}`;
     const parts = location.hash.replace(/^#/, "").split("&").filter(Boolean);
     let found = false;
     const next = parts.map((part) => {
@@ -1522,18 +1572,27 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const legendBuildingsGroup = document.querySelector(".legend-group[data-building-source]");
   const legendAddressesGroup = document.querySelector(".legend-group[data-address-source]");
   const legendUpdatesGroup = document.querySelector(".legend-group[data-updates-source]");
-  const legendChangesGroup = document.querySelector(".legend-group[data-changes-source]");
+  const legendChangesGroup = document.querySelector(".legend-group[data-changes-window]");
   const buildingSourceButtons = legendBuildingsGroup.querySelectorAll(".source-btn");
   const addressSourceButtons = legendAddressesGroup.querySelectorAll(".source-btn");
   const updatesSourceButtons = legendUpdatesGroup.querySelectorAll(".source-btn");
-  const changesSourceButtons = legendChangesGroup.querySelectorAll(".source-btn");
-  // The legend restates the window in words; derive it from the constant the
-  // map actually applies, so editing CHANGES_WINDOW_HOURS can't leave the
-  // panel confidently describing a window nothing uses. The HTML carries the
-  // default value so the row reads correctly before this runs.
+  const changesWindowButtons = legendChangesGroup.querySelectorAll(".source-btn");
+  // The legend restates the active window in words; derive it from the same
+  // CHANGES_WINDOWS entry the map applies, so editing a window's length
+  // can't leave the panel confidently describing a window nothing uses. The
+  // HTML carries the default's wording so the row reads correctly before
+  // this first runs. On "off" the row keeps whatever it last said: the
+  // swatch it labels is hidden anyway, and blanking it would collapse the
+  // row's height for no gain.
   const changesWindowLabel = document.getElementById("changes-window-label");
-  if (changesWindowLabel) {
-    changesWindowLabel.textContent = `Zmiany z ostatnich ${CHANGES_WINDOW_HOURS} h`;
+
+  function changesWindowEntry() {
+    return CHANGES_WINDOWS.find((w) => w.key === changesWindow) || CHANGES_WINDOWS[0];
+  }
+
+  function applyChangesWindowLabel() {
+    const label = changesWindowEntry().label;
+    if (changesWindowLabel && label) changesWindowLabel.textContent = label;
   }
 
   // "off"/"bdot10k"/"egib" and "off"/"prg": one mutually-exclusive control per
@@ -1557,23 +1616,36 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // "on"/"off": recently-downloaded export areas are their own single
   // registry-less overlay (see pollUpdates below), so there's no third state
   // to pick between the way buildingSource/addressSource choose a registry --
-  // just visible or not. Not restored from the URL hash: unlike the other
-  // three toggles it's not a *view* of one map layer's data, and adding a
-  // fourth hash field for a low-stakes default-on overlay isn't worth it.
+  // just visible or not. Deliberately still not carried in the URL hash, even
+  // though the changes overlay below now is: this one is default-on and shows
+  // whatever /updates last returned, so there is no state worth naming in a
+  // shared link -- the recipient sees the same thing either way.
   let updatesVisible = legendUpdatesGroup.dataset.updatesSource !== "off";
   for (const b of updatesSourceButtons) {
     b.setAttribute("aria-pressed", String(b.dataset.updatesSource === (updatesVisible ? "on" : "off")));
   }
 
-  // Same "on"/"off" shape as the updates overlay, and not restored from the
-  // URL hash for the same reason. Defaults *off*, unlike updates: right after
-  // a registry republishes, this lights up a large share of the country at
-  // once, which is useful when you go looking for it and noise when you
-  // don't.
-  let changesVisible = legendChangesGroup.dataset.changesSource !== "off";
-  for (const b of changesSourceButtons) {
-    b.setAttribute("aria-pressed", String(b.dataset.changesSource === (changesVisible ? "on" : "off")));
+  // One of CHANGES_WINDOWS' keys, "off" included -- so this is both the
+  // overlay's on/off switch and its window, which is why there is no separate
+  // boolean. On by default at 24 h: a registry republish lights up a large
+  // share of the country at once, but that *is* the signal an editor comes
+  // here for, and an overlay nobody sees until they find the toggle mostly
+  // does not get seen.
+  //
+  // Precedence is hash > localStorage > the HTML's default, matching the
+  // other three: a link someone shared describes a specific view and has to
+  // win over the visitor's own standing preference, which in turn wins over
+  // the built-in default.
+  let changesWindow =
+    restoredState.changesWindow ||
+    readStoredChangesWindow() ||
+    legendChangesGroup.dataset.changesWindow ||
+    DEFAULT_CHANGES_WINDOW;
+  legendChangesGroup.dataset.changesWindow = changesWindow;
+  for (const b of changesWindowButtons) {
+    b.setAttribute("aria-pressed", String(b.dataset.changesWindow === changesWindow));
   }
+  applyChangesWindowLabel();
 
   function setLayerVisible(layerId, visible) {
     map.setLayoutProperty(layerId, "visibility", visible ? "visible" : "none");
@@ -1607,10 +1679,10 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     setLayerVisible("updates-outline", updatesVisible);
   }
 
-  // MapLibre has no `now` expression, so "the last CHANGES_WINDOW_HOURS" has
-  // to be a value someone puts into the style. Stamp it as global state and
-  // re-stamp on a timer, otherwise the window freezes at page load and a tab
-  // left open overnight keeps highlighting yesterday's changes.
+  // MapLibre has no `now` expression, so "the last N hours" has to be a value
+  // someone puts into the style. Stamp it as global state and re-stamp on a
+  // timer, otherwise the window freezes at page load and a tab left open
+  // overnight keeps highlighting yesterday's changes.
   //
   // Cheap by construction: changes-outline references the cutoff from paint
   // only (see the layer above), so a re-stamp re-evaluates one property
@@ -1618,11 +1690,12 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const CHANGES_CUTOFF_STATE_KEY = "changesCutoff";
   const CHANGES_RESTAMP_MS = 60_000;
 
+  // Reads the *current* window, so switching windows is a re-stamp of this
+  // one number rather than a new paint expression -- picking "7 dni" simply
+  // moves the cutoff back, and the timer keeps it moving from there.
   function stampChangesCutoff() {
-    map.setGlobalStateProperty(
-      CHANGES_CUTOFF_STATE_KEY,
-      Date.now() / 1000 - CHANGES_WINDOW_HOURS * 3600,
-    );
+    const hours = changesWindowEntry().hours || CHANGES_WINDOWS[1].hours;
+    map.setGlobalStateProperty(CHANGES_CUTOFF_STATE_KEY, Date.now() / 1000 - hours * 3600);
   }
 
   // Per-source, reusing the same activeAggSources() the grid does, so picking
@@ -1647,7 +1720,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   function applyChangesVisibility() {
     const sources = activeAggSources();
-    const visible = changesVisible && sources.length > 0;
+    const visible = changesWindow !== "off" && sources.length > 0;
     setLayerVisible("changes-outline", visible);
     if (!visible) return;
     map.setPaintProperty("changes-outline", "line-opacity", [
@@ -1695,14 +1768,22 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         applyUpdatesVisibility();
       });
     }
-    for (const btn of changesSourceButtons) {
+    for (const btn of changesWindowButtons) {
       btn.addEventListener("click", () => {
-        changesVisible = btn.dataset.changesSource === "on";
-        legendChangesGroup.dataset.changesSource = btn.dataset.changesSource;
-        for (const b of changesSourceButtons) {
+        changesWindow = btn.dataset.changesWindow;
+        legendChangesGroup.dataset.changesWindow = changesWindow;
+        for (const b of changesWindowButtons) {
           b.setAttribute("aria-pressed", String(b === btn));
         }
+        applyChangesWindowLabel();
+        // Order matters: the cutoff is what the overlay's paint expression
+        // reads, so re-stamp it before applying visibility -- otherwise the
+        // layer turns on for one frame still holding the previous window's
+        // cutoff.
+        stampChangesCutoff();
         applyChangesVisibility();
+        storeChangesWindow(changesWindow);
+        writeStateHash();
       });
     }
     // Layer visibility starts as "none" in the style spec above; derive the
@@ -2273,9 +2354,10 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
 
   // Last-used mode, remembered only for this page session (module-level, not
-  // localStorage -- this frontend has no persisted-preference pattern
-  // elsewhere and adding one just for this would be scope creep). Rectangle
-  // is the default first mode since it needs no explanation.
+  // localStorage -- the one persisted preference this frontend has is the
+  // changes window, see CHANGES_WINDOW_STORAGE_KEY, and a draw mode is a
+  // per-task choice rather than a standing one). Rectangle is the default
+  // first mode since it needs no explanation.
   let drawMode = "rectangle";
 
   // In-progress geometry, one set of fields per mode -- only the fields for

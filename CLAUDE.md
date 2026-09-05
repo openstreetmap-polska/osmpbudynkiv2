@@ -118,11 +118,18 @@ removed/modified rows out of the live table.
 **Gotcha — `dataset_change_areas` is read by `/tiles`, and three numbers in
 three files have to stay ordered.** `server::tiles::agg_bin_ctes` LEFT JOINs it
 into every z5–z11 tile as a per-bin, per-source `ts_*` timestamp, which the
-frontend compares against its own window. So: `web/app.js`'s
-`CHANGES_WINDOW_HOURS` (24) ≤ `[changes] max_age_days` (7) ≤
+frontend compares against its own window. So: the longest window in
+`web/app.js`'s `CHANGES_WINDOWS` (7 d) ≤ `[changes] max_age_days` (7) ≤
 `[jobs.retention_prune] change_areas_days` (90). Violate either inequality and
 nothing errors — the overlay just goes blind for the tail of the window it
-still advertises. Two further consequences:
+still advertises. The first inequality is currently an **equality**: the "7 dni"
+preset sits exactly on `max_age_days`, which is the intended maximum, so
+*adding* a longer preset is a config change first — and one that costs every
+z5–z11 tile, per the next point, not just this overlay. The window is otherwise
+free: it is a paint-time comparison against a raw `ts_*` the tile already
+carries, so switching presets costs no refetch and no restyle, and the picked
+preset rides in the `layers=` hash entry and `localStorage` (this frontend's
+only persisted preference). Two further consequences:
 
 - **Per-tile cost is linear in `max_age_days` and independent of the tile.**
   The table has no index and no useful cell ordering (`insert_change_areas`

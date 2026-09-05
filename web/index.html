@@ -121,13 +121,20 @@
       </div>
     </div>
 
-    <div class="legend-group" data-changes-source="off">
+    <!-- Unlike the Budynki/Adresy pickers above, the states here are windows
+         rather than sources: the tile carries one raw timestamp per source
+         per bin and the window is a client-side comparison against it (see
+         CHANGES_WINDOWS in app.js), so switching between them costs no
+         refetch. "7 dni" is the longest option the server can honour -- the
+         tile never carries anything older than [changes] max_age_days. -->
+    <div class="legend-group" data-changes-window="24h">
       <div class="legend-group-header">
         <span class="legend-title">Ostatnio zaktualizowane</span>
       </div>
-      <div class="source-toggle" role="group" aria-label="Ostatnio zaktualizowane komórki">
-        <button type="button" class="source-btn" data-changes-source="off" aria-pressed="true">Wyłącz</button>
-        <button type="button" class="source-btn" data-changes-source="on" aria-pressed="false">Pokaż</button>
+      <div class="source-toggle" role="group" aria-label="Okno czasowe ostatnio zaktualizowanych komórek">
+        <button type="button" class="source-btn" data-changes-window="off" aria-pressed="false">Wyłącz</button>
+        <button type="button" class="source-btn" data-changes-window="24h" aria-pressed="true">24 h</button>
+        <button type="button" class="source-btn" data-changes-window="7d" aria-pressed="false">7 dni</button>
       </div>
       <div class="legend-row">
         <span class="swatch" data-swatch="changes"></span>

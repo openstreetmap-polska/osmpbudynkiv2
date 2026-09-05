@@ -317,15 +317,16 @@ pub struct ChangesConfig {
     /// Outer bound on the overlay's reach. The frontend picks its own,
     /// shorter window inside this one and evaluates it client-side, so this
     /// must be at least as long as the longest window the frontend offers
-    /// (`CHANGES_WINDOW_HOURS` in `web/app.js`, currently 24 h).
+    /// (`CHANGES_WINDOWS` in `web/app.js`, currently 7 d -- exactly this
+    /// value, so a longer preset there needs this raised first).
     ///
     /// Beyond that floor, keep it tight rather than generous. Every z5..z11
     /// tile scans every change row inside this window nationwide -- that is
     /// the only pruning `dataset_change_areas` supports, having no index and
     /// no useful cell ordering -- so per-tile cost is linear in this value and
-    /// independent of the tile. 7 days is 7x headroom over the only window
-    /// that exists, survives a week-long stall of the daily refresh jobs, and
-    /// leaves room for a "last week" preset with no server change.
+    /// independent of the tile. 7 days survives a week-long stall of the
+    /// daily refresh jobs, and is what the frontend's own longest preset
+    /// ("7 dni") now spends in full.
     ///
     /// Unrelated to `jobs.retention_prune.change_areas_days`, which decides
     /// how long the rows are *kept*; rows older than this are simply never

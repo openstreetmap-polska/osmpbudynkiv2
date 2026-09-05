@@ -326,11 +326,12 @@ max_minutes = 1440
 # The "recently updated" grid overlay: z5-z11 tiles carry, per bin and per
 # source, the most recent time a government refresh reported a change there
 # (from dataset_change_areas). The frontend picks its own window inside this
-# one and evaluates it client-side, so narrowing "last 24 h" costs no refetch.
+# one and evaluates it client-side, so switching between "last 24 h" and
+# "last 7 d" costs no refetch.
 [changes]
 # Outer bound on how far back a tile may look. Must be at least as long as the
-# longest window the frontend offers (CHANGES_WINDOW_HOURS in web/app.js,
-# currently 24 h).
+# longest window the frontend offers (CHANGES_WINDOWS in web/app.js, whose
+# longest preset is 7 d -- exactly this value).
 #
 # Beyond that floor, keep it tight rather than generous: every z5-z11 tile
 # scans every change row inside this window nationwide -- the table has no
