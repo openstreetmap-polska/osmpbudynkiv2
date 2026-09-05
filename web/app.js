@@ -189,7 +189,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
    * cancel. A wide range (this was 0.25..0.9) turned the regional pattern
    * into speckle. Kept wide enough to still rank bins by weight, narrow
    * enough that hue decides what a cell reads as. */
-  const COUNT_OPACITY_STOPS = [0.55, 0.68, 0.78, 0.87, 0.95];
+  const COUNT_OPACITY_STOPS = [0.3, 0.42, 0.52, 0.61, 0.7];
 
   function countOpacityExpr(attr) {
     return zoomPropertyRamp(attr, COUNT_OPACITY_STOPS);
@@ -1529,7 +1529,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     map.setPaintProperty(
       "agg-grid-fill",
       "fill-opacity",
-      ratioMode ? zoomPropertyRampFromValue(countValue, COUNT_OPACITY_STOPS) : 0.75,
+      ratioMode ? zoomPropertyRampFromValue(countValue, COUNT_OPACITY_STOPS) : 0.5,
     );
   }
 
