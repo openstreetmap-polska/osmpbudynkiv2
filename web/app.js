@@ -1080,8 +1080,24 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const reportModal = document.getElementById("report-modal");
   const reportModalObject = document.getElementById("report-modal-object");
   const reportModalText = document.getElementById("report-modal-text");
+  const reportModalCloseX = document.getElementById("report-modal-close-x");
   const reportSubmit = document.getElementById("report-submit");
   const reportCancel = document.getElementById("report-cancel");
+  const reportClose = document.getElementById("report-close");
+
+  // Submit/cancel are the pre-send pair; close is swapped in alone once a
+  // report has actually been accepted, since "Wyślij zgłoszenie" / "Anuluj"
+  // no longer mean anything once there's nothing left to send or cancel.
+  function showReportPreSendActions() {
+    reportSubmit.hidden = false;
+    reportCancel.hidden = false;
+    reportClose.hidden = true;
+  }
+  function showReportCloseOnly() {
+    reportSubmit.hidden = true;
+    reportCancel.hidden = true;
+    reportClose.hidden = false;
+  }
 
   // The object the open dialog is about. Cleared on close so a target can
   // never outlive the dialog opening that set it.
@@ -1130,10 +1146,13 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     reportModalObject.textContent = popupReport.label;
     setReportFeedback("", null);
     reportSubmit.disabled = false;
+    showReportPreSendActions();
     if (!reportModal.open) reportModal.showModal();
   });
 
   reportCancel.addEventListener("click", () => reportModal.close());
+  reportClose.addEventListener("click", () => reportModal.close());
+  reportModalCloseX.addEventListener("click", () => reportModal.close());
   // Same light-dismiss handling as #download-feedback: a click landing on the
   // dialog element itself but outside its content box is a backdrop click.
   reportModal.addEventListener("click", (e) => {
@@ -1175,6 +1194,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           "Zgłoszenie przyjęte. Obiekt zniknie z warstwy niedopasowanych po najbliższym odświeżeniu danych.",
           "ok",
         );
+        showReportCloseOnly();
         popup.remove();
         popupReport = null;
       } else {

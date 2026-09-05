@@ -228,6 +228,7 @@
        Opened from the "Zgłoś problem" button in a feature popup; posts to
        /report. -->
   <dialog id="report-modal" class="feedback-modal">
+    <button id="report-modal-close-x" type="button" class="modal-close-x" aria-label="Zamknij">&times;</button>
     <h2 id="report-modal-title">Zgłoś problem z obiektem</h2>
     <dl class="feedback-modal-details">
       <div>
@@ -244,6 +245,9 @@
       <div class="report-modal-actions">
         <button id="report-submit" type="button" class="download-btn">Wyślij zgłoszenie</button>
         <button id="report-cancel" type="button" class="feedback-modal-close">Anuluj</button>
+        <!-- Swapped in for the submit/cancel pair once a report has been
+             accepted -- see the report-modal-actions comment in app.js. -->
+        <button id="report-close" type="button" class="feedback-modal-close" hidden>Zamknij</button>
       </div>
     </div>
   </dialog>

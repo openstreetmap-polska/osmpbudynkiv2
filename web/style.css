@@ -634,6 +634,7 @@ button {
 }
 
 .feedback-modal {
+  position: relative;
   min-width: 220px;
   max-width: min(90vw, 360px);
   padding: 18px 20px;
@@ -642,6 +643,29 @@ button {
   border: 1px solid var(--line);
   border-radius: 6px;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+}
+
+/* "x" dismiss button, anchored to .feedback-modal's own position: relative.
+   Currently only #report-modal uses it (see its markup) -- #download-feedback
+   keeps its single bottom .feedback-modal-close, which already reads as
+   "dismiss". */
+.modal-close-x {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  border: none;
+  border-radius: 4px;
+  font-size: 20px;
+  line-height: 1;
+}
+.modal-close-x:hover {
+  color: var(--ink);
+  background: var(--paper);
 }
 .feedback-modal::backdrop {
   background: rgba(0, 0, 0, 0.35);
@@ -705,7 +729,23 @@ button {
 
 /* ---- report modal (#report-modal) ----
    Shares .feedback-modal's box, backdrop and data-state colouring with
-   #download-feedback; only the form inside it is new. */
+   #download-feedback; only the form inside it is new. Sized up a step from
+   the shared .feedback-modal-details/#download-feedback-text defaults
+   (11px/12px) -- scoped to #report-modal specifically so #download-feedback
+   keeps its original size. max-width grows to fit the larger text without
+   wrapping the two explanatory paragraphs too aggressively. */
+#report-modal {
+  max-width: min(90vw, 420px);
+}
+#report-modal .feedback-modal-details {
+  font-size: 13px;
+}
+#report-modal-text {
+  font-size: 14px;
+}
+.report-modal-actions button {
+  font-size: 13px;
+}
 /* #report-submit reuses .download-btn, whose width:100%/margin-top are meant
    for a stacked panel button -- neutralised here so the two actions share one
    row evenly instead of the submit button claiming the whole width. */
