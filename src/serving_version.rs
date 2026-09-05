@@ -136,7 +136,9 @@ pub const SERVING_EPOCH_KEY: &str = "serving_epoch";
 /// the data changed, only how it's rendered), so a client's cached `ETag`
 /// would keep matching and every existing client would serve the stale shape
 /// forever, with no way to self-heal short of a manual cache-buster.
-pub const TILE_FORMAT_VERSION: u32 = 1;
+/// 2: `BUILDINGS_MVT_SQL` gained the `source:building` and `building:levels`
+/// attributes, completing the buildings tag preview.
+pub const TILE_FORMAT_VERSION: u32 = 2;
 
 /// Record that the live serving state moved in a way no per-cell version
 /// tracks. A **counter**, not a timestamp -- deliberately, so a backwards

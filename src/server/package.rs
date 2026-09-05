@@ -272,8 +272,12 @@ const SOURCE_ADDR: &str = "gugik.gov.pl";
 /// `source:building` values -- the established OSM spellings for these two
 /// registries, not our own dataset names (`Dataset::sql_name`'s "bdot10k" /
 /// "egib" are internal identifiers, not tagging conventions).
-const SOURCE_BUILDING_BDOT10K: &str = "BDOT";
-const SOURCE_BUILDING_EGIB: &str = "EGiB";
+///
+/// `pub` because `server::tiles`'s `BUILDINGS_MVT_SQL` previews the same tag
+/// on the map, and a preview spelling the source differently from the export
+/// would be worse than no preview at all.
+pub const SOURCE_BUILDING_BDOT10K: &str = "BDOT";
+pub const SOURCE_BUILDING_EGIB: &str = "EGiB";
 
 fn non_empty(v: &Option<String>) -> Option<&str> {
     v.as_deref().map(str::trim).filter(|s| !s.is_empty())

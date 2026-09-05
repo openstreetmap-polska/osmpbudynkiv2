@@ -9,7 +9,10 @@ use super::AppState;
 use super::http_cache;
 use std::sync::LazyLock;
 
-use super::package::{ADJACENCY_READ_BUFFER_DEG, BDOT10K_ADJACENCY_KEY, EGIB_ADJACENCY_KEY};
+use super::package::{
+    ADJACENCY_READ_BUFFER_DEG, BDOT10K_ADJACENCY_KEY, EGIB_ADJACENCY_KEY, SOURCE_BUILDING_BDOT10K,
+    SOURCE_BUILDING_EGIB,
+};
 use crate::compare::rule::reported_sql;
 use crate::dataset::{BDOT10K, EGIB, PRG};
 use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
@@ -61,7 +64,10 @@ use crate::tile_math::tile_to_bbox;
 // Only the two *unmatched* layers (`addresses`/`buildings`) carry resolved
 // OSM tags -- a matched object would never be imported, so there's nothing
 // to preview for it, matching `server::package`'s own precedent of only ever
-// resolving tags for `*_unmatched` rows. Address tag resolution
+// resolving tags for `*_unmatched` rows. Both previews are the *complete*
+// tag set `/package` would export, not a subset: buildings reach that through
+// two columns rather than one, for the reason on `BUILDINGS_MVT_SQL` below.
+// Address tag resolution
 // (`resolved` CTE below) mirrors `package::unmatched_addresses`'s street-name
 // join; building tag resolution (`bdot10k_final`/`egib_final` below) mirrors
 // `package::unmatched_bdot10k_buildings`/`unmatched_egib_buildings`'s
@@ -120,7 +126,38 @@ static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-const BUILDINGS_MVT_SQL: &str = "
+/// Like `ADDRESSES_MVT_SQL`, built at first use rather than declared `const`,
+/// so the `source:building` values come from `package`'s own constants.
+///
+/// **The OSM tag preview is assembled from two columns, not one**, and the
+/// split mirrors where each half comes from in `/package`. `tags` is the
+/// `k=v;k=v` string the building-type mapping table produced -- arbitrary
+/// keys, which is exactly why it cannot be columnar the way
+/// `ADDRESSES_MVT_SQL`'s fixed `addr:*` set is. `source:building` and
+/// `building:levels` are the two tags `/package` adds *outside* that string
+/// (`package::building_tags` inserts the first unconditionally,
+/// `package::with_building_levels` the second when the storey count is >= 1),
+/// so they are projected as their own literally-named columns and the
+/// frontend merges the two halves back together (`describeFeature` in
+/// `web/app.js`). Two consequences worth keeping:
+///
+/// - `building:levels` is `NULL` below 1, and `ST_AsMVT` drops NULL
+///   attributes, so "no storeys to report" reaches the popup as an absent tag
+///   -- the same shape `with_building_levels` produces by not inserting.
+/// - An explicit column outranks the same key inside `tags`, which is what
+///   the frontend's merge implements, because `with_building_levels` inserts
+///   into the `BTreeMap` *after* the mapping string was parsed into it.
+static BUILDINGS_MVT_SQL: LazyLock<String> =
+    LazyLock::new(|| buildings_sql("ST_AsMVT(t, 'buildings', 4096, 'geom') AS mvt"));
+
+/// The `projection` seam is `all_buildings_sql`'s, and exists for the same
+/// reason: a test asserting on a per-feature attribute has to read it per row,
+/// because `ST_AsMVT` writes one key dictionary per layer, so an attribute's
+/// *key* appears in the tile bytes as soon as the column exists -- even with
+/// every row's value NULL.
+fn buildings_sql(projection: &str) -> String {
+    format!(
+        "
     WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
     bdot10k_pkg AS MATERIALIZED (
         SELECT b.rowid AS rid, b.LOKALNYID AS id, b.PRZESTRZENNAZW, b.geom,
@@ -150,7 +187,10 @@ const BUILDINGS_MVT_SQL: &str = "
                pkg.KATEGORIAISTNIENIA, pkg.NAZWA, pkg.FSBUD, pkg.INFORMACJADODATKOWA,
                pkg.KODKST::INTEGER AS KODKST, pkg.ZRODLODANYCHGEOMETRYCZNYCH,
                NULL::INTEGER AS kondygnacje_podziemne, NULL::VARCHAR AS rodzaj,
-               COALESCE(t.tags, 'building=yes') AS tags
+               COALESCE(t.tags, 'building=yes') AS tags,
+               '{bdot10k_source}' AS \"source:building\",
+               CASE WHEN pkg.liczba_kondygnacji >= 1
+                    THEN pkg.liczba_kondygnacji::VARCHAR END AS \"building:levels\"
         FROM bdot10k_pkg pkg
         LEFT JOIN bdot10k_cnt cnt USING (rid)
         LEFT JOIN LATERAL (
@@ -194,7 +234,10 @@ const BUILDINGS_MVT_SQL: &str = "
                NULL::VARCHAR AS FSBUD, NULL::VARCHAR AS INFORMACJADODATKOWA,
                NULL::INTEGER AS KODKST, NULL::VARCHAR AS ZRODLODANYCHGEOMETRYCZNYCH,
                pkg.kondygnacje_podziemne, pkg.rodzaj,
-               COALESCE(t.tags, 'building=yes') AS tags
+               COALESCE(t.tags, 'building=yes') AS tags,
+               '{egib_source}' AS \"source:building\",
+               CASE WHEN pkg.kondygnacje_nadziemne >= 1
+                    THEN pkg.kondygnacje_nadziemne::VARCHAR END AS \"building:levels\"
         FROM egib_pkg pkg
         LEFT JOIN egib_cnt cnt USING (rid)
         LEFT JOIN LATERAL (
@@ -209,7 +252,7 @@ const BUILDINGS_MVT_SQL: &str = "
             LIMIT 1
         ) t ON TRUE
     )
-    SELECT ST_AsMVT(t, 'buildings', 4096, 'geom') AS mvt
+    SELECT {projection}
     FROM (
         SELECT ST_AsMVTGeom(u.geom, bbox.geom, 4096, 256, true) AS geom, u.id, u.source,
                -- Identity, not display: the other half of BDOT10k's composite
@@ -219,11 +262,19 @@ const BUILDINGS_MVT_SQL: &str = "
                u.funkcja_szczegolowa, u.funkcja_ogolna, u.levels_above_ground,
                u.KATEGORIAISTNIENIA, u.NAZWA, u.FSBUD, u.INFORMACJADODATKOWA,
                u.KODKST, u.ZRODLODANYCHGEOMETRYCZNYCH,
-               u.kondygnacje_podziemne, u.rodzaj, u.tags
+               u.kondygnacje_podziemne, u.rodzaj, u.tags,
+               -- Last, and after `tags`, only as a readability convention:
+               -- the frontend merges the two halves by key rather than by
+               -- arrival order, so this is not load-bearing.
+               u.\"source:building\", u.\"building:levels\"
         FROM (SELECT * FROM bdot10k_final UNION ALL SELECT * FROM egib_final) u, bbox
     ) t
     WHERE t.geom IS NOT NULL
-";
+",
+        bdot10k_source = SOURCE_BUILDING_BDOT10K,
+        egib_source = SOURCE_BUILDING_EGIB,
+    )
+}
 
 // Same shape as ADDRESSES_MVT_SQL/BUILDINGS_MVT_SQL above, reading the full
 // government tables (`prg_addresses`, `bdot10k_buildings`, `egib_buildings`)
@@ -745,7 +796,7 @@ pub async fn serve_tile(
         )?;
         let buildings = query_mvt_layer(
             &conn,
-            BUILDINGS_MVT_SQL,
+            BUILDINGS_MVT_SQL.as_str(),
             duckdb::params![
                 min_lon,
                 min_lat,
@@ -1137,7 +1188,7 @@ mod tests {
         }
         bldg_params.push(&EGIB_ADJACENCY_KEY);
 
-        let bldg_plan = plan_of(BUILDINGS_MVT_SQL, &bldg_params);
+        let bldg_plan = plan_of(BUILDINGS_MVT_SQL.as_str(), &bldg_params);
         let bldg_scans = bldg_plan.matches("RTREE_IN").count();
         assert_eq!(
             bldg_scans, 4,
@@ -1878,12 +1929,127 @@ mod tests {
             "rodzaj",
             "tags",
             "building=yes",
+            "source:building",
+            "building:levels",
         ] {
             assert!(
                 body.contains(expected),
                 "expected tile bytes to contain {expected:?}"
             );
         }
+    }
+
+    /// --- the buildings OSM tag preview ---------------------------------
+    ///
+    /// `source:building` and `building:levels` are the two tags `/package`
+    /// adds outside the building-type mapping's `tags` string, so they are
+    /// their own MVT columns rather than part of it (see `buildings_sql`).
+    /// Read per row through the projection seam for the same reason the
+    /// `reported` tests below use it: a byte search finds the key in the
+    /// layer dictionary whether or not any row carries a value.
+    ///
+    /// The values are asserted against `package`'s own constants and
+    /// `with_building_levels`'s own rule rather than restated literals --
+    /// the whole point of the preview is that it agrees with the export.
+    fn building_tag_preview(state: &AppState) -> Vec<(String, String, Option<String>)> {
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let (buf_min_lon, buf_min_lat, buf_max_lon, buf_max_lat) = (
+            min_lon - ADJACENCY_READ_BUFFER_DEG,
+            min_lat - ADJACENCY_READ_BUFFER_DEG,
+            max_lon + ADJACENCY_READ_BUFFER_DEG,
+            max_lat + ADJACENCY_READ_BUFFER_DEG,
+        );
+        let sql = buildings_sql("t.id, t.\"source:building\", t.\"building:levels\"");
+        let conn = state.pool.get().unwrap();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut rows = stmt
+            .query(duckdb::params![
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat, // bbox CTE
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat, // bdot10k_pkg
+                buf_min_lon,
+                buf_min_lat,
+                buf_max_lon,
+                buf_max_lat, // bdot10k_nb
+                BDOT10K_ADJACENCY_KEY,
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat, // egib_pkg
+                buf_min_lon,
+                buf_min_lat,
+                buf_max_lon,
+                buf_max_lat, // egib_nb
+                EGIB_ADJACENCY_KEY,
+            ])
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            out.push((
+                row.get::<_, String>(0).unwrap(),
+                row.get::<_, String>(1).unwrap(),
+                row.get::<_, Option<String>>(2).unwrap(),
+            ));
+        }
+        out.sort();
+        out
+    }
+
+    /// Seeds one bdot10k and one egib unmatched building in the tile, with
+    /// `levels` spliced into each so a case can vary only the storey count.
+    fn seed_for_tag_preview(bdot10k_levels: &str, egib_levels: &str) -> String {
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+        format!(
+            "INSERT INTO bdot10k_unmatched
+                 (LOKALNYID, geom, cell_x, cell_y, computed_at, liczba_kondygnacji)
+             VALUES ('b1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now(), {bdot10k_levels});
+             INSERT INTO egib_unmatched
+                 (id_budynku, geom, cell_x, cell_y, computed_at, kondygnacje_nadziemne)
+             VALUES ('e1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now(), {egib_levels});"
+        )
+    }
+
+    #[test]
+    fn tile_preview_tags_each_source_the_way_package_exports_it() {
+        let state = make_state(&seed_for_tag_preview("4", "3"));
+        assert_eq!(
+            building_tag_preview(&state),
+            vec![
+                (
+                    "b1".to_string(),
+                    SOURCE_BUILDING_BDOT10K.to_string(),
+                    Some("4".to_string())
+                ),
+                (
+                    "e1".to_string(),
+                    SOURCE_BUILDING_EGIB.to_string(),
+                    Some("3".to_string())
+                ),
+            ]
+        );
+    }
+
+    /// `with_building_levels` reports nothing for a missing count or a `0`
+    /// ("budynek nie posiada kondygnacji" in the source's own definition), so
+    /// the preview must leave the attribute NULL in both cases -- `ST_AsMVT`
+    /// then drops it and the popup shows no `building:levels` row at all,
+    /// rather than asserting `building:levels=0`.
+    #[test]
+    fn a_missing_or_zero_storey_count_previews_no_levels_tag() {
+        let state = make_state(&seed_for_tag_preview("NULL", "0"));
+        assert_eq!(
+            building_tag_preview(&state),
+            vec![
+                ("b1".to_string(), SOURCE_BUILDING_BDOT10K.to_string(), None),
+                ("e1".to_string(), SOURCE_BUILDING_EGIB.to_string(), None),
+            ]
+        );
     }
 
     /// --- `reported` on the two `*_all` layers ---------------------------

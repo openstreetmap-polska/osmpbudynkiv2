@@ -650,6 +650,15 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     kondygnacje_podziemne: "Kondygnacje podziemne",
     rodzaj: "Rodzaj budynku",
 
+    // buildings -- OSM tag preview, same convention as the addr:* group:
+    // literal tag keys, shown unchanged. `building:levels` restates
+    // `levels_above_ground` on purpose -- the attributes section reports what
+    // the government record says, the tags section what /package would write,
+    // exactly as `numer_porzadkowy` and `addr:housenumber` both appear on an
+    // address popup.
+    "source:building": "source:building",
+    "building:levels": "building:levels",
+
     // buildings -- raw BDOT10k columns (also used by the buildings_all legend layer)
     PRZEWAZAJACAFUNKCJABUDYNKU: "Przeważająca funkcja budynku",
     FUNKCJAOGOLNABUDYNKU: "Funkcja ogólna budynku",
@@ -682,12 +691,19 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   //   reasoning that keeps "Niedopasowany"/"W rejestrze" out of the list.
   const POPUP_HIDDEN_ATTRIBUTES = new Set(["PRZESTRZENNAZW", "reported"]);
 
-  // ADDRESSES_MVT_SQL has no single `tags` column like BUILDINGS_MVT_SQL --
-  // it projects the OSM tag preview as separate addr:*/source:addr columns
-  // directly on the feature (see the "addresses -- OSM tag preview" group in
-  // ATTRIBUTE_LABELS above). describeFeature routes these into the same OSM
-  // tags section as buildings' `tags` column, keyed on this set.
-  const ADDRESS_TAG_KEYS = new Set([
+  // Tile attributes that are literal OSM tag keys rather than columns:
+  // describeFeature routes these into the popup's OSM-tags section instead of
+  // its attributes list.
+  //
+  // ADDRESSES_MVT_SQL has no `tags` column at all -- its tag set is fixed, so
+  // it projects the whole preview as separate addr:*/source:addr columns (see
+  // the "addresses -- OSM tag preview" group in ATTRIBUTE_LABELS above).
+  // BUILDINGS_MVT_SQL cannot do that for its whole preview, because the
+  // building-type mapping table's `tags` string carries arbitrary keys per
+  // class -- but the two tags /package adds *outside* that string are
+  // fixed-key, so they come across the same way and merge back in here. See
+  // the BUILDINGS_MVT_SQL doc comment in src/server/tiles.rs.
+  const TAG_PREVIEW_KEYS = new Set([
     "addr:housenumber",
     "addr:street",
     "addr:city",
@@ -695,6 +711,8 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     "addr:postcode",
     "addr:city:simc",
     "source:addr",
+    "source:building",
+    "building:levels",
   ]);
 
   // GUS Klasyfikacja Środków Trwałych (KŚT) group-1 names for the codes
@@ -800,17 +818,29 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
 
   // `tags` is the resolved k=v;k=v string the building-type mapping produced
-  // -- the tags /package would export for this object. Split into individual
-  // [key, value] pairs so the OSM-tags section can list one tag per row
-  // instead of one blob cell, matching the attributes section's layout.
+  // -- the class half of what /package would export for this object, the rest
+  // arriving as the literally-named columns in TAG_PREVIEW_KEYS. Split into
+  // individual [key, value] pairs so the OSM-tags section can list one tag per
+  // row instead of one blob cell, matching the attributes section's layout.
+  // Trims each segment and each side of the `=`, because
+  // mappings::building_types::parse_tags does -- it accepts
+  // `building=yes; man_made=silo` and exports the key as `man_made`, so
+  // splitting without trimming here would preview it as ` man_made` and,
+  // worse, make ` building:levels` a different key from the explicit column
+  // that is supposed to override it. Splits on the *first* `=` only, so a
+  // value may contain one; a value containing `;` is unrepresentable in this
+  // format, on both sides.
   function parseTags(value) {
     if (value === null || value === undefined || value === "") return [];
     return String(value)
       .split(";")
+      .map((pair) => pair.trim())
       .filter((pair) => pair !== "")
       .map((pair) => {
         const i = pair.indexOf("=");
-        return i === -1 ? [pair, ""] : [pair.slice(0, i), pair.slice(i + 1)];
+        return i === -1
+          ? [pair, ""]
+          : [pair.slice(0, i).trim(), pair.slice(i + 1).trim()];
       });
   }
 
@@ -837,10 +867,27 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     };
   }
 
+  // Merge the two halves of a buildings tag preview into the single ordered
+  // list the popup renders: `resolved` is what the mapping string parsed to,
+  // `explicit` the literally-named tag columns. An explicit column wins on a
+  // key collision, because that is what /package does -- building_tags parses
+  // the mapping string into a BTreeMap and with_building_levels inserts over
+  // it afterwards. The mapping CSV carries no building:levels today, so this
+  // is guarding the case where a curator adds one, and the alternative is a
+  // popup listing the same tag twice with two different values.
+  // Map.set keeps a key's original position when overwriting, so an override
+  // lands where the mapping string put it rather than jumping to the end.
+  function mergeTags(resolved, explicit) {
+    const merged = new Map(resolved);
+    for (const [key, value] of explicit) merged.set(key, value);
+    return [...merged];
+  }
+
   function describeFeature(layerId, props) {
     if (layerId === "updates-fill") return describeUpdateFeature(props);
     const attributes = [];
-    let tags = [];
+    let resolvedTags = [];
+    const explicitTags = new Map();
     // Insertion order is the tile's attribute order, which follows the
     // SELECT in src/server/tiles.rs (identity, then classification, then
     // the resolved tags) -- more useful than sorting alphabetically.
@@ -851,12 +898,12 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     // KODKST for the KST hover hint below.
     for (const key of Object.keys(props)) {
       if (key === "tags") {
-        tags = parseTags(props[key]);
+        resolvedTags = parseTags(props[key]);
         continue;
       }
       if (POPUP_HIDDEN_ATTRIBUTES.has(key)) continue;
-      if (ADDRESS_TAG_KEYS.has(key)) {
-        tags.push([key, formatValue(key, props[key])]);
+      if (TAG_PREVIEW_KEYS.has(key)) {
+        explicitTags.set(key, formatValue(key, props[key]));
         continue;
       }
       attributes.push([key, attributeLabel(key), formatValue(key, props[key])]);
@@ -865,7 +912,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       title: layerId.startsWith("buildings-") ? "Budynek" : "Adres",
       ...featureStatus(layerId, props),
       attributes,
-      tags,
+      tags: mergeTags(resolvedTags, explicitTags),
       // null for anything not reportable -- see reportKeyFor.
       report: reportKeyFor(layerId, props),
     };
