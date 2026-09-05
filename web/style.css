@@ -380,16 +380,30 @@ body {
   overflow: hidden;
 }
 
-/* #draw-mode-picker is a .source-toggle that also toggles the [hidden]
-   attribute (app.js's applyDownloadPanelState). Same fix as .ratio-legend
-   [hidden] below: the UA stylesheet's `[hidden] { display: none }` and this
-   class's `display: flex` are equal specificity (one attribute selector,
-   one class selector), and author CSS beats the UA sheet on a tie -- so
-   without this override [hidden] silently loses and the picker stays a
-   visible empty-ish flex row. The legend's own .source-toggle instances
-   never hit this because they're never [hidden]. */
-#draw-mode-picker[hidden] {
+/* #draw-mode-picker and #area-purpose-picker are .source-toggles that also
+   toggle the [hidden] attribute (app.js's applyAreaPanelState). Same fix as
+   .ratio-legend [hidden] below: the UA stylesheet's `[hidden] { display:
+   none }` and this class's `display: flex` are equal specificity (one
+   attribute selector, one class selector), and author CSS beats the UA sheet
+   on a tie -- so without this override [hidden] silently loses and the picker
+   stays a visible empty-ish flex row. Written against the class rather than
+   the two ids so the next .source-toggle that learns to hide itself doesn't
+   have to rediscover this; the legend's own instances are simply never
+   [hidden] and are unaffected. */
+.source-toggle[hidden] {
   display: none;
+}
+
+/* Panel-level mode switch, unlike the legend's toggles: it sits alone on its
+   own row above the panel's actions, so its two buttons share the full width
+   instead of hugging their labels the way .source-btn's `flex: none` default
+   makes them. */
+#area-purpose-picker {
+  margin-bottom: 6px;
+}
+#area-purpose-picker .source-btn {
+  flex: 1;
+  padding: 4px 7px;
 }
 
 .source-btn {
@@ -769,6 +783,64 @@ button {
   background: var(--paper);
   border-color: var(--ink-soft);
   color: var(--ink);
+}
+
+/* The panel's report action. Deliberately not .download-btn's filled accent,
+   and deliberately not a plain outlined secondary either: this sends up to a
+   hundred reports that change what every visitor sees, so it reads in
+   --danger the way the popup's own .report-btn:hover does -- an action to
+   take on purpose, not the panel's default one. Filling on hover (rather than
+   only recolouring, as .report-btn does) is the difference between the two:
+   this one *is* the primary action of the tab it appears in. */
+.report-area-btn {
+  background: var(--paper);
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.report-area-btn:hover:not(:disabled) {
+  background: var(--danger);
+  color: var(--paper-raised);
+}
+/* .download-btn's :hover rule is a plain class selector and would otherwise
+   repaint a disabled button on hover. */
+.report-area-btn:disabled:hover {
+  background: var(--paper);
+}
+
+@media (prefers-color-scheme: dark) {
+  /* --danger is deliberately not re-tuned in :root's dark block, and for the
+     short inline warnings that use it (the masthead notice, the feedback
+     modals' error text, two popup chips) that is fine. It is not fine on a
+     full-width button label: #a8402a against the dark --paper measures about
+     2.2:1. Lifted here for this one button rather than by re-tuning the token
+     itself, which would also restyle all of those other elements and, through
+     --draw-invalid, the over-limit colour of the draw overlay -- which paints
+     onto the always-light OSM raster and is documented in :root as
+     deliberately fixed across themes. */
+  .report-area-btn {
+    color: #e8705c;
+    border-color: #e8705c;
+  }
+  .report-area-btn:hover:not(:disabled) {
+    background: #e8705c;
+    color: var(--paper);
+  }
+}
+
+/* The batch report modal's object list. Capped and scrollable: 100 object
+   identifiers is more than fits on screen, but they are shown rather than
+   summarised because this is the last point at which the user can check what
+   is about to be sent. list-style-position: inside keeps a wrapped identifier
+   from hanging under the bullet. */
+.report-object-list {
+  margin: 4px 0 0;
+  padding: 0 0 0 2px;
+  max-height: 28vh;
+  overflow-y: auto;
+  list-style-position: inside;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .panel-status {

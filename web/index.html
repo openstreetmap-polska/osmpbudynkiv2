@@ -171,7 +171,16 @@
     </div>
   </section>
 
-  <section class="panel panel-download" aria-label="Pobierz paczkę">
+  <!-- One panel, two purposes for the same drawn area: download a JOSM package
+       (GET/POST /package) or bulk-report the objects it covers (POST /report).
+       The purpose picker at the top swaps only the *primary action* and the
+       hints -- the drawing machinery below it (mode picker, Anuluj, Usuń
+       zaznaczenie, the live hint) is shared, because drawing is one modal
+       thing on the map and a committed polygon is just a polygon: switching
+       purpose re-uses whatever is already selected rather than discarding it.
+       See applyAreaPanelState in app.js, the single place that reconciles all
+       of this against {areaPurpose, appDrawState, zoom, downloadInFlight}. -->
+  <section class="panel panel-download" aria-label="Pobierz lub zgłoś obszar">
     <button
       id="download-toggle"
       class="panel-toggle"
@@ -179,18 +188,31 @@
       aria-expanded="true"
       aria-controls="download-body"
     >
-      <span class="panel-toggle-label">Pobierz paczkę</span>
+      <span class="panel-toggle-label">Pobierz / Zgłoś</span>
       <span class="panel-toggle-icon" aria-hidden="true"></span>
     </button>
     <div id="download-body" class="panel-body">
+
+    <!-- Same segmented-control vocabulary as the legend's source toggles and
+         the draw-mode picker below (role="group" + .source-toggle +
+         .source-btn + aria-pressed). -->
+    <div id="area-purpose-picker" class="source-toggle" role="group" aria-label="Co zrobić z obszarem">
+      <button type="button" class="source-btn" data-area-purpose="download" aria-pressed="true">Pobierz</button>
+      <button type="button" class="source-btn" data-area-purpose="report" aria-pressed="false">Zgłoś</button>
+    </div>
+
+    <!-- Download purpose only: there is deliberately no "zgłoś widoczny
+         obszar" twin, since reporting everything on screen without drawing
+         anything is far too easy to fire by accident. -->
     <button id="download-btn" type="button" class="download-btn">Pobierz widoczny obszar</button>
+    <!-- Shared by both purposes; label swaps in applyAreaPanelState. -->
     <button id="draw-btn" type="button" class="download-btn">Narysuj obszar</button>
 
     <!-- Mode picker follows the legend's building/address source-toggle
          pattern exactly (role="group" + .source-toggle wrapper + .source-btn
          children + aria-pressed) rather than inventing new UI vocabulary for
          a second segmented control. Only shown in the "drawing" state --
-         app.js's applyDownloadPanelState toggles [hidden] on all of the
+         app.js's applyAreaPanelState toggles [hidden] on all of the
          draw-specific controls below. -->
     <div id="draw-mode-picker" class="source-toggle" role="group" aria-label="Sposób rysowania obszaru" hidden>
       <button type="button" class="source-btn" data-draw-mode="rectangle" aria-pressed="false">Prostokąt</button>
@@ -198,8 +220,17 @@
       <button type="button" class="source-btn" data-draw-mode="freehand" aria-pressed="false">Odręcznie</button>
     </div>
     <button id="draw-cancel-btn" type="button" class="download-btn" hidden>Anuluj</button>
-    <p id="download-zoom-hint" class="hint" hidden>Przybliż mapę (zoom 12+), aby pobrać paczkę z widocznego obszaru.</p>
     <button id="draw-clear-btn" type="button" class="download-btn" hidden>Usuń zaznaczenie</button>
+    <!-- Report purpose only, once a polygon is committed. Label carries the
+         live count (see applyAreaPanelState); disabled when the count is 0 or
+         over MAX_REPORT_OBJECTS. -->
+    <button id="report-area-btn" type="button" class="download-btn report-area-btn" hidden>Zgłoś zaznaczone obiekty</button>
+
+    <p id="download-zoom-hint" class="hint" hidden>Przybliż mapę (zoom 12+), aby pobrać paczkę z widocznego obszaru.</p>
+    <!-- Report purpose only: what the drawn area currently covers, whether the
+         count is still live, and why the send button is disabled when it is.
+         See reportSelectionHintText in app.js. -->
+    <p id="report-select-hint" class="hint" hidden></p>
 
     <!-- Mode instructions + live envelope-area readout while drawing, and the
          committed polygon's envelope + vertex count once selected -- see
@@ -224,17 +255,21 @@
     <button id="download-feedback-close" type="button" class="feedback-modal-close">Zamknij</button>
   </dialog>
 
-  <!-- Reporting an object as one that should not be proposed for import.
-       Opened from the "Zgłoś problem" button in a feature popup; posts to
-       /report. -->
+  <!-- Reporting objects that should not be proposed for import. Serves both
+       entry points -- the "Zgłoś problem" button in a single feature popup and
+       the panel's "Zgłoś zaznaczone obiekty" for a drawn area -- because
+       everything past "which objects" (the explanation, the POST, the
+       accepted/rejected rendering, the feedback states) is identical between
+       them. openReportModal in app.js swaps the title, the lead paragraph and
+       the object line; nothing else differs. -->
   <dialog id="report-modal" class="feedback-modal">
     <button id="report-modal-close-x" type="button" class="modal-close-x" aria-label="Zamknij">&times;</button>
     <h2 id="report-modal-title">Zgłoś problem z obiektem</h2>
     <dl class="feedback-modal-details">
       <div>
-        <p>Wybrany obiekt zostanie usunięty z podpowiadanych obiektów do importu.</p>
-        <p>Aplikacja przechowuje identyfikator i wersję obiektu, więc jeżeli obiekt zostanie zaktualizowany w rejestrze źródłowym to może znowu pojawić się na mapie.</p>
-        <dt>Obiekt</dt>
+        <p id="report-modal-lead">Wybrany obiekt zostanie usunięty z podpowiadanych obiektów do importu.</p>
+        <p>Aplikacja przechowuje identyfikator i wersję każdego zgłoszonego obiektu, więc jeżeli obiekt zostanie zaktualizowany w rejestrze źródłowym to może znowu pojawić się na mapie.</p>
+        <dt id="report-modal-object-label">Obiekt</dt>
         <dd id="report-modal-object"></dd>
       </div>
     </dl>

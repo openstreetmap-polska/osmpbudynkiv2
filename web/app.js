@@ -35,6 +35,16 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const drawOutlineColor = rootStyle.getPropertyValue("--draw-outline").trim();
   const drawFillColor = rootStyle.getPropertyValue("--draw-fill").trim();
   const drawInvalidColor = rootStyle.getPropertyValue("--draw-invalid").trim();
+  // Halo under the bulk-report selection highlight (report-selection-* layers
+  // below). A literal rather than --paper-raised, for the same reason
+  // --building-outline-all is one: its job is contrast against the solid
+  // 0.9-opacity red of the unmatched-building fill it outlines, on a basemap
+  // that is light in both themes -- flipping it dark would erase the highlight
+  // exactly where it is needed. The highlight's core colour is deliberately
+  // --draw-outline, not a new hue: it is part of the same transient drawing
+  // interaction and only ever appears inside the teal polygon that produced
+  // it, so a fifth colour here would read as another data series.
+  const reportSelectHaloColor = "#ffffff";
   // Recently-downloaded /package export areas, fed by GET /updates -- see the
   // updates-fill/updates-outline layers and pollUpdates below.
   const updatesColor = rootStyle.getPropertyValue("--updates").trim();
@@ -466,6 +476,72 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     },
   ];
 
+  // ---- bulk-report selection highlight ----
+  //
+  // The geometries queryRenderedFeatures handed back for the objects a drawn
+  // area covers (see refreshReportSelection), echoed straight onto the map so
+  // the user can see exactly which objects a "Zgłoś zaznaczone" would send.
+  // Those geometries are tile-clipped and tile-simplified like everything
+  // queryRenderedFeatures returns -- fine for a highlight, and never used as
+  // the geometry of anything submitted: a report carries only the object's
+  // key columns (see reportKeyFor).
+  //
+  // Halo-under-core rather than one stroke: this outlines buildings painted a
+  // solid 0.9-opacity red, against which a single teal line reads only at the
+  // edges.
+  //
+  // Every layer carries an explicit ["geometry-type"] filter, and the circle
+  // ones are the reason. A line layer does ignore points, but a circle layer
+  // does *not* ignore polygons -- it draws a circle at every vertex, so an
+  // unfiltered pair rendered each selected building as a teal ring of beads
+  // along its outline (seen in the browser, not reasoned about). Multi* types
+  // collapse to the singular in this expression, so "Polygon" covers
+  // MultiPolygon and "Point" covers MultiPoint.
+  const POLYGON_SELECTION_FILTER = ["==", ["geometry-type"], "Polygon"];
+  const POINT_SELECTION_FILTER = ["==", ["geometry-type"], "Point"];
+  const selectionPointRadius = ["interpolate", ["linear"], ["zoom"], 14, 6, 18, 11];
+  const reportSelectionLayers = [
+    {
+      id: "report-selection-halo",
+      type: "line",
+      source: "reportSelection",
+      filter: POLYGON_SELECTION_FILTER,
+      paint: { "line-color": reportSelectHaloColor, "line-width": 5, "line-opacity": 0.9 },
+    },
+    {
+      id: "report-selection-point-halo",
+      type: "circle",
+      source: "reportSelection",
+      filter: POINT_SELECTION_FILTER,
+      paint: {
+        "circle-radius": selectionPointRadius,
+        "circle-opacity": 0,
+        "circle-stroke-color": reportSelectHaloColor,
+        "circle-stroke-width": 5,
+        "circle-stroke-opacity": 0.9,
+      },
+    },
+    {
+      id: "report-selection-line",
+      type: "line",
+      source: "reportSelection",
+      filter: POLYGON_SELECTION_FILTER,
+      paint: { "line-color": drawOutlineColor, "line-width": 2.4 },
+    },
+    {
+      id: "report-selection-point",
+      type: "circle",
+      source: "reportSelection",
+      filter: POINT_SELECTION_FILTER,
+      paint: {
+        "circle-radius": selectionPointRadius,
+        "circle-opacity": 0,
+        "circle-stroke-color": drawOutlineColor,
+        "circle-stroke-width": 2.4,
+      },
+    },
+  ];
+
   const map = new maplibregl.Map({
     container: "map",
     style: {
@@ -490,6 +566,10 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           maxzoom: 14,
         },
         draw: {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        },
+        reportSelection: {
           type: "geojson",
           data: { type: "FeatureCollection", features: [] },
         },
@@ -560,6 +640,11 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           },
         },
         ...aggLayers,
+        // Above every data layer (it marks specific features and has to beat
+        // their own fills) but below drawLayers, so the drawn boundary that
+        // produced the selection still reads as the outermost thing on the
+        // map rather than being cut by the highlights inside it.
+        ...reportSelectionLayers,
         // Last, so the draw overlay always renders on top of every data
         // layer -- it's a UI affordance the user is actively interacting
         // with, not another data series to blend with the rest.
@@ -1097,6 +1182,9 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
 
   const reportModal = document.getElementById("report-modal");
+  const reportModalTitle = document.getElementById("report-modal-title");
+  const reportModalLead = document.getElementById("report-modal-lead");
+  const reportModalObjectLabel = document.getElementById("report-modal-object-label");
   const reportModalObject = document.getElementById("report-modal-object");
   const reportModalText = document.getElementById("report-modal-text");
   const reportModalCloseX = document.getElementById("report-modal-close-x");
@@ -1118,9 +1206,68 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     reportClose.hidden = false;
   }
 
-  // The object the open dialog is about. Cleared on close so a target can
-  // never outlive the dialog opening that set it.
-  let reportTarget = null;
+  // The objects the open dialog is about -- exactly one when it was opened
+  // from a feature popup, up to MAX_REPORT_OBJECTS when from a drawn-area
+  // selection. Cleared on close so a target can never outlive the dialog
+  // opening that set it.
+  let reportTargets = [];
+  // Whether the open dialog came from the drawn-area selection, so a
+  // successful send can clear that selection (the objects are reported; a
+  // highlight left standing would read as still-pending work) without a
+  // single-object popup report also wiping an unrelated drawn area.
+  let reportFromSelection = false;
+
+  // Polish plurals take three forms and the rule is not "n === 1": 1 obiekt,
+  // 2-4 obiekty, everything else obiektów -- with the 12-14 exception, which
+  // takes the third form despite ending in 2, 3 or 4.
+  function objectsPlural(n) {
+    const lastTwo = n % 100;
+    if (n === 1) return "1 obiekt";
+    if (n % 10 >= 2 && n % 10 <= 4 && !(lastTwo >= 12 && lastTwo <= 14)) return `${n} obiekty`;
+    return `${n} obiektów`;
+  }
+
+  // The one way the dialog is opened, from either entry point. `entries` are
+  // {target, label} pairs: `target` is what POST /report receives, `label` is
+  // only ever shown. Everything past this point -- the send, the
+  // accepted/rejected rendering, the feedback states -- is shared, which is
+  // why there is one dialog rather than a separate batch twin of it.
+  function openReportModal(entries, { fromSelection }) {
+    reportTargets = entries.map((entry) => entry.target);
+    reportFromSelection = fromSelection;
+    const batch = entries.length > 1;
+    reportModalTitle.textContent = batch ? "Zgłoś zaznaczone obiekty" : "Zgłoś problem z obiektem";
+    reportModalLead.textContent = batch
+      ? `Zaznaczone obiekty (${entries.length}) zostaną usunięte z podpowiadanych obiektów do importu.`
+      : "Wybrany obiekt zostanie usunięty z podpowiadanych obiektów do importu.";
+    reportModalObjectLabel.textContent = batch ? "Obiekty" : "Obiekt";
+    renderReportModalObjects(entries);
+    setReportFeedback("", null);
+    reportSubmit.disabled = false;
+    showReportPreSendActions();
+    if (!reportModal.open) reportModal.showModal();
+  }
+
+  // One label for a single object, a scrollable list for a batch -- 100
+  // identifiers is more than the modal can show at once, and hiding them
+  // behind a bare count would mean sending a hundred irreversible-ish reports
+  // without ever showing what they are. Sorted by label rather than left in
+  // tile render order, which is arbitrary.
+  function renderReportModalObjects(entries) {
+    reportModalObject.textContent = "";
+    if (entries.length === 1) {
+      reportModalObject.textContent = entries[0].label;
+      return;
+    }
+    const list = document.createElement("ul");
+    list.className = "report-object-list";
+    for (const entry of [...entries].sort((a, b) => a.label.localeCompare(b.label, "pl"))) {
+      const item = document.createElement("li");
+      item.textContent = entry.label;
+      list.appendChild(item);
+    }
+    reportModalObject.appendChild(list);
+  }
 
   function setReportFeedback(message, state) {
     reportModalText.textContent = message;
@@ -1161,12 +1308,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     if (appDrawState === "drawing") return;
     if (!e.target.closest || !e.target.closest(".report-btn")) return;
     if (!popupReport) return;
-    reportTarget = popupReport.target;
-    reportModalObject.textContent = popupReport.label;
-    setReportFeedback("", null);
-    reportSubmit.disabled = false;
-    showReportPreSendActions();
-    if (!reportModal.open) reportModal.showModal();
+    openReportModal([{ target: popupReport.target, label: popupReport.label }], { fromSelection: false });
   });
 
   // The textarea fallback is load-bearing, not belt-and-braces:
@@ -1232,11 +1374,35 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     if (e.target === reportModal) reportModal.close();
   });
   reportModal.addEventListener("close", () => {
-    reportTarget = null;
+    reportTargets = [];
+    reportFromSelection = false;
   });
 
+  // The one per-object rejection reason a user can act on, and the only one
+  // reports::insert produces today (UNKNOWN_RECORD_MESSAGE in
+  // src/server/reports.rs). Translated by exact match with a pass-through
+  // fallback, so a reason this map has not learned yet still reaches the user
+  // verbatim instead of being swallowed -- the same discipline
+  // ATTRIBUTE_LABELS follows for tile attribute names.
+  const REPORT_REJECTION_MESSAGES = {
+    "no such record in the current dataset": "nie ma już takiego obiektu w aktualnych danych rejestru",
+  };
+
+  // Per-object rejections each carry a reason (RejectedItem in
+  // src/server/reports.rs); a batch routinely hits the same one many times
+  // over -- typically the object having changed in the registry since the
+  // tile was rendered -- so collapse to distinct reasons rather than printing
+  // one line per object.
+  function rejectionSummary(rejected) {
+    const reasons = [
+      ...new Set(rejected.map((r) => REPORT_REJECTION_MESSAGES[r.error] || r.error).filter(Boolean)),
+    ];
+    return reasons.length ? reasons.join("; ") : "bez podanej przyczyny";
+  }
+
   reportSubmit.addEventListener("click", async () => {
-    if (!reportTarget) return;
+    if (!reportTargets.length) return;
+    const sent = reportTargets.length;
 
     reportSubmit.disabled = true;
     setReportFeedback("Wysyłanie…", null);
@@ -1244,7 +1410,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       const res = await fetch("/report", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ objects: [reportTarget] }),
+        body: JSON.stringify({ objects: reportTargets }),
       });
       if (!res.ok) {
         const detail = await readErrorDetail(res);
@@ -1256,24 +1422,38 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         return;
       }
       const data = await res.json();
-      if (data.accepted && data.accepted.length) {
-        // No optimistic client-side hiding of the reported feature. The
+      const accepted = data.accepted || [];
+      const rejected = data.rejected || [];
+      if (accepted.length) {
+        // No optimistic client-side hiding of the reported features. The
         // unmatched layers already carry a legend-driven `filter` (see
         // sourceFilter), so a report-driven setFilter would fight the source
         // toggle for ownership of it -- and the drain that really removes the
-        // object runs on the order of seconds, after which the next tile fetch
-        // shows the truth. Saying so is more honest than faking it.
-        setReportFeedback(
-          "Zgłoszenie przyjęte. Obiekt zniknie z warstwy niedopasowanych po najbliższym odświeżeniu danych.",
-          "ok",
-        );
+        // objects runs on the order of seconds, after which the next tile
+        // fetch shows the truth. Saying so is more honest than faking it.
+        //
+        // A batch can be partly accepted (each object is resolved against the
+        // live table independently), so the two counts are always reported
+        // rather than collapsing the mixed case into a flat "przyjęte".
+        let message =
+          sent === 1
+            ? "Zgłoszenie przyjęte. Obiekt zniknie z warstwy niedopasowanych po najbliższym odświeżeniu danych."
+            : `Przyjęto ${objectsPlural(accepted.length)} z ${sent}. Zgłoszone obiekty znikną z warstwy niedopasowanych po najbliższym odświeżeniu danych.`;
+        if (rejected.length) {
+          message += ` Odrzucono ${objectsPlural(rejected.length)}: ${rejectionSummary(rejected)}.`;
+        }
+        setReportFeedback(message, "ok");
         showReportCloseOnly();
         popup.remove();
         popupReport = null;
+        // The reported objects are done with; a highlighted selection left
+        // standing would read as work still pending.
+        if (reportFromSelection) clearSelection();
       } else {
-        const rejected = data.rejected && data.rejected[0];
         setReportFeedback(
-          rejected && rejected.error ? `Zgłoszenie odrzucone: ${rejected.error}` : "Zgłoszenie odrzucone.",
+          sent === 1
+            ? `Zgłoszenie odrzucone: ${rejectionSummary(rejected)}.`
+            : `Odrzucono wszystkie ${objectsPlural(sent)}: ${rejectionSummary(rejected)}.`,
           "error",
         );
         reportSubmit.disabled = false;
@@ -1991,6 +2171,10 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // ---- package download ----
 
   const downloadBtn = document.getElementById("download-btn");
+  const areaPurposePicker = document.getElementById("area-purpose-picker");
+  const areaPurposeButtons = areaPurposePicker.querySelectorAll(".source-btn");
+  const reportAreaBtn = document.getElementById("report-area-btn");
+  const reportSelectHint = document.getElementById("report-select-hint");
   const drawBtn = document.getElementById("draw-btn");
   const drawModePicker = document.getElementById("draw-mode-picker");
   const drawModeButtons = drawModePicker.querySelectorAll(".source-btn");
@@ -2024,20 +2208,69 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // true area, and the server would still reject it.
   const MAX_AREA_SQ_DEG = 0.04;
 
+  // Mirrors config.reports.max_objects_per_request (100 by default, see
+  // ReportsConfig in src/config.rs) exactly the way MAX_AREA_SQ_DEG above
+  // mirrors package.max_area_sq_deg: it only stops the frontend sending a
+  // request the server is guaranteed to reject with a 400, and the server
+  // stays authoritative -- a deployment that configured a different cap still
+  // rejects, and that surfaces through the report modal's existing error
+  // state. Deliberately not worked around by chunking a larger selection into
+  // several requests: the cap's stated job (see its comment in config.rs) is
+  // to make one mis-drawn bulk selection cheap to recover from, and a client
+  // that silently splits into batches gives that up.
+  const MAX_REPORT_OBJECTS = 100;
+
+  // buildings-unmatched-fill / addresses-unmatched-circle are both minzoom 14
+  // (the vector source's own maxzoom, and the only tier carrying per-object
+  // identity -- see the layer definitions above), so below this the layers
+  // render nothing and a selection query would truthfully return zero.
+  const REPORT_MIN_ZOOM = 14;
+
+  // The two layers a report can name an object on. Exactly the reportable
+  // subset of CLICKABLE_LAYERS -- reportKeyFor returns null for every other
+  // layer, so anything else here would be queried and then discarded. No
+  // visibility check rides alongside: a layer whose legend toggle is "Wyłącz"
+  // is `visibility: none` and queryRenderedFeatures skips it on its own,
+  // which is one fewer thing to keep in sync with applyBuildingVisibility.
+  const REPORTABLE_LAYERS = ["buildings-unmatched-fill", "addresses-unmatched-circle"];
+
   // ---- draw-an-area-to-download state machine ----
   //
   // Three states -- idle (no polygon), drawing (one of the three modes is
   // live), selected (a polygon has been committed) -- see the state table in
   // the design doc this shipped from. One primary button (#download-btn)
   // covers idle+selected (its label and click behaviour change); #draw-btn
-  // covers idle ("Narysuj obszar") and selected ("Narysuj ponownie"); the
-  // mode picker + Anuluj only show while drawing; Usuń zaznaczenie only shows
-  // once selected. applyDownloadPanelState (below) is the single place that
-  // reconciles all of that against {appDrawState, map zoom, downloadInFlight}
+  // covers idle ("Narysuj obszar"/"Zaznacz obszar") and selected ("... ponownie");
+  // the mode picker + Anuluj only show while drawing; Usuń zaznaczenie and, in
+  // the report purpose, "Zgłoś zaznaczone obiekty" only show once selected.
+  // applyAreaPanelState (below) is the single place that reconciles all of
+  // that against {areaPurpose, appDrawState, map zoom, downloadInFlight}
   // -- every state-changing function in this section ends by calling it
   // rather than poking DOM visibility itself, so the panel can never drift
   // out of sync with the state variables.
   let appDrawState = "idle"; // 'idle' | 'drawing' | 'selected'
+
+  // What the panel does with the drawn area: hand it to /package, or report
+  // every unmatched object it covers. Only the *primary action* and the hints
+  // differ -- the drawing machinery below is shared, and a committed polygon
+  // deliberately survives a purpose switch, because it is the same area
+  // either way. What does not survive is what the polygon is judged by: the
+  // download purpose gates on the envelope-area cap /package enforces, the
+  // report purpose on the object count POST /report accepts, so both the
+  // overlay's valid/invalid colouring and the selection are recomputed on
+  // every switch (see the picker wiring below).
+  let areaPurpose = "download"; // 'download' | 'report'
+
+  // The envelope-area cap is /package's alone (check_area in
+  // src/server/package.rs). POST /report has no area limit of any kind; its
+  // bound is MAX_REPORT_OBJECTS on the object count, applied separately.
+  function areaLimitApplies() {
+    return areaPurpose === "download";
+  }
+
+  function polygonAreaValid(areaSqDeg) {
+    return !areaLimitApplies() || areaSqDeg <= MAX_AREA_SQ_DEG;
+  }
 
   // Last-used mode, remembered only for this page session (module-level, not
   // localStorage -- this frontend has no persisted-preference pattern
@@ -2065,7 +2298,6 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   let committedEnvelope = null; // {minLng, minLat, maxLng, maxLat}
   let committedAreaSqDeg = 0;
   let committedVertexCount = 0;
-  let committedValid = true;
 
   // Handlers currently attached for the active drawing mode, so teardownDrawMode
   // can remove exactly those (and only those) on every exit path.
@@ -2144,7 +2376,9 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   function renderCommittedPolygon() {
     setDrawSourceData(
-      committedPolygon ? [polygonFeature(committedPolygon.coordinates[0], "committed", committedValid)] : [],
+      committedPolygon
+        ? [polygonFeature(committedPolygon.coordinates[0], "committed", polygonAreaValid(committedAreaSqDeg))]
+        : [],
     );
   }
 
@@ -2173,7 +2407,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     const ring = rectRing(rectStartLngLat, corner);
     const env = envelopeOf(ring);
     const area = envelopeAreaSqDeg(env);
-    const valid = area <= MAX_AREA_SQ_DEG;
+    const valid = polygonAreaValid(area);
     setDrawSourceData([polygonFeature(ring, "drawing", valid)]);
     currentDrawAreaSqDeg = area;
     currentDrawValid = valid;
@@ -2220,7 +2454,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       const ring = closeRing(clickVertices);
       const env = envelopeOf(ring);
       const area = envelopeAreaSqDeg(env);
-      const valid = area <= MAX_AREA_SQ_DEG;
+      const valid = polygonAreaValid(area);
       features.push(polygonFeature(ring, "drawing", valid));
       currentDrawAreaSqDeg = area;
       currentDrawValid = valid;
@@ -2276,7 +2510,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       const ring = closeRing(freehandPoints);
       const env = envelopeOf(ring);
       const area = envelopeAreaSqDeg(env);
-      const valid = area <= MAX_AREA_SQ_DEG;
+      const valid = polygonAreaValid(area);
       setDrawSourceData([polygonFeature(ring, "drawing", valid)]);
       currentDrawAreaSqDeg = area;
       currentDrawValid = valid;
@@ -2414,7 +2648,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     // the CLICKABLE_LAYERS mouseenter/mouseleave pair above for why those
     // don't fight this. teardownDrawMode restores it on every exit path.
     map.getCanvas().style.cursor = "crosshair";
-    applyDownloadPanelState();
+    applyAreaPanelState();
   }
 
   // Cancelling restores the previous committed polygon if one existed --
@@ -2425,7 +2659,10 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     resetInProgressGeometry();
     appDrawState = committedPolygon ? "selected" : "idle";
     renderCommittedPolygon();
-    applyDownloadPanelState();
+    // The restored polygon is the one that produced the current selection, so
+    // nothing needs recomputing -- but the highlight was hidden while drawing
+    // and applyAreaPanelState is what brings it back.
+    applyAreaPanelState();
   }
 
   function commitDrawnPolygon(ring, vertexCount) {
@@ -2436,11 +2673,13 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     committedEnvelope = env;
     committedAreaSqDeg = area;
     committedVertexCount = vertexCount;
-    committedValid = area <= MAX_AREA_SQ_DEG;
     resetInProgressGeometry();
     appDrawState = "selected";
     renderCommittedPolygon();
-    applyDownloadPanelState();
+    // Before applyAreaPanelState, which renders the highlight and reads the
+    // count for the send button's label and disabled state.
+    refreshReportSelection();
+    applyAreaPanelState();
   }
 
   function clearSelection() {
@@ -2448,10 +2687,305 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     committedEnvelope = null;
     committedAreaSqDeg = 0;
     committedVertexCount = 0;
-    committedValid = true;
     appDrawState = "idle";
     renderCommittedPolygon();
-    applyDownloadPanelState();
+    refreshReportSelection();
+    applyAreaPanelState();
+  }
+
+  // ---- which objects a drawn area covers (bulk reporting) ----
+  //
+  // Membership is *any overlap*, the same rule /package already applies to a
+  // request polygon (see the "/package membership is intersection, not
+  // centroid containment" gotcha in CLAUDE.md) -- so the two things the panel
+  // can do with one drawn area never disagree about what that area covers.
+  //
+  // Written out here rather than pulled from turf.js: this frontend vendors
+  // exactly one dependency (MapLibre) and has to work with no outbound
+  // network, and the predicates below are the whole of what is needed.
+  //
+  // All of it works in raw lng/lat degrees, treating the plane as flat. That
+  // is wrong in general and irrelevant here: these tests only ever compare a
+  // building footprint against a hand-drawn area a few hundred metres across,
+  // where the projection error is orders of magnitude below the tile
+  // simplification already baked into the geometry being tested.
+
+  // Ray casting, counting crossings of the horizontal ray towards +lng. The
+  // ring may be open or closed -- the j/i wrap makes the closing edge
+  // implicit either way. The `yi > y !== yj > y` test is strict on one side
+  // only, so a ray passing exactly through a vertex counts for exactly one of
+  // the two edges meeting there instead of zero or two.
+  function pointInRing(point, ring) {
+    const [x, y] = point;
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [xi, yi] = ring[i];
+      const [xj, yj] = ring[j];
+      if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+
+  // Sign of the cross product (b-a) x (c-a): +1 counter-clockwise, -1
+  // clockwise, 0 collinear.
+  function turnDirection(a, b, c) {
+    const cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    if (cross > 0) return 1;
+    if (cross < 0) return -1;
+    return 0;
+  }
+
+  // Only meaningful for a point already known to be collinear with a-b.
+  function collinearPointOnSegment(a, b, c) {
+    return (
+      Math.min(a[0], b[0]) <= c[0] &&
+      c[0] <= Math.max(a[0], b[0]) &&
+      Math.min(a[1], b[1]) <= c[1] &&
+      c[1] <= Math.max(a[1], b[1])
+    );
+  }
+
+  // Proper crossing (the four turn directions disagree pairwise) plus the
+  // four collinear-touch cases, which matter here rather than being pedantry:
+  // government building footprints share party walls, so two rings touching
+  // along an edge without crossing is an ordinary input, not a degenerate one.
+  function segmentsIntersect(a, b, c, d) {
+    const d1 = turnDirection(a, b, c);
+    const d2 = turnDirection(a, b, d);
+    const d3 = turnDirection(c, d, a);
+    const d4 = turnDirection(c, d, b);
+    if (d1 !== d2 && d3 !== d4) return true;
+    if (d1 === 0 && collinearPointOnSegment(a, b, c)) return true;
+    if (d2 === 0 && collinearPointOnSegment(a, b, d)) return true;
+    if (d3 === 0 && collinearPointOnSegment(c, d, a)) return true;
+    if (d4 === 0 && collinearPointOnSegment(c, d, b)) return true;
+    return false;
+  }
+
+  // The three cases together are exactly "the two rings share any area or
+  // boundary": a inside b, b inside a, or their boundaries crossing. Dropping
+  // either containment check would miss a building wholly inside the drawn
+  // area -- which is the common case, not an edge case.
+  function ringsOverlap(a, b) {
+    for (const position of a) if (pointInRing(position, b)) return true;
+    for (const position of b) if (pointInRing(position, a)) return true;
+    for (let i = 0, j = a.length - 1; i < a.length; j = i++) {
+      for (let k = 0, l = b.length - 1; k < b.length; l = k++) {
+        if (segmentsIntersect(a[j], a[i], b[l], b[k])) return true;
+      }
+    }
+    return false;
+  }
+
+  function envelopesOverlap(a, b) {
+    return a.minLng <= b.maxLng && b.minLng <= a.maxLng && a.minLat <= b.maxLat && b.minLat <= a.maxLat;
+  }
+
+  // Outer rings only -- holes are ignored on purpose: overlapping the
+  // courtyard of a footprint is still overlapping the footprint, and a report
+  // names the whole object either way.
+  function outerRingsOf(geometry) {
+    if (geometry.type === "Polygon") return geometry.coordinates.slice(0, 1);
+    if (geometry.type === "MultiPolygon") return geometry.coordinates.map((polygon) => polygon[0]);
+    return [];
+  }
+
+  // `ringEnvelope` is passed in rather than recomputed because this runs once
+  // per candidate feature and the drawn ring never changes across the sweep;
+  // the envelope reject in the loop is what keeps a viewport-full of
+  // candidates cheap against a small drawn area.
+  function geometryOverlapsRing(geometry, ring, ringEnvelope) {
+    if (!geometry) return false;
+    if (geometry.type === "Point") return pointInRing(geometry.coordinates, ring);
+    if (geometry.type === "MultiPoint") return geometry.coordinates.some((p) => pointInRing(p, ring));
+    for (const outer of outerRingsOf(geometry)) {
+      if (!envelopesOverlap(envelopeOf(outer), ringEnvelope)) continue;
+      if (ringsOverlap(outer, ring)) return true;
+    }
+    return false;
+  }
+
+  // ---- the drawn-area report selection ----
+  //
+  // Keyed by the identity POST /report needs (see reportKeyFor), because MVT
+  // clips a building at every tile boundary it crosses: one object arrives as
+  // several rendered features and has to collapse to one report. Values are
+  // {target, label, geometries} -- `target` is what gets sent, `label` is
+  // shown in the modal's list, `geometries` are every rendered part, used
+  // only to draw the highlight.
+  let reportSelection = new Map();
+  // True when the last attempt to recompute could not see the whole drawn
+  // area (panned away, or zoomed below REPORT_MIN_ZOOM), so the counts shown
+  // are the previous view's rather than the current truth.
+  let reportSelectionStale = false;
+
+  // A label is display-only, so it may lean on whatever the tile happens to
+  // carry: an unmatched PRG address carries its resolved addr:street /
+  // addr:housenumber (they are what the z17+ label layer draws), and a street
+  // and number identify an address to a human far better than its lokalny_id
+  // does. reportLabel still appends the registry and the actual key columns,
+  // which are the identity being reported.
+  function featureReportLabel(layerId, props, target) {
+    let title = layerId.startsWith("buildings-") ? "Budynek" : "Adres";
+    if (target.source === "prg") {
+      const where = [props["addr:street"] || props["addr:city"], props["addr:housenumber"]]
+        .filter(Boolean)
+        .join(" ");
+      if (where) title = `Adres ${where}`;
+    }
+    return reportLabel(title, target);
+  }
+
+  function selectionDedupeKey(target) {
+    return `${target.source}\u0000${Object.values(target.key).join("\u0000")}`;
+  }
+
+  function computeReportSelection(ring) {
+    const ringEnvelope = envelopeOf(ring);
+    // queryRenderedFeatures takes a screen-space box or a point, never a
+    // polygon, so the ring's screen bounding box is only the candidate net --
+    // geometryOverlapsRing below does the actual selecting.
+    const screen = ring.map((position) => map.project(position));
+    const xs = screen.map((point) => point.x);
+    const ys = screen.map((point) => point.y);
+    const candidates = map.queryRenderedFeatures(
+      [
+        [Math.min(...xs), Math.min(...ys)],
+        [Math.max(...xs), Math.max(...ys)],
+      ],
+      { layers: REPORTABLE_LAYERS },
+    );
+
+    // Two passes, not one: gather every rendered part of an object first, then
+    // decide. Testing as they arrive would drop the parts seen *before* the
+    // one that selects the object, and the highlight would then draw a
+    // building with its first tile's slice missing.
+    const byKey = new Map();
+    for (const feature of candidates) {
+      const target = reportKeyFor(feature.layer.id, feature.properties);
+      if (!target) continue;
+      const key = selectionDedupeKey(target);
+      let entry = byKey.get(key);
+      if (!entry) {
+        entry = { target, label: featureReportLabel(feature.layer.id, feature.properties, target), geometries: [] };
+        byKey.set(key, entry);
+      }
+      entry.geometries.push(feature.geometry);
+    }
+
+    const selection = new Map();
+    for (const [key, entry] of byKey) {
+      if (entry.geometries.some((geometry) => geometryOverlapsRing(geometry, ring, ringEnvelope))) {
+        selection.set(key, entry);
+      }
+    }
+    return selection;
+  }
+
+  // queryRenderedFeatures can only see what is on screen right now, so a
+  // recompute is only honest when the whole drawn area is visible at a zoom
+  // where the two reportable layers actually render. That is true by
+  // construction the moment a polygon is committed (it was just drawn on
+  // screen), and the map's `idle` handler re-runs it afterwards -- which also
+  // covers the ordinary case of tiles still streaming in at commit time.
+  function reportSelectionRefreshable() {
+    if (map.getZoom() < REPORT_MIN_ZOOM) return false;
+    const bounds = map.getBounds();
+    return (
+      committedEnvelope.minLng >= bounds.getWest() &&
+      committedEnvelope.maxLng <= bounds.getEast() &&
+      committedEnvelope.minLat >= bounds.getSouth() &&
+      committedEnvelope.maxLat <= bounds.getNorth()
+    );
+  }
+
+  // Note what this does *not* do when it cannot recompute: it keeps the last
+  // selection and flags it stale, rather than emptying it. Emptying would mean
+  // the count silently collapsed to zero the moment the user panned to check
+  // something, which is both alarming and wrong -- the objects are still
+  // there. The hint says the count is from an earlier view instead.
+  // Same objects, regardless of how many rendered parts each arrived in.
+  function sameSelection(a, b) {
+    if (a.size !== b.size) return false;
+    for (const key of a.keys()) if (!b.has(key)) return false;
+    return true;
+  }
+
+  function refreshReportSelection() {
+    if (!committedPolygon || areaPurpose !== "report") {
+      if (reportSelection.size) reportSelection = new Map();
+      reportSelectionStale = false;
+      return;
+    }
+    if (!reportSelectionRefreshable()) {
+      reportSelectionStale = true;
+      return;
+    }
+    const next = computeReportSelection(committedPolygon.coordinates[0]);
+    // Keeping the existing Map when nothing changed is not a micro-
+    // optimisation, it is what stops a feedback loop: this runs on every map
+    // `idle`, renderReportSelection below skips setData when the selection is
+    // the same object, and a setData would itself trigger a render and so the
+    // next `idle`. Recomputing into a fresh Map every time would make that
+    // cycle self-sustaining and the map would never go idle again.
+    if (!sameSelection(next, reportSelection)) reportSelection = next;
+    reportSelectionStale = false;
+  }
+
+  // Called only from applyAreaPanelState, so the highlight can never drift
+  // out of sync with the state that produced it -- the same discipline every
+  // other control in this panel follows. Hidden while drawing (the in-progress
+  // overlay owns the map then) and under the download purpose (a selection
+  // highlight there would mark objects nothing is about to do anything to).
+  // What the highlight source was last given, so an unchanged selection is a
+  // no-op. applyAreaPanelState runs on every `zoom` event and every `idle`,
+  // so an unconditional setData here would rebuild and re-upload the source
+  // dozens of times per zoom gesture -- and, worse, keep the map permanently
+  // busy (see the loop refreshReportSelection's own comment describes).
+  let renderedSelection = null;
+
+  function renderReportSelection() {
+    const source = map.getSource("reportSelection");
+    if (!source) return; // called once before the style has loaded
+    const visible = areaPurpose === "report" && appDrawState === "selected";
+    const selection = visible ? reportSelection : null;
+    if (selection === renderedSelection) return;
+    renderedSelection = selection;
+    const features = [];
+    if (selection) {
+      for (const entry of selection.values()) {
+        for (const geometry of entry.geometries) {
+          features.push({ type: "Feature", properties: {}, geometry });
+        }
+      }
+    }
+    source.setData({ type: "FeatureCollection", features });
+  }
+
+  function selectionCountsText() {
+    const counts = new Map();
+    for (const entry of reportSelection.values()) {
+      counts.set(entry.target.source, (counts.get(entry.target.source) || 0) + 1);
+    }
+    return [...counts].map(([source, n]) => `${REGISTRY_LABELS[source] || source}: ${n}`).join(", ");
+  }
+
+  const REPORT_STALE_HINT =
+    " Zaznaczenie policzono dla wcześniejszego widoku mapy — pokaż cały zaznaczony obszar przy zoomie 14+, aby je odświeżyć.";
+
+  function reportSelectionHintText() {
+    const count = reportSelection.size;
+    if (count === 0) {
+      return reportSelectionStale
+        ? `Nie policzono żadnych obiektów.${REPORT_STALE_HINT}`
+        : "Zaznaczony obszar nie obejmuje niedopasowanych obiektów z włączonych warstw.";
+    }
+    let text = `Zaznaczono ${objectsPlural(count)} (${selectionCountsText()}).`;
+    if (count > MAX_REPORT_OBJECTS) {
+      text += ` Limit to ${MAX_REPORT_OBJECTS} obiektów na zgłoszenie — zmniejsz zaznaczony obszar.`;
+    }
+    if (reportSelectionStale) text += REPORT_STALE_HINT;
+    return text;
   }
 
   // ---- panel chrome ----
@@ -2477,7 +3011,12 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     if (appDrawState !== "drawing") return;
     let text = modeInstructions(drawMode);
     if (currentDrawAreaSqDeg !== null) {
-      text += ` Powierzchnia obwiedni: ${areaText(currentDrawAreaSqDeg)} (limit ${areaText(MAX_AREA_SQ_DEG)}).`;
+      text += ` Powierzchnia obwiedni: ${areaText(currentDrawAreaSqDeg)}`;
+      // The cap belongs to /package, so it is only quoted under the download
+      // purpose -- see areaLimitApplies. Under the report purpose the bound
+      // that matters is the object count, which cannot be known until the
+      // polygon is committed and the selection computed.
+      text += areaLimitApplies() ? ` (limit ${areaText(MAX_AREA_SQ_DEG)}).` : ".";
       if (!currentDrawValid) text += " Przekroczono limit powierzchni — zmniejsz obszar.";
     }
     drawHint.textContent = text;
@@ -2489,27 +3028,46 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
 
   function selectedHintText() {
-    let text = `Powierzchnia obwiedni: ${areaText(committedAreaSqDeg)} (limit ${areaText(MAX_AREA_SQ_DEG)}).`;
-    if (!committedValid) text += " Przekroczono limit powierzchni — narysuj mniejszy obszar, aby pobrać.";
+    let text = `Powierzchnia obwiedni: ${areaText(committedAreaSqDeg)}`;
+    text += areaLimitApplies() ? ` (limit ${areaText(MAX_AREA_SQ_DEG)}).` : ".";
+    if (!polygonAreaValid(committedAreaSqDeg)) {
+      text += " Przekroczono limit powierzchni — narysuj mniejszy obszar, aby pobrać.";
+    }
     return text;
   }
 
-  // The single place that reconciles the whole download panel (both buttons,
-  // the mode picker, Anuluj/Usuń zaznaczenie, both hints) against
-  // {appDrawState, map zoom, downloadInFlight} -- see the state-machine
-  // comment above appDrawState's declaration. Renamed from the original
+  // The single place that reconciles the whole panel -- the purpose picker,
+  // both primary actions, the mode picker, Anuluj/Usuń zaznaczenie, all three
+  // hints and the selection highlight -- against {areaPurpose, appDrawState,
+  // map zoom, downloadInFlight}. Every state-changing function in this section
+  // ends by calling it rather than poking DOM visibility itself, so the panel
+  // can never drift out of sync with the state variables. Renamed from
   // applyDownloadZoomGating, which only ever toggled zoom-based disabling:
-  // that gate is real but now applies to the viewport path alone --
-  // drawing/selecting a polygon is legal at any zoom (a small polygon framed
-  // at z10 has a perfectly legal envelope), so it would be wrong to keep
-  // disabling the draw button below z12 the way the old function did.
-  function applyDownloadPanelState() {
+  // that gate is real but applies to the viewport path alone -- drawing or
+  // selecting a polygon is legal at any zoom (a small polygon framed at z10
+  // has a perfectly legal envelope), so it would be wrong to keep disabling
+  // the draw button below z12 the way the old function did.
+  function applyAreaPanelState() {
     const tooFarOut = map.getZoom() < MIN_DOWNLOAD_ZOOM;
     const idle = appDrawState === "idle";
     const drawing = appDrawState === "drawing";
     const selected = appDrawState === "selected";
+    const downloading = areaPurpose === "download";
+    const reporting = areaPurpose === "report";
+    const selectionCount = reportSelection.size;
 
-    downloadBtn.hidden = drawing;
+    // Hidden while drawing for the same reason the primary actions are:
+    // switching purpose mid-gesture would re-judge the in-progress polygon
+    // against a different limit halfway through drawing it.
+    areaPurposePicker.hidden = drawing;
+    for (const btn of areaPurposeButtons) {
+      btn.setAttribute("aria-pressed", String(btn.dataset.areaPurpose === areaPurpose));
+      btn.disabled = downloadInFlight;
+    }
+
+    // No reporting twin of "Pobierz widoczny obszar" exists, deliberately --
+    // see the markup in index.html.
+    downloadBtn.hidden = drawing || reporting;
     if (idle) {
       downloadBtn.textContent = "Pobierz widoczny obszar";
       downloadBtn.disabled = tooFarOut || downloadInFlight;
@@ -2517,13 +3075,14 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       downloadBtn.textContent = "Pobierz zaznaczony obszar";
       // Gated on the polygon's own envelope, never on zoom -- see the
       // function comment above.
-      downloadBtn.disabled = !committedValid || downloadInFlight;
+      downloadBtn.disabled = !polygonAreaValid(committedAreaSqDeg) || downloadInFlight;
     }
-    // Only the idle/viewport path is zoom-gated -- see the function comment.
-    downloadZoomHint.hidden = !(idle && tooFarOut);
+    // Only the download purpose's viewport path is zoom-gated.
+    downloadZoomHint.hidden = !(downloading && idle && tooFarOut);
 
     drawBtn.hidden = drawing;
-    drawBtn.textContent = selected ? "Narysuj ponownie" : "Narysuj obszar";
+    if (reporting) drawBtn.textContent = selected ? "Zaznacz ponownie" : "Zaznacz obszar";
+    else drawBtn.textContent = selected ? "Narysuj ponownie" : "Narysuj obszar";
     drawBtn.disabled = downloadInFlight;
 
     drawModePicker.hidden = !drawing;
@@ -2531,12 +3090,37 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     drawClearBtn.hidden = !selected;
     drawClearBtn.disabled = downloadInFlight;
 
+    reportAreaBtn.hidden = !(reporting && selected);
+    reportAreaBtn.textContent = selectionCount
+      ? `Zgłoś zaznaczone obiekty (${selectionCount})`
+      : "Zgłoś zaznaczone obiekty";
+    // Over the cap the request is a guaranteed 400, so it is refused here
+    // rather than sent -- see MAX_REPORT_OBJECTS on why it is not chunked.
+    reportAreaBtn.disabled = selectionCount === 0 || selectionCount > MAX_REPORT_OBJECTS;
+
+    reportSelectHint.hidden = !(reporting && selected);
+    if (reporting && selected) reportSelectHint.textContent = reportSelectionHintText();
+
     drawHint.hidden = idle;
     if (drawing) updateDrawHint();
     else if (selected) drawHint.textContent = selectedHintText();
+
+    renderReportSelection();
   }
 
-  map.on("zoom", applyDownloadPanelState);
+  map.on("zoom", applyAreaPanelState);
+
+  // The selection is only as complete as what was rendered when it was
+  // computed, so recompute whenever the map settles -- which covers tiles
+  // still streaming in right after a polygon was committed, a legend source
+  // toggled on or off, and a pan back onto an area the user had left.
+  // refreshReportSelection itself decides whether the current view is one it
+  // can trust; this only decides when to ask.
+  map.on("idle", () => {
+    if (areaPurpose !== "report" || !committedPolygon) return;
+    refreshReportSelection();
+    applyAreaPanelState();
+  });
 
   drawBtn.addEventListener("click", () => enterDrawingMode(drawMode));
   drawCancelBtn.addEventListener("click", cancelDrawing);
@@ -2545,7 +3129,28 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     btn.addEventListener("click", () => enterDrawingMode(btn.dataset.drawMode));
   }
 
-  applyDownloadPanelState();
+  for (const btn of areaPurposeButtons) {
+    btn.addEventListener("click", () => {
+      if (areaPurpose === btn.dataset.areaPurpose) return;
+      areaPurpose = btn.dataset.areaPurpose;
+      // A committed polygon survives the switch -- see areaPurpose's own
+      // comment -- but what it is judged by does not, so both the overlay's
+      // valid/invalid colouring and the selection are recomputed here.
+      refreshReportSelection();
+      renderCommittedPolygon();
+      applyAreaPanelState();
+    });
+  }
+
+  reportAreaBtn.addEventListener("click", () => {
+    // Same two conditions the button's disabled state already carries,
+    // repeated because a disabled button is a UI affordance rather than a
+    // guarantee about what can reach this handler.
+    if (reportSelection.size === 0 || reportSelection.size > MAX_REPORT_OBJECTS) return;
+    openReportModal([...reportSelection.values()], { fromSelection: true });
+  });
+
+  applyAreaPanelState();
 
   // Keys match the `datasets` values /package accepts (src/server/package.rs
   // parse_datasets) and what activeAggSources() above returns.
@@ -2607,7 +3212,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     }
 
     downloadInFlight = true;
-    applyDownloadPanelState();
+    applyAreaPanelState();
     setFeedback("Pobieranie…", null);
     try {
       const res = await fetch(request.url, request.init);
@@ -2646,7 +3251,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       console.error("package download failed", err);
     } finally {
       downloadInFlight = false;
-      applyDownloadPanelState();
+      applyAreaPanelState();
     }
   }
 
