@@ -60,12 +60,88 @@ EnvironmentFile=-/opt/osmpbudynkiv2/.env
 # so plain SIGTERM is enough -- no need for SIGKILL or a custom KillSignal.
 # Give it real time to finish an in-flight DuckDB statement and drain
 # in-flight requests before systemd escalates to SIGKILL.
-TimeoutStopSec=60
+#
+# Generous on purpose, and this is not just politeness to in-flight requests:
+# a SIGKILL closes the database *without checkpointing*, which leaves a WAL
+# full of inserts into pre-existing RTREE indexes -- exactly the precondition
+# for duckdb-spatial issue #861, whose replay bug then breaks index-bound
+# queries (every /tiles zoom) on the next open with "Operation requires a flat
+# vector but a non-flat vector was encountered". A production instance hit
+# that after a 60s timeout proved too short to shut down a process with
+# several GB paged out. Raise this further rather than lower it; the cost of
+# waiting is seconds, the cost of a dirty WAL is broken tiles until the
+# extension is patched. See docs/memory_growth_investigation.md.
+TimeoutStopSec=300
 
 # Crash recovery. Not concurrent-writer risk: systemd only starts the new
 # process after the old one has fully exited.
 Restart=on-failure
 RestartSec=5
+
+# Allocator tuning. This process contains *two* jemallocs -- DuckDB's prefixed
+# `duckdb_je_*` build and rust-rocksdb's unprefixed one, whose malloc/free
+# override glibc's and so back the entire Rust heap (see CLAUDE.md's jemalloc
+# gotcha). Both read this same MALLOC_CONF, so one line configures both.
+#
+# Without it, both run at jemalloc's defaults -- notably `narenas` at 4x the
+# CPU count. jemalloc never migrates memory between arenas, so with 34 threads
+# (8 pooled DuckDB connections, tokio workers, RocksDB background jobs) each
+# arena retains its own high-water mark independently and process RSS ratchets
+# upward under bursty allocation without ever coming back down. A production
+# instance reached 9.7 GB RSS plus 6 GB of swap over four days with ~9.5 GB of
+# that sitting in ~21 sparsely-resident anonymous arenas; see
+# docs/memory_growth_investigation.md for the full measurements.
+#
+# narenas caps that spread; background_thread purges asynchronously so the
+# decay settings do not land as latency on a request thread; dirty_decay_ms
+# halves jemalloc's 10 s default. muzzy_decay_ms:0 is already jemalloc's
+# default and is spelled out only so a later edit does not quietly raise it --
+# a higher value delays returning muzzy pages, which is backwards here.
+Environment=MALLOC_CONF=narenas:4,background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0
+
+# Memory accounting. Pure observability, no behaviour change, and the reason
+# to keep it unconditionally: without it
+# `systemctl show -p MemoryCurrent osmpbudynkiv2` reads [not set] and there is
+# nothing to watch a slow leak with short of poking around in /proc.
+MemoryAccounting=true
+
+# Memory ceiling. A backstop against a runaway, NOT a way to squeeze the
+# working set -- and the distinction is load-bearing, because getting it wrong
+# does not look like a memory error.
+#
+# MemoryMax is a hard OOM-kill ceiling; combined with Restart=on-failure above,
+# exceeding it restarts the service instead of taking the host down. Set it
+# from a *measured* baseline, not from a guess: start the service with this
+# commented out, let it serve for an hour, read `MemoryCurrent`, and set this
+# comfortably (say 2x) above that. It must in any case stay well above
+# `memory_limit` in config.toml (4 GB by default), which governs only DuckDB's
+# own buffer manager -- not the spatial extension's GEOS allocations, the Rust
+# heap, or allocator overhead, all of which are real and none of which DuckDB
+# counts.
+#
+# The value below assumes a 16 GB host and a 4 GB `memory_limit`. Treat it as
+# a placeholder to replace, not a default to keep.
+MemoryMax=12G
+
+# MemoryHigh is deliberately NOT set here, and it is the setting most likely to
+# be reached for by mistake. It does not cap anything: it throttles the cgroup
+# and reclaims aggressively once crossed, so a value below the real working set
+# does not fail loudly -- it just makes every DuckDB query slow. Set 2 GB too
+# low on a live instance, the symptom was the r2d2 pool exhausting within 40
+# seconds of startup and every endpoint logging
+# "Failed to acquire pool connection", with nothing anywhere naming memory as
+# the cause. If you do want a soft brake, set it only after you know the
+# steady-state figure, and read
+# /sys/fs/cgroup/system.slice/<unit>/memory.events afterwards -- a climbing
+# `high` counter means it is throttling.
+# MemoryHigh=10G
+
+# Swap is deliberately left alone (no MemorySwapMax). Denying swap outright
+# makes the ceiling above bind more predictably, but it also removes the slack
+# that lets a shutdown complete -- and an incomplete shutdown means a SIGKILL,
+# a dirty WAL, and the #861 breakage described at TimeoutStopSec above. If the
+# host is swapping *steadily* that is a problem to fix at its source, not to
+# paper over here.
 
 # Basic hardening. Tighten/extend ReadWritePaths if you move the database,
 # RocksDB directory, or `download_dir` outside WorkingDirectory.
