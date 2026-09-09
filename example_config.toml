@@ -11,6 +11,13 @@ rocksdb_block_cache_mb = 512
 # RocksDB write buffer size in MB (per column family)
 rocksdb_write_buffer_mb = 64
 
+# Block cache for the `tiles` column family only, in MB. Deliberately separate
+# from rocksdb_block_cache_mb: tile blocks and OSM node blocks have unrelated
+# access patterns, and one shared cache would let a browsing session evict the
+# nodes `update osm` reads on every minutely diff. Stored tiles are gzipped, so
+# this budget holds 3-4x more of them than the same budget of raw MVT would.
+rocksdb_tile_block_cache_mb = 256
+
 # Log verbosity: trace, debug, info, warn, error
 # Can be overridden by RUST_LOG environment variable
 log_level = "info"
@@ -234,6 +241,20 @@ batch_size = 512
 # (docs/centroid_index_measured.md), not a freshly measured full sweep --
 # left disabled pending an actual timed sweep; flip to `true` once that
 # number is in and comfortably inside interval_seconds.
+[jobs.tile_refresh]
+# Re-renders the tiles that data changes just invalidated. On by default and on
+# a short interval: with no read-time freshness check anywhere, this job is the
+# only thing that makes a pushed invalidation visible, so its interval is
+# served-stale time.
+enabled = true
+interval_seconds = 10
+timeout_seconds = 300
+run_on_start = true
+# Dirty cells expanded per tick. Each cell expands to the nine z14 tiles that
+# can render its rows plus one parent per lower persisted zoom, deduplicated
+# across the tick -- so this is not the number of tiles rendered.
+batch_size = 256
+
 [jobs.match_reconcile]
 enabled = false
 interval_seconds = 86400
@@ -360,6 +381,14 @@ tile_max_age_seconds = 60
 # max-age for z5..=z13 /tiles responses (aggregated bins and unbinned
 # points). Coarser zooms move less per individual edit, so they tolerate a
 # longer TTL than z14.
+#
+# This value does double duty and one of the two uses is load-bearing: it is
+# also the TTL of the in-process z5..=z11 cache below. The server must never
+# hold a tile staler than one every browser is already entitled to hold under
+# the header we ourselves send, and equality between the two is that proof --
+# so if you ever split this into separate knobs, the z5..=z11 pair is the half
+# that has to stay equal. (z12..=z13 borrows the same number for its header,
+# where it carries no such requirement.)
 agg_tile_max_age_seconds = 300
 # max-age for GET /updates.
 updates_max_age_seconds = 60
@@ -371,6 +400,21 @@ static_max_age_seconds = 604800
 # PBFs are named by a fixed byte range per font and never change in place,
 # so a year-long cache is safe.
 font_max_age_seconds = 31536000
-# Maximum size in bytes of the in-process z14 /tiles response cache. Set to 0
-# to disable the cache entirely (a genuine no-op, not just a tiny budget).
-tile_cache_max_bytes = 268435456
+# Maximum size in bytes of the in-process z5..=z11 /tiles response cache. Set
+# to 0 to disable the cache entirely (a genuine no-op, not just a tiny budget).
+#
+# Only the aggregate tier lives here -- it is the one tier that cannot be
+# push-invalidated, because its content is bounded by a `now() - max_age_days`
+# window and so moves with the wall clock. The default holds that whole tier
+# several times over: all of Poland is ~4,260 tiles, ~20 MB gzipped.
+# z12..=z14 is persisted to RocksDB instead (see persist_tiles below).
+tile_cache_max_bytes = 67108864
+# Whether z12..=z14 /tiles bodies are persisted to the `tiles` RocksDB column
+# family, so they survive a restart and cost a ~1ms point lookup instead of a
+# 49-350ms render. Set to false to make every tile render cold -- the escape
+# hatch if the store is ever suspected of serving stale bytes (`tiles clear`
+# is the other, and does not require a restart).
+#
+# Populate it in one pass with `tiles warm` (offline, needs exclusive DB
+# access); otherwise it fills in lazily as clients request tiles.
+persist_tiles = true

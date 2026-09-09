@@ -182,6 +182,36 @@ fn insert_one(conn: &Connection, target: &ReportTarget, report_id: i64) -> Resul
     Ok(n > 0)
 }
 
+/// The tile-queue twin of every `match_dirty_cells` enqueue in this module.
+///
+/// A report changes a tile *and* a match decision, so both queues need the
+/// same cells -- see CLAUDE.md's tile-invalidation rule. The tile half is not
+/// implied by the match half: `/tiles`' `addresses_all`/`buildings_all` layers
+/// carry a `reported` attribute computed at serve time from `object_reports`
+/// (`compare::rule::reported_sql`), and those layers read the raw source
+/// tables, which no drain ever touches. Without this, a report would grey out
+/// the object on the unmatched layers after the next drain and never mark it
+/// on the legend layers at all.
+///
+/// Takes the caller's `WHERE` fragment verbatim so the two enqueues can never
+/// select different rows; every call site pairs them immediately.
+fn enqueue_tiles_for_reports(
+    conn: &Connection,
+    where_sql: &str,
+    params: impl duckdb::Params,
+) -> Result<()> {
+    conn.execute(
+        &crate::server::tile_dirty::enqueue_from_select_sql(
+            "cell_x",
+            "cell_y",
+            &format!("FROM object_reports WHERE {where_sql}"),
+        ),
+        params,
+    )
+    .context("Failed to enqueue dirty tiles for reports")?;
+    Ok(())
+}
+
 /// Enqueue the z14 cell of every report with `report_id >= from_id`, so the
 /// drain rebuilds the cells whose contents these reports just changed.
 fn enqueue_cells_for_reports(conn: &Connection, from_id: i64) -> Result<i64> {
@@ -196,6 +226,11 @@ fn enqueue_cells_for_reports(conn: &Connection, from_id: i64) -> Result<i64> {
             duckdb::params![from_id],
         )
         .context("Failed to enqueue dirty cells for reports")?;
+    enqueue_tiles_for_reports(
+        conn,
+        "report_id >= ? AND cell_x IS NOT NULL AND cell_y IS NOT NULL",
+        duckdb::params![from_id],
+    )?;
     Ok(n as i64)
 }
 
@@ -266,6 +301,16 @@ pub fn reconcile_source(conn: &Connection, spec: &DatasetSpec) -> Result<Reconci
         )
         .with_context(|| format!("Failed to enqueue expired-report cells for {}", spec.name))?
         as i64;
+    enqueue_tiles_for_reports(
+        conn,
+        &format!(
+            "status = '{STATUS_ACTIVE}' AND source = '{source}'
+               AND cell_x IS NOT NULL AND cell_y IS NOT NULL
+               AND ({record_missing} OR {record_changed})",
+            source = spec.name,
+        ),
+        [],
+    )?;
 
     // Split into "changed" and "removed" rather than one combined UPDATE
     // because the two mean different things to an operator reading the log: a
@@ -381,6 +426,14 @@ pub fn revoke(conn: &Connection, selector: RevokeSelector<'_>) -> Result<(i64, i
                 refs.as_slice(),
             )
             .context("Failed to enqueue revoked-report cells")? as i64;
+        enqueue_tiles_for_reports(
+            conn,
+            &format!(
+                "status = '{STATUS_ACTIVE}' AND {predicate}
+                   AND cell_x IS NOT NULL AND cell_y IS NOT NULL"
+            ),
+            refs.as_slice(),
+        )?;
         let revoked = conn
             .execute(
                 &format!(
@@ -610,6 +663,14 @@ pub fn import_rows(conn: &Connection, rows: &[ReportRow]) -> Result<i64> {
             duckdb::params![next_id - n],
         )
         .context("Failed to enqueue imported-report cells")?;
+        enqueue_tiles_for_reports(
+            conn,
+            &format!(
+                "report_id >= ? AND status = '{STATUS_ACTIVE}'
+                   AND cell_x IS NOT NULL AND cell_y IS NOT NULL"
+            ),
+            duckdb::params![next_id - n],
+        )?;
         Ok(n)
     })();
     match applied {

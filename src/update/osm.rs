@@ -1494,7 +1494,7 @@ mod tests {
 
     fn setup_test_db_and_kv() -> Result<(Connection, Arc<RocksDB>, tempfile::TempDir)> {
         let tmpdir = tempfile::tempdir()?;
-        let kv = Arc::new(kvstore::open(tmpdir.path(), 8, 4)?);
+        let kv = Arc::new(kvstore::open(tmpdir.path(), 8, 4, 8)?);
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init_commands, Some(kv.clone()))?;
 
@@ -2892,7 +2892,7 @@ mod tests {
         use crate::compare::reconcile::enqueue_all;
 
         let tmpdir = tempfile::tempdir().unwrap();
-        let kv = Arc::new(kvstore::open(tmpdir.path(), 8, 4).unwrap());
+        let kv = Arc::new(kvstore::open(tmpdir.path(), 8, 4, 8).unwrap());
         let init_commands = vec![
             "INSTALL spatial".to_string(),
             "LOAD spatial".to_string(),

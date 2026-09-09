@@ -91,7 +91,7 @@ fn test_import_bdot10k_missing_file() {
 /// with the whole-row-hash diff mechanism (see
 /// `docs/superpowers/plans/2026-08-14-key-based-diff.md`) and have no
 /// replacement to assert here — the file-backed-database setup is kept
-/// because `test_import_bdot10k_bumps_serving_epoch` below relies on the
+/// because `test_import_bdot10k_enqueues_no_dirty_tiles` below relies on the
 /// same technique and refers back to this test by name.
 #[test]
 fn test_import_bdot10k_persists_expected_row_count() {
@@ -131,15 +131,22 @@ fn test_import_bdot10k_persists_expected_row_count() {
     assert_eq!(total, 74);
 }
 
-/// An import rewrites `bdot10k_buildings` wholesale, including the
-/// `centroid` column `/tiles`' adjacency CTE reads with no per-cell version
-/// covering it -- see `serving_version`'s module doc. The import dispatch
-/// must bump `metadata.serving_epoch`. Uses a file-backed database (like
-/// `test_import_bdot10k_persists_expected_row_count` above, not
-/// `memory_config()`) so the state can be read back after the CLI process
-/// exits.
+/// An import rewrites `bdot10k_buildings` wholesale, so every tile in the
+/// country is potentially stale -- but it must invalidate them by **wiping the
+/// tile store**, never by enqueueing. Enqueueing here would mean a queue row
+/// per z14 cell in Poland (~200k of them) for work a single `drop_cf` does,
+/// and `main.rs`'s dispatch calls `clear_tile_store` for exactly that reason.
+///
+/// This pins the half that is observable from DuckDB. The wipe itself is
+/// pinned by `tile_store::clear_empties_the_store_but_leaves_the_osm_families_alone`;
+/// asserting it here would need the RocksDB handle, which an integration test
+/// driving the binary does not have.
+///
+/// Uses a file-backed database (like `test_import_bdot10k_persists_expected_row_count`
+/// above, not `memory_config()`) so the state can be read back after the CLI
+/// process exits.
 #[test]
-fn test_import_bdot10k_bumps_serving_epoch() {
+fn test_import_bdot10k_enqueues_no_dirty_tiles() {
     let db = tempfile::TempDir::new().unwrap();
     let rocksdb_dir = tempfile::TempDir::new().unwrap();
     let db_path = db.path().join("test.duckdb");
@@ -168,12 +175,14 @@ fn test_import_bdot10k_bumps_serving_epoch() {
     let conn = duckdb::Connection::open(&db_path).unwrap();
     conn.execute_batch("INSTALL spatial; LOAD spatial;")
         .unwrap();
-    let epoch: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'serving_epoch'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("import must bump metadata.serving_epoch");
-    assert_eq!(epoch, "1", "first bump on a fresh database must land at 1");
+    let queued: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |row| {
+            row.get(0)
+        })
+        .expect("tile_dirty_cells must exist after an import");
+    assert_eq!(
+        queued, 0,
+        "an import invalidates by wiping the tile store, never by enqueueing \
+         one row per cell in the country"
+    );
 }

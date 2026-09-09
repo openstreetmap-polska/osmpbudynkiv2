@@ -266,6 +266,21 @@ fn create_schema(conn: &Connection) -> Result<()> {
             enqueued_at TIMESTAMP WITH TIME ZONE
         );
 
+        -- Tiles whose rendered bytes are stale, drained by jobs::tile_refresh.
+        --
+        -- Deliberately NOT keyed like match_dirty_cells: no `source` (a tile
+        -- is source-agnostic -- it renders all three) and no `cell_z` (always
+        -- CHANGE_CELL_ZOOM, since that is the granularity every producer
+        -- already computes). One row per changed cell; the expansion into the
+        -- tiles that render it is server::tile_dirty::tiles_for_cell's job,
+        -- which keeps the queue an eleventh the size a pre-expanded one would
+        -- be and keeps the ring/parent asymmetry in one place.
+        CREATE TABLE IF NOT EXISTS tile_dirty_cells (
+            cell_x INTEGER,
+            cell_y INTEGER,
+            enqueued_at TIMESTAMP WITH TIME ZONE
+        );
+
         -- Denominator for the low-zoom completeness ratio: how many government
         -- objects a z14 cell holds *in total*, against which <source>_unmatched
         -- is the numerator. Written by exactly the two paths that write the

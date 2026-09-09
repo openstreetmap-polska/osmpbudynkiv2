@@ -76,8 +76,38 @@ pub enum Command {
         #[arg(long)]
         egib_building_types_file: Option<PathBuf>,
     },
+    /// Operate on the persistent rendered-tile store (z12..=z14)
+    Tiles {
+        #[command(subcommand)]
+        action: TilesAction,
+    },
     /// Run HTTP service with background data updates
     Run,
+}
+
+#[derive(Subcommand)]
+pub enum TilesAction {
+    /// Pre-render and store every z12..=z14 tile the data covers, so no client
+    /// ever pays a cold render. Requires exclusive access to the database — do
+    /// not run this against a database a `run` server also has open.
+    ///
+    /// The tile list comes from `cell_totals` (every z14 cell holding
+    /// government objects) expanded to the tiles that render it, not from a
+    /// bounding box — so sea and border tiles are skipped. Tiles already
+    /// present are skipped too, which makes an interrupted warm resumable.
+    Warm {
+        /// Only warm tiles intersecting this area, as
+        /// `min_lon,min_lat,max_lon,max_lat`. Intersected with the covered
+        /// set, never a replacement for it.
+        #[arg(long)]
+        bbox: Option<String>,
+        /// Parallel render workers. Defaults to the machine's parallelism.
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
+    /// Empty the tile store. The escape hatch for a suspected missed
+    /// invalidation; tiles re-render on demand afterwards.
+    Clear,
 }
 
 #[derive(Subcommand)]

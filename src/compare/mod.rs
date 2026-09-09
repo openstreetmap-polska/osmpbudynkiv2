@@ -46,18 +46,6 @@ pub fn run(conn: &Connection, target: CompareTarget) -> Result<()> {
             buildings::compare_egib(conn)?;
             crate::shutdown::check_requested()?;
             addresses::compare_prg(conn)?;
-            // Pure insurance, not a normal invalidation path: every row this
-            // rewrote already moved that cell's own per-cell version (see
-            // `serving_version`'s module doc), so this bump covers only the
-            // case where `compare full` is run as an offline rebuild (e.g.
-            // restoring the DB from a snapshot) that never went through a
-            // dirty cell at all -- without it, a client's cached ETag for an
-            // unrelated tile could in principle survive such a rebuild.
-            // Deliberately NOT inside `full`'s per-source transactions
-            // (`in_transaction`, above): each source's rebuild is already
-            // independently atomic, and this is a single global stamp for
-            // the whole `Full` run, not per source.
-            crate::serving_version::bump_serving_epoch(conn)?;
         }
     }
     Ok(())
@@ -98,11 +86,13 @@ pub fn run_queue(conn: &Connection, action: QueueAction) -> Result<()> {
 
             let mut total_drained = 0u64;
             let mut total_failed = 0u64;
+            let mut total_purged = 0u64;
             loop {
                 crate::shutdown::check_requested()?;
                 let stats = drain::drain_batch(conn, batch_size, &crate::shutdown::is_requested)?;
                 total_drained += stats.cells;
                 total_failed += stats.failed;
+                total_purged += stats.purged;
                 if stats.cells == 0 {
                     break;
                 }
@@ -110,6 +100,15 @@ pub fn run_queue(conn: &Connection, action: QueueAction) -> Result<()> {
                     progress = format!("{total_drained}/{queued_cells}"),
                     failed = total_failed,
                     "drain progress"
+                );
+            }
+            // `purged` should always be zero -- this codebase is the only
+            // writer of the queue -- so a non-zero count is worth surfacing
+            // rather than folding into the drained total.
+            if total_purged > 0 {
+                tracing::warn!(
+                    purged = total_purged,
+                    "discarded queue rows naming an unknown source"
                 );
             }
             if total_failed > 0 {

@@ -125,7 +125,7 @@ mod tests {
         let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
         let pool = crate::server::build_pool(conn, 2).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let kv = Arc::new(crate::osm::kvstore::open(dir.path(), 8, 4).unwrap());
+        let kv = Arc::new(crate::osm::kvstore::open(dir.path(), 8, 4, 8).unwrap());
 
         let mut config = AppConfig::default();
         config.jobs.retention_prune.package_exports_days = package_exports_days;

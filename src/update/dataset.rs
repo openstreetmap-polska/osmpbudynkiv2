@@ -218,16 +218,6 @@ pub fn refresh(
                 );
             }
 
-            // Fires on EVERY landed refresh, even a 0/0/0 diff (no added,
-            // modified or removed keys at all): a refresh can rewrite raw
-            // columns `/tiles` reads (`centroid`, `rodzaj_kod`) that sit
-            // outside `compared_columns`, so "the delta was empty" does not
-            // mean "nothing /tiles reads changed". Inside the transaction, so
-            // an aborted refresh (see the `?` above, which returns before
-            // reaching here) cannot claim a bump that never landed — see
-            // `serving_version`'s module doc.
-            crate::serving_version::bump_serving_epoch(conn)?;
-
             conn.execute(
                 "INSERT INTO dataset_refreshes
                  (snapshot_id, source, started_at, finished_at, source_etag,
@@ -365,10 +355,10 @@ fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> 
 /// resumes from a `metadata` stamp, so stopping early is real, durable
 /// partial progress -- "less caught up, resume next run". `refresh` has no
 /// such checkpoint: until the apply transaction commits, nothing has landed
-/// -- no `dataset_refreshes` row, no delta, no dirty cells, no serving-epoch
-/// bump. `Ok(())` here would make the `job_log::record` call at the bottom of
-/// `refresh` write a `Success` row, and the job registry report a successful
-/// run, for a refresh that did nothing at all.
+/// -- no `dataset_refreshes` row, no delta, no cells enqueued into either
+/// dirty-cell queue. `Ok(())` here would make the `job_log::record` call at
+/// the bottom of `refresh` write a `Success` row, and the job registry report
+/// a successful run, for a refresh that did nothing at all.
 fn check_cancelled(source: &str, stage: &str, is_cancelled: &dyn Fn() -> bool) -> Result<()> {
     let reason = if crate::shutdown::is_requested() {
         "shutdown requested"
@@ -1065,59 +1055,81 @@ mod tests {
         );
     }
 
-    // --- serving_version bump -------------------------------------------
+    // --- tile-dirty-cell enqueue ------------------------------------------
     //
-    // The bump is unconditional on every LANDED refresh (see the comment
-    // beside its call site in `refresh`, above) -- these three tests pin
-    // "landed" (bumps), "aborted" (does not) and "never attempted" (does
-    // not) as the three cases that matter.
+    // `insert_dirty_cells` (called inside the apply transaction alongside
+    // `insert_change_areas`, see `refresh` above) feeds `tile_dirty_cells` as
+    // well as `match_dirty_cells` and is unconditional on every LANDED
+    // refresh -- these three tests pin "landed" (enqueues), "aborted" (does
+    // not) and "never attempted" (does not) as the three cases that matter.
+    // See `server::tile_dirty`'s module doc for the enqueue-vs-match-dirty
+    // rule this is one half of.
 
-    /// The 0/0/0-diff case (`LIVE_ROWS` staged against itself, so nothing
-    /// changed) still counts as a landed refresh and must still bump --
-    /// raw columns `/tiles` reads (`centroid`, `rodzaj_kod`) can move even
-    /// when the diffed row set didn't.
+    /// This fixture's diff is added=1/modified=1/removed=1, all at the same
+    /// point (21.0, 52.0) -- `keep` survives, `mod` changes content in place,
+    /// `del` is removed, `add` arrives. A landed refresh must enqueue that
+    /// one touched cell into `tile_dirty_cells`, not just `match_dirty_cells`:
+    /// the refresh rewrites the raw source table, which `/tiles`' `*_all`
+    /// legend layers read directly, so the tile is stale the moment this
+    /// commits regardless of whether any match decision changed.
     #[test]
-    fn successful_refresh_bumps_the_serving_epoch() {
+    fn successful_refresh_enqueues_the_changed_cells_for_tile_regeneration() {
+        use crate::tile_math::{CHANGE_CELL_ZOOM, lonlat_to_tile};
+
         let conn = conn_with_live(LIVE_ROWS);
-        assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            0
-        );
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 0);
+
         refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
+
+        let (cell_x, cell_y) = lonlat_to_tile(21.0, 52.0, CHANGE_CELL_ZOOM);
+        let cells: Vec<(i32, i32)> = {
+            let mut stmt = conn
+                .prepare("SELECT cell_x, cell_y FROM tile_dirty_cells")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
         assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            1
+            cells,
+            vec![(cell_x as i32, cell_y as i32)],
+            "every row in this fixture sits at the same point, so exactly \
+             one cell must be enqueued"
         );
     }
 
-    /// Pins the in-transaction placement: an aborted refresh applied nothing,
-    /// so it must not claim the serving state moved either.
+    /// Pins the in-transaction placement: an aborted refresh applied nothing
+    /// -- `insert_dirty_cells` never ran -- so it must not claim any tile
+    /// changed either.
     #[test]
-    fn aborted_refresh_does_not_bump_the_serving_epoch() {
+    fn aborted_refresh_enqueues_no_dirty_tiles() {
         let conn = conn_with_live(LIVE_ROWS);
         let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
         refresh(&conn, &TEST_SPEC, loader(empty), None, &|| false).unwrap_err();
-        assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            0
-        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
-    /// `update::record_noop_refresh` (the ETag-unchanged skip; see
-    /// `serving_version`'s module-doc "Must NOT bump" list) never calls
-    /// `refresh` at all, so it must not move the epoch either -- otherwise a
-    /// daily poll against an unchanged government source would flush every
+    /// `update::record_noop_refresh` (the ETag-unchanged skip) never calls
+    /// `refresh` at all, so it must not enqueue anything either -- otherwise
+    /// a daily poll against an unchanged government source would flush every
     /// cached tile in the country for a change that never happened.
     /// `record_noop_refresh` is private to `update`, but reachable here
     /// since `update::dataset` is a descendant module of `update`.
     #[test]
-    fn noop_refresh_does_not_bump_the_serving_epoch() {
+    fn noop_refresh_enqueues_no_dirty_tiles() {
         let conn = bare_conn();
         crate::update::record_noop_refresh(&conn, "test", Some("etag-1")).unwrap();
-        assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            0
-        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     // --- cancellation ------------------------------------------------------
@@ -1151,9 +1163,12 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM dataset_refreshes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(refreshes, 0, "a cancelled refresh must not be recorded");
+        let dirty_tiles: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            0
+            dirty_tiles, 0,
+            "cancelled before load() ever ran -- nothing could have been enqueued"
         );
         assert!(
             !staging_exists(&conn),
@@ -1199,10 +1214,6 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM dataset_refreshes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(refreshes, 0, "a cancelled refresh must not be recorded");
-        assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            0
-        );
         assert!(
             !staging_exists(&conn),
             "staging left behind after a cancelled refresh"
@@ -1218,6 +1229,14 @@ mod tests {
             dirty, 0,
             "dirty cells are only enqueued inside the apply transaction, \
              which a cancelled-before-apply refresh never reaches"
+        );
+        let dirty_tiles: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            dirty_tiles, 0,
+            "tile dirty cells are enqueued inside the same apply transaction, \
+             which a cancelled-before-apply refresh never reaches either"
         );
     }
 

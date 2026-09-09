@@ -5,8 +5,12 @@ use axum::response::{IntoResponse, Response};
 
 use anyhow::Context;
 
+use duckdb::Connection;
+
 use super::AppState;
 use super::http_cache;
+use super::tile_dirty;
+use super::tile_store::{self, TileBody};
 use std::sync::LazyLock;
 
 use super::package::{
@@ -16,8 +20,24 @@ use super::package::{
 use crate::compare::rule::reported_sql;
 use crate::dataset::{BDOT10K, EGIB, PRG};
 use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
-use crate::serving_version;
-use crate::tile_math::tile_to_bbox;
+use crate::tile_math::{CHANGE_CELL_ZOOM, tile_to_bbox};
+
+/// Bumped by hand whenever the MVT SQL in this module changes shape -- a new
+/// attribute column, a renamed one, a different geometry simplification.
+///
+/// It lives here, next to the SQL it describes, so the hand-bump rule sits
+/// where the thing it guards is edited. `tile_store` stamps it into every
+/// stored value and treats a mismatch as a miss, so a binary that changes what
+/// a tile *contains* cannot serve tiles rendered by its predecessor. Nothing
+/// about the underlying rows changed, so no invalidation would fire on its own
+/// -- without this, every warmed tile would keep its old shape until something
+/// unrelated dirtied its cell.
+///
+/// 2: `BUILDINGS_MVT_SQL` gained the `source:building` and `building:levels`
+/// attributes, completing the buildings tag preview.
+/// 3: bodies are stored gzipped with a content-hash `ETag`; z12..=z13 joined
+/// the persisted tiers.
+pub const TILE_FORMAT_VERSION: u32 = 3;
 
 // ST_AsMVTGeom's bounds argument is BOX_2D, not GEOMETRY -- ST_MakeEnvelope
 // returns GEOMETRY, so it must be narrowed via ST_Extent() first or DuckDB's
@@ -76,12 +96,79 @@ use crate::tile_math::tile_to_bbox;
 // constants rather than re-typing them. Both omit `package`'s polygon-clip
 // predicate (`ST_Intersects(_, ST_GeomFromGeoJSON(?))`) since tiles are
 // always rectangular, unlike a `/package` request area.
+/// The sort that makes a rendered tile a deterministic function of its rows,
+/// and hence the content-hash `ETag` stable across re-renders of unchanged
+/// data. `alias` names the subquery holding the projected `geom`; `row` is the
+/// expression `ST_AsMVT` is being handed.
+///
+/// Without it `ST_AsMVT` emits features in whatever order the scan produced,
+/// which under a parallel scan is not stable. Measured on the real database
+/// before this existed: a z12 tile re-rendered while `match_refresh` was
+/// disabled -- so `*_unmatched` provably could not have changed -- came back
+/// the same length with 331 bytes different and a new `ETag`, costing every
+/// revalidating client a 200 where a 304 was owed. With it,
+/// `tile_render_determinism_and_thread_count` reports 0 differing renders out
+/// of 8 on every tier at 1, 2, 4 and default thread counts.
+///
+/// Three properties of the key, each measured rather than assumed:
+///
+/// - **It sorts on the tile-space geometry `ST_AsMVTGeom` produced**, not on
+///   the source geometry. That is the value actually encoded, so it is the
+///   coarsest key that can still separate distinguishable features, and the
+///   projection is already computed.
+/// - **The whole row is the final tiebreak**, which makes this a total order
+///   over *distinguishable* rows by construction: two rows tying on it are
+///   equal structs, hence byte-identical features, so their relative order
+///   cannot matter. Explicit identity columns would be provably total for
+///   three of the four z14 layers and only *probably* so for `buildings_all`,
+///   whose `LOKALNYID` is unique by measurement rather than by schema -- and
+///   the row costs nothing measurable: 41.97 ms against 41.65 ms for a
+///   `(y, x, source)` key over a 253-tile z13 batch, for identical bytes.
+/// - **Y before X**, because feature order is a compression choice as well as
+///   a determinism one, and tiles are stored and served **gzipped**. Over a
+///   253-tile z13 batch: unordered 235,166 B gzipped, `(y, x)` 223,342 B
+///   (-5.0%), `(x, y)` 240,082 B (+2.1%). On the densest z12 tile `(y, x)` is
+///   -11.7% against unordered, while `ST_Hilbert` -- the obvious
+///   spatial-locality answer -- is +6.9%. On the four densest z14 tiles the
+///   win is -1.2% to -5.1%.
+///
+/// **Do not assume the *raw* tile size is order-invariant.** It is at z12/z13,
+/// measured byte-identical across five orderings of three tiles, because
+/// geometry deltas never cross a feature boundary -- each feature restarts the
+/// cursor at (0,0) -- and that layer's only attribute, `source`, has three
+/// distinct values. The z14 layers do move: -0.9% to -1.7% raw on the four
+/// densest tiles, which is the attribute dictionary rather than the geometry.
+/// Values are interned once per layer and referenced by varint index, so which
+/// ones land in the low, one-byte indices depends on which feature is written
+/// first.
+///
+/// **The cost, so the trade is visible.** The sort is paid per query, so it
+/// lands hardest where a tile is cheap: a one-object z14 tile goes from
+/// ~12.7 ms to ~17.1 ms (+33%, four sorted aggregates over almost nothing),
+/// while the densest z14 tiles pay +6.6% (253-296 ms -> 270-316 ms). The
+/// points tier pays +22% batched (0.13 -> 0.16 ms/tile over 253 z13 tiles)
+/// and +36% at a batch of one (3.26 -> 4.43 ms). Against that: a re-render no
+/// longer invalidates every client's copy, and the store shrinks.
+fn deterministic_mvt_order_sql(alias: &str, row: &str) -> String {
+    format!(" ORDER BY ST_YMin({alias}.geom), ST_XMin({alias}.geom), {row}")
+}
+
+/// `ST_AsMVT` over a whole-tile subquery aliased `t`, deterministically
+/// ordered. The one home for the four z14 layers' and the aggregate tier's
+/// aggregate call; `points_mvt_sql` builds its own because it groups.
+fn as_mvt_sql(layer: &str) -> String {
+    format!(
+        "ST_AsMVT(t, '{layer}', 4096, 'geom'{order}) AS mvt",
+        order = deterministic_mvt_order_sql("t", "t")
+    )
+}
+
 /// Built once at first use rather than declared `const`, because the street
 /// resolution comes from `mappings::street_names`'s shared builders — the same
 /// text `/package` and both compare paths use. The resulting SQL is
 /// semantically identical to the hand-written chain this replaced, so
-/// `serving_version::TILE_FORMAT_VERSION` must **not** move for it: nothing
-/// about what a tile contains changed.
+/// [`TILE_FORMAT_VERSION`] must **not** move for it: nothing about what a tile
+/// contains changed.
 static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "
@@ -99,7 +186,7 @@ static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
         FROM candidates
         {mapping_joins}
     )
-    SELECT ST_AsMVT(t, 'addresses', 4096, 'geom') AS mvt
+    SELECT {mvt}
     FROM (
         SELECT ST_AsMVTGeom(resolved.geom, bbox.geom, 4096, 256, true) AS geom,
                resolved.lokalny_id,
@@ -121,6 +208,7 @@ static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
     ) t
     WHERE t.geom IS NOT NULL
 ",
+        mvt = as_mvt_sql("addresses"),
         resolved_street = resolved_street_expr_sql("candidates"),
         mapping_joins = resolved_street_join_sql("candidates"),
     )
@@ -148,7 +236,7 @@ static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
 ///   the frontend's merge implements, because `with_building_levels` inserts
 ///   into the `BTreeMap` *after* the mapping string was parsed into it.
 static BUILDINGS_MVT_SQL: LazyLock<String> =
-    LazyLock::new(|| buildings_sql("ST_AsMVT(t, 'buildings', 4096, 'geom') AS mvt"));
+    LazyLock::new(|| buildings_sql(&as_mvt_sql("buildings")));
 
 /// The `projection` seam is `all_buildings_sql`'s, and exists for the same
 /// reason: a test asserting on a per-feature attribute has to read it per row,
@@ -320,14 +408,15 @@ fn buildings_sql(projection: &str) -> String {
 //    `mvt_bbox_filter_uses_the_rtree_index` asserts on the plan and is the
 //    only thing that would catch a regression here.
 //
-// Cache correctness: `POST /report` is on `serving_version`'s must-not-bump
-// list, and this attribute does not change that. The insert enqueues the
-// object's z14 cell, the drain recomputes it, and the row leaving
-// `<source>_unmatched` moves that cell's per-cell version -- which every tile
-// rendering the object already folds in, since a surviving building's reach
-// from its own centroid's cell is <= 1 (`dataset::filter_oversized_geometry`)
-// and `z14_tile_version` reads a 3x3 ring. So the flag becomes visible in the
-// same version change that removes the object from the unmatched layer, not
+// Cache correctness: `POST /report` enqueues the object's z14 cell into
+// `tile_dirty_cells` as well as `match_dirty_cells` (see `reports::
+// enqueue_tiles_for_reports`), which is exactly what this attribute needs --
+// it is computed at serve time from `object_reports`, on layers that read the
+// raw source tables and so are never touched by a drain. The tile refresh
+// re-renders the 3x3 ring around the cell, which covers every tile that can
+// draw the object, since a surviving building's reach from its own centroid's
+// cell is <= 1 (`dataset::filter_oversized_geometry`). So the flag appears in
+// the same re-render that removes the object from the unmatched layer, not
 // before and not later. Revoke and expiry enqueue the same way.
 //
 // Both are built through a `projection` seam for the same reason
@@ -338,7 +427,7 @@ fn buildings_sql(projection: &str) -> String {
 // column list instead of the `ST_AsMVT(...)` call lets the tests read the flag
 // per row off the real generated SQL, wrapper aside.
 static ALL_ADDRESSES_MVT_SQL: LazyLock<String> =
-    LazyLock::new(|| all_addresses_sql("ST_AsMVT(t, 'addresses_all', 4096, 'geom') AS mvt"));
+    LazyLock::new(|| all_addresses_sql(&as_mvt_sql("addresses_all")));
 
 fn all_addresses_sql(projection: &str) -> String {
     format!(
@@ -371,7 +460,7 @@ fn all_addresses_sql(projection: &str) -> String {
 }
 
 static ALL_BUILDINGS_MVT_SQL: LazyLock<String> =
-    LazyLock::new(|| all_buildings_sql("ST_AsMVT(t, 'buildings_all', 4096, 'geom') AS mvt"));
+    LazyLock::new(|| all_buildings_sql(&as_mvt_sql("buildings_all")));
 
 fn all_buildings_sql(projection: &str) -> String {
     format!(
@@ -614,8 +703,8 @@ const RATIO_UNKNOWN: f64 = -1.0;
 /// its max -- `ST_MakeEnvelope` wants (min_lon, min_lat, max_lon, max_lat).
 fn agg_cells_sql(shift: u32, n: u32, max_age_days: u64) -> String {
     format!(
-        "{}
-        SELECT ST_AsMVT(t, 'agg_cells', 4096, 'geom') AS mvt
+        "{ctes}
+        SELECT {mvt}
         FROM (
             SELECT ST_AsMVTGeom(
                        ST_MakeEnvelope(geo.lon0, geo.lat_south, geo.lon1, geo.lat_north),
@@ -627,7 +716,8 @@ fn agg_cells_sql(shift: u32, n: u32, max_age_days: u64) -> String {
             FROM geo, bbox
         ) t
         WHERE t.geom IS NOT NULL",
-        agg_bin_ctes(shift, n, max_age_days)
+        mvt = as_mvt_sql("agg_cells"),
+        ctes = agg_bin_ctes(shift, n, max_age_days),
     )
 }
 
@@ -636,52 +726,115 @@ fn agg_cells_sql(shift: u32, n: u32, max_age_days: u64) -> String {
 // One feature per unmatched object -- same cell_x/cell_y BETWEEN filter as
 // Tier A, just not binned. Buildings are recentred to their centroid since
 // bdot10k_unmatched/egib_unmatched carry polygons; prg_unmatched's `geom` is
-// already a point (PRG addresses always were). Worst measured tile is ~14k
-// features / ~0.1s -- acceptable for a look-and-feel MVP where performance is
-// explicitly not the point.
-const POINTS_MVT_SQL: &str = "
-    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom)
-    SELECT ST_AsMVT(t, 'points', 4096, 'geom') AS mvt
-    FROM (
-        SELECT ST_AsMVTGeom(p.geom, bbox.geom, 4096, 256, true) AS geom, p.source
-        FROM (
-            SELECT ST_Centroid(b.geom) AS geom, 'bdot10k' AS source
-              FROM bdot10k_unmatched b
-             WHERE b.cell_x BETWEEN ? AND ? AND b.cell_y BETWEEN ? AND ?
-            UNION ALL
-            SELECT ST_Centroid(e.geom) AS geom, 'egib' AS source
-              FROM egib_unmatched e
-             WHERE e.cell_x BETWEEN ? AND ? AND e.cell_y BETWEEN ? AND ?
-            UNION ALL
-            SELECT a.geom AS geom, 'prg' AS source
-              FROM prg_unmatched a
-             WHERE a.cell_x BETWEEN ? AND ? AND a.cell_y BETWEEN ? AND ?
-        ) p, bbox
-    ) t
-    WHERE t.geom IS NOT NULL
-";
+// already a point (PRG addresses always were).
+//
+// **This tier renders a batch of tiles per query, and a single request is a
+// batch of one.** Everything below is one SQL text, not two -- which is only
+// possible because the batching itself is free at a batch of one: 3.80 ms
+// against the per-tile query's 3.79 ms on a Warsaw z13 tile, measured before
+// either grew an ORDER BY. So the bulk paths need no separate copy of the MVT
+// SQL, and "the MVT SQL has one home" survives the 27x speedup.
 
-/// Outcome of the z14 blocking task: either the client's `If-None-Match`
-/// already covers this version and there is nothing further to do (the pool
-/// connection has already been dropped by the time this variant is built --
-/// see `serve_tile`'s comment on why that happens inside the blocking task),
-/// or the tile bytes plus whatever `ETag` the version computed to. `etag` is
-/// `None` only when `serving_version::z14_tile_version` itself failed --
-/// see the comment at that call site for why that degrades instead of 500s.
+/// The row `ST_AsMVT` is handed for this layer.
 ///
-/// `Body` covers both a freshly queried tile and a `tile_cache::TileCache`
-/// hit, deliberately as one variant rather than two: a hit must be
-/// indistinguishable from a miss in the response it produces, and giving the
-/// two their own variants would mean two response-shaping paths that could
-/// drift apart on a header, a status code, or the empty-tile 204 (see
-/// `z14_tile_response`). `Bytes` either way, so a cache hit is a refcount
-/// bump rather than a copy of a several-hundred-KB tile.
-enum Z14TaskOutcome {
-    NotModified(HeaderValue),
-    Body {
-        bytes: Bytes,
-        etag: Option<HeaderValue>,
-    },
+/// `struct_pack` rather than the bare projected row, because the query groups:
+/// passing `g` directly would publish the grouping keys `tx`/`ty` as feature
+/// attributes on every point.
+const POINTS_MVT_ROW: &str = "struct_pack(geom := g.geom, source := g.source)";
+
+/// The z12--z13 `points` layer: one query, one row per requested tile.
+///
+/// Batching is worth **27x**: 253 z13 tiles around Warsaw render in 41.2 ms
+/// as one query against 1121.3 ms one at a time, for identical bytes
+/// (`points_batch_size_vs_render_cost`). It costs nothing at a batch of one,
+/// which is why this *replaces* the per-tile query rather than sitting beside
+/// it. `tiles warm` and `jobs::tile_refresh` reach it through
+/// [`render_points_tiles`]; a request reaches it through [`render_tile`].
+///
+/// Three details carry the byte-identity, and each has a silent failure mode:
+///
+/// 1. **The tile list drives the group set, via `env LEFT JOIN proj`.** A bare
+///    `GROUP BY tx, ty` over the rows emits *no row at all* for a requested
+///    tile that holds nothing, and a missing row is not the same thing as an
+///    empty tile: `ST_AsMVT` is an aggregate with no `GROUP BY` behind it in
+///    the per-tile form, so it emits a layer header even over zero features
+///    (23 bytes), which is what makes an in-range tile always a 200 -- see
+///    `finish_tile_response`'s 204 branch, which must stay unreachable. The
+///    `FILTER` is the other half: it drops the LEFT JOIN's null row so the
+///    aggregate sees an empty group and produces exactly those 23 bytes.
+///    Verified against the per-tile query on eight tiles, empty ones included.
+/// 2. **The envelope comes from [`tile_to_bbox`], carried in the `VALUES`
+///    list**, rather than being recomputed with a Web Mercator inverse in SQL
+///    the way `agg_bin_ctes` has to. One home for tile -> bbox.
+/// 3. **The scan is bounded by the batch's cell range and *then* joined to the
+///    exact tile list.** The `BETWEEN` bounds are what let the zonemaps prune;
+///    the join is what keeps a scattered batch from rendering tiles nobody
+///    asked for. Callers should therefore batch spatially coherent runs --
+///    both do, since their tile lists are sorted.
+///
+/// Tile coordinates are interpolated rather than bound: they are `u32`s off
+/// the URL path or out of a store key, so there is nothing to inject, and a
+/// `VALUES` list cannot be a single bound parameter anyway.
+fn points_mvt_sql(z: u32, tiles: &[(u32, u32)]) -> String {
+    debug_assert!(!tiles.is_empty(), "points_mvt_sql needs at least one tile");
+    let cell_shift = CHANGE_CELL_ZOOM - z;
+    let (min_tx, max_tx) = minmax(tiles.iter().map(|t| t.0));
+    let (min_ty, max_ty) = minmax(tiles.iter().map(|t| t.1));
+    let lo_x = (min_tx << cell_shift) as i32;
+    let hi_x = (((max_tx + 1) << cell_shift) - 1) as i32;
+    let lo_y = (min_ty << cell_shift) as i32;
+    let hi_y = (((max_ty + 1) << cell_shift) - 1) as i32;
+
+    let values = tiles
+        .iter()
+        .map(|&(x, y)| {
+            let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
+            // `{:?}` on an f64 is the shortest representation that round-trips,
+            // so the envelope DuckDB parses is the one `tile_to_bbox` computed.
+            format!("({x}, {y}, {min_lon:?}, {min_lat:?}, {max_lon:?}, {max_lat:?})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "
+    WITH tiles(tx, ty, min_lon, min_lat, max_lon, max_lat) AS (VALUES {values}),
+    env AS (
+        SELECT tx, ty, ST_Extent(ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat)) AS geom
+        FROM tiles
+    ),
+    pts AS (
+        SELECT b.cell_x >> {cell_shift} AS tx, b.cell_y >> {cell_shift} AS ty,
+               ST_Centroid(b.geom) AS geom, 'bdot10k' AS source
+          FROM bdot10k_unmatched b
+         WHERE b.cell_x BETWEEN {lo_x} AND {hi_x} AND b.cell_y BETWEEN {lo_y} AND {hi_y}
+        UNION ALL
+        SELECT e.cell_x >> {cell_shift}, e.cell_y >> {cell_shift},
+               ST_Centroid(e.geom), 'egib'
+          FROM egib_unmatched e
+         WHERE e.cell_x BETWEEN {lo_x} AND {hi_x} AND e.cell_y BETWEEN {lo_y} AND {hi_y}
+        UNION ALL
+        SELECT a.cell_x >> {cell_shift}, a.cell_y >> {cell_shift}, a.geom, 'prg'
+          FROM prg_unmatched a
+         WHERE a.cell_x BETWEEN {lo_x} AND {hi_x} AND a.cell_y BETWEEN {lo_y} AND {hi_y}
+    ),
+    proj AS (
+        SELECT e.tx, e.ty, ST_AsMVTGeom(p.geom, e.geom, 4096, 256, true) AS geom, p.source
+          FROM pts p JOIN env e USING (tx, ty)
+    )
+    SELECT e.tx, e.ty,
+           ST_AsMVT({POINTS_MVT_ROW}, 'points', 4096, 'geom'{order})
+               FILTER (WHERE g.geom IS NOT NULL) AS mvt
+      FROM env e LEFT JOIN proj g ON g.tx = e.tx AND g.ty = e.ty
+     GROUP BY e.tx, e.ty
+",
+        order = deterministic_mvt_order_sql("g", POINTS_MVT_ROW),
+    )
+}
+
+/// `(min, max)` of a non-empty iterator, 0/0 for an empty one.
+fn minmax(it: impl Iterator<Item = u32> + Clone) -> (u32, u32) {
+    (it.clone().min().unwrap_or(0), it.max().unwrap_or(0))
 }
 
 pub async fn serve_tile(
@@ -689,34 +842,167 @@ pub async fn serve_tile(
     Path((z, x, y)): Path<(u32, u32, u32)>,
     headers: HeaderMap,
 ) -> Response {
-    // Tiers A/B (z5..=z13) are dispatched before the z14 guard below, which
-    // is otherwise left byte-for-byte as it was -- see the module-level
-    // tiers documented above `agg_bin_ctes`/`POINTS_MVT_SQL`.
+    // Three tiers, three caching strategies -- see the tier documentation
+    // above `agg_bin_ctes`/`points_mvt_sql`, and `tile_dirty`'s module doc for
+    // why the persisted pair can be pushed and this one cannot.
     if (5..=11).contains(&z) {
-        return serve_tile_agg(state, z, x, y).await;
+        return serve_tile_agg(state, z, x, y, &headers).await;
     }
-    if (12..=13).contains(&z) {
-        return serve_tile_points(state, z, x, y).await;
+    if (tile_dirty::MIN_PERSISTED_ZOOM..=CHANGE_CELL_ZOOM).contains(&z) {
+        return serve_persisted_tile(state, z, x, y, &headers).await;
     }
-    if z != 14 {
-        // A property of the binary's zoom dispatch table, not of the data --
-        // see http_cache::OUT_OF_RANGE_ZOOM_MAX_AGE_SECONDS's doc comment.
-        let mut resp = StatusCode::NO_CONTENT.into_response();
-        resp.headers_mut().insert(
-            header::CACHE_CONTROL,
-            state.cache_headers.out_of_range_zoom.clone(),
-        );
-        return resp;
+    // A property of the binary's zoom dispatch table, not of the data --
+    // see http_cache::OUT_OF_RANGE_ZOOM_MAX_AGE_SECONDS's doc comment.
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        state.cache_headers.out_of_range_zoom.clone(),
+    );
+    resp
+}
+
+/// The z12..=z14 path: one lookup in the persistent store, and only on a miss
+/// a pool connection and a render.
+///
+/// The store lookup happens *before* any pool acquisition, which is the whole
+/// point: a 16-tile viewport refresh that is already warm costs zero pool
+/// slots and touches DuckDB not at all. A 304 likewise returns without ever
+/// asking for a connection.
+///
+/// One function for all three persisted zooms rather than one per tier, so a
+/// hit cannot differ from a miss -- nor z12 from z14 -- on status, headers, or
+/// body bytes. `render_tile` is the only thing that varies by zoom.
+async fn serve_persisted_tile(
+    state: AppState,
+    z: u32,
+    x: u32,
+    y: u32,
+    headers: &HeaderMap,
+) -> Response {
+    let cache_header = if z == CHANGE_CELL_ZOOM {
+        state.cache_headers.tile.clone()
+    } else {
+        state.cache_headers.agg_tile.clone()
+    };
+    let if_none_match = headers.get(header::IF_NONE_MATCH).cloned();
+    let wants_gzip = http_cache::accepts_gzip(headers);
+
+    // Served without a pool connection when the store already has it.
+    if let Some(stored) = state.tile_store.get((z, x, y)) {
+        if http_cache::if_none_match_matches(if_none_match.as_ref(), &stored.etag) {
+            return http_cache::not_modified(http_cache::weak_etag(&stored.etag), cache_header);
+        }
+        return tile_body_response(stored.body, cache_header, Some(&stored.etag), wants_gzip);
     }
 
-    let cache_header = state.cache_headers.tile.clone();
-    // Only z14 gets an ETag. z5..=z13 have no version faithful to their
-    // aggregated/point content -- serving_version's per-cell coverage is
-    // z14-cell-shaped, and falling back to the epoch-only global signal
-    // alone would pin those tiers stale until the next epoch bump, which is
-    // strictly worse than the plain TTL they already get from cache_header.
-    let if_none_match = headers.get(header::IF_NONE_MATCH).cloned();
-    let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, TileBody)> {
+        let conn = state
+            .pool
+            .get()
+            .context("Failed to acquire pool connection")?;
+        let raw = render_tile(&conn, z, x, y)?;
+        drop(conn);
+        let (etag, body) = tile_store::prepare(&raw)?;
+        state.tile_store.put((z, x, y), &etag, &body);
+        Ok((etag, body))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((etag, body))) => {
+            // Checked after the render too: a client revalidating a tile that
+            // fell out of the store (or was never in it) must still get its
+            // 304 when the bytes turn out unchanged, which is exactly what a
+            // content hash makes possible and the old derived version did not.
+            if http_cache::if_none_match_matches(if_none_match.as_ref(), &etag) {
+                return http_cache::not_modified(http_cache::weak_etag(&etag), cache_header);
+            }
+            tile_body_response(body, cache_header, Some(&etag), wants_gzip)
+        }
+        Ok(Err(e)) => finish_tile_response(Ok(Err(e)), z, x, y, cache_header, None),
+        Err(e) => finish_tile_response(Err(e), z, x, y, cache_header, None),
+    }
+}
+
+/// The one home for "what bytes is the tile at (z, x, y)".
+///
+/// Called from three places -- the serving path above, `jobs::tile_refresh`,
+/// and the `tiles warm` CLI verb -- which is why it is a free function taking
+/// a connection rather than living inside a request handler. A second copy of
+/// this SQL for the bulk paths is exactly what "the MVT SQL has one home"
+/// forbids.
+pub fn render_tile(conn: &Connection, z: u32, x: u32, y: u32) -> anyhow::Result<Vec<u8>> {
+    if z == CHANGE_CELL_ZOOM {
+        render_z14_tile(conn, x, y)
+    } else {
+        render_points_tile(conn, z, x, y)
+    }
+}
+
+/// Tier B (z12..=z13): one `points` layer, one feature per unmatched object.
+///
+/// Reads only the three `*_unmatched` tables, filtered by the z14 cell range
+/// the tile covers -- never by geometry. That is what makes this tier an exact
+/// function of the cells beneath it, and hence invalidatable by parent alone
+/// (see `tile_dirty`).
+fn render_points_tile(conn: &Connection, z: u32, x: u32, y: u32) -> anyhow::Result<Vec<u8>> {
+    let rendered = render_points_tiles(conn, z, &[(x, y)])?;
+    // `points_mvt_sql` drives its group set from the requested tile list, so
+    // exactly one row comes back per tile -- an empty tile is a 23-byte layer
+    // header, not an absent row. A missing row is therefore a bug in that
+    // query, and serving it as an empty body would turn into a 204 the tier
+    // must never send.
+    match rendered.into_iter().next() {
+        Some((_, mvt)) => Ok(mvt),
+        None => anyhow::bail!("z{z}/{x}/{y}: the points query returned no row for the tile"),
+    }
+}
+
+/// One rendered tile: its `(x, y)` within the batch's zoom, and the raw MVT
+/// bytes -- raw, because compressing is [`tile_store::prepare`]'s job and the
+/// caller decides whether the bytes are worth storing at all.
+pub type RenderedTile = ((u32, u32), Vec<u8>);
+
+/// [`render_points_tile`]'s bulk form: every tile in `tiles`, one query.
+///
+/// Returns one `((x, y), mvt)` per requested tile, in whatever order the group
+/// operator produced -- callers index by key rather than by position. All the
+/// tiles must be at the same zoom, which is how both callers group them.
+///
+/// See [`points_mvt_sql`] for why a batch is worth ~18x and a batch of one
+/// costs nothing.
+pub fn render_points_tiles(
+    conn: &Connection,
+    z: u32,
+    tiles: &[(u32, u32)],
+) -> anyhow::Result<Vec<RenderedTile>> {
+    if tiles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = points_mvt_sql(z, tiles);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::with_capacity(tiles.len());
+    while let Some(row) = rows.next()? {
+        let tx: i32 = row.get(0)?;
+        let ty: i32 = row.get(1)?;
+        // NULL is not reachable -- an all-filtered group still emits the layer
+        // header -- but decoding it as empty rather than failing matches
+        // `query_mvt_layer`'s own NULL handling.
+        let mvt: Option<Vec<u8>> = row.get(2)?;
+        out.push(((tx as u32, ty as u32), mvt.unwrap_or_default()));
+    }
+    Ok(out)
+}
+
+/// Tier C (z14): the four-layer tile -- `addresses`, `buildings`,
+/// `addresses_all`, `buildings_all`, concatenated.
+///
+/// Unlike Tier B this selects by *geometry*, so it renders rows tagged to
+/// neighbouring z14 cells; that asymmetry is what forces the 3x3 invalidation
+/// ring (see `tile_dirty`).
+fn render_z14_tile(conn: &Connection, x: u32, y: u32) -> anyhow::Result<Vec<u8>> {
+    let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(CHANGE_CELL_ZOOM, x, y);
     let (buf_min_lon, buf_min_lat, buf_max_lon, buf_max_lat) = (
         min_lon - ADJACENCY_READ_BUFFER_DEG,
         min_lat - ADJACENCY_READ_BUFFER_DEG,
@@ -724,178 +1010,122 @@ pub async fn serve_tile(
         max_lat + ADJACENCY_READ_BUFFER_DEG,
     );
 
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Z14TaskOutcome> {
-        let conn = state
-            .pool
-            .get()
-            .context("Failed to acquire pool connection")?;
-
-        // Computed and checked against If-None-Match before any MVT SQL
-        // runs, and inside this blocking task rather than around it -- that
-        // is what lets a match `drop(conn)` and return right here, instead
-        // of holding a pool slot through the tile queries below. A 16-tile
-        // viewport refresh then releases 16 pool slots in ~2ms total instead
-        // of the ~250ms the full queries would take.
-        //
-        // `cache_key_version` is kept around (not just folded into `etag`
-        // immediately) because `tile_cache::TileCache` is keyed on the same
-        // raw version string that `etag` wraps -- see the cache lookup right
-        // below. It stays `None` exactly when `etag` does: a version
-        // computation failure means there is no version to key a cache
-        // entry on, so both the lookup and the eventual insert are skipped
-        // together (an entry with no version could never be invalidated
-        // correctly).
-        let (etag, cache_key_version) = match serving_version::z14_tile_version(&conn, x, y) {
-            Ok(version) => {
-                if http_cache::if_none_match_matches(if_none_match.as_ref(), &version) {
-                    let etag = http_cache::weak_etag(&version);
-                    drop(conn);
-                    return Ok(Z14TaskOutcome::NotModified(etag));
-                }
-                let etag = http_cache::weak_etag(&version);
-                (Some(etag), Some(version))
-            }
-            Err(e) => {
-                // A version hiccup should not take down tiles -- fall
-                // through and serve the tile without an ETag rather than
-                // failing the whole request over a metadata read, matching
-                // z14_tile_version's own "degrade, don't fail" choices for
-                // the pieces of its computation that can go individually
-                // stale (see its doc comment).
-                tracing::warn!(
-                    error = %e, x, y,
-                    "failed to compute z14 tile version; serving without an ETag"
-                );
-                (None, None)
-            }
-        };
-
-        // Cache lookup, only reached once we know this isn't a 304 (that
-        // returned above already). A hit drops the pool connection and
-        // returns without running any MVT SQL, same reasoning as the 304
-        // early-release right above: a 16-tile viewport refresh that's
-        // already fully cached costs no pool slots at all beyond this
-        // version read.
-        if let Some(version) = cache_key_version.as_deref()
-            && let Some(bytes) = state.tile_cache.get((z, x, y), version)
-        {
-            drop(conn);
-            return Ok(Z14TaskOutcome::Body { bytes, etag });
-        }
-
-        // The bbox is repeated once per `?` group: the `bbox` CTE, then one
-        // ST_MakeEnvelope per filtered table. Each group must stay in
-        // min_lon, min_lat, max_lon, max_lat order.
-        let addresses = query_mvt_layer(
-            &conn,
-            ADDRESSES_MVT_SQL.as_str(),
-            duckdb::params![
-                min_lon, min_lat, max_lon, max_lat, // bbox CTE
-                min_lon, min_lat, max_lon, max_lat, // resolved (prg_unmatched) filter
-            ],
-        )?;
-        let buildings = query_mvt_layer(
-            &conn,
-            BUILDINGS_MVT_SQL.as_str(),
-            duckdb::params![
-                min_lon,
-                min_lat,
-                max_lon,
-                max_lat, // bbox CTE
-                min_lon,
-                min_lat,
-                max_lon,
-                max_lat, // bdot10k_pkg (bdot10k_unmatched) filter
-                buf_min_lon,
-                buf_min_lat,
-                buf_max_lon,
-                buf_max_lat, // bdot10k_nb buffered filter
-                BDOT10K_ADJACENCY_KEY,
-                min_lon,
-                min_lat,
-                max_lon,
-                max_lat, // egib_pkg (egib_unmatched) filter
-                buf_min_lon,
-                buf_min_lat,
-                buf_max_lon,
-                buf_max_lat, // egib_nb buffered filter
-                EGIB_ADJACENCY_KEY,
-            ],
-        )?;
-        let addresses_all = query_mvt_layer(
-            &conn,
-            ALL_ADDRESSES_MVT_SQL.as_str(),
-            duckdb::params![
-                min_lon, min_lat, max_lon, max_lat, // bbox CTE
-                min_lon, min_lat, max_lon, max_lat, // candidates (prg_addresses) filter
-            ],
-        )?;
-        let buildings_all = query_mvt_layer(
-            &conn,
-            ALL_BUILDINGS_MVT_SQL.as_str(),
-            duckdb::params![
-                min_lon, min_lat, max_lon, max_lat, // bbox CTE
-                min_lon, min_lat, max_lon, max_lat, // bdot10k_candidates filter
-                min_lon, min_lat, max_lon, max_lat, // egib_candidates filter
-            ],
-        )?;
-        // Into `Bytes` once, not once per consumer: the cache stores `Bytes`
-        // and the response is built from `Bytes`, so going through `Vec<u8>`
-        // for either would memcpy a tile that runs to several hundred KB.
-        let bytes = Bytes::from([addresses, buildings, addresses_all, buildings_all].concat());
-
-        // Only cache when the version computed successfully -- see this
-        // function's comment on `cache_key_version` above for why an
-        // entry with no version must never be written.
-        if let Some(version) = cache_key_version {
-            state.tile_cache.insert((z, x, y), version, bytes.clone());
-        }
-
-        Ok(Z14TaskOutcome::Body { bytes, etag })
-    })
-    .await;
-
-    match result {
-        Ok(Ok(Z14TaskOutcome::NotModified(etag))) => http_cache::not_modified(etag, cache_header),
-        Ok(Ok(Z14TaskOutcome::Body { bytes, etag })) => {
-            z14_tile_response(bytes, cache_header, etag)
-        }
-        Ok(Err(e)) => finish_tile_response(Ok(Err(e)), z, x, y, cache_header, None),
-        Err(e) => finish_tile_response(Err(e), z, x, y, cache_header, None),
-    }
+    // The bbox is repeated once per `?` group: the `bbox` CTE, then one
+    // ST_MakeEnvelope per filtered table. Each group must stay in
+    // min_lon, min_lat, max_lon, max_lat order.
+    let addresses = query_mvt_layer(
+        conn,
+        ADDRESSES_MVT_SQL.as_str(),
+        duckdb::params![
+            min_lon, min_lat, max_lon, max_lat, // bbox CTE
+            min_lon, min_lat, max_lon, max_lat, // resolved (prg_unmatched) filter
+        ],
+    )?;
+    let buildings = query_mvt_layer(
+        conn,
+        BUILDINGS_MVT_SQL.as_str(),
+        duckdb::params![
+            min_lon,
+            min_lat,
+            max_lon,
+            max_lat, // bbox CTE
+            min_lon,
+            min_lat,
+            max_lon,
+            max_lat, // bdot10k_pkg (bdot10k_unmatched) filter
+            buf_min_lon,
+            buf_min_lat,
+            buf_max_lon,
+            buf_max_lat, // bdot10k_nb buffered filter
+            BDOT10K_ADJACENCY_KEY,
+            min_lon,
+            min_lat,
+            max_lon,
+            max_lat, // egib_pkg (egib_unmatched) filter
+            buf_min_lon,
+            buf_min_lat,
+            buf_max_lon,
+            buf_max_lat, // egib_nb buffered filter
+            EGIB_ADJACENCY_KEY,
+        ],
+    )?;
+    let addresses_all = query_mvt_layer(
+        conn,
+        ALL_ADDRESSES_MVT_SQL.as_str(),
+        duckdb::params![
+            min_lon, min_lat, max_lon, max_lat, // bbox CTE
+            min_lon, min_lat, max_lon, max_lat, // candidates (prg_addresses) filter
+        ],
+    )?;
+    let buildings_all = query_mvt_layer(
+        conn,
+        ALL_BUILDINGS_MVT_SQL.as_str(),
+        duckdb::params![
+            min_lon, min_lat, max_lon, max_lat, // bbox CTE
+            min_lon, min_lat, max_lon, max_lat, // bdot10k_candidates filter
+            min_lon, min_lat, max_lon, max_lat, // egib_candidates filter
+        ],
+    )?;
+    Ok([addresses, buildings, addresses_all, buildings_all].concat())
 }
 
-/// Response shaping for every successful z14 tile -- freshly queried or
-/// served from `tile_cache::TileCache`, which is the point: one path, so a
-/// hit cannot differ from a miss on a header, a status code, or the
-/// empty-tile 204. (A z14 tile covering open country renders no features at
-/// all, so an empty body is the *common* case over most of Poland, not an
-/// edge case.)
+/// Response shaping for every successful tile that came through a cache --
+/// the persistent store or the RAM one, fresh render or hit alike. One path,
+/// so a hit cannot differ from a miss on a header, a status code, or the
+/// encoding negotiated.
 ///
 /// Deliberately not routed through `finish_tile_response` below, which the
-/// z5..=z13 tiers still use: its `bytes: Vec<u8>` parameter would force a
-/// copy out of the cache's `Bytes` on every hit, defeating the entire point
-/// of storing `Bytes` there (see `tile_cache`'s module doc). The two are
-/// otherwise the same shaping, and the success branches must stay in step.
-fn z14_tile_response(
-    bytes: Bytes,
+/// error branches still use: its `bytes: Vec<u8>` parameter would force a copy
+/// out of the cache's `Bytes` on every hit, defeating the point of holding
+/// `Bytes` at all. The two are otherwise the same shaping and the success
+/// branches must stay in step.
+///
+/// Bodies are stored gzipped, so the common path hands the stored buffer to
+/// the response verbatim -- no copy, no compression, nothing per-request. The
+/// identity branch exists for `curl` and monitoring probes, which send no
+/// `Accept-Encoding` at all; it is not dead code, and a browser never takes
+/// it.
+///
+/// Note there is no empty-body 204 here, and that is not an oversight:
+/// `ST_AsMVT` emits a layer header even over zero features (pinned by
+/// `empty_tile_returns_ok_not_500`), so an in-range tile always has bytes.
+/// `finish_tile_response`'s 204 branch is reached only by the out-of-range
+/// zoom dispatch.
+fn tile_body_response(
+    body: TileBody,
     cache_header: HeaderValue,
-    etag: Option<HeaderValue>,
+    etag: Option<&str>,
+    wants_gzip: bool,
 ) -> Response {
-    let mut resp = if bytes.is_empty() {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        let mut resp = bytes.into_response();
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.mapbox-vector-tile"),
-        );
+    let mut resp = if wants_gzip {
+        let mut resp = body.gzip.into_response();
+        resp.headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
         resp
+    } else {
+        match body.decompress() {
+            Ok(raw) => Bytes::from(raw).into_response(),
+            Err(e) => {
+                // A stored value that will not decompress is corrupt, not a
+                // client problem -- but it is also not worth a 500 when a
+                // re-render would fix it, so fall through to the error
+                // shaping that leaves the response header-less and uncached.
+                tracing::error!(error = %e, "stored tile failed to decompress");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
     };
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.mapbox-vector-tile"),
+    );
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, cache_header);
+    resp.headers_mut()
+        .insert(header::VARY, http_cache::VARY_ACCEPT_ENCODING);
     if let Some(etag) = etag {
-        resp.headers_mut().insert(header::ETAG, etag);
+        resp.headers_mut()
+            .insert(header::ETAG, http_cache::weak_etag(etag));
     }
     resp
 }
@@ -919,8 +1149,20 @@ fn query_mvt_layer(
 /// Tier A dispatch (z5..=z11): one layer (`agg_cells`) -- binned unmatched
 /// counts, their denominators, and each source's most recent government
 /// change in the bin. See `agg_bin_ctes` above for the design rationale.
-async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
+///
+/// The only tier served from RAM rather than the persistent store, and the
+/// only one with no `ETag`. Both follow from the same property: the `changes`
+/// CTE is bounded by `now() - max_age_days`, so this tile's content moves with
+/// the wall clock even when no row changes. There is no write to hang a push
+/// invalidation off, and no stable validator to hand a client -- so it gets a
+/// TTL cache whose TTL is the very `max-age` this response advertises.
+async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32, headers: &HeaderMap) -> Response {
     let cache_header = state.cache_headers.agg_tile.clone();
+    let wants_gzip = http_cache::accepts_gzip(headers);
+    if let Some(body) = state.tile_cache.get((z, x, y)) {
+        return tile_body_response(body, cache_header, None, wants_gzip);
+    }
+
     let max_age_days = state.config.changes.max_age_days;
     let bz = (z + 5).min(14);
     let shift = 14 - bz;
@@ -937,7 +1179,7 @@ async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
     let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
     let cells_sql = agg_cells_sql(shift, n, max_age_days);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<TileBody> {
         let conn = state
             .pool
             .get()
@@ -945,7 +1187,7 @@ async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
         // Same bound-group shape as every other query in this file: the bbox
         // CTE, then one (lo_x, hi_x, lo_y, hi_y) group per source table, in
         // the order the CTEs spell them out.
-        query_mvt_layer(
+        let raw = query_mvt_layer(
             &conn,
             &cells_sql,
             duckdb::params![
@@ -956,47 +1198,22 @@ async fn serve_tile_agg(state: AppState, z: u32, x: u32, y: u32) -> Response {
                 lo_x, hi_x, lo_y, hi_y, // cell_totals filter (denominators)
                 lo_x, hi_x, lo_y, hi_y, // dataset_change_areas filter
             ],
-        )
-    })
-    .await;
-
-    // z5..=z13 never carry an ETag -- see serve_tile's comment on why.
-    finish_tile_response(result, z, x, y, cache_header, None)
-}
-
-/// Tier B dispatch (z12..=z13): one `points` layer, one feature per
-/// unmatched object (not binned).
-async fn serve_tile_points(state: AppState, z: u32, x: u32, y: u32) -> Response {
-    let cache_header = state.cache_headers.agg_tile.clone();
-    let cell_shift = 14 - z;
-    let lo_x = (x << cell_shift) as i32;
-    let hi_x = (((x + 1) << cell_shift) - 1) as i32;
-    let lo_y = (y << cell_shift) as i32;
-    let hi_y = (((y + 1) << cell_shift) - 1) as i32;
-
-    let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(z, x, y);
-
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = state
-            .pool
-            .get()
-            .context("Failed to acquire pool connection")?;
-        let points = query_mvt_layer(
-            &conn,
-            POINTS_MVT_SQL,
-            duckdb::params![
-                min_lon, min_lat, max_lon, max_lat, // bbox CTE
-                lo_x, hi_x, lo_y, hi_y, // bdot10k_unmatched filter
-                lo_x, hi_x, lo_y, hi_y, // egib_unmatched filter
-                lo_x, hi_x, lo_y, hi_y, // prg_unmatched filter
-            ],
         )?;
-        Ok::<Vec<u8>, anyhow::Error>(points)
+        drop(conn);
+        // Compressed here rather than per response, so the RAM cache holds the
+        // same representation the store does and the response path needs no
+        // per-tier branch. The ETag is discarded: this tier does not send one.
+        let (_, body) = tile_store::prepare(&raw)?;
+        state.tile_cache.insert((z, x, y), body.clone());
+        Ok(body)
     })
     .await;
 
-    // z5..=z13 never carry an ETag -- see serve_tile's comment on why.
-    finish_tile_response(result, z, x, y, cache_header, None)
+    match result {
+        Ok(Ok(body)) => tile_body_response(body, cache_header, None, wants_gzip),
+        Ok(Err(e)) => finish_tile_response(Ok(Err(e)), z, x, y, cache_header, None),
+        Err(e) => finish_tile_response(Err(e), z, x, y, cache_header, None),
+    }
 }
 
 /// Response shaping shared by all three tiers (z5..=z11, z12..=z13, and --
@@ -1012,10 +1229,10 @@ async fn serve_tile_points(state: AppState, z: u32, x: u32, y: u32) -> Response 
 /// `etag`, likewise, is only ever applied on the 200/204 branches, never on
 /// a 500 -- an `ETag` on an error response would tell a client "this failure
 /// is a representation of the resource, cache it and compare against it
-/// later", which is exactly as wrong as caching the 500 itself. z5..=z13
-/// callers always pass `None` (see `serve_tile`'s comment on why those
-/// tiers get no `ETag` at all); z14 passes `Some` unless
-/// `serving_version::z14_tile_version` itself failed.
+/// later", which is exactly as wrong as caching the 500 itself. Every caller
+/// now passes `None`: this function only ever shapes error branches, since the
+/// success paths go through [`tile_body_response`], which owns the `ETag` and
+/// the content negotiation.
 fn finish_tile_response(
     result: Result<anyhow::Result<Vec<u8>>, tokio::task::JoinError>,
     z: u32,
@@ -1060,6 +1277,7 @@ fn finish_tile_response(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     use axum::Router;
@@ -1293,6 +1511,27 @@ mod tests {
         let mut builder = Request::builder().uri(format!("/tiles/{z}/{x}/{y}"));
         if let Some(value) = if_none_match {
             builder = builder.header(header::IF_NONE_MATCH, value);
+        }
+        tiles_app(state)
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// Same as `request_tile`, plus an `Accept-Encoding` header -- used by
+    /// the content-negotiation tests. `None` means the header is absent
+    /// entirely, which is `curl`'s default and the case the identity fallback
+    /// exists for.
+    async fn request_tile_with_accept_encoding(
+        state: AppState,
+        z: u32,
+        x: u32,
+        y: u32,
+        accept_encoding: Option<&str>,
+    ) -> Response {
+        let mut builder = Request::builder().uri(format!("/tiles/{z}/{x}/{y}"));
+        if let Some(value) = accept_encoding {
+            builder = builder.header(header::ACCEPT_ENCODING, value);
         }
         tiles_app(state)
             .oneshot(builder.body(Body::empty()).unwrap())
@@ -2347,13 +2586,17 @@ mod tests {
         );
     }
 
-    /// Pins the ETag's three sources of movement end to end through HTTP --
-    /// serving_version's own unit tests already pin each source against
-    /// `z14_tile_version` directly; this test is what proves `serve_tile`
-    /// actually wires that primitive into a response header a client would
-    /// see change.
+    /// The `ETag` is a hash of the tile's bytes, so it moves exactly when the
+    /// rendered content moves -- no epoch term, no per-cell term, nothing that
+    /// can drift out of step with what the client actually receives.
+    ///
+    /// Both cases below used to need separate machinery to detect: the tile's
+    /// own cell, and a *neighbouring* cell whose rows this tile still renders
+    /// (rows are selected by geometry but tagged by their representative
+    /// point's cell). A content hash covers both for free, which is the whole
+    /// argument for it.
     #[tokio::test]
-    async fn etag_moves_after_a_cell_recompute_an_epoch_bump_and_a_neighbouring_cell_recompute() {
+    async fn the_etag_moves_when_the_tile_bytes_move_including_from_a_neighbouring_cell() {
         let state = make_state("");
         let etag_a = request_tile(state.clone(), 14, 8000, 4900)
             .await
@@ -2362,13 +2605,22 @@ mod tests {
             .expect("z14 must carry an ETag")
             .clone();
 
-        // 1. A recompute of the tile's own cell (8000, 4900).
+        // Seeded at the tile's own midpoint, not an arbitrary coordinate:
+        // the layers select by `ST_Intersects`, so a row outside the tile's
+        // envelope changes no bytes however it is tagged. (The deleted
+        // version query read the cell *tag* instead, so it moved the ETag for
+        // rows this tile never draws -- a false invalidation the content hash
+        // simply does not have.)
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+
+        // 1. A row landing in the tile's own cell (8000, 4900).
         {
             let conn = state.pool.get().unwrap();
-            conn.execute_batch(
+            conn.execute_batch(&format!(
                 "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at) VALUES
-                     ('b1', ST_Point(21.0, 52.0), 8000, 4900, now());",
-            )
+                     ('b1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());"
+            ))
             .unwrap();
         }
         let etag_b = request_tile(state.clone(), 14, 8000, 4900)
@@ -2377,56 +2629,80 @@ mod tests {
             .get(header::ETAG)
             .unwrap()
             .clone();
-        assert_ne!(etag_a, etag_b, "a cell recompute must move the tile's ETag");
+        assert_ne!(etag_a, etag_b, "new rows must move the tile's ETag");
 
-        // 2. An epoch bump -- covers the sources with no per-cell signal at
-        // all (street/building-type mapping reloads, a `compare full`
-        // rebuild; see serving_version's module doc) -- with the cell itself
-        // left untouched.
+        // 2. A row tagged to a NEIGHBOURING cell but geometrically inside this
+        // tile -- exactly the case the 3x3 invalidation ring exists for, and
+        // the reason a cell's own change is not enough to keep tiles fresh.
         {
             let conn = state.pool.get().unwrap();
-            serving_version::bump_serving_epoch(&conn).unwrap();
-        }
-        let etag_c = request_tile(state.clone(), 14, 8000, 4900)
-            .await
-            .headers()
-            .get(header::ETAG)
-            .unwrap()
-            .clone();
-        assert_ne!(etag_b, etag_c, "an epoch bump must move the tile's ETag");
-
-        // 3. A recompute of a NEIGHBOURING cell, one z14 cell away -- still
-        // inside the 3x3 ring `z14_tile_version` reads (see its doc comment)
-        // -- must move it too.
-        {
-            let conn = state.pool.get().unwrap();
-            conn.execute_batch(
+            conn.execute_batch(&format!(
                 "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at) VALUES
-                     ('b2', ST_Point(21.0, 52.0), 8001, 4901, now());",
-            )
+                     ('b2', ST_Point({mid_lon}, {mid_lat}), 8001, 4901, now());"
+            ))
             .unwrap();
         }
-        let etag_d = request_tile(state, 14, 8000, 4900)
+        let etag_c = request_tile(state, 14, 8000, 4900)
             .await
             .headers()
             .get(header::ETAG)
             .unwrap()
             .clone();
         assert_ne!(
-            etag_c, etag_d,
-            "a neighbouring cell's recompute must move the tile's ETag"
+            etag_b, etag_c,
+            "a neighbouring cell's row renders in this tile, so it must move the ETag"
         );
     }
 
+    /// Two requests that hit the store return the same `ETag`, because they
+    /// return the same stored bytes.
+    ///
+    /// The stronger property -- that a *re-render* returns the same `ETag`
+    /// too -- is pinned separately by
+    /// `a_re_render_of_unchanged_rows_produces_the_same_bytes`, and holds
+    /// because every MVT query sorts (`deterministic_mvt_order_sql`). The
+    /// validator stays *weak* regardless: weak is what lets one `ETag` serve
+    /// both the gzip and the identity representation of the same tile.
     #[tokio::test]
-    async fn agg_and_points_tiles_carry_no_etag() {
-        for (z, x, y) in [(6, 31, 19), (12, 2000, 1225)] {
+    async fn two_store_hits_return_the_same_etag() {
+        let state = make_state("");
+        let first = request_tile(state.clone(), 14, 8000, 4900)
+            .await
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .clone();
+        let second = request_tile(state, 14, 8000, 4900)
+            .await
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .clone();
+        assert_eq!(first, second);
+    }
+
+    /// z5..=z11 carries no `ETag` because its content moves with the wall
+    /// clock; z12..=z13 now *does* carry one, since a stored content hash is a
+    /// faithful validator for a tier that had none before. Both halves in one
+    /// test, so the boundary between them cannot silently move.
+    #[tokio::test]
+    async fn only_the_persisted_tiers_carry_an_etag() {
+        for (z, x, y) in [(6, 31, 19), (11, 1000, 612)] {
             let state = make_state("");
             let response = request_tile(state, z, x, y).await;
             assert_eq!(response.status(), StatusCode::OK, "z{z}");
             assert!(
                 response.headers().get(header::ETAG).is_none(),
-                "z{z} must not carry an ETag -- see serve_tile's comment on why"
+                "z{z} content moves with the clock, so it has no honest validator"
+            );
+        }
+        for (z, x, y) in [(12, 2000, 1225), (13, 4000, 2450), (14, 8000, 4900)] {
+            let state = make_state("");
+            let response = request_tile(state, z, x, y).await;
+            assert_eq!(response.status(), StatusCode::OK, "z{z}");
+            assert!(
+                response.headers().get(header::ETAG).is_some(),
+                "z{z} is persisted and content-hashed, so it must carry an ETag"
             );
         }
     }
@@ -2439,56 +2715,66 @@ mod tests {
         assert!(response.headers().get(header::ETAG).is_none());
     }
 
-    // --- Phase 5: z14 tile_cache wiring -------------------------------------
+    // --- Cache and store wiring ---------------------------------------------
 
-    /// The basic payoff: a second request for the exact same tile, with
-    /// nothing having changed in between, is served from `tile_cache`
-    /// instead of running the four MVT queries again. Asserted on the
-    /// cache's own hit/miss counters, not on timing -- timing would be racy
-    /// and wouldn't actually prove which code path served the response.
-    /// A cache hit and a cache miss must be indistinguishable in the response
-    /// they produce, and the empty-tile case is where that is easiest to get
-    /// wrong: `finish_tile_response` answers 204 for empty bytes, so
-    /// `z14_tile_response` (the path a cache hit takes, and the only z14 path
-    /// since the two were unified) has to as well. An earlier draft returned
-    /// a bare 200 with an empty body here, which would have made a z14 tile
-    /// over open country -- the common case across most of Poland -- flip
-    /// between 204 and 200 depending purely on whether it happened to be
-    /// resident in the cache.
-    #[test]
-    fn z14_response_shaping_is_identical_for_empty_and_cached_empty_tiles() {
-        let cache_header = HeaderValue::from_static("public, max-age=60");
-        let etag = HeaderValue::from_static("W/\"1-0-0.0-0.0-0.0\"");
-
-        let fresh = finish_tile_response(
-            Ok(Ok(Vec::new())),
-            14,
-            8000,
-            4900,
-            cache_header.clone(),
-            Some(etag.clone()),
-        );
-        let cached = z14_tile_response(Bytes::new(), cache_header.clone(), Some(etag.clone()));
-
-        assert_eq!(fresh.status(), StatusCode::NO_CONTENT);
-        assert_eq!(cached.status(), fresh.status());
-        assert_eq!(cached.headers().get(header::ETAG), Some(&etag));
-        assert_eq!(
-            cached.headers().get(header::CACHE_CONTROL),
-            Some(&cache_header)
-        );
-        assert_eq!(
-            cached.headers().get(header::CONTENT_TYPE),
-            None,
-            "a 204 must not claim a body's content type"
-        );
+    /// A tile with no features is a **200 carrying a layer header**, never a
+    /// 204: `ST_AsMVT` is an aggregate with no `GROUP BY`, so it emits one row
+    /// -- a layer header -- whatever the input (see
+    /// `empty_tile_returns_ok_not_500`). `finish_tile_response`'s empty-bytes
+    /// 204 branch therefore only ever fires for the out-of-range zoom
+    /// dispatch, and this test pins that the store path does not invent a 204
+    /// of its own. "Empty tile ⇒ 204" is the convention in other tile servers,
+    /// so it is exactly the assumption a future reader will import by mistake.
+    #[tokio::test]
+    async fn a_featureless_tile_is_a_200_with_a_layer_header_not_a_204() {
+        for (z, x, y) in [(12, 2000, 1225), (14, 8000, 4900)] {
+            let state = make_state("");
+            let response = request_tile(state, z, x, y).await;
+            assert_eq!(response.status(), StatusCode::OK, "z{z}");
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert!(!bytes.is_empty(), "z{z} must carry its layer header");
+        }
     }
 
+    /// The response must not differ by cache residency on anything a client
+    /// can see. Compared field by field rather than by a single equality,
+    /// because a `Response` is not `PartialEq` and the interesting failure
+    /// (an earlier draft returned a bare 200 where the fresh path returned a
+    /// 204) is exactly a status/header divergence.
+    #[test]
+    fn a_cached_body_and_a_fresh_body_shape_identically() {
+        let cache_header = HeaderValue::from_static("public, max-age=60");
+        let (etag, body) = tile_store::prepare(b"some rendered mvt bytes").unwrap();
+
+        let a = tile_body_response(body.clone(), cache_header.clone(), Some(&etag), true);
+        let b = tile_body_response(body, cache_header.clone(), Some(&etag), true);
+
+        assert_eq!(a.status(), b.status());
+        assert_eq!(a.headers().get(header::ETAG), b.headers().get(header::ETAG));
+        assert_eq!(
+            a.headers().get(header::CACHE_CONTROL),
+            b.headers().get(header::CACHE_CONTROL)
+        );
+        assert_eq!(
+            a.headers().get(header::CONTENT_TYPE),
+            b.headers().get(header::CONTENT_TYPE)
+        );
+        assert_eq!(
+            a.headers().get(header::CONTENT_ENCODING),
+            b.headers().get(header::CONTENT_ENCODING)
+        );
+        assert_eq!(a.headers().get(header::VARY), b.headers().get(header::VARY));
+    }
+
+    /// The aggregate tier's payoff: a second request for the same tile inside
+    /// the TTL is served from RAM instead of re-running the binned query.
+    /// Asserted on the cache's own counters, not on timing -- timing would be
+    /// racy and would not prove which path served the response.
     #[tokio::test]
-    async fn repeat_request_for_the_same_tile_is_served_from_the_cache() {
+    async fn a_repeat_request_for_an_aggregate_tile_is_served_from_the_cache() {
         let state = make_state("");
 
-        let first = request_tile(state.clone(), 14, 8000, 4900).await;
+        let first = request_tile(state.clone(), 6, 31, 19).await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(
             state.tile_cache.misses(),
@@ -2497,67 +2783,29 @@ mod tests {
         );
         assert_eq!(state.tile_cache.hits(), 0);
 
-        let second = request_tile(state.clone(), 14, 8000, 4900).await;
+        let second = request_tile(state.clone(), 6, 31, 19).await;
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(
             state.tile_cache.hits(),
             1,
             "repeat request must be served from the cache"
         );
-        assert_eq!(
-            state.tile_cache.misses(),
-            1,
-            "no additional miss on the repeat request"
-        );
+        assert_eq!(state.tile_cache.misses(), 1, "and add no second miss");
     }
 
-    /// A recompute moves `z14_tile_version`'s output (pinned end-to-end
-    /// already by `etag_moves_after_a_cell_recompute_...` above), which must
-    /// also mean the cache entry keyed on the OLD version is bypassed: the
-    /// request after a recompute must miss the cache and return the fresh
-    /// bytes, not the stale cached ones.
+    /// z12..=z14 must never touch the RAM cache -- they are persisted instead.
+    /// Sharing one cache across tiers with different invalidation stories is
+    /// exactly the bug this split exists to prevent.
     #[tokio::test]
-    async fn cache_is_bypassed_after_a_version_move() {
+    async fn the_persisted_tiers_do_not_use_the_ram_cache() {
         let state = make_state("");
-
-        let first = request_tile(state.clone(), 14, 8000, 4900).await;
-        assert_eq!(first.status(), StatusCode::OK);
-        assert_eq!(state.tile_cache.misses(), 1);
-
-        // Inserted at the tile's own midpoint (not an arbitrary coordinate)
-        // so the row is actually selected by BUILDINGS_MVT_SQL's spatial
-        // `ST_Intersects` filter, not just tagged with the matching
-        // cell_x/cell_y -- matching the pattern every other content-bearing
-        // seed in this file already uses.
-        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
-        let (mid_lon, mid_lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
-        {
-            let conn = state.pool.get().unwrap();
-            conn.execute_batch(&format!(
-                "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at) VALUES
-                     ('b1', ST_Point({mid_lon}, {mid_lat}), 8000, 4900, now());"
-            ))
-            .unwrap();
-        }
-
-        let second = request_tile(state.clone(), 14, 8000, 4900).await;
-        assert_eq!(second.status(), StatusCode::OK);
+        request_tile(state.clone(), 14, 8000, 4900).await;
+        request_tile(state.clone(), 12, 2000, 1225).await;
+        assert_eq!(state.tile_cache.hits(), 0);
         assert_eq!(
             state.tile_cache.misses(),
-            2,
-            "a version move must miss the cache rather than serve the stale entry"
-        );
-        assert_eq!(
-            state.tile_cache.hits(),
             0,
-            "the recompute must never have been served from the cache"
-        );
-
-        let bytes = to_bytes(second.into_body(), 1024 * 1024).await.unwrap();
-        let body = String::from_utf8_lossy(&bytes);
-        assert!(
-            body.contains("bdot10k"),
-            "the recomputed row must appear in the fresh (uncached) tile"
+            "the RAM cache must not even be consulted above z11"
         );
     }
 
@@ -2599,12 +2847,14 @@ mod tests {
         );
     }
 
-    /// z5..=z13 and out-of-range zooms never touch `tile_cache` at all --
-    /// it's a z14-only cache (see the module doc on `tile_cache`).
+    /// The RAM cache serves z5..=z11 and nothing else. An out-of-range zoom
+    /// returns before any cache is consulted, and z12..=z14 go to the
+    /// persistent store instead -- sharing one cache across tiers with
+    /// different invalidation stories is the bug the split exists to prevent.
     #[tokio::test]
-    async fn cache_is_never_consulted_below_z14() {
+    async fn the_ram_cache_is_consulted_for_the_aggregate_tier_and_no_other() {
         let state = make_state("");
-        for (z, x, y) in [(3, 1, 1), (6, 31, 19), (12, 2000, 1225)] {
+        for (z, x, y) in [(3, 1, 1), (12, 2000, 1225), (14, 8000, 4900)] {
             let response = request_tile(state.clone(), z, x, y).await;
             assert!(
                 response.status() == StatusCode::OK || response.status() == StatusCode::NO_CONTENT,
@@ -2615,22 +2865,30 @@ mod tests {
             assert_eq!(
                 state.tile_cache.misses(),
                 0,
-                "z{z} must never miss tile_cache either -- it must not be consulted at all"
+                "z{z} must not consult tile_cache at all"
             );
         }
+        request_tile(state.clone(), 6, 31, 19).await;
+        assert_eq!(
+            state.tile_cache.misses(),
+            1,
+            "z6 is the tier this cache is for, so it must be consulted"
+        );
     }
 
-    /// A cache hit must be indistinguishable from a fresh response on the
-    /// headers a client actually keys revalidation off of.
+    /// A cache hit must be indistinguishable from a fresh response on every
+    /// header a client keys revalidation off of. Driven through the aggregate
+    /// tier, since that is the one the RAM cache serves.
     #[tokio::test]
-    async fn cached_response_carries_the_same_etag_and_cache_control_as_a_fresh_one() {
+    async fn a_cached_response_carries_the_same_headers_as_a_fresh_one() {
         let state = make_state("");
 
-        let first = request_tile(state.clone(), 14, 8000, 4900).await;
+        let first = request_tile(state.clone(), 6, 31, 19).await;
         let first_etag = first.headers().get(header::ETAG).cloned();
         let first_cache_control = first.headers().get(header::CACHE_CONTROL).cloned();
+        let first_vary = first.headers().get(header::VARY).cloned();
 
-        let second = request_tile(state.clone(), 14, 8000, 4900).await;
+        let second = request_tile(state.clone(), 6, 31, 19).await;
         assert_eq!(
             state.tile_cache.hits(),
             1,
@@ -2641,5 +2899,435 @@ mod tests {
             second.headers().get(header::CACHE_CONTROL).cloned(),
             first_cache_control
         );
+        assert_eq!(second.headers().get(header::VARY).cloned(), first_vary);
+    }
+    // --- Content negotiation ------------------------------------------------
+
+    /// Bodies are stored gzipped, so a client that accepts gzip gets the
+    /// stored bytes handed straight to the response -- no per-request
+    /// compression, which is the whole point of compressing once at render
+    /// time.
+    #[tokio::test]
+    async fn a_client_that_accepts_gzip_gets_a_gzip_encoded_body() {
+        let state = make_state("");
+        let response = request_tile_with_accept_encoding(state, 14, 8000, 4900, Some("gzip")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING),
+            Some(&HeaderValue::from_static("gzip"))
+        );
+    }
+
+    /// `curl` and most monitoring probes send no `Accept-Encoding` at all.
+    /// They must get the identical tile, decompressed -- asserted against a
+    /// gzip response's own decompressed bytes so the fallback cannot drift
+    /// away from what everyone else receives.
+    #[tokio::test]
+    async fn a_client_with_no_accept_encoding_gets_identical_bytes_decompressed() {
+        let state = make_state("");
+        let gzipped =
+            request_tile_with_accept_encoding(state.clone(), 14, 8000, 4900, Some("gzip")).await;
+        let gzip_bytes = to_bytes(gzipped.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(&gzip_bytes[..]),
+            &mut expected,
+        )
+        .unwrap();
+
+        let identity = request_tile_with_accept_encoding(state, 14, 8000, 4900, None).await;
+        assert_eq!(identity.status(), StatusCode::OK);
+        assert_eq!(
+            identity.headers().get(header::CONTENT_ENCODING),
+            None,
+            "a client that did not ask for gzip must not be sent gzip"
+        );
+        let identity_bytes = to_bytes(identity.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(identity_bytes, expected);
+    }
+
+    /// `gzip;q=0` is an explicit refusal. A substring test for "gzip" would
+    /// read it as consent and send bytes the client just said it cannot use.
+    #[tokio::test]
+    async fn a_client_sending_gzip_q_0_is_served_identity() {
+        let state = make_state("");
+        let response =
+            request_tile_with_accept_encoding(state, 14, 8000, 4900, Some("gzip;q=0")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::CONTENT_ENCODING), None);
+    }
+
+    /// One URL now has two representations, so a shared cache without `Vary`
+    /// could hand gzip to a client that cannot read it. It has to ride on the
+    /// 304 too, which is a response about that same negotiated representation.
+    #[tokio::test]
+    async fn vary_accept_encoding_is_present_on_the_200_and_the_304() {
+        let state = make_state("");
+        let first = request_tile(state.clone(), 14, 8000, 4900).await;
+        assert_eq!(
+            first.headers().get(header::VARY),
+            Some(&HeaderValue::from_static("accept-encoding"))
+        );
+        let etag = first.headers().get(header::ETAG).unwrap().clone();
+
+        let second =
+            request_tile_with_if_none_match(state, 14, 8000, 4900, Some(etag.to_str().unwrap()))
+                .await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            second.headers().get(header::VARY),
+            Some(&HeaderValue::from_static("accept-encoding"))
+        );
+    }
+
+    /// The `ETag` hashes the *uncompressed* bytes, so it identifies content
+    /// rather than encoding. That is what makes one weak validator honest
+    /// across both representations -- and what stops a `flate2` version bump
+    /// from invalidating every client's cache.
+    #[tokio::test]
+    async fn the_etag_is_the_same_in_both_encodings() {
+        let state = make_state("");
+        let gzipped =
+            request_tile_with_accept_encoding(state.clone(), 14, 8000, 4900, Some("gzip")).await;
+        let identity = request_tile_with_accept_encoding(state, 14, 8000, 4900, None).await;
+        assert_eq!(
+            gzipped.headers().get(header::ETAG),
+            identity.headers().get(header::ETAG)
+        );
+    }
+    /// A z13 tile and the z14 cell whose rows it renders, as a seed plus the
+    /// coordinates to ask for.
+    fn points_seed() -> (String, (u32, u32)) {
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(CHANGE_CELL_ZOOM, 8000, 4900);
+        let (lon, lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+        (
+            format!(
+                "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at)
+                 VALUES ('b1', ST_Point({lon}, {lat}), 8000, 4900, now());
+                 INSERT INTO prg_unmatched (lokalny_id, geom, cell_x, cell_y, computed_at)
+                 VALUES ('a1', ST_Point({lon}, {lat}), 8000, 4900, now());"
+            ),
+            (4000, 2450),
+        )
+    }
+
+    /// The batched points query must answer for **every** tile asked about,
+    /// not only the ones holding rows.
+    ///
+    /// A bare `GROUP BY tx, ty` emits no group for a tile with nothing in it,
+    /// and a missing row is not an empty tile: `ST_AsMVT` produces a layer
+    /// header even over zero features, which is what keeps an in-range tile a
+    /// 200 rather than the 204 `finish_tile_response` reserves for
+    /// out-of-range zooms. The `env LEFT JOIN proj` + `FILTER` pair is what
+    /// reproduces that, and this is the test that notices if either half goes.
+    #[tokio::test]
+    async fn a_points_batch_answers_for_every_requested_tile_including_empty_ones() {
+        let (seed, (x, y)) = points_seed();
+        let state = make_state(&seed);
+        let conn = state.pool.get().unwrap();
+        let asked = [(x, y), (x + 1, y), (x, y + 1)];
+        let out = render_points_tiles(&conn, 13, &asked).unwrap();
+
+        assert_eq!(out.len(), asked.len(), "one row per requested tile");
+        let keys: BTreeSet<(u32, u32)> = out.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, asked.into_iter().collect::<BTreeSet<_>>());
+
+        let populated = out.iter().find(|(k, _)| *k == (x, y)).unwrap();
+        let empty: Vec<_> = out.iter().filter(|(k, _)| *k != (x, y)).collect();
+        assert!(
+            populated.1.len() > empty[0].1.len(),
+            "the seeded tile must carry more than a bare layer header"
+        );
+        for (key, mvt) in &empty {
+            assert!(
+                !mvt.is_empty(),
+                "{key:?} holds nothing, but an empty tile is a layer header, not zero bytes"
+            );
+        }
+        assert_eq!(
+            empty[0].1, empty[1].1,
+            "every empty tile is the same header"
+        );
+    }
+
+    /// A tile rendered inside a batch is byte-identical to the same tile
+    /// rendered alone.
+    ///
+    /// This is the property that lets `points_mvt_sql` be the *only* copy of
+    /// the points SQL: `tiles warm` and `tile_refresh` batch, a request does
+    /// not, and neither may produce different bytes for the same tile. It
+    /// holds only because the aggregate sorts -- without
+    /// `deterministic_mvt_order_sql` the two paths would agree in length and
+    /// differ in content.
+    #[tokio::test]
+    async fn a_tile_rendered_in_a_batch_is_byte_identical_to_one_rendered_alone() {
+        let (seed, (x, y)) = points_seed();
+        let state = make_state(&seed);
+        let conn = state.pool.get().unwrap();
+        let asked = [(x, y), (x + 1, y), (x, y + 1)];
+        let batched = render_points_tiles(&conn, 13, &asked).unwrap();
+        for (key, mvt) in batched {
+            let alone = render_tile(&conn, 13, key.0, key.1).unwrap();
+            assert_eq!(
+                mvt, alone,
+                "z13/{}/{} differs between the paths",
+                key.0, key.1
+            );
+        }
+    }
+
+    /// Re-rendering unchanged rows produces the same bytes, which is what
+    /// makes the content-hash `ETag` survive a `tile_refresh` that had nothing
+    /// real to change.
+    ///
+    /// The seeded database here is far too small to *reproduce* the
+    /// nondeterminism this pins against -- that needs a parallel scan over
+    /// thousands of rows, and is what
+    /// `tile_render_determinism_and_thread_count` measures on the real
+    /// database. This states the property for all three persisted tiers so a
+    /// dropped `ORDER BY` at least has somewhere to fail.
+    #[tokio::test]
+    async fn a_re_render_of_unchanged_rows_produces_the_same_bytes() {
+        let (seed, (x, y)) = points_seed();
+        let state = make_state(&seed);
+        let conn = state.pool.get().unwrap();
+        for (z, x, y) in [
+            (12, x / 2, y / 2),
+            (13, x, y),
+            (CHANGE_CELL_ZOOM, 8000, 4900),
+        ] {
+            let first = render_tile(&conn, z, x, y).unwrap();
+            assert!(!first.is_empty(), "z{z} must render something");
+            for _ in 0..4 {
+                assert_eq!(
+                    first,
+                    render_tile(&conn, z, x, y).unwrap(),
+                    "z{z}/{x}/{y} is not a deterministic function of its rows"
+                );
+            }
+        }
+    }
+
+    // --- Determinism / ORDER BY benchmark ------------------------------------
+    //
+    // Ignored by default: needs the real ./osmpbudynkiv2.duckdb and exclusive
+    // access to it (stop any `run` server first). Run with:
+    //   cargo test --release tile_render_determinism -- --ignored --nocapture
+
+    fn real_db() -> Option<Connection> {
+        let path = Path::new("./osmpbudynkiv2.duckdb");
+        if !path.exists() {
+            eprintln!("skipping: no ./osmpbudynkiv2.duckdb");
+            return None;
+        }
+        let init = vec![
+            "INSTALL spatial".to_string(),
+            "LOAD spatial".to_string(),
+            "INSTALL icu".to_string(),
+            "LOAD icu".to_string(),
+            "SET geometry_always_xy = true".to_string(),
+        ];
+        Some(crate::db::init_db(path, &init, None).unwrap())
+    }
+
+    fn time_renders(conn: &Connection, z: u32, x: u32, y: u32, n: u32) -> (f64, usize) {
+        let _ = render_tile(conn, z, x, y).unwrap(); // warm
+        let t = std::time::Instant::now();
+        let mut len = 0;
+        for _ in 0..n {
+            len = render_tile(conn, z, x, y).unwrap().len();
+        }
+        (t.elapsed().as_secs_f64() * 1000.0 / n as f64, len)
+    }
+
+    fn determinism(conn: &Connection, z: u32, x: u32, y: u32, tries: u32) -> u32 {
+        let first = render_tile(conn, z, x, y).unwrap();
+        let mut differing = 0;
+        for _ in 0..tries {
+            if render_tile(conn, z, x, y).unwrap() != first {
+                differing += 1;
+            }
+        }
+        differing
+    }
+
+    /// What the batched points query buys, as a function of batch size.
+    ///
+    /// The last row is the one the design rests on: at a batch of one the
+    /// batched query costs what the per-tile query it replaced cost, so it
+    /// could *replace* that query instead of sitting beside it, and the MVT
+    /// SQL still has one home. Measured over a z9 region around Warsaw:
+    ///
+    /// | tiles | ms/tile |
+    /// |---|---|
+    /// | 253 | 0.16 |
+    /// | 16 | 0.58 |
+    /// | 4 | 1.50 |
+    /// | 1 | 4.43 |
+    ///
+    /// Byte totals are identical at every batch size (696,857 B here), which
+    /// is the check that the batching is not quietly dropping or duplicating
+    /// features.
+    #[test]
+    #[ignore]
+    fn points_batch_size_vs_render_cost() {
+        let Some(conn) = real_db() else { return };
+        const Z: u32 = 13;
+        let cell_shift = CHANGE_CELL_ZOOM - Z;
+        // A z9 region around Warsaw -> up to 16x16 z13 tiles with data.
+        let (rx, ry) = (285u32, 168u32);
+        let shift = Z - 9;
+        let (tx0, ty0) = (rx << shift, ry << shift);
+        let (tx1, ty1) = (((rx + 1) << shift) - 1, ((ry + 1) << shift) - 1);
+        let (lo_x, hi_x) = (
+            (tx0 << cell_shift) as i32,
+            (((tx1 + 1) << cell_shift) - 1) as i32,
+        );
+        let (lo_y, hi_y) = (
+            (ty0 << cell_shift) as i32,
+            (((ty1 + 1) << cell_shift) - 1) as i32,
+        );
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT DISTINCT cell_x >> {cell_shift}, cell_y >> {cell_shift} FROM (
+                     SELECT cell_x, cell_y FROM bdot10k_unmatched
+                     UNION ALL SELECT cell_x, cell_y FROM egib_unmatched
+                     UNION ALL SELECT cell_x, cell_y FROM prg_unmatched
+                 ) WHERE cell_x BETWEEN {lo_x} AND {hi_x} AND cell_y BETWEEN {lo_y} AND {hi_y}
+                 ORDER BY 1, 2"
+            ))
+            .unwrap();
+        let tiles: Vec<(u32, u32)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i32>(0)? as u32, r.get::<_, i32>(1)? as u32))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        println!("region holds {} z{Z} tiles with data", tiles.len());
+
+        for chunk in [tiles.len(), 16, 4, 1] {
+            let _ = render_points_tiles(&conn, Z, &tiles[..chunk.min(tiles.len())]).unwrap();
+            let t = std::time::Instant::now();
+            let mut bytes = 0usize;
+            let mut count = 0usize;
+            for part in tiles.chunks(chunk) {
+                for (_, mvt) in render_points_tiles(&conn, Z, part).unwrap() {
+                    bytes += mvt.len();
+                    count += 1;
+                }
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "batch {chunk:>4}: {ms:8.1} ms for {count} tiles ({:.2} ms/tile), {bytes} B",
+                ms / count as f64
+            );
+        }
+    }
+
+    /// How much of a z14 render is fixed per-query cost rather than data?
+    /// That is what decides whether batching z14 would pay -- if a nearly
+    /// empty tile still costs tens of milliseconds, the cost is the four
+    /// queries, not the rows.
+    #[test]
+    #[ignore]
+    fn z14_render_cost_floor_across_densities() {
+        let Some(conn) = real_db() else { return };
+        let mut stmt = conn
+            .prepare(
+                "SELECT cell_x, cell_y, SUM(total) AS n FROM cell_totals
+                  GROUP BY cell_x, cell_y ORDER BY n LIMIT 8",
+            )
+            .unwrap();
+        let sparse: Vec<(u32, u32, i64)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i32>(0)? as u32,
+                    r.get::<_, i32>(1)? as u32,
+                    r.get(2)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let mut stmt = conn
+            .prepare(
+                "SELECT cell_x, cell_y, SUM(total) AS n FROM cell_totals
+                  GROUP BY cell_x, cell_y ORDER BY n DESC LIMIT 4",
+            )
+            .unwrap();
+        let dense: Vec<(u32, u32, i64)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i32>(0)? as u32,
+                    r.get::<_, i32>(1)? as u32,
+                    r.get(2)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        for (label, set) in [("sparsest", &sparse), ("densest", &dense)] {
+            for (x, y, n) in set {
+                let _ = render_tile(&conn, 14, *x, *y).unwrap();
+                let t = std::time::Instant::now();
+                let iters = 5;
+                let mut len = 0;
+                for _ in 0..iters {
+                    len = render_tile(&conn, 14, *x, *y).unwrap().len();
+                }
+                let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+                // Gzip too: the store holds the served representation, so the
+                // number that matters for disk and bandwidth is the compressed
+                // one, and feature order moves it.
+                let gz =
+                    crate::server::tile_store::prepare(&render_tile(&conn, 14, *x, *y).unwrap())
+                        .unwrap()
+                        .1
+                        .gzip
+                        .len();
+                println!(
+                    "{label:<9} z14/{x}/{y:<6} {n:>7} objects  {ms:8.2} ms  {len:>8} B raw  {gz:>8} B gzip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn tile_render_determinism_and_thread_count() {
+        let Some(conn) = real_db() else { return };
+        // Dense Warsaw z14, a quieter z14, and the z12/z13 parents.
+        let tiles = [
+            (14u32, 9145u32, 5395u32),
+            (14, 9144, 5394),
+            (13, 4572, 2697),
+            (12, 2286, 1348),
+        ];
+
+        for threads in [0u32, 1, 2, 4] {
+            if threads > 0 {
+                conn.execute_batch(&format!("SET threads={threads}"))
+                    .unwrap();
+            }
+            let label = if threads == 0 {
+                "default".to_string()
+            } else {
+                threads.to_string()
+            };
+            for (z, x, y) in tiles {
+                let (ms, len) = time_renders(&conn, z, x, y, 10);
+                let diff = determinism(&conn, z, x, y, 8);
+                println!(
+                    "threads={label:<7} z{z}/{x}/{y:<6} {ms:8.2} ms  {len:>7} B  nondeterministic {diff}/8"
+                );
+            }
+            println!();
+        }
     }
 }

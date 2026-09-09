@@ -3,7 +3,10 @@ pub mod jobs;
 mod package;
 mod reports;
 mod tile_cache;
-mod tiles;
+pub mod tile_dirty;
+pub mod tile_store;
+pub mod tile_warm;
+pub mod tiles;
 mod updates;
 
 use std::sync::{Arc, Mutex};
@@ -103,12 +106,17 @@ pub struct AppState {
     /// (`CacheHeaders::from_config`, called from `build_router`) that turns
     /// cache config into header bytes.
     pub cache_headers: Arc<http_cache::CacheHeaders>,
-    /// Bounded in-process byte cache for z14 `/tiles` responses -- see
-    /// `tile_cache` module doc for the design. `TileCache::new(0)` (i.e.
+    /// Bounded in-process byte cache for z5..=z11 `/tiles` responses -- see
+    /// `tile_cache` module doc for the design. `TileCache::new(0, ttl)` (i.e.
     /// `config.cache.tile_cache_max_bytes == 0`) is a working no-op, so this
     /// field is never `Option` and callers never need to branch on whether
     /// caching is enabled.
     pub tile_cache: Arc<tile_cache::TileCache>,
+    /// Persistent store for z12..=z14 `/tiles` responses, in the RocksDB
+    /// `tiles` column family -- see `tile_store`'s module doc.
+    /// `TileStore::disabled()` (i.e. `config.cache.persist_tiles == false`) is
+    /// a working no-op for the same reason `tile_cache` has one.
+    pub tile_store: Arc<tile_store::TileStore>,
 }
 
 impl AppState {
@@ -126,6 +134,7 @@ impl AppState {
         let cache_headers = Arc::new(http_cache::CacheHeaders::from_config(&config.cache));
         let tile_cache = Arc::new(tile_cache::TileCache::new(
             config.cache.tile_cache_max_bytes,
+            agg_tile_ttl(&config),
         ));
         Self {
             pool,
@@ -133,8 +142,24 @@ impl AppState {
             config,
             cache_headers,
             tile_cache,
+            // No RocksDB handle in a test AppState, and none needed: every
+            // z12..=z14 request then renders cold, which is exactly the
+            // behaviour the tile tests want to assert against.
+            tile_store: Arc::new(tile_store::TileStore::disabled()),
         }
     }
+}
+
+/// The z5..=z11 RAM cache's TTL, read from the *same* config field
+/// `http_cache` builds that tier's `Cache-Control: max-age` from.
+///
+/// That equality is the entire soundness argument for caching a tier whose
+/// content moves with the wall clock: the server can never hold a copy staler
+/// than one every browser is already entitled to hold under the header we
+/// ourselves sent. Reading the field in one place, here, is what stops the two
+/// from drifting into separate knobs -- see `tile_cache`'s module doc.
+fn agg_tile_ttl(config: &AppConfig) -> std::time::Duration {
+    std::time::Duration::from_secs(config.cache.agg_tile_max_age_seconds)
 }
 
 pub async fn run(
@@ -206,6 +231,21 @@ pub async fn run(
                 run_on_start: config.jobs.match_refresh.run_on_start,
             },
         ),
+        // Re-renders the tiles the writers above just invalidated. On by
+        // default and on a short interval: with no read-time freshness check
+        // anywhere, this job is the only thing that makes a pushed
+        // invalidation visible, so a long interval is served-stale time.
+        (
+            Arc::new(jobs::tile_refresh::TileRefreshJob::new(
+                config.jobs.tile_refresh.batch_size,
+            )) as Arc<dyn jobs::Job>,
+            jobs::JobConfigResolved {
+                enabled: config.jobs.tile_refresh.enabled,
+                interval: std::time::Duration::from_secs(config.jobs.tile_refresh.interval_seconds),
+                timeout: std::time::Duration::from_secs(config.jobs.tile_refresh.timeout_seconds),
+                run_on_start: config.jobs.tile_refresh.run_on_start,
+            },
+        ),
         // The safety net for a dropped enqueue. Off by default -- see
         // MatchReconcileConfig for the measured reasons. It only appends to
         // match_dirty_cells and lets the per-cell drain rebuild, so unlike
@@ -250,6 +290,9 @@ pub async fn run(
             jobs::JobConfigResolved::from(&config.jobs.building_types_update),
         ),
     ];
+    // Cloned before the scheduler takes ownership: the tile store needs the
+    // same handle, and `TileStore` is what the request path reads through.
+    let kv_for_tiles = kv.clone();
     let scheduler = jobs::Scheduler::start(job_list, pool.clone(), kv, config.clone());
     let registry = scheduler.registry.clone();
     let shutdown_notify = scheduler.shutdown_notify();
@@ -265,6 +308,12 @@ pub async fn run(
     // through unchanged.
     let tile_cache = Arc::new(tile_cache::TileCache::new(
         config.cache.tile_cache_max_bytes,
+        agg_tile_ttl(&config),
+    ));
+    let tile_store = Arc::new(tile_store::TileStore::new(
+        kv_for_tiles,
+        tiles::TILE_FORMAT_VERSION,
+        config.cache.persist_tiles,
     ));
     let state = AppState {
         pool,
@@ -272,6 +321,7 @@ pub async fn run(
         config: config.clone(),
         cache_headers,
         tile_cache,
+        tile_store,
     };
 
     let app = build_router(state);

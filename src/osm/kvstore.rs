@@ -9,14 +9,27 @@ use rocksdb::{
 
 use super::encoding;
 
-/// Column family names for the 5 key spaces, plus a tiny `meta` space holding
-/// the on-disk format version.
+/// Column family names for the 5 OSM key spaces, a tiny `meta` space holding
+/// the on-disk format version, and the rendered-tile cache.
 pub const CF_NODES: &str = "nodes";
 pub const CF_WAYS: &str = "ways";
 pub const CF_RELATIONS: &str = "relations";
 pub const CF_NODE_TO_WAYS: &str = "node_to_ways";
 pub const CF_WAY_TO_RELATIONS: &str = "way_to_relations";
 pub const CF_META: &str = "meta";
+
+/// Rendered z12-z14 `/tiles` bodies, gzipped. A pure cache: every entry has an
+/// authoritative source (DuckDB) behind it, which is what licenses every
+/// "degrade, don't fail" choice in `server::tile_store` -- a miss costs a
+/// re-render, never a wrong answer.
+///
+/// Adding this CF deliberately does NOT bump [`KV_FORMAT_VERSION`]: it changes
+/// no existing key or value layout, `create_missing_column_families(true)` is
+/// already set, and bumping would force a ~12-minute `import osm` on deploy for
+/// nothing. Its own guard is `tile_store::TILE_VALUE_FORMAT`, whose mismatch
+/// decodes as a *miss* rather than a hard bail -- the opposite policy to the
+/// one below, because the recovery costs differ by four orders of magnitude.
+pub const CF_TILES: &str = "tiles";
 
 const ALL_CFS: &[&str] = &[
     CF_NODES,
@@ -25,6 +38,7 @@ const ALL_CFS: &[&str] = &[
     CF_NODE_TO_WAYS,
     CF_WAY_TO_RELATIONS,
     CF_META,
+    CF_TILES,
 ];
 
 /// On-disk format version for this store.
@@ -86,8 +100,36 @@ fn id_list_partial_merge(
     Some(result)
 }
 
-fn make_cf_opts(name: &str, write_buffer_bytes: usize) -> Options {
+/// Tile block-cache size used when column families are recreated outside
+/// [`open`] -- i.e. by [`clear`], which has no config in scope. A store being
+/// cleared is mid-`import osm` and serves no tiles, and the next [`open`]
+/// installs the configured size, so the only cost of the default being wrong
+/// is a differently-sized cache for the rest of that import.
+const DEFAULT_TILE_BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+fn make_cf_opts(name: &str, write_buffer_bytes: usize, tile_block_cache_bytes: usize) -> Options {
     let mut cf_opts = Options::default();
+    if name == CF_TILES {
+        // Values arrive already gzipped by `server::tile_store`, so compressing
+        // them again would burn CPU on every write and every compaction for
+        // nothing. This is the one CF that opts out of the blanket Zstd below,
+        // and it reads as an oversight without this comment.
+        cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
+        // Its own block cache, so tile blocks can never evict OSM node blocks
+        // off the `update osm` hot path. Pre-compressed values mean this cache
+        // holds 3-4x more tiles per byte than raw MVT would.
+        let mut bbt = BlockBasedOptions::default();
+        let cache = rocksdb::Cache::new_lru_cache(tile_block_cache_bytes);
+        bbt.set_block_cache(&cache);
+        cf_opts.set_block_based_table_factory(&bbt);
+        // Steady small request-path writes, not a bulk-load burst.
+        cf_opts.set_max_write_buffer_number(2);
+        if write_buffer_bytes > 0 {
+            cf_opts.set_write_buffer_size(write_buffer_bytes);
+        }
+        cf_opts.set_level_compaction_dynamic_level_bytes(true);
+        return cf_opts;
+    }
     cf_opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
     if write_buffer_bytes > 0 {
         cf_opts.set_write_buffer_size(write_buffer_bytes);
@@ -105,7 +147,12 @@ fn make_cf_opts(name: &str, write_buffer_bytes: usize) -> Options {
     cf_opts
 }
 
-pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<RocksDB> {
+pub fn open(
+    path: &Path,
+    block_cache_mb: u64,
+    write_buffer_mb: u64,
+    tile_block_cache_mb: u64,
+) -> Result<RocksDB> {
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
@@ -133,10 +180,18 @@ pub fn open(path: &Path, block_cache_mb: u64, write_buffer_mb: u64) -> Result<Ro
     let write_buffer_bytes: usize = (write_buffer_mb * 1024 * 1024)
         .try_into()
         .context("write_buffer_mb overflow")?;
+    let tile_block_cache_bytes: usize = (tile_block_cache_mb * 1024 * 1024)
+        .try_into()
+        .context("tile_block_cache_mb overflow")?;
 
     let cfs: Vec<ColumnFamilyDescriptor> = ALL_CFS
         .iter()
-        .map(|name| ColumnFamilyDescriptor::new(*name, make_cf_opts(name, write_buffer_bytes)))
+        .map(|name| {
+            ColumnFamilyDescriptor::new(
+                *name,
+                make_cf_opts(name, write_buffer_bytes, tile_block_cache_bytes),
+            )
+        })
         .collect();
 
     let db = DBWithThreadMode::open_cf_descriptors(&db_opts, path, cfs)
@@ -193,13 +248,35 @@ pub fn clear(db: &RocksDB) -> Result<()> {
     for name in ALL_CFS {
         db.drop_cf(name)
             .with_context(|| format!("Failed to drop CF {name}"))?;
-        db.create_cf(*name, &make_cf_opts(name, 0))
-            .with_context(|| format!("Failed to recreate CF {name}"))?;
+        db.create_cf(
+            *name,
+            &make_cf_opts(name, 0, DEFAULT_TILE_BLOCK_CACHE_BYTES),
+        )
+        .with_context(|| format!("Failed to recreate CF {name}"))?;
     }
     // The meta CF was just dropped along with the rest, so the version stamp
     // has to be rewritten or the next `open` would see a store with data and
     // no stamp, and reject it.
     stamp_format_version(db)?;
+    Ok(())
+}
+
+/// Drop and recreate just the tiles column family, emptying it without
+/// touching the OSM key spaces or the format stamp.
+///
+/// The whole-store [`clear`] is `import osm`'s tool; this is
+/// `server::tile_store::clear`'s, behind the `tiles clear` CLI verb. Kept here
+/// rather than in `tile_store` so column-family options stay in one place --
+/// a recreate that forgot `make_cf_opts` would silently give the family
+/// RocksDB's defaults, re-enabling Zstd over already-gzipped values.
+pub fn clear_tiles(db: &RocksDB) -> Result<()> {
+    db.drop_cf(CF_TILES)
+        .with_context(|| format!("Failed to drop CF {CF_TILES}"))?;
+    db.create_cf(
+        CF_TILES,
+        &make_cf_opts(CF_TILES, 0, DEFAULT_TILE_BLOCK_CACHE_BYTES),
+    )
+    .with_context(|| format!("Failed to recreate CF {CF_TILES}"))?;
     Ok(())
 }
 
@@ -491,7 +568,7 @@ mod tests {
 
     fn open_tmp_db() -> (TempDir, RocksDB) {
         let tmp = TempDir::new().unwrap();
-        let db = open(tmp.path(), 32, 4).unwrap();
+        let db = open(tmp.path(), 32, 4, 8).unwrap();
         (tmp, db)
     }
 
@@ -534,7 +611,7 @@ mod tests {
     fn store_with_a_different_format_version_is_rejected_on_open() {
         let tmp = TempDir::new().unwrap();
         {
-            let db = open(tmp.path(), 32, 4).unwrap();
+            let db = open(tmp.path(), 32, 4, 8).unwrap();
             put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
             db.put_cf(
                 &cf(&db, CF_META),
@@ -544,7 +621,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = open(tmp.path(), 32, 4).unwrap_err();
+        let err = open(tmp.path(), 32, 4, 8).unwrap_err();
         assert!(
             format!("{err:#}").contains(FORMAT_MISMATCH_MESSAGE),
             "got: {err:#}"
@@ -557,7 +634,7 @@ mod tests {
     #[test]
     fn clear_restamps_the_format_version() {
         let tmp = TempDir::new().unwrap();
-        let db = open(tmp.path(), 32, 4).unwrap();
+        let db = open(tmp.path(), 32, 4, 8).unwrap();
         put_node(&db, 1, dm(20.0), dm(50.0)).unwrap();
         clear(&db).unwrap();
 

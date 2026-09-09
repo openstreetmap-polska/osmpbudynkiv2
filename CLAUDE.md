@@ -96,8 +96,14 @@ binary, easy to deploy.
 - `reports <action>` — manage user reports offline: `list`, `revoke`,
   `reconcile`, `export`/`import` (JSONL). A revoke/expire only reaches the
   serving tables after a drain
+- `tiles <action>` — operate on the persistent rendered-tile store (requires
+  exclusive DB access, same caveat as `queue drain`). `warm` pre-renders every
+  z12–z14 tile the data covers (list derived from `cell_totals`, not a bbox, so
+  sea and border tiles are skipped; already-stored tiles are skipped too, so an
+  interrupted warm resumes); `clear` empties it
 - `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package`,
-  `/updates`, `POST /report`) plus background update, drain and reconcile jobs
+  `/updates`, `POST /report`) plus background update, drain, tile-refresh and
+  reconcile jobs
 
 **Storage:** DuckDB for geospatial queries and processed data; RocksDB for raw
 OSM node coordinates and structural mappings (way node refs, relation members,
@@ -385,6 +391,12 @@ instead of comparing live. Between full runs, each producer enqueues the z14
 cells it touched into `match_dirty_cells`, and the `match_refresh` job drains
 that queue by recomputing just those cells.
 
+The same cell coordinates key the *tile* queue (`tile_dirty_cells`), which is
+what makes precomputed tiles possible at all: `match_dirty_cells` is already
+keyed on the z14 XYZ tile numbers `/tiles/14/x/y` uses, so "which tiles just
+went stale" is a bit shift away from work the write path already did. See the
+tile-invalidation gotcha under *Serving, caching and the HTTP layer*.
+
 **Gotcha — serving tables store rows, not id references.** They copy the columns
 needed to render a feature instead of pointing back at the source by id or
 rowid. BDOT10k's identity is the composite `(PRZESTRZENNAZW, LOKALNYID)`, and
@@ -421,6 +433,39 @@ the paired queue-delete. Both sides must use that same stored value, never
 wasn't seen by this tick) and be picked up by the next one. Using `now()` on
 either side — or two different timestamps — either strands a cell dirty forever
 or deletes a queue row for a change the recompute never read.
+`jobs::tile_refresh` follows the same convention for `tile_dirty_cells`.
+
+**Gotcha — the batch *is* the transaction, and cancellation commits.** One
+`BEGIN`/`COMMIT` per `drain_batch`, not per cell: 512 commits per batch, each a
+WAL append and flush, is the wrong ratio against ~0.098 s of real work per cell.
+Three things make that safe, and none of them is obvious:
+
+1. **Cancellation commits rather than rolling back.** Each cell's recompute is
+   paired with its own queue delete, so the transaction is a *grouping of
+   independently valid units* and committing at any cell boundary is correct.
+   `is_cancelled` is still polled between cells. Rolling back instead would
+   redo that work every tick and on every shutdown.
+2. **A failed batch replays one cell at a time.** A poison cell would otherwise
+   stall the queue forever, since nothing gets deleted. The replay isolates it,
+   warns, leaves it queued, and drains everything else — and costs a second
+   pass over one batch only when something actually failed.
+3. **The conflict surface does not widen with transaction size.** The only
+   table shared with a concurrent dataset refresh is `match_dirty_cells`
+   (`tile_dirty_cells` is append-vs-append), and append-vs-delete-of-different-
+   rows is not a conflict for DuckDB's optimistic CC. `drain_refresh_concurrency`
+   drives `drain_batch` directly and is the standing evidence.
+
+A queue row naming a source `dataset::spec_by_name` does not know is **purged**,
+not skipped: filtering it out of the read alone would leave it in the table
+forever, inflating `/status`'s queue depth with work nothing will ever do.
+
+**Gotcha — `tile_dirty_cells` is deliberately keyed unlike `match_dirty_cells`.**
+No `source` (a tile is source-agnostic — it renders all three) and no `cell_z`
+(always `CHANGE_CELL_ZOOM`, the granularity every producer already computes).
+One row per changed cell. Do not "make it consistent" with the match queue:
+the extra columns would only ever be constants, and de-duplicating across
+sources at read time is the whole reason the tile job's per-tick work stays
+small.
 
 **Gotcha — dirty-queue source strings must match everywhere.**
 `match_dirty_cells.source` is a plain string (`"bdot10k"` / `"egib"` / `"prg"`),
@@ -461,7 +506,7 @@ silent. Four further things:
 
 Do not confuse this with the two unrelated "3x3" mechanisms: `compare::addresses`'
 grid-key neighbourhood (a different 0.005° grid) and
-`serving_version::z14_tile_version`'s read-time ring (exact by the
+`server::tile_dirty::tiles_for_cell`'s z14 invalidation ring (exact by the
 `filter_oversized_geometry` invariant — **must not be narrowed**).
 
 ### Mappings
@@ -722,6 +767,31 @@ twice per drained cell. Both now wrap the source scan in a `candidates` CTE via 
    for an RTREE walk to beat a sequential scan — whereas a z14 cell is
    ~1/340,000. Both full paths *want* their sequential scan.
 
+**Gotcha — the `tiles` column family is the one that opts out of everything
+the others do.** It holds rendered z12–z14 `/tiles` bodies
+(`server::tile_store`), and three of its settings look like oversights next to
+the four OSM families:
+
+1. **Compression is `None`, not Zstd.** Values arrive already gzipped (see the
+   serving section below), so compressing them again burns CPU on every write
+   and every compaction for nothing.
+2. **It has its own block cache** (`rocksdb_tile_block_cache_mb`, default 256),
+   so a browsing session's tile blocks can never evict the OSM node blocks
+   `update osm` reads on every minutely diff.
+3. **Adding it did NOT bump `KV_FORMAT_VERSION`**, deliberately: it changes no
+   existing key or value layout, `create_missing_column_families(true)` is
+   already set, and bumping would force a ~12-minute `import osm` on deploy for
+   nothing. Its guard is instead a per-value `tile_store::TILE_VALUE_FORMAT`
+   whose mismatch decodes as a **miss** — the opposite policy to the one below,
+   because the recovery costs differ by four orders of magnitude (one
+   re-render vs a full re-import).
+
+`kvstore::clear` drops it along with everything else, which is correct: a
+re-import rebuilds every OSM table, so every match decision changes anyway.
+`kvstore::clear_tiles` empties just this family, and is what `tiles clear` and
+`TileStore::clear` call — it goes through `make_cf_opts` rather than
+`Options::default()` precisely so a recreate cannot silently re-enable Zstd.
+
 **Gotcha — the RocksDB store's byte layout is versioned, because none of it is
 self-describing.** `kvstore::KV_FORMAT_VERSION` exists for one reason: an old
 store read by a new binary decodes to *plausible* garbage rather than failing. An
@@ -795,62 +865,66 @@ Pinned by `failed_import_does_not_stamp_replication_metadata`.
 
 ### Serving, caching and the HTTP layer
 
-**Gotcha — the serving version has one home.** `serving_version::z14_tile_version`
-folds a global `serving_epoch` counter together with the per-cell `*_unmatched`
-state visible from a tile. Bump rule: **bump wherever a table `/tiles` reads and
-no per-cell version tracks is rewritten.**
+**Gotcha — tile invalidation is *pushed*, and the rule is about what a site
+changes.** There is no read-time freshness check anywhere: `server::tile_store`
+is authoritative and a hit is served as-is. What keeps it correct is that every
+site changing what a tile renders enqueues the affected z14 cell.
 
-1. **Bump sites**: the `import` dispatch's bdot10k/egib/prg/full arms;
-   `update::dataset::refresh`'s apply transaction; both mapping loaders, each
-   inside the loader itself in the same swap transaction as its `DELETE`+`INSERT`
-   rather than at either call site; and `compare::run`'s `Full` target (pure
-   insurance so a cached `ETag` can't survive an offline rebuild).
-2. **Must-not-bump — this list matters more than the one above.** Bumping here
-   would be silently "correct" while defeating the whole point of the `ETag`:
-   `update::record_noop_refresh` (an ETag-unchanged poll rewrote nothing, so
-   bumping would flush the world's cached tiles daily, three times over, for
-   nothing); the mapping jobs' own ETag-match early returns, which `return`
-   strictly *before* calling into the loader — which is also why putting the bump
-   inside the loader gets this right for free; `queue reconcile`, which only
-   enqueues for a drain whose per-cell recompute already moves `computed_at`;
-   `import osm`/`update osm`, since `/tiles` reads no `osm_*` table directly —
-   bumping would flush every tile in the country on every minutely update; and
-   single-source `compare buildings`/`compare addresses`, whose `*_unmatched`
-   rewrite already moves its own per-cell `computed_at`. `POST /report` is on this
-   list too — the insert enqueues the object's cell, so per-cell `computed_at`
-   covers it, and bumping would flush every tile once per report.
-3. **The `*_all` legend layers and the adjacency `nb` CTEs are epoch-only, and
-   that's sound rather than a gap.** They read the raw source tables, never the
-   serving tables, so per-cell `computed_at` never moves for them; the `nb` CTEs
-   specifically read a *neighbouring* cell's raw rows, which no cell-local version
-   could cover even in principle. The only writers of those raw tables are
-   `import` and `refresh` — both already bump sites.
-4. **The version is a per-table `(count, max(computed_at))` pair per source, never
-   one merged `max`.** With a single merged max: a cell holding 3 bdot10k rows at
-   T0 and 5 prg rows at T1 reads version `...T1...`; the drain then recomputes
-   bdot10k down to zero rows — a real, common mutation — and the merged max is
-   *still* T1, because prg's never moved. Same version, three buildings gone. The
-   per-table pair is faithful by construction: a recompute either inserts ≥1 row
-   (its max moves) or 0 (its count drops). Pinned by
-   `version_changes_when_a_cell_empties_out`.
-5. **The 3x3-cell ring is an invariant enforced by
-   `dataset::filter_oversized_geometry`, not a guess.** Rows are *selected* for a
-   tile by `ST_Intersects` but *tagged* with the cell of their representative
-   point, so a tile can render rows owned by a neighbour. The oversize filter makes
-   a surviving building's reach `<= 1` by construction, so radius 1 is exactly
-   enough.
-6. **`serving_version::TILE_FORMAT_VERSION` must be bumped by hand whenever the
+> A site enqueues `tile_dirty_cells` iff it changes **what a tile renders**.
+> It enqueues `match_dirty_cells` iff it changes **which objects are
+> unmatched**.
+
+Most producers do both. Two do exactly one, and they are the test of the rule:
+
+| site | tile | match | why |
+|---|---|---|---|
+| `update::changeset::insert_dirty_cells` (refresh apply txn) | ✓ | ✓ | the raw tables changed, so the `*_all` layers are stale the moment the apply commits — before any drain, and even if the delta changes no match decision |
+| `compare::drain::drain_batch` (in the batch txn) | ✓ | — | `*_unmatched` changed; it *is* the match recompute |
+| `reports::` insert / revoke / expire / import | ✓ | ✓ | `reported` is computed at serve time on layers that read the raw tables, which no drain touches |
+| `mappings::street_names::validate_and_swap` | ✓ | ✓ | resolved at serve time *and* a match input |
+| `mappings::building_types::validate_and_swap` | ✓ | — | serving-time only; the match rule reads no classification column |
+| `update::dirty_cells::note_existing` (OSM) | — | ✓ | `/tiles` reads no `osm_*` table, so an OSM edit reaches a tile only through the drain |
+| `compare::reconcile` (`queue reconcile`) | — | ✓ | changes nothing itself; the drain it feeds does the enqueueing |
+
+To enumerate the producers, grep rather than trusting this table:
+`grep -rn 'tile_dirty_cells' src/`.
+
+Four further points:
+
+1. **Producers enqueue the bare changed cell**, never a pre-expanded tile list.
+   `server::tile_dirty::tiles_for_cell` is the one home for turning a cell into
+   tile keys, which keeps the queue an eleventh the size and the ring/parent
+   asymmetry in one place.
+2. **The expansion is per-tier, and the asymmetry is load-bearing.** z14
+   selects rows by *geometry* while tagging them by their representative
+   point's cell, so it renders rows its neighbours own and a changed cell
+   dirties the **3×3 ring**; radius 1 is exact by
+   `dataset::filter_oversized_geometry`'s invariant, not a margin. z12–z13
+   select by *cell range* (`cell_x BETWEEN`), so each is an exact function of
+   the cells beneath it and a changed cell dirties exactly **one parent per
+   zoom**, a pure bit shift. A ring at z12 is waste; a parent-only expansion at
+   z14 leaves eight neighbours permanently stale, silently.
+3. **What has no dirty cell must wipe the store instead.** `import <source>`
+   and `compare <any target>` — not just `full` — rewrite what tiles render
+   nationally while enqueueing nothing, so `main.rs`'s dispatch calls
+   `clear_tile_store` after each. A single-source `compare buildings` is
+   included deliberately: it rewrites `bdot10k_unmatched` across the whole
+   country.
+4. **`server::tiles::TILE_FORMAT_VERSION` must be bumped by hand whenever the
    MVT SQL changes shape** — a new attribute, a renamed one, a different
-   simplification. Nothing about *rows* changed, so neither the epoch nor any
-   `computed_at` moves on its own; without this, a binary that changes what a tile
-   *contains* keeps producing the same version string, every cached `ETag` keeps
-   matching, and every existing client serves the stale shape forever with no way
-   to self-heal.
-7. **`refresh`'s placement is deliberate.** The bump runs **inside** the apply
-   transaction, so a rollback can't leave a bumped epoch describing a delta that
-   never landed, and it is **unconditional** — it fires even on a zero-delta
-   refresh, because the raw columns `/tiles` reads that sit outside
-   `compared_columns` are recomputed for every staged row and can have moved.
+   simplification. Nothing about the *rows* changed, so no invalidation fires
+   on its own; the constant lives next to the SQL it describes and is stamped
+   into every stored value, so a mismatch is a miss and the tile re-renders.
+   Without it, every warmed tile keeps its old shape until something unrelated
+   dirties its cell.
+
+`jobs::tile_refresh` drains the queue in **two passes per tick, and the split
+matters**: pass 1 deletes the affected keys and records which existed, pass 2
+re-renders only those. Deleting is microseconds per key while rendering is
+milliseconds, so a large invalidation clears in seconds but takes far longer to
+re-render — in one pass, tiles at the back of the queue would serve stale bytes
+for that whole time. Re-rendering only store-resident keys is also what keeps
+background load proportional to what has actually been rendered.
 
 **Gotcha — the HTTP cache layer has one home too.** `src/server/http_cache.rs`
 builds every `Cache-Control` and `ETag` this server sends — nothing else should
@@ -878,21 +952,123 @@ list: a 404 is left header-less and inherits `no-store`, while anything `ServeDi
 actually served — including its own `304` — gets at least `no-cache`, with
 `/fonts/` and `/vendor/` upgraded to a long `max-age`.
 
-`TileCache::new(0)` is a genuine working no-op, not a special-cased `Option`:
-`max_bytes == 0` makes every `get` miss and every `insert` a no-op before either
-touches the lock, so `tile_cache_max_bytes = 0` reverts the feature via config
-alone. The cache is keyed on `(z, x, y)` with the version stored **inside** the
-entry rather than folded into the key, so a recompute makes the next `get` a miss
-and the following `insert` *replaces* it in place — there is never a dead,
-superseded-version entry counted against the budget waiting for eviction.
-`tiles::z14_tile_response` is the single response-shaping path for every
-successful z14 response, fresh *or* cached, precisely so a cache hit cannot differ
-from a miss on status, headers, or the **empty-tile 204** — a z14 tile over open
-country renders no features at all, the common case across most of Poland.
-`z14_response_shaping_is_identical_for_empty_and_cached_empty_tiles` records a
-real bug caught in review: an earlier draft returned a bare 200 from the cached
-path, making an open-country tile flip between 204 and 200 depending purely on
-cache residency.
+**Gotcha — three tiers, two caches, and the tier boundary is not where it
+looks.** z12–z14 are *persisted* in RocksDB (`server::tile_store`), push-
+invalidated, and content-hash-`ETag`ged; z5–z11 lives in a RAM TTL cache
+(`server::tile_cache`). Both `TileStore::disabled()` and `TileCache::new(0, ttl)`
+are genuine working no-ops rather than special-cased `Option`s, so
+`persist_tiles = false` / `tile_cache_max_bytes = 0` revert either feature by
+config alone. Five things to keep straight:
+
+1. **The z5–z11 TTL must be the same config field as that tier's `max-age`.**
+   `server::agg_tile_ttl` reads `cache.agg_tile_max_age_seconds`, which is
+   exactly what `http_cache` builds its `Cache-Control` from. That equality *is*
+   the soundness proof for caching a tier whose content moves with the clock:
+   the server can never hold a copy staler than one every browser is already
+   entitled to hold under the header we ourselves sent. That field also supplies
+   z12–z13's `max-age`, where it carries no such proof and is merely a shared
+   default — so if it is ever split, the z5–z11 equality is the half that is
+   load-bearing.
+2. **`tiles::tile_body_response` is the single response-shaping path** for every
+   successful tile, from either cache or a fresh render, so residency cannot
+   change status, headers, or bytes. Both caches hold the *same* `TileBody`, so
+   that path needs no per-tier branch.
+3. **There is no empty-tile 204, and adding one would be a regression.**
+   `ST_AsMVT` emits a layer header even over zero features, so an in-range tile
+   always has bytes — 23 of them (`empty_tile_returns_ok_not_500` pins this
+   against an empty database). `finish_tile_response`'s empty-bytes 204 branch
+   fires only for the out-of-range zoom dispatch. "Empty tile ⇒ 204" is the
+   convention in other tile servers and is exactly the assumption to not import
+   here. **The z12–z13 query has to work for that**, because it groups: a bare
+   `GROUP BY tx, ty` emits no row at all for a tile holding nothing, and a
+   missing row is not an empty tile. `points_mvt_sql` drives its groups from
+   the requested tile list (`env LEFT JOIN proj`) and drops the join's null row
+   with a `FILTER`, so an empty group still produces those 23 bytes. Pinned by
+   `a_points_batch_answers_for_every_requested_tile_including_empty_ones`.
+4. **The store is not consulted for z5–z11 and the RAM cache is not consulted
+   above z11.** Sharing one cache across tiers with different invalidation
+   stories is the bug the split exists to prevent.
+5. **z12–z13 renders a *batch* of tiles per query, and a request is a batch of
+   one.** `tiles::points_mvt_sql` is the only copy of that SQL — 253 z13 tiles
+   cost 41 ms as one query against 1121 ms one at a time (**27×**), and the
+   batching is free at a batch of one, which is what let it replace the
+   per-tile query instead of sitting beside it. Two things follow. Callers must
+   batch **same-zoom, spatially coherent** runs: the query bounds its scan by
+   the batch's cell range before joining to the exact tile list, so a scattered
+   batch reads a bounding box nobody asked for, and a batch mixing zooms would
+   render at the wrong one rather than fail. And a batch fails as a unit —
+   `tiles warm` and `jobs::tile_refresh` both degrade to "those tiles stay
+   unwarmed / stale", which is the same outcome a per-tile failure had, just
+   coarser. **z14 has no batched form**: it selects by geometry, so a row
+   belongs to several tiles and batching it needs a fan-out join across four
+   layers including the adjacency CTEs. Its ~13 ms fixed floor per tile makes
+   that the bigger prize and its own change.
+
+**Gotcha — tiles are stored in the form they are served: gzipped.** This server
+does no other response compression (`tower-http` is built with
+`["fs", "set-header"]`), so before this the reverse proxy gzipped every tile on
+every request; compressing once at level 9 at render time removes that and
+shrinks the store at once. Five consequences, each with a silent failure mode:
+
+- **`Vary: Accept-Encoding` is mandatory** and rides on the 304 as well as the
+  200 — one URL now has two representations.
+- **The identity fallback is not dead code.** `curl` and most monitoring probes
+  send no `Accept-Encoding`; they get an on-the-fly gunzip.
+- **`Accept-Encoding` is token-parsed** (`http_cache::accepts_gzip`), never
+  substring-matched: `gzip;q=0` is a refusal, and `contains("gzip")` would read
+  it as consent.
+- **The `ETag` hashes the *uncompressed* bytes**, so it identifies content
+  rather than encoding — which is what makes one weak validator honest across
+  both representations, and what stops a `flate2` version bump from
+  invalidating every client's cache. It is FNV-1a 64 by hand because
+  `DefaultHasher` is not stable across Rust releases.
+
+- **`orig_len` is stored explicitly**, since a gzip of zero bytes is ~20 bytes
+  and the payload length therefore cannot answer "did the render produce
+  nothing".
+
+**Gotcha — every MVT query sorts, and dropping the `ORDER BY` breaks the
+`ETag` silently rather than loudly.** `ST_AsMVT` emits features in whatever
+order the scan produced, which under a parallel scan is not stable — measured
+before the sort existed: a z12 tile re-rendered with `match_refresh` disabled,
+so `*_unmatched` provably could not have changed, came back the same length
+with 331 bytes different and a new `ETag`. Since the `ETag` is a content hash,
+that handed a 200 to every client revalidating a tile `tile_refresh` had merely
+touched. `server::tiles::deterministic_mvt_order_sql` is the one home for the
+sort and carries the measurements; five things about it:
+
+1. **The key is `(ST_YMin, ST_XMin, the whole row)` on the *tile-space*
+   geometry.** The row as the final tiebreak is what makes it a total order
+   over *distinguishable* rows by construction — two rows tying on it are equal
+   structs, so their features are byte-identical and their order cannot matter.
+   Explicit identity columns would be provably total for three of the four z14
+   layers and only *probably* so for `buildings_all`, whose `LOKALNYID` is
+   unique by measurement rather than by schema, and the row measured free.
+2. **Y before X is a compression decision**, not a spelling. Tiles are stored
+   and served gzipped: over a 253-tile z13 batch, `(y, x)` is −5.0% against
+   unordered while `(x, y)` is **+2.1%** and `ST_Hilbert` — the obvious
+   spatial-locality answer — is worse still.
+3. **Raw tile size is order-invariant at z12/z13 and *not* at z14.** Geometry
+   deltas never cross a feature boundary, so reordering cannot move the
+   geometry bytes; but `ST_AsMVT` interns attribute values once per layer and
+   references them by varint index, so on a layer with a large dictionary the
+   order decides which values get one-byte indices. Measured: byte-identical
+   raw lengths across five orderings at z12/z13, −0.9% to −1.7% at z14.
+4. **The cost lands on cheap tiles, not dense ones.** A one-object z14 tile
+   goes 12.7 → 17.1 ms (+33%: four sorted aggregates over almost nothing) while
+   the densest pay +6.6%. Budget ~15 extra CPU-minutes on a full-country
+   `tiles warm`.
+5. **The validator stays weak regardless.** Weak is what lets one `ETag` serve
+   both the gzip and the identity representation of the same tile; determinism
+   is a separate property and `weak_etag`'s doc should not be read as licence
+   to drop the sort.
+
+Adding the sort did **not** bump `TILE_FORMAT_VERSION`, deliberately: a tile
+stored in the old order is still a correct tile, so forcing a national
+re-render to fix feature order would be a large cost for no client-visible
+change. Each tile picks up the new order the first time something dirties its
+cell, and its `ETag` moves once and then holds. An operator who wants the
+smaller bytes sooner runs `tiles clear` + `tiles warm`.
 
 **Gotcha — cancellation has two signals and one message, and `Ok` vs `Err` is
 per-path, never a style choice.** Ctrl+C/SIGTERM sets a process-global flag

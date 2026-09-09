@@ -151,15 +151,18 @@ fn test_update_bdot10k_unchanged_snapshot_is_a_noop() {
     assert_eq!(cells, 0);
 }
 
-/// A landed refresh rewrites raw columns (`centroid`) `/tiles`' adjacency
-/// CTE reads outside the diffed row set, so `update::dataset::refresh` must
-/// bump `metadata.serving_epoch` on every landed refresh, not just a
-/// non-empty diff -- see `serving_version`'s module doc. `import` itself
-/// also bumps (pinned by `cli_import_bdot10k`'s twin test), so this asserts
-/// the epoch moved again on top of that, i.e. `update` bumps too rather than
-/// relying on the import's earlier bump.
+/// A landed refresh must enqueue the cells it touched into `tile_dirty_cells`,
+/// end to end through the real CLI.
+///
+/// The tile half is not implied by the match half: a refresh rewrites the raw
+/// source tables, which `/tiles`' `addresses_all`/`buildings_all` layers read
+/// directly, so those layers are stale the moment the apply commits -- before
+/// any drain runs, and regardless of whether the delta changed a match
+/// decision. `import` deliberately enqueues nothing (it wipes the store
+/// instead -- see `cli_import_bdot10k`'s twin test), so a non-empty queue here
+/// can only have come from the refresh.
 #[test]
-fn test_update_bdot10k_bumps_serving_epoch() {
+fn test_update_bdot10k_enqueues_dirty_tiles() {
     let (cfg, _dir, db_path) = file_config();
 
     cmd()
@@ -174,17 +177,19 @@ fn test_update_bdot10k_bumps_serving_epoch() {
         .assert()
         .success();
 
-    let epoch_after_import: String = {
+    let queued_after_import: i64 = {
         let conn = duckdb::Connection::open(&db_path).unwrap();
         conn.execute_batch("INSTALL spatial; LOAD spatial;")
             .unwrap();
-        conn.query_row(
-            "SELECT value FROM metadata WHERE key = 'serving_epoch'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("import must bump metadata.serving_epoch")
+        conn.query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
     };
+    assert_eq!(
+        queued_after_import, 0,
+        "an import wipes the store rather than enqueueing, so the queue starts empty"
+    );
 
     cmd()
         .args([
@@ -201,16 +206,14 @@ fn test_update_bdot10k_bumps_serving_epoch() {
     let conn = duckdb::Connection::open(&db_path).unwrap();
     conn.execute_batch("INSTALL spatial; LOAD spatial;")
         .unwrap();
-    let epoch_after_update: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'serving_epoch'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("update must also bump metadata.serving_epoch");
-    assert_ne!(
-        epoch_after_import, epoch_after_update,
-        "update must move the epoch again on top of import's own bump"
+    let queued_after_update: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        queued_after_update > 0,
+        "a landed refresh must enqueue the cells it touched for tile regeneration"
     );
 }
 

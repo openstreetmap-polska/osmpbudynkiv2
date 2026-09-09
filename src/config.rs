@@ -37,6 +37,13 @@ pub struct Config {
     pub rocksdb_path: String,
     pub rocksdb_block_cache_mb: u64,
     pub rocksdb_write_buffer_mb: u64,
+    /// Block-cache size for the `tiles` column family only. Deliberately
+    /// separate from `rocksdb_block_cache_mb`: tile blocks and OSM node blocks
+    /// have unrelated access patterns, and sharing one cache would let a
+    /// browsing session evict the nodes `update osm` reads on every minutely
+    /// diff. Stored values are already gzipped, so this holds 3-4x more tiles
+    /// than the same budget would hold raw MVT.
+    pub rocksdb_tile_block_cache_mb: u64,
     pub log_level: String,
     pub http_listen_addr: String,
     /// Directory the `run` HTTP server serves static frontend assets from
@@ -218,6 +225,36 @@ impl Default for MatchRefreshConfig {
     }
 }
 
+/// `jobs.tile_refresh` — drains `tile_dirty_cells` (see `server::tile_dirty`),
+/// deleting resident stale tiles from `server::tile_store::TileStore` and
+/// re-rendering only those. See `server::jobs::tile_refresh` for the two-pass
+/// design. Mirrors `MatchRefreshConfig`'s shape and defaults on purpose: the
+/// two queues share the same "drain what's dirty, oldest first, bounded per
+/// tick" pattern, just against a different table and a different store.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct TileRefreshConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    /// See `JobConfig::run_on_start`.
+    pub run_on_start: bool,
+    /// Max number of distinct dirty `(cell_x, cell_y)` processed per tick.
+    pub batch_size: usize,
+}
+
+impl Default for TileRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 10,
+            timeout_seconds: 300,
+            run_on_start: true,
+            batch_size: 256,
+        }
+    }
+}
+
 /// Periodic `enqueue_all` sweep — the design's safety net against a dropped
 /// enqueue (design ~line 282).
 ///
@@ -365,12 +402,24 @@ pub struct CacheConfig {
     /// range per font and never change in place, so they're safe to mark
     /// `immutable` and cache for a year.
     pub font_max_age_seconds: u64,
-    /// Maximum size in bytes of the in-process z14 `/tiles` response cache
-    /// (`server::tile_cache::TileCache`) -- see that module's doc for the
-    /// two-generation eviction design. Setting this to `0` disables the
-    /// cache entirely: `TileCache::new(0)` is a genuine no-op (every lookup
-    /// misses, every insert drops), not a placeholder that still allocates.
+    /// Maximum size in bytes of the in-process z5..=z11 `/tiles` response
+    /// cache (`server::tile_cache::TileCache`) -- see that module's doc for
+    /// the two-generation eviction design. Setting this to `0` disables the
+    /// cache entirely: `TileCache::new(0, ttl)` is a genuine no-op (every
+    /// lookup misses, every insert drops), not a placeholder that still
+    /// allocates.
+    ///
+    /// The default holds that whole tier several times over: z5..=z11 is
+    /// ~4,260 tiles, ~20 MB gzipped for all of Poland. z12..=z14 does not
+    /// live here at all -- it is persisted in RocksDB by
+    /// `server::tile_store`.
     pub tile_cache_max_bytes: u64,
+    /// Whether z12..=z14 `/tiles` bodies are persisted to the `tiles` RocksDB
+    /// column family. `false` makes `TileStore` a genuine no-op (every lookup
+    /// misses, every write drops) and every tile renders cold, which is the
+    /// escape hatch if the store is ever suspected of serving stale bytes --
+    /// `tiles clear` is the other.
+    pub persist_tiles: bool,
 }
 
 impl Default for CacheConfig {
@@ -381,7 +430,8 @@ impl Default for CacheConfig {
             updates_max_age_seconds: 60,
             static_max_age_seconds: 604_800,
             font_max_age_seconds: 31_536_000,
-            tile_cache_max_bytes: 268_435_456,
+            tile_cache_max_bytes: 67_108_864,
+            persist_tiles: true,
         }
     }
 }
@@ -395,6 +445,7 @@ pub struct JobsConfig {
     pub egib_update: JobConfig,
     pub prg_update: JobConfig,
     pub match_refresh: MatchRefreshConfig,
+    pub tile_refresh: TileRefreshConfig,
     pub match_reconcile: MatchReconcileConfig,
     pub reports_reconcile: ReportsReconcileConfig,
     pub street_mappings_update: JobConfig,
@@ -419,6 +470,7 @@ impl Default for JobsConfig {
             // PRG streams ~16 GML files out of a ~1.7GB zip, so it needs longer.
             prg_update: daily(7200),
             match_refresh: MatchRefreshConfig::default(),
+            tile_refresh: TileRefreshConfig::default(),
             match_reconcile: MatchReconcileConfig::default(),
             reports_reconcile: ReportsReconcileConfig::default(),
             street_mappings_update: JobConfig {
@@ -503,6 +555,7 @@ impl Default for Config {
             rocksdb_path: "./osmpbudynkiv2.rocksdb".to_string(),
             rocksdb_block_cache_mb: 512,
             rocksdb_write_buffer_mb: 64,
+            rocksdb_tile_block_cache_mb: 256,
             log_level: "info".to_string(),
             http_listen_addr: "127.0.0.1:3000".to_string(),
             web_dir: "./web".to_string(),
@@ -720,6 +773,7 @@ osm_replication = "https://example.com/replication"
         assert_eq!(config.rocksdb_path, "./osmpbudynkiv2.rocksdb");
         assert_eq!(config.rocksdb_block_cache_mb, 512);
         assert_eq!(config.rocksdb_write_buffer_mb, 64);
+        assert_eq!(config.rocksdb_tile_block_cache_mb, 256);
     }
 
     #[test]
@@ -731,6 +785,7 @@ osm_replication = "https://example.com/replication"
 rocksdb_path = "/custom/rocksdb"
 rocksdb_block_cache_mb = 256
 rocksdb_write_buffer_mb = 32
+rocksdb_tile_block_cache_mb = 64
 "#
         )
         .unwrap();
@@ -739,6 +794,7 @@ rocksdb_write_buffer_mb = 32
         assert_eq!(config.rocksdb_path, "/custom/rocksdb");
         assert_eq!(config.rocksdb_block_cache_mb, 256);
         assert_eq!(config.rocksdb_write_buffer_mb, 32);
+        assert_eq!(config.rocksdb_tile_block_cache_mb, 64);
     }
 
     #[test]
@@ -785,6 +841,10 @@ file_path = "/data/TERC.zip"
         assert_eq!(config.jobs.match_refresh.interval_seconds, 30);
         assert_eq!(config.jobs.match_refresh.timeout_seconds, 300);
         assert_eq!(config.jobs.match_refresh.batch_size, 512);
+        assert!(config.jobs.tile_refresh.enabled);
+        assert_eq!(config.jobs.tile_refresh.interval_seconds, 10);
+        assert_eq!(config.jobs.tile_refresh.timeout_seconds, 300);
+        assert_eq!(config.jobs.tile_refresh.batch_size, 256);
         // Off by default on purpose: a sweep enqueues ~339k cells, which the
         // drain cannot absorb at its current per-cell cost, and would starve
         // fresh OSM edits behind it. See MatchReconcileConfig.
@@ -1118,7 +1178,8 @@ street_mappings = "https://example.test/m.csv"
         assert_eq!(config.cache.updates_max_age_seconds, 60);
         assert_eq!(config.cache.static_max_age_seconds, 604_800);
         assert_eq!(config.cache.font_max_age_seconds, 31_536_000);
-        assert_eq!(config.cache.tile_cache_max_bytes, 268_435_456);
+        assert_eq!(config.cache.tile_cache_max_bytes, 67_108_864);
+        assert!(config.cache.persist_tiles);
     }
 
     #[test]
@@ -1140,7 +1201,8 @@ tile_max_age_seconds = 30
         assert_eq!(config.cache.updates_max_age_seconds, 60);
         assert_eq!(config.cache.static_max_age_seconds, 604_800);
         assert_eq!(config.cache.font_max_age_seconds, 31_536_000);
-        assert_eq!(config.cache.tile_cache_max_bytes, 268_435_456);
+        assert_eq!(config.cache.tile_cache_max_bytes, 67_108_864);
+        assert!(config.cache.persist_tiles);
     }
 
     #[test]

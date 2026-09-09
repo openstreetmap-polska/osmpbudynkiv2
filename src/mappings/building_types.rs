@@ -158,6 +158,101 @@ fn staged_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Enqueue the tile cells of every building whose classification key changed
+/// in this reload. Must run **before** the swap's `DELETE`: the live table's
+/// pre-swap contents are half the symmetric difference and are gone a
+/// statement later.
+///
+/// Mirrors `street_names::enqueue_mapping_delta_cells`, with one deliberate
+/// difference: this mapping enqueues **tiles only, never matches**. The match
+/// rule reads no classification column (`unmatched_buildings_sql` does not
+/// touch these tables), so a building-type edit cannot change which objects
+/// are unmatched -- it changes only what a tile draws. That asymmetry is the
+/// sharpest test of CLAUDE.md's tile-invalidation rule, and a `compare`,
+/// reconcile or drain here would be pure waste.
+///
+/// Affected buildings are exactly those carrying a changed key: `max_neighbours`
+/// counts same-class neighbours *of the building being rendered*, so an
+/// adjacency edit reaches nothing outside that set, and `tiles_for_cell`'s ring
+/// covers a tile's reach into its neighbours.
+///
+/// The classification columns are unindexed, so this is a full scan of the
+/// source table per reload. Accepted: the job is off by default and this is a
+/// rare operator action. A common key legitimately collapsing the delta to most
+/// of the country is the answer being correct, not the query misbehaving.
+fn enqueue_mapping_delta_cells(
+    conn: &Connection,
+    source: &BuildingTypeSource,
+    clean: &str,
+) -> Result<i64> {
+    // The source table is created by `import bdot10k`/`import egib`, so it is
+    // legitimately absent when `import building-types` runs first on a fresh
+    // database. Probe the catalog rather than swallowing a query error, which
+    // would silently skip the enqueue forever instead of just once.
+    let source_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = ?",
+            duckdb::params![source.source_table],
+            |r| r.get(0),
+        )
+        .context("Failed to probe for the building-type source table")?;
+    if source_exists == 0 {
+        return Ok(0);
+    }
+
+    let cx = crate::tile_math::cell_x_sql("b.centroid");
+    let cy = crate::tile_math::cell_y_sql("b.centroid");
+    let t1 = source.tier1_source_column;
+    let t2 = source.tier2_source_column.unwrap_or(t1);
+    // Only this source's own tiers are matched: tier 2 collapses onto tier 1
+    // for EGIB, which has no second cascade tier, so the second arm is a
+    // harmless duplicate of the first there rather than a wrong join.
+    let tier2_arm = if source.tier2_source_column.is_some() {
+        format!("OR (c.tier = 2 AND lower(trim(b.{t2})) = c.key)")
+    } else {
+        String::new()
+    };
+
+    let n = conn
+        .execute(
+            &format!(
+                "INSERT INTO tile_dirty_cells (cell_x, cell_y, enqueued_at)
+                 WITH rows_live AS (
+                     SELECT tier, key, min_levels, max_levels, max_neighbours, tags
+                     FROM {dest}
+                 ),
+                 rows_new AS (
+                     SELECT tier, key, min_levels, max_levels, max_neighbours, tags
+                     FROM {clean}
+                 ),
+                 -- Each EXCEPT must be parenthesized: EXCEPT and UNION share
+                 -- precedence and are left-associative, so the unparenthesized
+                 -- form silently parses as ((A EXCEPT B) UNION B) EXCEPT A,
+                 -- not the symmetric difference this needs. Correctness, not
+                 -- style. (EXCEPT also compares NULLs as equal, which is what
+                 -- keeps unchanged rows with NULL bounds out of the delta.)
+                 changed AS (
+                     (SELECT * FROM rows_live EXCEPT SELECT * FROM rows_new)
+                     UNION
+                     (SELECT * FROM rows_new EXCEPT SELECT * FROM rows_live)
+                 ),
+                 keys AS (SELECT DISTINCT tier, key FROM changed)
+                 -- `b.centroid` is the stored representative point, never
+                 -- ST_Centroid(b.geom) inline: an RTREE index cannot be used
+                 -- through a function wrapped around the indexed column.
+                 SELECT DISTINCT {cx}, {cy}, now()
+                 FROM {src} b JOIN keys c
+                   ON (c.tier = 1 AND lower(trim(b.{t1})) = c.key) {tier2_arm}
+                 WHERE b.centroid IS NOT NULL",
+                dest = source.mapping_table,
+                src = source.source_table,
+            ),
+            [],
+        )
+        .context("Failed to enqueue dirty tiles for changed building-type mappings")?;
+    Ok(n as i64)
+}
+
 fn validate_and_swap(
     conn: &Connection,
     source: &BuildingTypeSource,
@@ -367,22 +462,20 @@ fn validate_and_swap(
 
     conn.execute_batch("BEGIN TRANSACTION")
         .context("Failed to begin building-type mapping swap")?;
-    // Same funnel, same reasoning as `street_names::load_from_path`: this
-    // mapping is applied at serve time with no dirty cell and no recompute,
-    // so a landed swap needs the global epoch to reach `/tiles` at all.
-    // `.context()` bridges `duckdb::Error` to `anyhow::Error` so the swap and
-    // the bump chain through the same `Result` type, folding the bump into
-    // the swap's own fallible value so it commits or rolls back atomically
-    // with it below.
-    let swap = conn
-        .execute_batch(&format!(
+    // Same funnel, same reasoning as `street_names::load_from_path`: the delta
+    // must be computed before the DELETE below discards the live rows it needs
+    // to diff against, and it is chained into the swap's own fallible value so
+    // the two land or roll back together. `.context()` bridges `duckdb::Error`
+    // to `anyhow::Error` so the calls' error types line up.
+    let swap = enqueue_mapping_delta_cells(conn, source, &clean).and_then(|_| {
+        conn.execute_batch(&format!(
             "DELETE FROM {dest};
          INSERT INTO {dest} (tier, key, min_levels, max_levels, max_neighbours, tags)
          SELECT tier, key, min_levels, max_levels, max_neighbours, tags FROM {clean};",
             dest = source.mapping_table
         ))
         .context("Failed to apply building-type mapping swap")
-        .and_then(|()| crate::serving_version::bump_serving_epoch(conn));
+    });
     match swap {
         Ok(()) => conn
             .execute_batch("COMMIT")
@@ -595,17 +688,12 @@ mod tests {
 
     #[test]
     fn drift_reports_keys_absent_from_source_and_uncovered_source_keys() {
-        let conn = setup_db();
-        conn.execute_batch(
-            "CREATE TABLE bdot10k_buildings (
-                 LOKALNYID VARCHAR, geom GEOMETRY,
-                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR);
-             INSERT INTO bdot10k_buildings VALUES
-                 ('a', NULL, 'budynek gospodarczy', 'budynki mieszkalne'),
-                 ('b', NULL, 'garaż', 'budynki mieszkalne'),
-                 ('c', NULL, 'nieznana funkcja', 'nieznana kategoria');",
-        )
-        .unwrap();
+        let conn = setup_db_with_bdot10k_buildings(
+            "INSERT INTO bdot10k_buildings VALUES
+                 ('a', NULL, NULL, 'budynek gospodarczy', 'budynki mieszkalne'),
+                 ('b', NULL, NULL, 'garaż', 'budynki mieszkalne'),
+                 ('c', NULL, NULL, 'nieznana funkcja', 'nieznana kategoria');",
+        );
         // Covers 'budynek gospodarczy' (tier 1) and 'budynki mieszkalne' via
         // tier 2 as a fallback for the rows tier 1 doesn't cover ('garaż' has
         // no tier-1 row here, but tier 2 covers it; 'nieznana funkcja' has
@@ -670,35 +758,116 @@ mod tests {
         assert_eq!(rows[0].1, "budynek gospodarczy");
     }
 
-    /// This mapping changes what `/tiles` renders (the building `tags`
-    /// attribute) with no dirty cell and no recompute, so a landed load must
-    /// bump the global serving epoch -- see `serving_version`'s module doc.
-    #[test]
-    fn successful_load_bumps_the_serving_epoch() {
+    /// A minimal `bdot10k_buildings` fixture carrying the one column
+    /// `enqueue_mapping_delta_cells` reads besides the classification columns:
+    /// `centroid`, the stored representative point (see CLAUDE.md's "bdot10k/
+    /// egib's representative point is a stored column" gotcha -- an RTREE
+    /// index cannot be used through a function wrapped around the indexed
+    /// column, so the real table stores it rather than computing
+    /// `ST_Centroid(geom)` inline, and this fixture must too or the query
+    /// referencing `b.centroid` fails to bind).
+    fn setup_db_with_bdot10k_buildings(rows_sql: &str) -> Connection {
         let conn = setup_db();
-        assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            0
+        conn.execute_batch(&format!(
+            "CREATE TABLE bdot10k_buildings (
+                 LOKALNYID VARCHAR, geom GEOMETRY, centroid GEOMETRY,
+                 PRZEWAZAJACAFUNKCJABUDYNKU VARCHAR, FUNKCJAOGOLNABUDYNKU VARCHAR);
+             {rows_sql}"
+        ))
+        .unwrap();
+        conn
+    }
+
+    fn dirty_tile_cell_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn dirty_match_cell_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM match_dirty_cells", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// This mapping load changes what `/tiles` renders (the building `tags`
+    /// attribute) for the one building carrying the classification key it
+    /// sets, so a landed load must enqueue that building's cell into
+    /// `tile_dirty_cells` -- there is no drain or recompute to catch this
+    /// otherwise, since the match rule never reads a classification column.
+    #[test]
+    fn successful_load_enqueues_the_changed_cell_into_tile_dirty_cells() {
+        use crate::tile_math::{CHANGE_CELL_ZOOM, lonlat_to_tile};
+
+        let conn = setup_db_with_bdot10k_buildings(
+            "INSERT INTO bdot10k_buildings VALUES
+                 ('1', ST_Point(21.0, 52.0), ST_Point(21.0, 52.0), 'a', 'a');",
         );
+        assert_eq!(dirty_tile_cell_count(&conn), 0);
+
         let f = write_csv(BDOT_HEADER, "1,a,,,,building=yes\n");
         load_from_path(&conn, &BDOT10K, f.path()).unwrap();
+
+        let (cell_x, cell_y) = lonlat_to_tile(21.0, 52.0, CHANGE_CELL_ZOOM);
+        let cells: Vec<(i32, i32)> = {
+            let mut stmt = conn
+                .prepare("SELECT cell_x, cell_y FROM tile_dirty_cells")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
         assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            1
+            cells,
+            vec![(cell_x as i32, cell_y as i32)],
+            "the one building carrying the newly-mapped key must be the one \
+             cell enqueued"
         );
     }
 
     /// Mirror of `a_bad_load_leaves_the_previous_table_untouched`: a rejected
-    /// load must not claim the serving state moved when nothing was
-    /// actually swapped in.
+    /// load must not enqueue a tile cell for a mapping swap that never
+    /// happened.
     #[test]
-    fn failed_load_does_not_bump_the_serving_epoch() {
-        let conn = setup_db();
+    fn failed_load_enqueues_no_tile_dirty_cells() {
+        let conn = setup_db_with_bdot10k_buildings(
+            "INSERT INTO bdot10k_buildings VALUES
+                 ('1', ST_Point(21.0, 52.0), ST_Point(21.0, 52.0), 'a', 'a');",
+        );
         let bad = write_csv(BDOT_HEADER, "1,a,,,,man_made=silo\n");
         load_from_path(&conn, &BDOT10K, bad.path()).unwrap_err();
+        assert_eq!(dirty_tile_cell_count(&conn), 0);
+    }
+
+    /// The sharpest test of CLAUDE.md's tile-invalidation rule (and the point
+    /// of converting this whole test module): the match rule
+    /// (`rule::unmatched_buildings_sql`) reads no classification column at
+    /// all, so a building-type edit can never change which objects are
+    /// unmatched -- only what a tile draws. A change here must therefore land
+    /// exclusively in `tile_dirty_cells`, with `match_dirty_cells` left
+    /// completely untouched, unlike `street_names::enqueue_mapping_delta_cells`
+    /// (a genuine match input) which feeds both.
+    #[test]
+    fn a_building_type_edit_dirties_tiles_but_never_match_decisions() {
+        let conn = setup_db_with_bdot10k_buildings(
+            "INSERT INTO bdot10k_buildings VALUES
+                 ('1', ST_Point(21.0, 52.0), ST_Point(21.0, 52.0), 'a', 'a');",
+        );
+        let first = write_csv(BDOT_HEADER, "1,a,,,,building=yes\n");
+        load_from_path(&conn, &BDOT10K, first.path()).unwrap();
+
+        let second = write_csv(BDOT_HEADER, "1,a,,,,building=house\n");
+        load_from_path(&conn, &BDOT10K, second.path()).unwrap();
+
+        assert!(
+            dirty_tile_cell_count(&conn) > 0,
+            "the edit must dirty at least one tile"
+        );
         assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            0
+            dirty_match_cell_count(&conn),
+            0,
+            "a building-type edit must never enqueue a match recompute -- \
+             the match rule reads no classification column, so it cannot \
+             change which objects are unmatched"
         );
     }
 }

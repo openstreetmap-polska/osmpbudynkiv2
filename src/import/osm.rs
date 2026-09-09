@@ -752,7 +752,7 @@ mod tests {
 
     fn run_import_with_fixture(conn: &Connection, pbf_path: &Path) -> Result<()> {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let kv = Arc::new(kvstore::open(tmp_dir.path(), 512, 64)?);
+        let kv = Arc::new(kvstore::open(tmp_dir.path(), 512, 64, 8)?);
         crate::osm::udf::register_udfs(conn, kv.clone())?;
         let config = Config::default();
         import(conn, &kv, &config, Some(pbf_path), "")?;
@@ -1048,7 +1048,7 @@ mod tests {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(Path::new(":memory:"), &init_commands, None).unwrap();
         let tmp_dir = tempfile::tempdir().unwrap();
-        let kv = Arc::new(kvstore::open(tmp_dir.path(), 512, 64).unwrap());
+        let kv = Arc::new(kvstore::open(tmp_dir.path(), 512, 64, 8).unwrap());
         let config = Config::default();
 
         let result = import(

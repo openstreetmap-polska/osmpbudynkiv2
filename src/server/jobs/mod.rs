@@ -15,6 +15,7 @@ pub mod reports_reconcile;
 pub mod retention_prune;
 pub mod status_handler;
 pub mod street_mappings_update;
+pub mod tile_refresh;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -479,7 +480,7 @@ mod tests {
         let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
         let pool = crate::server::build_pool(conn, 2).expect("build pool");
         let dir = tempfile::tempdir().expect("tempdir");
-        let kv = Arc::new(crate::osm::kvstore::open(dir.path(), 8, 4).expect("kvstore open"));
+        let kv = Arc::new(crate::osm::kvstore::open(dir.path(), 8, 4, 8).expect("kvstore open"));
         let cfg = Arc::new(AppConfig::default());
         (pool, kv, cfg, dir)
     }

@@ -1,20 +1,28 @@
-//! A bounded in-process byte cache for served z14 `/tiles` responses.
+//! A bounded in-process byte cache for served z5..=z11 `/tiles` responses.
 //!
-//! z14 only -- see `tiles::serve_tile`'s comment on why z5..=z13 carry no
-//! `ETag` at all, which is exactly the signal this cache invalidates against.
-//! A viewport refresh in MapLibre requests ~16 adjacent tiles at once; without
-//! this, that's ~16 full MVT query rounds even when nothing in the covered
-//! cells changed since the same viewport was requested a few seconds earlier.
-//! This trades a bounded slice of process memory for skipping those.
+//! This tier only. z12..=z14 are persisted in `tile_store` and
+//! push-invalidated by every write path that changes what one of those tiles
+//! renders -- see that module's doc and CLAUDE.md's producer list. z5..=z11
+//! cannot use that scheme: `server::tiles::agg_bin_ctes` bounds each tile's
+//! `ts_*` attributes by `now() - [changes] max_age_days`, so a tile's content
+//! moves with the wall clock even when not one row underneath it has changed.
+//! There is no write that could push-invalidate that -- the only thing that
+//! changed is what time it is -- so a TTL is not a simpler substitute for a
+//! push signal here, it is the only correct tool. A viewport refresh in
+//! MapLibre requests ~16 adjacent tiles at once; without this, that's ~16 full
+//! aggregate-query rounds even when nothing this tier reads has changed since
+//! the same viewport was requested a few seconds earlier. This trades a
+//! bounded slice of process memory for skipping those.
 //!
 //! # Disabling
 //!
-//! [`TileCache::new(0)`] is a genuine working no-op, not a special-cased
-//! `Option<TileCache>` at the call site: every [`TileCache::get`] misses
-//! (`max_bytes == 0` short-circuits before touching the lock) and every
-//! [`TileCache::insert`] is a no-op for the same reason. Setting
-//! `tile_cache_max_bytes = 0` in config therefore reverts to the pre-cache
-//! behaviour with no code path change and no redeploy beyond the config edit.
+//! [`TileCache::new(0, ttl)`] is a genuine working no-op, not a
+//! special-cased `Option<TileCache>` at the call site: every
+//! [`TileCache::get`] misses (`max_bytes == 0` short-circuits before touching
+//! the lock) and every [`TileCache::insert`] is a no-op for the same reason.
+//! Setting `tile_cache_max_bytes = 0` in config therefore reverts to the
+//! pre-cache behaviour with no code path change and no redeploy beyond the
+//! config edit.
 //!
 //! # Design: two generations, not an LRU
 //!
@@ -26,9 +34,9 @@
 //!   the last couple of *viewports* (not individual tiles within one) survive
 //!   between bursts.
 //! - `lru` bounds by entry count, not bytes. This cache has to be
-//!   byte-bounded (tile sizes vary a lot -- a real Kraków z14 tile measured
-//!   650 KB), which means writing the eviction accounting by hand regardless
-//!   of whether an LRU crate is doing the list-splicing underneath.
+//!   byte-bounded (tile sizes vary a lot), which means writing the eviction
+//!   accounting by hand regardless of whether an LRU crate is doing the
+//!   list-splicing underneath.
 //!
 //! So instead: a `hot` generation and a `cold` generation. Everything new
 //! lands in `hot`. A read that only finds the key in `cold` *promotes* it
@@ -54,17 +62,32 @@
 //! invariant reachable at all: without a cap, one huge tile could jump `hot`
 //! from just under half straight past the full budget in a single insert.
 //!
-//! # Key and invalidation
+//! # TTL
 //!
-//! Keyed on `(z, x, y)`, with the version string that produced the entry's
-//! bytes stored *inside* the entry rather than folded into the key. A
-//! recompute of the tile's cell then makes a `get` at the new version a
-//! **miss** against the stale entry, and the `insert` that follows
-//! *replaces* it in place -- there is never a dead, superseded-version entry
-//! sitting in the map, still counted against the budget, waiting for byte
-//! eviction to notice nobody wants it. Folding the version into the key
-//! instead would leave exactly that dead entry resident until eviction got
-//! around to it.
+//! Keyed on `(z, x, y)` alone -- there is no version to fold in, because
+//! there is nothing that changes to version against (see above). Freshness is
+//! instead an [`std::time::Instant`] stamped on each entry at insert time,
+//! checked against `self.ttl` on every [`TileCache::get`]. The TTL is not an
+//! independent tuning knob: it is set from `cache.agg_tile_max_age_seconds`,
+//! the exact same config field `http_cache` uses to build this tier's
+//! `Cache-Control: max-age`. That equality is the whole soundness argument --
+//! it guarantees this cache can never hand back a copy staler than one every
+//! browser talking to this server is already entitled to hold under the
+//! header we ourselves send, so the two must never be split into separate
+//! knobs that could drift apart. (The same field also supplies z12..=z13's
+//! max-age, where it carries no such proof -- those tiers read `tile_store`,
+//! not this cache, and the field is merely a shared default there. If the
+//! field is ever split in two, this tier's half is the one the proof is
+//! about.)
+//!
+//! An entry past its TTL is a miss, exactly like the key being absent; the
+//! stale entry is left in place for the next [`TileCache::insert`] to
+//! overwrite rather than being cleaned up on the read path. An expired entry
+//! therefore keeps counting against the byte budget until it is either
+//! overwritten or aged out by a generation swap -- there is no eager sweep.
+//! That's sufficient: the budget is sized for residency, not for freshness,
+//! and a swap already happens on the same rhythm viewport bursts do, so a
+//! stale entry cannot occupy space indefinitely any more than a live one can.
 //!
 //! # No single-flight
 //!
@@ -83,29 +106,34 @@
 //! tool for. Reaching for the async mutex anyway would only add executor
 //! overhead for no correctness benefit.
 //!
-//! Bytes are stored as [`axum::body::Bytes`] rather than `Vec<u8>` so a hit
-//! clones a refcounted handle (a few atomic increments) instead of copying a
-//! tile that can run several hundred KB.
+//! Bodies are stored as [`TileBody`], i.e. gzip bytes plus the uncompressed
+//! length, so the byte budget below counts compressed bytes -- the same form
+//! `tile_store` persists and the same form the response body sends verbatim.
+//! `TileBody::gzip` is `axum::body::Bytes`, so a hit clones a refcounted
+//! handle (a few atomic increments) instead of copying a tile that can run
+//! several hundred KB.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use super::tile_store::TileBody;
 
-/// `(z, x, y)`. `z` is always 14 from today's one caller (`tiles::serve_tile`),
-/// but keeping it in the key rather than assuming z14 costs nothing and
-/// avoids a silent collision if this cache is ever reused for another tier.
+/// `(z, x, y)`. `z` is always in `5..=11` from today's one caller
+/// (`tiles::serve_tile`), but keeping it in the key rather than assuming a
+/// fixed zoom costs nothing and avoids a silent collision if this cache is
+/// ever reused for another tier.
 type Key = (u32, u32, u32);
 
 struct Entry {
-    version: String,
-    bytes: Bytes,
+    inserted: Instant,
+    body: TileBody,
 }
 
 impl Entry {
     fn size(&self) -> u64 {
-        self.bytes.len() as u64
+        self.body.size()
     }
 }
 
@@ -122,15 +150,17 @@ struct Generations {
 /// See the module doc for the full design rationale.
 pub struct TileCache {
     max_bytes: u64,
+    ttl: Duration,
     state: Mutex<Generations>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
 
 impl TileCache {
-    pub fn new(max_bytes: u64) -> Self {
+    pub fn new(max_bytes: u64, ttl: Duration) -> Self {
         Self {
             max_bytes,
+            ttl,
             state: Mutex::new(Generations {
                 hot: HashMap::new(),
                 hot_bytes: 0,
@@ -152,12 +182,12 @@ impl TileCache {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A hit requires both the key and the stored version to match -- see
-    /// the module doc's "Key and invalidation" section. A version mismatch
-    /// is a miss, exactly like the key being absent; the stale entry is left
-    /// in place for the next [`TileCache::insert`] to overwrite rather than
+    /// A hit requires the key to be present with an entry that has not yet
+    /// aged past `self.ttl` -- see the module doc's "TTL" section. An expired
+    /// entry is a miss, exactly like the key being absent; it is left in
+    /// place for the next [`TileCache::insert`] to overwrite rather than
     /// being cleaned up here.
-    pub fn get(&self, key: Key, version: &str) -> Option<Bytes> {
+    pub fn get(&self, key: Key) -> Option<TileBody> {
         if self.max_bytes == 0 {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -165,25 +195,25 @@ impl TileCache {
         let mut state = self.state();
 
         if let Some(entry) = state.hot.get(&key)
-            && entry.version == version
+            && entry.inserted.elapsed() < self.ttl
         {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            return Some(entry.bytes.clone());
+            return Some(entry.body.clone());
         }
 
-        let cold_matches = state
+        let cold_fresh = state
             .cold
             .get(&key)
-            .is_some_and(|entry| entry.version == version);
-        if cold_matches {
+            .is_some_and(|entry| entry.inserted.elapsed() < self.ttl);
+        if cold_fresh {
             // Promote: a cold hit is exactly the case the two-generation
             // design exists for (see module doc) -- move it into hot so it
             // survives whatever swap `cold` itself next goes through.
             let entry = state.cold.remove(&key).expect("just matched above");
             self.hits.fetch_add(1, Ordering::Relaxed);
-            let bytes = entry.bytes.clone();
+            let body = entry.body.clone();
             place_in_hot(&mut state, self.max_bytes, key, entry);
-            return Some(bytes);
+            return Some(body);
         }
 
         self.misses.fetch_add(1, Ordering::Relaxed);
@@ -194,11 +224,14 @@ impl TileCache {
     /// entry bigger than a quarter of the budget -- see the module doc's
     /// invariant explanation for why that cap is load-bearing, not merely
     /// defensive.
-    pub fn insert(&self, key: Key, version: String, bytes: Bytes) {
+    pub fn insert(&self, key: Key, body: TileBody) {
         if self.max_bytes == 0 {
             return;
         }
-        let entry = Entry { version, bytes };
+        let entry = Entry {
+            inserted: Instant::now(),
+            body,
+        };
         if entry.size() > self.max_bytes / 4 {
             return;
         }
@@ -215,7 +248,8 @@ impl TileCache {
     }
 
     /// Cache misses since process start (including every lookup while the
-    /// cache is disabled via `max_bytes == 0`).
+    /// cache is disabled via `max_bytes == 0`, and every lookup of an
+    /// entry past its TTL).
     pub fn misses(&self) -> u64 {
         self.misses.load(Ordering::Relaxed)
     }
@@ -262,74 +296,85 @@ impl TileCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
 
-    fn bytes(n: usize) -> Bytes {
-        Bytes::from(vec![0u8; n])
+    /// An exact-size body: `tile_store::prepare` gzips its input, so its
+    /// output size does not track the input size -- the budget tests here
+    /// depend on exact sizes, so this builds a `TileBody` directly instead.
+    fn body(n: usize) -> TileBody {
+        TileBody {
+            orig_len: n as u32,
+            gzip: Bytes::from(vec![0u8; n]),
+        }
     }
+
+    const LONG_TTL: Duration = Duration::from_secs(300);
 
     #[test]
     fn new_with_zero_budget_disables_cleanly() {
-        let cache = TileCache::new(0);
+        let cache = TileCache::new(0, LONG_TTL);
         // Must not panic.
-        cache.insert((14, 1, 1), "v1".to_string(), bytes(10));
-        assert!(cache.get((14, 1, 1), "v1").is_none());
+        cache.insert((7, 1, 1), body(10));
+        assert!(cache.get((7, 1, 1)).is_none());
         assert_eq!(cache.hits(), 0);
         assert_eq!(cache.misses(), 1);
     }
 
     #[test]
-    fn get_with_a_version_mismatch_is_a_miss() {
-        let cache = TileCache::new(1_000);
-        cache.insert((14, 1, 1), "v1".to_string(), bytes(10));
+    fn an_entry_past_its_ttl_is_a_miss() {
+        let cache = TileCache::new(1_000, Duration::from_millis(1));
+        cache.insert((7, 1, 1), body(10));
+        std::thread::sleep(Duration::from_millis(20));
 
-        assert!(cache.get((14, 1, 1), "v2").is_none());
+        assert!(cache.get((7, 1, 1)).is_none());
         assert_eq!(cache.misses(), 1);
         assert_eq!(cache.hits(), 0);
+    }
 
-        // The current, matching version is still there afterwards -- a
-        // mismatched lookup must not have disturbed the real entry.
-        assert!(cache.get((14, 1, 1), "v1").is_some());
+    #[test]
+    fn an_entry_within_its_ttl_is_a_hit() {
+        let cache = TileCache::new(1_000, LONG_TTL);
+        cache.insert((7, 1, 1), body(10));
+
+        let got = cache.get((7, 1, 1)).expect("must hit within the TTL");
+        assert_eq!(got.gzip.len(), 10);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 0);
     }
 
     #[test]
     fn entry_larger_than_a_quarter_of_the_budget_is_refused() {
-        let cache = TileCache::new(400); // quarter = 100
-        cache.insert((14, 1, 1), "v1".to_string(), bytes(101));
-        assert!(cache.get((14, 1, 1), "v1").is_none());
+        let cache = TileCache::new(400, LONG_TTL); // quarter = 100
+        cache.insert((7, 1, 1), body(101));
+        assert!(cache.get((7, 1, 1)).is_none());
     }
 
     #[test]
-    fn insert_with_a_new_version_replaces_rather_than_duplicates_the_entry() {
-        let cache = TileCache::new(10_000);
-        cache.insert((14, 1, 1), "v1".to_string(), bytes(50));
-        cache.insert((14, 1, 1), "v2".to_string(), bytes(80));
+    fn insert_replaces_rather_than_duplicating_the_entry() {
+        let cache = TileCache::new(10_000, LONG_TTL);
+        cache.insert((7, 1, 1), body(50));
+        cache.insert((7, 1, 1), body(80));
 
-        assert!(
-            cache.get((14, 1, 1), "v1").is_none(),
-            "the superseded version must no longer be servable"
-        );
-        let got = cache
-            .get((14, 1, 1), "v2")
-            .expect("the new version must hit");
-        assert_eq!(got.len(), 80);
+        let got = cache.get((7, 1, 1)).expect("must hit");
+        assert_eq!(got.gzip.len(), 80);
         assert_eq!(
             cache.resident_bytes(),
             80,
-            "must not still be counting the superseded version's bytes -- \
-             that would mean a second entry, not a replacement"
+            "must not still be counting the replaced entry's bytes -- that \
+             would mean a second entry, not a replacement"
         );
     }
 
     #[test]
     fn stays_under_budget_and_peak_resident_never_exceeds_max_bytes_across_many_inserts() {
         let max_bytes = 10_000u64;
-        let cache = TileCache::new(max_bytes);
+        let cache = TileCache::new(max_bytes, LONG_TTL);
         let mut peak = 0u64;
         for i in 0..500u32 {
             // Sizes vary but always stay comfortably under the quarter-budget
             // refusal threshold (2_500), so every insert here is accepted.
             let size = 100 + (i % 20) as usize * 50;
-            cache.insert((14, i, i), format!("v{i}"), bytes(size));
+            cache.insert((7, i, i), body(size));
             peak = peak.max(cache.resident_bytes());
         }
         assert!(
@@ -347,32 +392,30 @@ mod tests {
         // max_bytes = 40: quarter = 10 (every entry below is exactly that,
         // the largest size this budget accepts), half = 20 (the hot->cold
         // swap threshold).
-        let cache = TileCache::new(40);
-        let k1 = (14, 1, 1);
-        let k2 = (14, 2, 2);
-        let k3 = (14, 3, 3);
-        let k4 = (14, 4, 4);
+        let cache = TileCache::new(40, LONG_TTL);
+        let k1 = (7, 1, 1);
+        let k2 = (7, 2, 2);
+        let k3 = (7, 3, 3);
+        let k4 = (7, 4, 4);
 
-        cache.insert(k1, "v1".to_string(), bytes(10)); // hot: {k1}=10
-        cache.insert(k2, "v1".to_string(), bytes(10)); // hot: {k1,k2}=20
-        cache.insert(k3, "v1".to_string(), bytes(10)); // 20+10>20 -> swap: cold={k1,k2}, hot={k3}=10
+        cache.insert(k1, body(10)); // hot: {k1}=10
+        cache.insert(k2, body(10)); // hot: {k1,k2}=20
+        cache.insert(k3, body(10)); // 20+10>20 -> swap: cold={k1,k2}, hot={k3}=10
 
         // k1 now lives only in cold.
         assert_eq!(cache.hits(), 0);
-        let got = cache
-            .get(k1, "v1")
-            .expect("k1 must still be cached, in cold");
-        assert_eq!(got.len(), 10);
+        let got = cache.get(k1).expect("k1 must still be cached, in cold");
+        assert_eq!(got.gzip.len(), 10);
         assert_eq!(cache.hits(), 1);
         // Promotion moved it: hot: {k3,k1}=20, cold: {k2}.
 
-        cache.insert(k4, "v1".to_string(), bytes(10)); // 20+10>20 -> swap: cold={k3,k1}, hot={k4}=10
+        cache.insert(k4, body(10)); // 20+10>20 -> swap: cold={k3,k1}, hot={k4}=10
 
         // Without the promotion above, k1 would have been dropped wholesale
         // along with the rest of the OLD cold ({k1,k2}) by this second swap.
         // It wasn't -- it rode along inside hot and is now in the NEW cold.
         assert!(
-            cache.get(k1, "v1").is_some(),
+            cache.get(k1).is_some(),
             "a promoted cold hit must survive the next generation swap"
         );
     }

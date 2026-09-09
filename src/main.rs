@@ -10,7 +10,6 @@ mod mappings;
 mod osm;
 mod reports;
 mod server;
-mod serving_version;
 mod shutdown;
 mod tile_math;
 mod update;
@@ -42,6 +41,7 @@ fn main() -> Result<()> {
         Path::new(&config.rocksdb_path),
         config.rocksdb_block_cache_mb,
         config.rocksdb_write_buffer_mb,
+        config.rocksdb_tile_block_cache_mb,
     )?);
     let conn = db::init_db(
         Path::new(&config.db_path),
@@ -61,7 +61,8 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Import { source } => {
-            import::run(&conn, &kv, source, &config, &config.download_urls)?
+            import::run(&conn, &kv, source, &config, &config.download_urls)?;
+            clear_tile_store(&kv)?;
         }
         Command::Update { source } => {
             // The CLI has no job supervisor to cancel it, unlike the
@@ -81,7 +82,10 @@ fn main() -> Result<()> {
                 &|| false,
             )?
         }
-        Command::Compare { target } => compare::run(&conn, target)?,
+        Command::Compare { target } => {
+            compare::run(&conn, target)?;
+            clear_tile_store(&kv)?;
+        }
         Command::Queue { action } => compare::run_queue(&conn, action)?,
         Command::Reports { action } => reports::run(&conn, action)?,
         Command::Init {
@@ -124,7 +128,9 @@ fn main() -> Result<()> {
             compare::run(&conn, cli::CompareTarget::Full)?;
             shutdown::check_requested()?;
             compare::run_queue(&conn, cli::QueueAction::Drain { batch_size: 512 })?;
+            clear_tile_store(&kv)?;
         }
+        Command::Tiles { action } => server::tile_warm::run(&conn, kv.clone(), action, &config)?,
         Command::Run => {
             let rt = tokio::runtime::Runtime::new()?;
             let config = Arc::new(config);
@@ -132,5 +138,24 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Empty the rendered-tile store after an offline command that rewrote what
+/// tiles render without enqueueing anything.
+///
+/// `import <source>` rebuilds a raw source table wholesale and `compare <any
+/// target>` rewrites `*_unmatched` nationally; neither produces dirty cells,
+/// and with no read-time freshness check left, every warmed tile would
+/// otherwise be stale forever. `compare buildings` and `compare addresses` are
+/// included deliberately, not just `full`: a single-source compare still
+/// rewrites its serving table across the whole country.
+///
+/// Done here in the dispatch rather than inside the loaders, so there is one
+/// obvious place per command rather than a wipe buried in each arm. Both
+/// commands hold exclusive DB access, so this races nothing.
+fn clear_tile_store(kv: &osm::kvstore::RocksDB) -> anyhow::Result<()> {
+    osm::kvstore::clear_tiles(kv)?;
+    info!("Cleared the rendered-tile store; run `tiles warm` to repopulate it");
     Ok(())
 }

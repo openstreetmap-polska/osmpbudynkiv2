@@ -23,12 +23,12 @@ pub fn run(
         ImportSource::Bdot10k { file } => {
             bdot10k::import(conn, config, file.as_deref(), &urls.bdot10k)?;
             reconcile_reports(conn, &crate::dataset::BDOT10K);
-            bump_serving_epoch(conn)
+            Ok(())
         }
         ImportSource::Egib { file } => {
             egib::import(conn, config, file.as_deref(), &urls.egib)?;
             reconcile_reports(conn, &crate::dataset::EGIB);
-            bump_serving_epoch(conn)
+            Ok(())
         }
         ImportSource::Prg { file, terc_file } => {
             prg::import(
@@ -39,7 +39,7 @@ pub fn run(
                 &urls.prg,
             )?;
             reconcile_reports(conn, &crate::dataset::PRG);
-            bump_serving_epoch(conn)
+            Ok(())
         }
         ImportSource::StreetMappings { file, url } => {
             run_street_mappings_import(conn, config, file, url.as_deref(), &urls.street_mappings)
@@ -111,7 +111,7 @@ pub fn run(
             ] {
                 reconcile_reports(conn, spec);
             }
-            bump_serving_epoch(conn)
+            Ok(())
         }
     }
 }
@@ -311,17 +311,4 @@ fn reconcile_reports(conn: &Connection, spec: &crate::dataset::DatasetSpec) {
             "could not reconcile user reports after import; run `reports reconcile`"
         ),
     }
-}
-
-/// Bump the serving epoch after an import rebuilds a dataset table.
-///
-/// `/tiles` reads bdot10k/egib/prg through the `*_unmatched` serving tables
-/// (per-cell versioned, see `serving_version`) but also reads the raw
-/// `bdot10k_buildings`/`egib_buildings`/`prg_addresses` tables directly for
-/// the `*_all` legend layers and the adjacency CTEs — neither of which any
-/// per-cell version can cover. An `import` rewrites those raw tables
-/// wholesale, so it must bump. OSM is exempt — `/tiles` reads no `osm_*`
-/// table (see `serving_version`'s module doc, "Must NOT bump").
-fn bump_serving_epoch(conn: &Connection) -> Result<()> {
-    crate::serving_version::bump_serving_epoch(conn)
 }

@@ -180,7 +180,7 @@ mod tests {
 
     fn setup() -> (TempDir, Connection, Arc<RocksDB>) {
         let tmp = TempDir::new().unwrap();
-        let kv = Arc::new(kvstore::open(tmp.path(), 32, 4).unwrap());
+        let kv = Arc::new(kvstore::open(tmp.path(), 32, 4, 8).unwrap());
 
         // Insert some test nodes (a simple square)
         kvstore::put_node(&kv, 1, dm(20.0), dm(50.0)).unwrap();
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn test_udf_with_large_batch() {
         let tmp = TempDir::new().unwrap();
-        let kv = Arc::new(kvstore::open(tmp.path(), 32, 4).unwrap());
+        let kv = Arc::new(kvstore::open(tmp.path(), 32, 4, 8).unwrap());
 
         for i in 0..5000i64 {
             kvstore::put_node(&kv, i, dm(20.0 + (i as f64) * 0.001), dm(50.0)).unwrap();

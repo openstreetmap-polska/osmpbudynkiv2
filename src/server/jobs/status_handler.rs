@@ -78,6 +78,30 @@ pub fn compute_match_staleness(conn: &Connection) -> Result<MatchStaleness> {
 /// is exhausted, the connection is broken, or `match_dirty_cells` can't be
 /// queried (e.g. missing in a bare test connection) -- the queue is a
 /// secondary diagnostic, not a reason for `/status` to fail.
+/// Depth of the tile-invalidation queue. Degrades to 0 rather than failing
+/// `/status`, same as every other DB read here.
+fn tile_dirty_cells_or_default(state: &AppState) -> i64 {
+    let outcome = (|| -> Result<i64> {
+        let conn = state
+            .pool
+            .get()
+            .context("Failed to acquire pool connection")?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM tile_dirty_cells GROUP BY cell_x, cell_y)",
+            [],
+            |r| r.get(0),
+        )
+        .context("Failed to count dirty tile cells")
+    })();
+    match outcome {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to count dirty tile cells for /status; reporting 0");
+            0
+        }
+    }
+}
+
 fn match_staleness_or_default(state: &AppState) -> MatchStaleness {
     let outcome = (|| -> Result<MatchStaleness> {
         let conn = state
@@ -188,6 +212,20 @@ pub struct StatusResponse {
     /// go through for their DB reads.
     pub tile_cache_hits: u64,
     pub tile_cache_misses: u64,
+    /// The persistent z12..=z14 store's counters. `enabled` distinguishes "no
+    /// hits because nothing is warm" from "no hits because persistence is
+    /// off"; a growing `write_skips` means RocksDB is declining request-path
+    /// writes because compaction is behind, i.e. the disk cannot keep up.
+    /// `bytes` is `rocksdb.estimate-live-data-size` -- an estimate by name.
+    pub tile_store_enabled: bool,
+    pub tile_store_hits: u64,
+    pub tile_store_misses: u64,
+    pub tile_store_write_skips: u64,
+    pub tile_store_bytes: Option<u64>,
+    /// Cells whose tiles are stale and awaiting re-render. Should sit near
+    /// zero; a number that only grows means `tile_refresh` is not keeping up
+    /// (or is disabled), and tiles are being served stale.
+    pub tile_dirty_cells: i64,
     /// User reports by lifecycle state. `active` is the number currently
     /// vetoing objects out of the serving tables; a growing `expired` count is
     /// the registries fixing records people complained about.
@@ -198,13 +236,19 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let jobs = state.registry.snapshot();
     let tile_cache_hits = state.tile_cache.hits();
     let tile_cache_misses = state.tile_cache.misses();
-    let (match_staleness, job_run_log, osm_replication, reports) =
+    let tile_store_enabled = state.tile_store.enabled();
+    let tile_store_hits = state.tile_store.hits();
+    let tile_store_misses = state.tile_store.misses();
+    let tile_store_write_skips = state.tile_store.write_skips();
+    let tile_store_bytes = state.tile_store.live_bytes();
+    let (match_staleness, job_run_log, osm_replication, reports, tile_dirty_cells) =
         tokio::task::spawn_blocking(move || {
             (
                 match_staleness_or_default(&state),
                 job_run_log_or_default(&state),
                 osm_replication_state_or_default(&state),
                 report_counts_or_default(&state),
+                tile_dirty_cells_or_default(&state),
             )
         })
         .await
@@ -216,6 +260,12 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         osm_replication,
         tile_cache_hits,
         tile_cache_misses,
+        tile_store_enabled,
+        tile_store_hits,
+        tile_store_misses,
+        tile_store_write_skips,
+        tile_store_bytes,
+        tile_dirty_cells,
         reports,
     })
 }

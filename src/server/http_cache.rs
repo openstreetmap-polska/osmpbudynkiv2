@@ -7,19 +7,23 @@
 //!
 //! Per-endpoint policy:
 //!
-//! | endpoint | `Cache-Control` | `ETag` |
-//! |---|---|---|
-//! | `/health`, `/status` | `no-store` (API default, see `build_router`) | none |
-//! | `/package` (GET + POST) | `no-store` -- see below, this one is load-bearing | none |
-//! | `/tiles` z14 | `public, max-age=<tile_max_age_seconds>` | weak, from `serving_version::z14_tile_version` |
-//! | `/tiles` z5..=z13 | `public, max-age=<agg_tile_max_age_seconds>` | none -- see `tiles::serve_tile`'s comment on why |
-//! | `/tiles` out-of-range zoom (204) | `public, max-age=`[`OUT_OF_RANGE_ZOOM_MAX_AGE_SECONDS`] | none |
-//! | `/tiles` 500 | none set here -> falls through to the API default `no-store` | none |
-//! | `/updates` | `public, max-age=<updates_max_age_seconds>` | none |
-//! | `web_dir/fonts/**` | `public, max-age=<font_max_age_seconds>, immutable` | none |
-//! | `web_dir/vendor/**` | `public, max-age=<static_max_age_seconds>` | none |
-//! | any other file `web_dir` actually served (`index.html`, `app.js`, `style.css`, favicons) | `no-cache` | none |
-//! | a path under `web_dir` that resolved to nothing (404) | none set here -> `no-store` | none |
+//! | endpoint | `Cache-Control` | `ETag` | `Vary` |
+//! |---|---|---|---|
+//! | `/health`, `/status` | `no-store` (API default, see `build_router`) | none | none |
+//! | `/package` (GET + POST) | `no-store` -- see below, this one is load-bearing | none | none |
+//! | `/tiles` z14 | `public, max-age=<tile_max_age_seconds>` | weak, from `tile_store::content_etag` | `accept-encoding` |
+//! | `/tiles` z12..=z13 | `public, max-age=<agg_tile_max_age_seconds>` | weak, from `tile_store::content_etag` | `accept-encoding` |
+//! | `/tiles` z5..=z11 | `public, max-age=<agg_tile_max_age_seconds>` | none -- its content moves with the wall clock, so no honest validator exists | `accept-encoding` |
+//! | `/tiles` out-of-range zoom (204) | `public, max-age=`[`OUT_OF_RANGE_ZOOM_MAX_AGE_SECONDS`] | none | none |
+//! | `/tiles` 500 | none set here -> falls through to the API default `no-store` | none | none |
+//! | `/updates` | `public, max-age=<updates_max_age_seconds>` | none | none |
+//! | `web_dir/fonts/**` | `public, max-age=<font_max_age_seconds>, immutable` | none | none |
+//! | `web_dir/vendor/**` | `public, max-age=<static_max_age_seconds>` | none | none |
+//! | any other file `web_dir` actually served (`index.html`, `app.js`, `style.css`, favicons) | `no-cache` | none | none |
+//! | a path under `web_dir` that resolved to nothing (404) | none set here -> `no-store` | none | none |
+//!
+//! Every `Cache-Control` value above is unchanged from before tiles were
+//! persisted; only the `ETag` and `Vary` columns moved.
 //!
 //! `/package` is `no-store` for a **correctness** reason, not just
 //! freshness: a cached response never reaches `package::log_export`, so
@@ -38,7 +42,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use tower_http::services::ServeDir;
@@ -106,15 +110,61 @@ impl CacheHeaders {
     }
 }
 
-// --- z14 ETag / conditional 304 -----------------------------------------
-//
-// Only `tiles::serve_tile`'s z14 branch calls any of these -- see that
-// module for why z5..=z13 deliberately don't get an ETag at all. Building
-// the primitive here rather than in `tiles.rs` matches this module's own
-// "one home for every header value" charter (see the module doc above).
+// --- Content negotiation -------------------------------------------------
 
-/// A weak `ETag` for a z14 tile, built from `serving_version::z14_tile_version`'s
-/// output: `W/"<version>"`.
+/// `Vary: Accept-Encoding`, stamped on every `/tiles` response.
+///
+/// `/tiles` bodies are stored gzipped and served verbatim to clients that
+/// accept gzip, gunzipped for those that don't -- so one URL has two
+/// representations and a shared cache without this header could hand gzip to a
+/// client that cannot read it. The reverse proxy emits the same header today
+/// when it does the compressing; moving compression to the origin means the
+/// origin takes ownership of it. It rides on the 304 as well as the 200, since
+/// a revalidation is a response about the same negotiated representation.
+pub const VARY_ACCEPT_ENCODING: HeaderValue = HeaderValue::from_static("accept-encoding");
+
+/// Whether the client will accept a gzip-encoded body.
+///
+/// Token-parsed rather than substring-matched: `Accept-Encoding: gzip;q=0` is
+/// an explicit *refusal*, and a `contains("gzip")` test would read it as
+/// consent and send bytes the client just said it cannot use. A missing header
+/// means no encoding is acceptable beyond identity (RFC 9110 SS12.5.3), which
+/// is the `curl`-with-no-flags case.
+pub fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    value.split(',').any(|part| {
+        let mut fields = part.split(';').map(str::trim);
+        let coding = fields.next().unwrap_or("");
+        if !coding.eq_ignore_ascii_case("gzip") && coding != "*" {
+            return false;
+        }
+        // Any explicit q=0 (in any of its spellings) is a refusal.
+        !fields.any(|f| {
+            f.strip_prefix("q=")
+                .or_else(|| f.strip_prefix("Q="))
+                .is_some_and(|q| q.parse::<f32>().is_ok_and(|q| q <= 0.0))
+        })
+    })
+}
+
+// --- Tile ETag / conditional 304 -----------------------------------------
+//
+// Called by `tiles`' z12..=z14 branch -- the persisted tiers, whose stored
+// content hash is a faithful version. z5..=z11 deliberately gets no `ETag`:
+// its content moves with the wall clock (`dataset_change_areas` is read
+// through a `now() - max_age_days` bound), so no stable validator exists for
+// it and the plain TTL it already has is the honest answer. Building the
+// primitive here rather than in `tiles.rs` matches this module's own "one home
+// for every header value" charter (see the module doc above).
+
+/// A weak `ETag` for a persisted tile, built from
+/// `tile_store::content_etag`'s hash of the tile's uncompressed bytes:
+/// `W/"<hash>"`.
 ///
 /// Weak, not strong: two responses for the same tile are only guaranteed
 /// *semantically* equivalent, never byte-identical -- `ST_AsMVT`'s feature
@@ -189,6 +239,8 @@ pub fn not_modified(etag: HeaderValue, cache_header: HeaderValue) -> Response {
     resp.headers_mut().insert(header::ETAG, etag);
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, cache_header);
+    resp.headers_mut()
+        .insert(header::VARY, VARY_ACCEPT_ENCODING);
     resp
 }
 
@@ -267,6 +319,7 @@ mod tests {
             static_max_age_seconds: 604_800,
             font_max_age_seconds: 31_536_000,
             tile_cache_max_bytes: 268_435_456,
+            persist_tiles: true,
         };
         let headers = CacheHeaders::from_config(&cfg);
         assert_eq!(headers.tile, "public, max-age=60");
@@ -413,5 +466,52 @@ mod tests {
         );
         assert!(resp.headers().get(header::CONTENT_TYPE).is_none());
         assert!(resp.headers().get(header::CONTENT_LENGTH).is_none());
+    }
+    /// `Accept-Encoding` is a token list with quality values, not a string to
+    /// search. Each case below is a real client shape, and the `q=0` ones are
+    /// the reason a `contains("gzip")` test is wrong rather than merely
+    /// sloppy: it would send gzip to a client that explicitly refused it.
+    #[test]
+    fn accept_encoding_is_token_parsed_not_substring_matched() {
+        let cases: &[(Option<&str>, bool)] = &[
+            (None, false),                     // curl's default
+            (Some("gzip"), true),              // the common case
+            (Some("gzip, deflate, br"), true), // every browser
+            (Some("GZIP"), true),              // tokens are case-insensitive
+            (Some("br, gzip;q=0.5"), true),    // accepted, just not preferred
+            (Some("*"), true),                 // wildcard
+            (Some("gzip;q=0"), false),         // explicit refusal
+            (Some("gzip;q=0.0"), false),       // the same, spelled out
+            (Some("br, gzip;q=0"), false),     // refusal among others
+            (Some("deflate"), false),          // some other coding
+            (Some("identity"), false),         // identity only
+            (Some("x-gzip-ish"), false),       // substring, not a token
+        ];
+        for (header_value, expected) in cases {
+            let mut headers = HeaderMap::new();
+            if let Some(v) = header_value {
+                headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(v));
+            }
+            assert_eq!(
+                accepts_gzip(&headers),
+                *expected,
+                "Accept-Encoding: {header_value:?}"
+            );
+        }
+    }
+
+    /// A 304 describes the same negotiated representation as the 200 it
+    /// replaces, so it needs the same `Vary` -- otherwise a shared cache can
+    /// revalidate one encoding and serve the other.
+    #[test]
+    fn a_304_carries_vary_accept_encoding() {
+        let resp = not_modified(
+            HeaderValue::from_static("W/\"abc\""),
+            HeaderValue::from_static("public, max-age=60"),
+        );
+        assert_eq!(
+            resp.headers().get(header::VARY),
+            Some(&VARY_ACCEPT_ENCODING)
+        );
     }
 }

@@ -80,6 +80,14 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
 /// Enqueue one dirty-cell row per distinct z14 cell this refresh touches
 /// (added from staging, removed/modified from both live and staging). Must run
 /// inside the apply transaction so the queue commits atomically with the delta.
+///
+/// Feeds **both** queues from one scan of the same cell set, and the tile half
+/// is not redundant with the match half. A refresh rewrites the raw source
+/// tables, which `/tiles`' `addresses_all`/`buildings_all` layers read
+/// directly -- so those layers are stale the moment the apply commits, before
+/// any drain has run. Waiting for the drain to enqueue the tile would leave a
+/// window where the legend layers show the old rows; and a refresh whose delta
+/// changes no match decision would never close it at all.
 pub fn insert_dirty_cells(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
     let live = spec.table;
     let staging = spec.staging_table();
@@ -111,7 +119,29 @@ pub fn insert_dirty_cells(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
         source = spec.name,
     );
     conn.execute_batch(&sql)
-        .with_context(|| format!("Failed to enqueue dirty cells for {}", spec.name))
+        .with_context(|| format!("Failed to enqueue dirty cells for {}", spec.name))?;
+
+    let tile_sql = crate::server::tile_dirty::enqueue_from_select_sql(
+        "cell_x",
+        "cell_y",
+        &format!(
+            "FROM (
+                 SELECT {sx} AS cell_x, {sy} AS cell_y
+                 FROM {staging} s JOIN diff_added d USING ({keys}) WHERE s.geom IS NOT NULL
+                 UNION
+                 SELECT {lx}, {ly}
+                 FROM {live} l JOIN diff_removed d USING ({keys}) WHERE l.geom IS NOT NULL
+                 UNION
+                 SELECT {sx}, {sy}
+                 FROM {staging} s JOIN diff_modified d USING ({keys}) WHERE s.geom IS NOT NULL
+                 UNION
+                 SELECT {lx}, {ly}
+                 FROM {live} l JOIN diff_modified d USING ({keys}) WHERE l.geom IS NOT NULL
+             )"
+        ),
+    );
+    conn.execute_batch(&tile_sql)
+        .with_context(|| format!("Failed to enqueue dirty tiles for {}", spec.name))
 }
 
 #[cfg(test)]

@@ -183,6 +183,39 @@ fn enqueue_mapping_delta_cells(conn: &Connection) -> Result<i64> {
             [],
         )
         .context("Failed to enqueue dirty cells for changed mappings")?;
+
+    // The tile half of the same delta. A street-name mapping is both a match
+    // input *and* a serve-time lookup: `ADDRESSES_MVT_SQL` resolves `ulica`
+    // through this table on every request, so a mapping edit changes the
+    // rendered label of every affected address immediately -- before, and
+    // independently of, whatever the drain later decides about matching.
+    // Deliberately built from the same CTE text and the same predicate as the
+    // enqueue above; the two must never select different addresses.
+    conn.execute(
+        &format!(
+            "{insert}
+             WITH triples_live AS (
+                 SELECT teryt_simc_code, lower(prg_street_name) AS n, osm_street_name
+                 FROM {MAPPINGS_TABLE}
+             ),
+             triples_new AS (
+                 SELECT teryt_simc_code, lower(prg_street_name) AS n, osm_street_name
+                 FROM {STAGING_TABLE}
+             ),
+             changed AS (
+                 (SELECT * FROM triples_live EXCEPT SELECT * FROM triples_new)
+                 UNION
+                 (SELECT * FROM triples_new EXCEPT SELECT * FROM triples_live)
+             )
+             SELECT DISTINCT {cx}, {cy}, now()
+             FROM prg_addresses p
+             WHERE p.geom IS NOT NULL
+               AND lower(trim(p.ulica)) IN (SELECT DISTINCT n FROM changed)",
+            insert = "INSERT INTO tile_dirty_cells (cell_x, cell_y, enqueued_at)",
+        ),
+        [],
+    )
+    .context("Failed to enqueue dirty tiles for changed mappings")?;
     Ok(n as i64)
 }
 
@@ -275,29 +308,19 @@ fn validate_and_swap(conn: &Connection, path_str: &str) -> Result<LoadStats> {
     // the DELETE below discards the live rows it needs to diff against.
     // Chained via `.context().and_then(...)` (converting the duckdb::Error
     // into anyhow::Error first, so the calls' error types line up) so the
-    // enqueue and the bump are folded into the same fallible value the swap
-    // already is and land or roll back with it below -- this is the one home
-    // for the load (both call sites go through here), so doing either step
-    // anywhere else would risk a second, divergent copy.
-    let swap = enqueue_mapping_delta_cells(conn)
-        .and_then(|cells_enqueued| {
-            conn.execute_batch(&format!(
-                "DELETE FROM {MAPPINGS_TABLE};
+    // enqueue is folded into the same fallible value the swap already is and
+    // lands or rolls back with it below -- this is the one home for the load
+    // (both call sites go through here), so enqueueing anywhere else would
+    // risk a second, divergent copy.
+    let swap = enqueue_mapping_delta_cells(conn).and_then(|cells_enqueued| {
+        conn.execute_batch(&format!(
+            "DELETE FROM {MAPPINGS_TABLE};
              INSERT INTO {MAPPINGS_TABLE} (teryt_simc_code, prg_street_name, osm_street_name)
              SELECT teryt_simc_code, prg_street_name, osm_street_name FROM {STAGING_TABLE};"
-            ))
-            .context("Failed to apply mapping swap")
-            .map(|()| cells_enqueued)
-        })
-        // Even with the per-cell enqueue above, an undrained cell keeps
-        // serving the old match decision alongside the new serve-time
-        // addr:street until the drain catches up, and the addresses_all
-        // legend layer plus z5-z13 tiles are epoch-only (see
-        // `serving_version`'s module doc) -- so this bump is still required
-        // on top of the enqueue, not replaced by it.
-        .and_then(|cells_enqueued| {
-            crate::serving_version::bump_serving_epoch(conn).map(|()| cells_enqueued)
-        });
+        ))
+        .context("Failed to apply mapping swap")
+        .map(|()| cells_enqueued)
+    });
     let cells_enqueued = match swap {
         Ok(cells_enqueued) => {
             conn.execute_batch("COMMIT")
@@ -501,36 +524,58 @@ mod tests {
         );
     }
 
-    /// This mapping changes what `/tiles` renders (`addr:street`) with no
-    /// dirty cell and no recompute, so a landed load must bump the global
-    /// serving epoch -- see `serving_version`'s module doc.
+    /// This mapping load changes what `/tiles` renders (`addr:street`) for
+    /// the one address whose street name it maps, so a landed load must
+    /// enqueue that address's cell into `tile_dirty_cells` too --
+    /// independent of whether the address's match decision moved at all (see
+    /// the tile half of `enqueue_mapping_delta_cells`).
     #[test]
-    fn successful_load_bumps_the_serving_epoch() {
-        let conn = setup_db();
-        assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            0
+    fn successful_load_enqueues_the_changed_cell_into_tile_dirty_cells() {
+        use crate::tile_math::lonlat_to_tile;
+
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES ('1', 'gen. Kruka', ST_Point(21.0, 52.0));",
         );
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 0);
+
         let f = write_csv(",gen. Kruka,Generała Kruka\n");
         load_from_path(&conn, f.path()).unwrap();
+
+        let (cell_x, cell_y) = lonlat_to_tile(21.0, 52.0, CHANGE_CELL_ZOOM);
+        let cells: Vec<(i32, i32)> = {
+            let mut stmt = conn
+                .prepare("SELECT cell_x, cell_y FROM tile_dirty_cells")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
         assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            1
+            cells,
+            vec![(cell_x as i32, cell_y as i32)],
+            "the one address whose mapped street name was just set must be \
+             the one cell enqueued"
         );
     }
 
     /// Mirror of `duplicate_key_rejects_the_load_and_leaves_the_table_untouched`:
-    /// a rejected load must not claim the serving state moved when nothing
-    /// was actually swapped in.
+    /// a rejected load must not enqueue a tile cell for a mapping swap that
+    /// never happened.
     #[test]
-    fn failed_load_does_not_bump_the_serving_epoch() {
-        let conn = setup_db();
+    fn failed_load_enqueues_no_tile_dirty_cells() {
+        let conn = setup_db_with_prg_addresses(
+            "INSERT INTO prg_addresses VALUES ('1', 'gen. Kruka', ST_Point(21.0, 52.0));",
+        );
         let bad = write_csv(",B,Bbb\n,b,Bbb2\n");
         load_from_path(&conn, bad.path()).unwrap_err();
-        assert_eq!(
-            crate::serving_version::read_serving_epoch(&conn).unwrap(),
-            0
-        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     /// Creates `prg_addresses` with the shape `enqueue_mapping_delta_cells`
@@ -721,9 +766,9 @@ mod tests {
         );
     }
 
-    /// Mirror of `failed_load_does_not_bump_the_serving_epoch`: a rejected
-    /// load must not enqueue dirty cells for a mapping swap that never
-    /// happened.
+    /// Mirror of `failed_load_enqueues_no_tile_dirty_cells`: a rejected load
+    /// must not enqueue match dirty cells for a mapping swap that never
+    /// happened either.
     #[test]
     fn failed_load_enqueues_no_cells() {
         let conn = setup_db_with_prg_addresses(
