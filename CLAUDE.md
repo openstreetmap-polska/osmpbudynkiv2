@@ -792,6 +792,36 @@ re-import rebuilds every OSM table, so every match decision changes anyway.
 `TileStore::clear` call — it goes through `make_cf_opts` rather than
 `Options::default()` precisely so a recreate cannot silently re-enable Zstd.
 
+**Gotcha — the block cache rides on the per-family table factory, and setting
+it on the DB-level options does nothing at all.** A `ColumnFamilyDescriptor`'s
+options *replace* the DB-level ones for every column-family-scoped setting
+rather than merging, and the block-based table factory — which is what carries
+`block_cache` — is one of those. A family that sets no factory silently gets
+`Options::default()`'s, which lazily builds its **own 32 MB cache**. No warning,
+no error; the only symptom is `capacity: 32.00 MB` in RocksDB's `LOG`. This ran
+in production for the life of v0.1.2: `rocksdb_block_cache_mb = 512` bought
+three saturated 32 MB caches. Write-up:
+`docs/rocksdb_block_cache_not_applied.md`. Four things:
+
+1. **`make_cf_opts` sets the factory for every family**, and `open` deliberately
+   does *not* set one on `db_opts` — there is a comment there saying so, because
+   adding it back looks like an obvious fix and is inert.
+2. **The OSM families share one `Cache` handle**, which is what
+   `rocksdb_block_cache_mb`'s "shared across all column families" means. A fresh
+   `new_lru_cache` per family would multiply the configured budget by the family
+   count while every *capacity* reading still looked right.
+3. **`RocksDB` is a struct, not a type alias**, and owns its two `Cache`
+   handles. That is not decoration: `clear`/`clear_tiles` recreate a family on a
+   live database, and without the original cache in hand the recreated family
+   falls back to the 32 MB default — so the bug would return after every
+   `tiles clear`. It `Deref`s to the database, so call sites are unaffected.
+4. **The guard is
+   `every_column_family_opens_on_its_configured_block_cache`**, and it must
+   never be configured with 32 MB: that is RocksDB's default, so the capacity
+   assertion would pass for a family that had silently fallen back to it. It
+   also flushes an SST before checking usage, since a memtable read never
+   consults the block cache.
+
 **Gotcha — the RocksDB store's byte layout is versioned, because none of it is
 self-describing.** `kvstore::KV_FORMAT_VERSION` exists for one reason: an old
 store read by a new binary decodes to *plausible* garbage rather than failing. An
@@ -988,21 +1018,61 @@ config alone. Five things to keep straight:
 4. **The store is not consulted for z5–z11 and the RAM cache is not consulted
    above z11.** Sharing one cache across tiers with different invalidation
    stories is the bug the split exists to prevent.
-5. **z12–z13 renders a *batch* of tiles per query, and a request is a batch of
-   one.** `tiles::points_mvt_sql` is the only copy of that SQL — 253 z13 tiles
-   cost 41 ms as one query against 1121 ms one at a time (**27×**), and the
-   batching is free at a batch of one, which is what let it replace the
-   per-tile query instead of sitting beside it. Two things follow. Callers must
-   batch **same-zoom, spatially coherent** runs: the query bounds its scan by
-   the batch's cell range before joining to the exact tile list, so a scattered
-   batch reads a bounding box nobody asked for, and a batch mixing zooms would
-   render at the wrong one rather than fail. And a batch fails as a unit —
-   `tiles warm` and `jobs::tile_refresh` both degrade to "those tiles stay
-   unwarmed / stale", which is the same outcome a per-tile failure had, just
-   coarser. **z14 has no batched form**: it selects by geometry, so a row
-   belongs to several tiles and batching it needs a fan-out join across four
-   layers including the adjacency CTEs. Its ~13 ms fixed floor per tile makes
-   that the bigger prize and its own change.
+5. **Every persisted tier renders a *batch* of tiles per query.**
+   `tiles::render_blocks` groups keys into same-zoom 8×8 blocks under a common
+   ancestor and `render_block` picks the tier's query; `tiles warm` and
+   `jobs::tile_refresh` call nothing else. Measured against rendering the same
+   tiles one at a time: z13 **27×**, and z14 **7.7×** on dense Warsaw, 17× rural,
+   32× on sea. Four things follow.
+
+   - **Blocks are same-zoom and ancestor-aligned.** `render_block` derives every
+     tile's envelope from one `z`, so a mixed-zoom block would render at the
+     wrong zoom rather than fail; and a block's bounding box *is* its ancestor's,
+     which is what keeps the batched source scans reading only the area asked
+     for. `RENDER_BLOCK_SHIFT = 3` also bounds the result set — a dense 64-tile
+     z14 block is ~9.2 MB of MVT in one go.
+   - **A block fails as a unit**, degrading to "those tiles stay unwarmed /
+     stale" — the same outcome a per-tile failure had, only coarser.
+   - **z12–z13 has one SQL text; z14 has two, and that is measured, not
+     sloppy.** `points_mvt_sql` batches for free at a batch of one, so it
+     *replaced* the per-tile query. z14 cannot: `TileScope::Single` vs
+     `Batched` exist because the `buildings` layer's adjacency count is per
+     (building, tile), so `Batched` fans the neighbour set out and groups by
+     `(tx, ty, rid)` — and at one tile that key has a single distinct value, so
+     DuckDB plans a `HASH_JOIN` and materialises the whole `pkg × nb` cross
+     product (71.9 → 202.2 ms on the densest tile). The request path stays on
+     `Single`. Both arms share every predicate, constant and column list; only
+     the wrapper differs.
+   - **The `Single` texts must stay constant**, because `query_mvt_layer` caches
+     the prepared statement on the text and DuckDB re-plans otherwise — worth
+     ~3 ms on every z14 tile. `render_points_tiles` and `query_batched_layer`
+     interpolate their tile lists, so they deliberately use plain `prepare`.
+
+**Gotcha — a batched tile query must materialise `ST_AsMVTGeom` in a CTE
+before aggregating, or DuckDB crashes.** `ST_AsMVT` raises
+`INTERNAL Error: Buffer overflow` — an assertion failure that poisons the
+connection, so every later query on it returns
+`FATAL … database has been invalidated` — whenever `ST_AsMVTGeom` is evaluated
+**inside the aggregate's own input expression** and some group has no surviving
+row. An empty tile in a batch is exactly that group, so this fires on sea tiles
+and on any ring member with nothing in it. Reduced:
+
+```sql
+-- crashes when a group is empty:
+SELECT ST_AsMVT(struct_pack(geom := ST_AsMVTGeom(r.geom, …)), …)
+  FROM env e LEFT JOIN rows r ON … GROUP BY e.tx
+-- works:
+WITH proj AS (SELECT ST_AsMVTGeom(r.geom, …) AS geom FROM rows r JOIN env e ON …)
+SELECT ST_AsMVT(struct_pack(geom := g.geom), …)
+  FROM env e LEFT JOIN proj g ON … GROUP BY e.tx
+```
+
+`points_mvt_sql` is safe only because it happens to be written the second way;
+`TileScope::body` is written that way deliberately. It is not a wrong-bytes bug
+that a smoke test would survive — it takes the process's database handle down —
+so `a_z14_batch_answers_for_tiles_holding_nothing` and
+`a_points_batch_answers_for_every_requested_tile_including_empty_ones` are the
+two tests to keep.
 
 **Gotcha — tiles are stored in the form they are served: gzipped.** This server
 does no other response compression (`tower-http` is built with

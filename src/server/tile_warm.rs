@@ -25,7 +25,7 @@ use crate::config::Config;
 use crate::osm::kvstore::RocksDB;
 use crate::server::tile_dirty::tiles_for_cell;
 use crate::server::tile_store::{TileKey, TileStore};
-use crate::server::tiles::{TILE_FORMAT_VERSION, render_points_tiles, render_tile};
+use crate::server::tiles::{TILE_FORMAT_VERSION, render_block, render_blocks};
 use crate::tile_math::lonlat_to_tile;
 
 pub fn run(
@@ -97,70 +97,6 @@ fn parse_bbox_cells(bbox: &str) -> Result<(i32, i32, i32, i32)> {
     Ok((lo_x as i32, lo_y as i32, hi_x as i32, hi_y as i32))
 }
 
-/// One unit of warming work: a single z14 tile, or a run of same-zoom z12/z13
-/// tiles rendered by one query.
-///
-/// The split is the tiers' own. z14 is four queries per tile with no batched
-/// form; z12--z13 render a whole run in one query, worth 27x
-/// (`tiles::render_points_tiles`). Runs are cut out of the *sorted* key list
-/// so each is spatially coherent, which is not cosmetic: the batched query
-/// bounds its table scan by the run's cell range before joining to the exact
-/// tile list, so a scattered run would read a bounding box nobody asked for.
-enum WarmUnit {
-    Z14(TileKey),
-    Points { z: u32, tiles: Vec<(u32, u32)> },
-}
-
-impl WarmUnit {
-    fn tiles(&self) -> usize {
-        match self {
-            WarmUnit::Z14(_) => 1,
-            WarmUnit::Points { tiles, .. } => tiles.len(),
-        }
-    }
-}
-
-/// Tiles per batched points query. Large enough that the per-query cost
-/// disappears (0.16 ms/tile at 253 tiles against 4.43 ms at one), small enough
-/// that a unit's rendered bytes stay bounded -- the query materialises every
-/// tile in the run at once, and a dense z12 tile is ~70 KB.
-const POINTS_BATCH_TILES: usize = 256;
-
-/// Group a sorted key list into work units, preserving order so the runs stay
-/// spatially coherent.
-fn warm_units(todo: &[TileKey]) -> Vec<WarmUnit> {
-    let mut units = Vec::new();
-    let mut run: Vec<(u32, u32)> = Vec::new();
-    let mut run_z = 0u32;
-    for &(z, x, y) in todo {
-        if !run.is_empty() && (z == crate::tile_math::CHANGE_CELL_ZOOM || z != run_z) {
-            units.push(WarmUnit::Points {
-                z: run_z,
-                tiles: std::mem::take(&mut run),
-            });
-        }
-        if z == crate::tile_math::CHANGE_CELL_ZOOM {
-            units.push(WarmUnit::Z14((z, x, y)));
-            continue;
-        }
-        run_z = z;
-        run.push((x, y));
-        if run.len() >= POINTS_BATCH_TILES {
-            units.push(WarmUnit::Points {
-                z: run_z,
-                tiles: std::mem::take(&mut run),
-            });
-        }
-    }
-    if !run.is_empty() {
-        units.push(WarmUnit::Points {
-            z: run_z,
-            tiles: run,
-        });
-    }
-    units
-}
-
 /// Render in parallel, write in batches.
 ///
 /// **`import osm`'s deliberate refusal to parallelize does not apply here**,
@@ -207,7 +143,7 @@ fn warm(
     );
 
     let next = Arc::new(AtomicUsize::new(0));
-    let units = Arc::new(warm_units(&todo));
+    let blocks = Arc::new(render_blocks(&todo));
     let failed = Arc::new(AtomicU64::new(0));
     let (tx, rx) =
         std::sync::mpsc::sync_channel::<(TileKey, String, crate::server::tile_store::TileBody)>(
@@ -223,7 +159,7 @@ fn warm(
             // original connection, so a Ctrl+C lets each worker finish its
             // in-flight tile (seconds) before the poll below stops it.
             let worker_conn = conn.try_clone().context("tiles warm: clone connection")?;
-            let units = units.clone();
+            let blocks = blocks.clone();
             let next = next.clone();
             let failed = failed.clone();
             let tx = tx.clone();
@@ -233,35 +169,26 @@ fn warm(
                         return;
                     }
                     let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(unit) = units.get(i) else {
+                    let Some(block) = blocks.get(i) else {
                         return;
                     };
-                    // A whole unit fails together: one batched query either
-                    // produces every tile in its run or none of them. That is
+                    // A whole block fails together: one batched query either
+                    // produces every tile in it or none of them. That is
                     // coarser than the per-tile failure this replaced, and
                     // acceptable for the same reason a failed render is
                     // acceptable at all -- the tile is simply not warmed, and
                     // the next request renders it.
-                    let rendered = match unit {
-                        WarmUnit::Z14(key) => render_tile(&worker_conn, key.0, key.1, key.2)
-                            .map(|raw| vec![(*key, raw)]),
-                        WarmUnit::Points { z, tiles } => {
-                            render_points_tiles(&worker_conn, *z, tiles).map(|out| {
-                                out.into_iter()
-                                    .map(|((x, y), raw)| ((*z, x, y), raw))
-                                    .collect()
-                            })
-                        }
-                    };
-                    let rendered: Vec<(TileKey, Vec<u8>)> = match rendered {
+                    let rendered = match render_block(&worker_conn, block) {
                         Ok(r) => r,
                         Err(e) => {
-                            failed.fetch_add(unit.tiles() as u64, Ordering::Relaxed);
-                            tracing::warn!(error = %e, tiles = unit.tiles(), "tiles warm: render failed");
+                            let n = block.tiles.len();
+                            failed.fetch_add(n as u64, Ordering::Relaxed);
+                            tracing::warn!(error = %e, z = block.z, tiles = n, "tiles warm: render failed");
                             continue;
                         }
                     };
-                    for (key, raw) in rendered {
+                    for ((x, y), raw) in rendered {
+                        let key: TileKey = (block.z, x, y);
                         match crate::server::tile_store::prepare(&raw) {
                             Ok((etag, body)) => {
                                 // A closed receiver means the writer died; stop.
@@ -323,45 +250,6 @@ mod tests {
         // The northwest corner really is (lo_x, lo_y).
         let (nw_x, nw_y) = lonlat_to_tile(21.0, 52.2, crate::tile_math::CHANGE_CELL_ZOOM);
         assert_eq!((nw_x as i32, nw_y as i32), (lo_x, lo_y));
-    }
-
-    /// z14 keys stay one unit each; z12/z13 keys collapse into batched runs
-    /// that never straddle a zoom.
-    ///
-    /// The zoom boundary matters more than the size cap: `render_points_tiles`
-    /// takes a single `z` and derives every tile's envelope and cell range
-    /// from it, so a run mixing z12 and z13 would render half its tiles at the
-    /// wrong zoom rather than fail.
-    #[test]
-    fn warm_units_batch_the_points_tiers_per_zoom_and_leave_z14_alone() {
-        let mut todo: Vec<TileKey> = Vec::new();
-        todo.extend((0..POINTS_BATCH_TILES as u32 + 3).map(|i| (12, 100, i)));
-        todo.extend((0..5u32).map(|i| (13, 200, i)));
-        todo.extend((0..2u32).map(|i| (14, 300, i)));
-
-        let units = warm_units(&todo);
-        assert_eq!(
-            units.iter().map(WarmUnit::tiles).sum::<usize>(),
-            todo.len(),
-            "every requested tile must land in exactly one unit"
-        );
-        let z14: Vec<_> = units
-            .iter()
-            .filter(|u| matches!(u, WarmUnit::Z14(_)))
-            .collect();
-        assert_eq!(z14.len(), 2, "z14 keys are never batched");
-        let runs: Vec<(u32, usize)> = units
-            .iter()
-            .filter_map(|u| match u {
-                WarmUnit::Points { z, tiles } => Some((*z, tiles.len())),
-                WarmUnit::Z14(_) => None,
-            })
-            .collect();
-        assert_eq!(
-            runs,
-            vec![(12, POINTS_BATCH_TILES), (12, 3), (13, 5)],
-            "runs split on the size cap and on the zoom change, never across one"
-        );
     }
 
     /// A `--bbox` has to exclude a cell that is outside it on *either* axis.

@@ -1,15 +1,10 @@
 # Plan — Batched z14 tile rendering, and prepared statements
 
-**Status:** not started. Investigated and prototyped on 2026-09-06 against the real
-`./osmpbudynkiv2.duckdb`; **every number in this document is measured, not estimated**, and the
-prototype produced byte-identical output for all four z14 layers before it was thrown away. The
-prototype itself lived in a session scratchpad and is gone — it is not needed, because the
-byte-identity check is far easier to write in Rust (`render_tile` vs `render_z14_tiles`) than it was
-outside it.
-
-**Tree state when this was written:** the persisted-tile work (`tile_store`, `tile_dirty`,
-`tile_warm`, `jobs::tile_refresh`, the z12–z13 batching and the deterministic `ORDER BY`) is present
-but **uncommitted**. Check `git status` before starting.
+**Status: done, 2026-09-09.** All six steps landed, plus the RocksDB block-cache
+fix that preceded them (`docs/rocksdb_block_cache_not_applied.md`). Outcome and
+the three places reality differed from this plan are in *What actually landed*
+at the bottom — read that first; the body below is the plan as written
+beforehand and is kept for its measurements and its list of traps.
 
 ## Context
 
@@ -311,3 +306,87 @@ that is a different decision and needs the bump plus a national re-warm.)
   it scoped.
 - Record `prepare_cached`'s constant-text requirement next to `query_mvt_layer`, so nobody extends it
   to `points_mvt_sql`.
+
+
+---
+
+# What actually landed
+
+## Outcome
+
+Byte-identical on every tile tried, and faster than this plan predicted.
+`z14_batches_match_per_tile_renders_on_the_real_database` (ignored; needs the
+real DuckDB file and exclusive access) over whole z11 blocks:
+
+| block | per-tile | batched | |
+|---|---|---|---|
+| Warsaw centre | 159.3 ms/tile | 20.7 | **7.7×** |
+| dense unmatched | 132.9 | 33.8 | 3.9× |
+| rural | 15.5 | 0.90 | **17.1×** |
+| Baltic (empty) | 13.8 | 0.43 | **31.8×** |
+
+`differing 0` in all four. End-to-end: a 735-tile Warsaw warm, served, cleared,
+re-warmed and re-served produced an identical ETag/sha for every probed tile —
+and those ETags match what the *per-tile* renderer produced three days earlier,
+which is the strongest evidence available that the two paths agree.
+
+## Three things this plan got wrong
+
+### 1. The struct literal was unnecessary — and so was the fan-out arithmetic
+
+The plan said the grouping keys force a hand-written struct beside the column
+list. They do not. `CROSS JOIN LATERAL (SELECT <the column list verbatim>) t`
+yields a `t` holding exactly the listed columns, so **the projection is written
+once and shared by both arms**, and `TileScope` only wraps it. The arithmetic
+tile-range prefilter was already known unnecessary (a plain `ST_Intersects` join
+is faster) and is not in the landed code either.
+
+### 2. `ST_AsMVTGeom` inside the aggregate's input crashes DuckDB
+
+Not anticipated anywhere in this plan, and the most important thing it missed.
+`ST_AsMVT` raises `INTERNAL Error: Buffer overflow` — an assertion failure that
+**invalidates the database handle**, so every later query on that connection
+returns `FATAL … database has been invalidated` — whenever `ST_AsMVTGeom` is
+evaluated in the aggregate's own input expression and a group has no surviving
+row. An empty tile in a batch is precisely that group.
+
+The fix is to materialise the projection in a `proj` CTE first, so the aggregate
+reads a plain column. `points_mvt_sql` was already safe only by accident of how
+it was written. Full repro on `TileScope::body` and in CLAUDE.md.
+
+This is why the empty-tile test earns its place: the failure mode is a crash,
+not wrong bytes, so a warm over sea would have taken the process down.
+
+### 3. `prepare_cached` is worth ~3 ms, not ~6
+
+Measured in-process rather than through the DuckDB CLI:
+`z14_render_cost_floor_across_densities` moved from 16.7–18.2 ms to 13.9–14.7 ms
+on one-object tiles, with dense tiles unchanged inside noise. Still worth having
+— it is one line plus a cache-capacity call — but the CLI experiment that
+suggested ~6 ms was measuring its own overhead too.
+
+## Also different, by choice
+
+- **Blocks replaced `WarmUnit` entirely.** `tiles::render_blocks` /
+  `render_block` group *every* tier's keys into same-zoom 8×8 ancestor-aligned
+  blocks, so `tile_warm` and `jobs::tile_refresh` each lost their bespoke
+  batching. z12/z13 moved from 256-tile sorted runs to 64-tile ancestor blocks:
+  slightly smaller batches, but a batch's bounding box is now exactly its
+  ancestor tile's, instead of a tall thin strip.
+- **The adjacency count kept the `USING (tx, ty)` shape** this plan flagged as a
+  trap. That shape's pathology is specific to a batch of *one*, which
+  `Batched` never sees now that `Single` serves the request path — so the open
+  design question the plan ended on turned out not to need solving. The two
+  alternatives it listed remain unexplored and unnecessary.
+- **`TILE_FORMAT_VERSION` was not bumped**, as planned: the bytes are identical,
+  so stored tiles stay valid.
+
+## Not done
+
+- The systemd/production rollout, and confirming the ~640 MB RSS rise from the
+  block-cache fix against `MemoryCurrent` alongside the `MALLOC_CONF`
+  experiment in `docs/memory_growth_investigation.md`.
+- A full-country `tiles warm` to re-measure the ~85 → ~18 CPU-minute projection
+  end to end. The per-block numbers above are consistent with it and better in
+  the rural blocks that dominate the warm set, so the real figure should land
+  under 18.

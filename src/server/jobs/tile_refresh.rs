@@ -69,10 +69,9 @@ use anyhow::{Context, Result};
 use duckdb::Connection;
 
 use crate::server::jobs::{Job, JobContext};
-use crate::server::tile_dirty::{self, tiles_for_cell};
+use crate::server::tile_dirty::tiles_for_cell;
 use crate::server::tile_store::{self, TileKey, TileStore};
 use crate::server::tiles;
-use crate::tile_math::CHANGE_CELL_ZOOM;
 
 /// `job_run_log` key this job reports under (see `Job::log_keys`).
 const JOB_LOG_KEY: &str = "tile_refresh";
@@ -260,69 +259,46 @@ pub fn tick(
 
     // ---- Pass 2: re-render lazily, only what pass 1 found resident ----
     //
-    // The z12/z13 members go through one batched query per zoom rather than
-    // one per tile: a tick's cells collapse to a handful of parents, and the
-    // batched form costs no more at a batch of one (see
-    // `tiles::points_mvt_sql`). z14 has no batched form and stays per tile.
+    // Every tier renders in blocks -- `tiles::render_blocks` groups the
+    // resident keys by zoom and common ancestor, and `render_block` picks the
+    // tier's batched query. A tick's cells collapse to a handful of blocks, so
+    // this is where the batching pays: one query per layer per block instead of
+    // one per layer per tile.
     let mut rendered = 0u64;
     let mut failed = 0u64;
     let mut render_batch = store.batch();
-    let mut put = |key: TileKey, raw: &[u8], rendered: &mut u64, failed: &mut u64| -> Result<()> {
-        match tile_store::prepare(raw) {
-            Ok((etag, body)) => {
-                store.batch_put(&mut render_batch, key, &etag, &body);
-                *rendered += 1;
-                store.flush_if_full(&mut render_batch)?;
-            }
-            Err(e) => {
-                let (z, x, y) = key;
-                tracing::warn!(z, x, y, error = %e, "tile_refresh: failed to prepare a re-rendered tile, leaving it stale");
-                *failed += 1;
-            }
-        }
-        Ok(())
-    };
-
-    for (z, x, y) in resident.iter().filter(|k| k.0 == CHANGE_CELL_ZOOM) {
+    for block in tiles::render_blocks(&resident) {
         // Deletes are microseconds each and already done; renders are
         // milliseconds each, so this is where a timeout or shutdown actually
         // needs to be able to cut a tick short.
         if is_cancelled() {
             break;
         }
-        match tiles::render_tile(conn, *z, *x, *y) {
-            Ok(raw) => put((*z, *x, *y), &raw, &mut rendered, &mut failed)?,
-            // A render failure must not abort the tick -- see the module
-            // doc's tradeoff. The queue row is already gone, so this tile
-            // stays stale (served as a cold render) until its cell is next
-            // dirtied for real.
+        // A block fails as a unit. The queue rows are already gone, so those
+        // tiles stay stale (served as a cold render) until their cells are next
+        // dirtied for real -- the same outcome a per-tile failure had, only
+        // coarser. See the module doc's tradeoff.
+        let out = match tiles::render_block(conn, &block) {
+            Ok(out) => out,
             Err(e) => {
-                tracing::warn!(z, x, y, error = %e, "tile_refresh: failed to re-render a tile, leaving it stale");
-                failed += 1;
+                let n = block.tiles.len();
+                tracing::warn!(z = block.z, tiles = n, error = %e, "tile_refresh: failed to re-render a block of tiles, leaving them stale");
+                failed += n as u64;
+                continue;
             }
-        }
-    }
-    for z in tile_dirty::MIN_PERSISTED_ZOOM..CHANGE_CELL_ZOOM {
-        let batch: Vec<(u32, u32)> = resident
-            .iter()
-            .filter(|k| k.0 == z)
-            .map(|k| (k.1, k.2))
-            .collect();
-        if batch.is_empty() || is_cancelled() {
-            continue;
-        }
-        // One query for the whole zoom, so a failure takes the zoom's tiles
-        // with it -- the same "leave them stale" outcome as a per-tile
-        // failure, just coarser.
-        match tiles::render_points_tiles(conn, z, &batch) {
-            Ok(out) => {
-                for ((x, y), raw) in out {
-                    put((z, x, y), &raw, &mut rendered, &mut failed)?;
+        };
+        for ((x, y), raw) in out {
+            let key: TileKey = (block.z, x, y);
+            match tile_store::prepare(&raw) {
+                Ok((etag, body)) => {
+                    store.batch_put(&mut render_batch, key, &etag, &body);
+                    rendered += 1;
+                    store.flush_if_full(&mut render_batch)?;
                 }
-            }
-            Err(e) => {
-                tracing::warn!(z, tiles = batch.len(), error = %e, "tile_refresh: failed to re-render a batch of tiles, leaving them stale");
-                failed += batch.len() as u64;
+                Err(e) => {
+                    tracing::warn!(z = block.z, x, y, error = %e, "tile_refresh: failed to prepare a re-rendered tile, leaving it stale");
+                    failed += 1;
+                }
             }
         }
     }

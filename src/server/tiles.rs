@@ -10,7 +10,8 @@ use duckdb::Connection;
 use super::AppState;
 use super::http_cache;
 use super::tile_dirty;
-use super::tile_store::{self, TileBody};
+use super::tile_store::{self, TileBody, TileKey};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use super::package::{
@@ -163,32 +164,191 @@ fn as_mvt_sql(layer: &str) -> String {
     )
 }
 
+/// How a z14 layer query is bound to the tiles it renders.
+///
+/// **The calculation is identical in both arms** -- same predicates, same
+/// projection text, same constants. The only thing that changes is that the
+/// tile stops being a constant and becomes a join variable. Each builder
+/// therefore writes its column list exactly once and lets this decide the
+/// wrapper around it.
+///
+/// Why both arms exist rather than one: a batch of one pays for machinery it
+/// does not need, and the `buildings` layer is where that lands. Its adjacency
+/// count is per (building, tile), so `Batched` has to fan the neighbour set out
+/// to tiles and group by `(tx, ty, rid)`; at a single tile that key has one
+/// distinct value, DuckDB plans a `HASH_JOIN` on it, and the whole
+/// `pkg x nb` cross product materialises before the `ST_Intersects` filter runs
+/// -- measured 71.9 -> 202.2 ms on the densest tile. `Single` keeps the request
+/// path off that. See `docs/superpowers/plans/2026-09-06-z14-tile-batching.md`.
+#[derive(Clone, Copy)]
+enum TileScope<'a> {
+    /// One tile, envelope bound as `?` parameters. **The text is constant**,
+    /// which is what lets `query_mvt_layer` cache the prepared statement --
+    /// see its doc comment.
+    Single,
+    /// A block of tiles, interpolated as a `VALUES` list; one output row per
+    /// requested tile. Tile coordinates are `u32`s off a store key, so there is
+    /// nothing to inject, and a `VALUES` list cannot be a bound parameter.
+    Batched(&'a [(u32, u32)]),
+}
+
+impl TileScope<'_> {
+    /// The `WITH` header: the one-row `bbox` CTE, or the tile list and the
+    /// per-tile envelopes derived from it.
+    ///
+    /// `Batched` builds each envelope from [`tile_to_bbox`] and carries it in
+    /// the `VALUES` list rather than recomputing a Web Mercator inverse in SQL
+    /// the way `agg_bin_ctes` has to -- one home for tile -> bbox. `{:?}` on an
+    /// `f64` is the shortest representation that round-trips, so the envelope
+    /// DuckDB parses is the one `tile_to_bbox` computed.
+    fn header(&self) -> String {
+        match self {
+            TileScope::Single => {
+                "WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),".to_string()
+            }
+            TileScope::Batched(tiles) => {
+                let values = tiles
+                    .iter()
+                    .map(|&(x, y)| {
+                        let (a, b, c, d) = tile_to_bbox(CHANGE_CELL_ZOOM, x, y);
+                        format!("({x}, {y}, {a:?}, {b:?}, {c:?}, {d:?})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "WITH tiles(tx, ty, x0, y0, x1, y1) AS (VALUES {values}),
+    env AS (
+        SELECT tx, ty, ST_MakeEnvelope(x0, y0, x1, y1) AS poly,
+               ST_Extent(ST_MakeEnvelope(x0, y0, x1, y1)) AS box
+        FROM tiles
+    ),"
+                )
+            }
+        }
+    }
+
+    /// The envelope a source scan filters on, optionally grown by `pad` degrees
+    /// (the adjacency reads).
+    ///
+    /// **This is what keeps the scan on the RTREE index and it cannot be
+    /// dropped in favour of the join below.** The index needs a *constant*
+    /// bound; a join condition yields `Bounds: deferred (from join filter)`,
+    /// which prunes nothing. Measured on `buildings_all` over 16 tiles:
+    /// removing it took `RTREE_IN` x2 to x0 and 309.6 ms to 26,970.7 ms.
+    fn scan_envelope(&self, pad: f64) -> String {
+        match self {
+            TileScope::Single => "ST_MakeEnvelope(?, ?, ?, ?)".to_string(),
+            TileScope::Batched(tiles) => {
+                let boxes = tiles
+                    .iter()
+                    .map(|&(x, y)| tile_to_bbox(CHANGE_CELL_ZOOM, x, y));
+                let (mut a, mut b, mut c, mut d) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                for (x0, y0, x1, y1) in boxes {
+                    a = a.min(x0);
+                    b = b.min(y0);
+                    c = c.max(x1);
+                    d = d.max(y1);
+                }
+                let (a, b, c, d) = (a - pad, b - pad, c + pad, d + pad);
+                format!("ST_MakeEnvelope({a:?}, {b:?}, {c:?}, {d:?})")
+            }
+        }
+    }
+
+    /// The envelope `ST_AsMVTGeom` clips each feature to.
+    fn box_expr(&self) -> &'static str {
+        match self {
+            TileScope::Single => "bbox.geom",
+            TileScope::Batched(_) => "e.box",
+        }
+    }
+
+    /// Everything after the CTE chain: the projection `cols` plus the
+    /// aggregate that consumes it.
+    ///
+    /// `Batched` reaches the projection through `CROSS JOIN LATERAL (SELECT
+    /// ...)`, which is a projection alias rather than a correlated table scan.
+    /// That is what lets `cols` be the *same text* in both arms: `t` ends up
+    /// holding exactly the listed columns, so the grouping keys never leak into
+    /// the layer's attribute dictionary and no struct has to be spelled out
+    /// beside the column list. `LEFT JOIN` plus `FILTER` is what keeps a tile
+    /// holding nothing from vanishing: a bare `GROUP BY` emits no row for it,
+    /// and a missing row is not an empty tile -- see the no-204 rule in
+    /// CLAUDE.md.
+    ///
+    /// **The `proj` CTE is not optional, and inlining it crashes the database.**
+    /// `ST_AsMVT` hits an `INTERNAL Error: Buffer overflow` -- a DuckDB
+    /// assertion failure, which poisons the whole connection so every later
+    /// query returns `FATAL ... database has been invalidated` -- whenever
+    /// `ST_AsMVTGeom` is evaluated *in the aggregate's own input expression*
+    /// and a group has no surviving row. Materialising the projected geometry
+    /// one step earlier, so the aggregate reads a plain column, avoids it.
+    /// Reduced to:
+    ///
+    /// ```sql
+    /// -- crashes:
+    /// SELECT ST_AsMVT(struct_pack(geom := ST_AsMVTGeom(r.geom, ...)), ...)
+    ///   FROM env e LEFT JOIN rows r ON ... GROUP BY e.tx
+    /// -- works:
+    /// WITH proj AS (SELECT ST_AsMVTGeom(r.geom, ...) AS geom FROM rows r JOIN env e ON ...)
+    /// SELECT ST_AsMVT(struct_pack(geom := g.geom), ...)
+    ///   FROM env e LEFT JOIN proj g ON ... GROUP BY e.tx
+    /// ```
+    ///
+    /// `points_mvt_sql` is safe only because it happens to be written the
+    /// second way. Pinned by `a_z14_batch_answers_for_tiles_holding_nothing`,
+    /// which is worth keeping precisely because the failure is a hard crash
+    /// rather than wrong bytes.
+    fn body(
+        &self,
+        layer: &str,
+        projection: &str,
+        from_sql: &str,
+        on_sql: &str,
+        cols: &str,
+    ) -> String {
+        match self {
+            TileScope::Single => format!(
+                "    SELECT {projection}
+    FROM (
+        SELECT {cols}
+        FROM {from_sql}, bbox
+    ) t
+    WHERE t.geom IS NOT NULL
+"
+            ),
+            TileScope::Batched(_) => format!(
+                ",
+    proj AS (
+        SELECT e.tx, e.ty, t AS f
+        FROM {from_sql} JOIN env e ON {on_sql}
+        CROSS JOIN LATERAL (
+            SELECT {cols}
+        ) t
+    )
+    SELECT e.tx, e.ty, ST_AsMVT(g.f, '{layer}', 4096, 'geom'{order})
+               FILTER (WHERE g.f.geom IS NOT NULL) AS mvt
+    FROM env e LEFT JOIN proj g ON g.tx = e.tx AND g.ty = e.ty
+    GROUP BY e.tx, e.ty
+",
+                order = deterministic_mvt_order_sql("g.f", "g.f")
+            ),
+        }
+    }
+}
+
 /// Built once at first use rather than declared `const`, because the street
 /// resolution comes from `mappings::street_names`'s shared builders — the same
 /// text `/package` and both compare paths use. The resulting SQL is
 /// semantically identical to the hand-written chain this replaced, so
 /// [`TILE_FORMAT_VERSION`] must **not** move for it: nothing about what a tile
 /// contains changed.
-static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "
-    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
-    candidates AS MATERIALIZED (
-        SELECT a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc,
-               a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania,
-               a.teryt_gmina, a.gmina
-        FROM prg_unmatched a
-        WHERE ST_Intersects(a.geom, ST_MakeEnvelope(?, ?, ?, ?))
-    ),
-    resolved AS (
-        SELECT candidates.*,
-               NULLIF(trim({resolved_street}), '') AS resolved_street
-        FROM candidates
-        {mapping_joins}
-    )
-    SELECT {mvt}
-    FROM (
-        SELECT ST_AsMVTGeom(resolved.geom, bbox.geom, 4096, 256, true) AS geom,
+static ADDRESSES_MVT_SQL: LazyLock<String> =
+    LazyLock::new(|| addresses_sql(&as_mvt_sql("addresses"), TileScope::Single));
+
+fn addresses_sql(projection: &str, scope: TileScope) -> String {
+    let cols = format!(
+        "ST_AsMVTGeom(resolved.geom, {box}, 4096, 256, true) AS geom,
                resolved.lokalny_id,
                resolved.numer_porzadkowy,
                resolved.ulica,
@@ -203,16 +363,39 @@ static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
                CASE WHEN resolved.resolved_street IS NULL THEN NULLIF(trim(resolved.miejscowosc), '') END AS \"addr:place\",
                NULLIF(trim(resolved.kod_pocztowy), '') AS \"addr:postcode\",
                NULLIF(trim(resolved.teryt_miejscowosc), '') AS \"addr:city:simc\",
-               'gugik.gov.pl' AS \"source:addr\"
-        FROM resolved, bbox
-    ) t
-    WHERE t.geom IS NOT NULL
-",
-        mvt = as_mvt_sql("addresses"),
+               'gugik.gov.pl' AS \"source:addr\"",
+        box = scope.box_expr(),
+    );
+    format!(
+        "
+    {header}
+    candidates AS MATERIALIZED (
+        SELECT a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc,
+               a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania,
+               a.teryt_gmina, a.gmina
+        FROM prg_unmatched a
+        WHERE ST_Intersects(a.geom, {scan})
+    ),
+    resolved AS (
+        SELECT candidates.*,
+               NULLIF(trim({resolved_street}), '') AS resolved_street
+        FROM candidates
+        {mapping_joins}
+    )
+{body}",
+        header = scope.header(),
+        scan = scope.scan_envelope(0.0),
         resolved_street = resolved_street_expr_sql("candidates"),
         mapping_joins = resolved_street_join_sql("candidates"),
+        body = scope.body(
+            "addresses",
+            projection,
+            "resolved",
+            "ST_Intersects(resolved.geom, e.poly)",
+            &cols
+        ),
     )
-});
+}
 
 /// Like `ADDRESSES_MVT_SQL`, built at first use rather than declared `const`,
 /// so the `source:building` values come from `package`'s own constants.
@@ -236,40 +419,90 @@ static ADDRESSES_MVT_SQL: LazyLock<String> = LazyLock::new(|| {
 ///   the frontend's merge implements, because `with_building_levels` inserts
 ///   into the `BTreeMap` *after* the mapping string was parsed into it.
 static BUILDINGS_MVT_SQL: LazyLock<String> =
-    LazyLock::new(|| buildings_sql(&as_mvt_sql("buildings")));
+    LazyLock::new(|| buildings_sql(&as_mvt_sql("buildings"), TileScope::Single));
 
 /// The `projection` seam is `all_buildings_sql`'s, and exists for the same
 /// reason: a test asserting on a per-feature attribute has to read it per row,
 /// because `ST_AsMVT` writes one key dictionary per layer, so an attribute's
 /// *key* appears in the tile bytes as soon as the column exists -- even with
 /// every row's value NULL.
-fn buildings_sql(projection: &str) -> String {
+fn buildings_sql(projection: &str, scope: TileScope) -> String {
+    // The adjacency count is per (building, tile), not per building: each `nb`
+    // read is bounded by *that tile's* buffered envelope, so the same building
+    // can legitimately land on different `max_neighbours` verdicts -- and so a
+    // different `tags` string -- in two tiles that both draw it. `Batched`
+    // therefore fans both sides out to tiles and groups by (tx, ty, rid).
+    // Widening the neighbour read to the whole batch instead would read as an
+    // obvious tidy-up and would silently change tags across the country.
+    let batched = matches!(scope, TileScope::Batched(_));
+    let tile_cols = if batched { "e.tx, e.ty, " } else { "" };
+    let pkg_join = if batched {
+        "\n        JOIN env e ON ST_Intersects(b.geom, e.poly)"
+    } else {
+        ""
+    };
+    let nb_join = if batched {
+        format!(
+            "\n        JOIN env e ON ST_Intersects(nb.geom, ST_Expand(e.poly, {ADJACENCY_READ_BUFFER_DEG:?}))"
+        )
+    } else {
+        String::new()
+    };
+    let cnt_keys = if batched {
+        "p.tx, p.ty, p.rid"
+    } else {
+        "p.rid"
+    };
+    let cnt_tile_on = if batched {
+        "p.tx = nb.tx AND p.ty = nb.ty\n         AND "
+    } else {
+        ""
+    };
+    let cnt_using = if batched { "(tx, ty, rid)" } else { "(rid)" };
+    let final_tile_cols = if batched { "pkg.tx, pkg.ty, " } else { "" };
+
+    let cols = format!(
+        "ST_AsMVTGeom(u.geom, {box}, 4096, 256, true) AS geom, u.id, u.source,
+               -- Identity, not display: the other half of BDOT10k's composite
+               -- key, so the frontend's report action can send a complete
+               -- record key. NULL for egib, whose id_budynku is the whole key.
+               u.PRZESTRZENNAZW,
+               u.funkcja_szczegolowa, u.funkcja_ogolna, u.levels_above_ground,
+               u.KATEGORIAISTNIENIA, u.NAZWA, u.FSBUD, u.INFORMACJADODATKOWA,
+               u.KODKST, u.ZRODLODANYCHGEOMETRYCZNYCH,
+               u.kondygnacje_podziemne, u.rodzaj, u.tags,
+               -- Last, and after `tags`, only as a readability convention:
+               -- the frontend merges the two halves by key rather than by
+               -- arrival order, so this is not load-bearing.
+               u.\"source:building\", u.\"building:levels\"",
+        box = scope.box_expr(),
+    );
     format!(
         "
-    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
+    {header}
     bdot10k_pkg AS MATERIALIZED (
-        SELECT b.rowid AS rid, b.LOKALNYID AS id, b.PRZESTRZENNAZW, b.geom,
+        SELECT {tile_cols}b.rowid AS rid, b.LOKALNYID AS id, b.PRZESTRZENNAZW, b.geom,
                ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
                b.funkcja_szczegolowa, b.funkcja_ogolna, b.liczba_kondygnacji,
                b.KATEGORIAISTNIENIA, b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA,
                b.KODKST, b.ZRODLODANYCHGEOMETRYCZNYCH
-        FROM bdot10k_unmatched b
-        WHERE ST_Intersects(b.geom, ST_MakeEnvelope(?, ?, ?, ?))
+        FROM bdot10k_unmatched b{pkg_join}
+        WHERE ST_Intersects(b.geom, {scan})
     ),
     bdot10k_nb AS MATERIALIZED (
-        SELECT geom, ST_X(centroid) AS cx, ST_Y(centroid) AS cy
-        FROM bdot10k_buildings
-        WHERE ST_Intersects(geom, ST_MakeEnvelope(?, ?, ?, ?))
-          AND lower(trim(PRZEWAZAJACAFUNKCJABUDYNKU)) = ?
+        SELECT {tile_cols}nb.geom, ST_X(nb.centroid) AS cx, ST_Y(nb.centroid) AS cy
+        FROM bdot10k_buildings nb{nb_join}
+        WHERE ST_Intersects(nb.geom, {scan_buf})
+          AND lower(trim(nb.PRZEWAZAJACAFUNKCJABUDYNKU)) = {bdot10k_key}
     ),
     bdot10k_cnt AS (
-        SELECT p.rid, count(*) AS neighbours
+        SELECT {cnt_keys}, count(*) AS neighbours
         FROM bdot10k_pkg p JOIN bdot10k_nb nb
-          ON (p.cx <> nb.cx OR p.cy <> nb.cy) AND ST_Intersects(p.geom, nb.geom)
-        GROUP BY p.rid
+          ON {cnt_tile_on}(p.cx <> nb.cx OR p.cy <> nb.cy) AND ST_Intersects(p.geom, nb.geom)
+        GROUP BY {cnt_keys}
     ),
     bdot10k_final AS (
-        SELECT pkg.geom, 'bdot10k' AS source, pkg.id, pkg.PRZESTRZENNAZW,
+        SELECT {final_tile_cols}pkg.geom, 'bdot10k' AS source, pkg.id, pkg.PRZESTRZENNAZW,
                pkg.funkcja_szczegolowa, pkg.funkcja_ogolna,
                pkg.liczba_kondygnacji::INTEGER AS levels_above_ground,
                pkg.KATEGORIAISTNIENIA, pkg.NAZWA, pkg.FSBUD, pkg.INFORMACJADODATKOWA,
@@ -280,7 +513,7 @@ fn buildings_sql(projection: &str) -> String {
                CASE WHEN pkg.liczba_kondygnacji >= 1
                     THEN pkg.liczba_kondygnacji::VARCHAR END AS \"building:levels\"
         FROM bdot10k_pkg pkg
-        LEFT JOIN bdot10k_cnt cnt USING (rid)
+        LEFT JOIN bdot10k_cnt cnt USING {cnt_using}
         LEFT JOIN LATERAL (
             SELECT m.tags FROM bdot10k_building_types m
             WHERE ((m.tier = 1 AND m.key = lower(trim(pkg.funkcja_szczegolowa)))
@@ -296,26 +529,26 @@ fn buildings_sql(projection: &str) -> String {
         ) t ON TRUE
     ),
     egib_pkg AS MATERIALIZED (
-        SELECT b.rowid AS rid, b.id_budynku AS id, b.geom,
+        SELECT {tile_cols}b.rowid AS rid, b.id_budynku AS id, b.geom,
                ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
                b.rodzaj_kod, b.kondygnacje_nadziemne, b.kondygnacje_podziemne, b.rodzaj
-        FROM egib_unmatched b
-        WHERE ST_Intersects(b.geom, ST_MakeEnvelope(?, ?, ?, ?))
+        FROM egib_unmatched b{pkg_join}
+        WHERE ST_Intersects(b.geom, {scan})
     ),
     egib_nb AS MATERIALIZED (
-        SELECT geom, ST_X(centroid) AS cx, ST_Y(centroid) AS cy
-        FROM egib_buildings
-        WHERE ST_Intersects(geom, ST_MakeEnvelope(?, ?, ?, ?))
-          AND rodzaj_kod = ?
+        SELECT {tile_cols}nb.geom, ST_X(nb.centroid) AS cx, ST_Y(nb.centroid) AS cy
+        FROM egib_buildings nb{nb_join}
+        WHERE ST_Intersects(nb.geom, {scan_buf})
+          AND nb.rodzaj_kod = {egib_key}
     ),
     egib_cnt AS (
-        SELECT p.rid, count(*) AS neighbours
+        SELECT {cnt_keys}, count(*) AS neighbours
         FROM egib_pkg p JOIN egib_nb nb
-          ON (p.cx <> nb.cx OR p.cy <> nb.cy) AND ST_Intersects(p.geom, nb.geom)
-        GROUP BY p.rid
+          ON {cnt_tile_on}(p.cx <> nb.cx OR p.cy <> nb.cy) AND ST_Intersects(p.geom, nb.geom)
+        GROUP BY {cnt_keys}
     ),
     egib_final AS (
-        SELECT pkg.geom, 'egib' AS source, pkg.id, NULL::VARCHAR AS PRZESTRZENNAZW,
+        SELECT {final_tile_cols}pkg.geom, 'egib' AS source, pkg.id, NULL::VARCHAR AS PRZESTRZENNAZW,
                NULL::VARCHAR AS funkcja_szczegolowa, NULL::VARCHAR AS funkcja_ogolna,
                pkg.kondygnacje_nadziemne AS levels_above_ground,
                NULL::VARCHAR AS KATEGORIAISTNIENIA, NULL::VARCHAR AS NAZWA,
@@ -327,7 +560,7 @@ fn buildings_sql(projection: &str) -> String {
                CASE WHEN pkg.kondygnacje_nadziemne >= 1
                     THEN pkg.kondygnacje_nadziemne::VARCHAR END AS \"building:levels\"
         FROM egib_pkg pkg
-        LEFT JOIN egib_cnt cnt USING (rid)
+        LEFT JOIN egib_cnt cnt USING {cnt_using}
         LEFT JOIN LATERAL (
             SELECT m.tags FROM egib_building_types m
             WHERE m.tier = 1 AND m.key = pkg.rodzaj_kod
@@ -340,108 +573,38 @@ fn buildings_sql(projection: &str) -> String {
             LIMIT 1
         ) t ON TRUE
     )
-    SELECT {projection}
-    FROM (
-        SELECT ST_AsMVTGeom(u.geom, bbox.geom, 4096, 256, true) AS geom, u.id, u.source,
-               -- Identity, not display: the other half of BDOT10k's composite
-               -- key, so the frontend's report action can send a complete
-               -- record key. NULL for egib, whose id_budynku is the whole key.
-               u.PRZESTRZENNAZW,
-               u.funkcja_szczegolowa, u.funkcja_ogolna, u.levels_above_ground,
-               u.KATEGORIAISTNIENIA, u.NAZWA, u.FSBUD, u.INFORMACJADODATKOWA,
-               u.KODKST, u.ZRODLODANYCHGEOMETRYCZNYCH,
-               u.kondygnacje_podziemne, u.rodzaj, u.tags,
-               -- Last, and after `tags`, only as a readability convention:
-               -- the frontend merges the two halves by key rather than by
-               -- arrival order, so this is not load-bearing.
-               u.\"source:building\", u.\"building:levels\"
-        FROM (SELECT * FROM bdot10k_final UNION ALL SELECT * FROM egib_final) u, bbox
-    ) t
-    WHERE t.geom IS NOT NULL
-",
+{body}",
+        header = scope.header(),
+        scan = scope.scan_envelope(0.0),
+        scan_buf = scope.scan_envelope(ADJACENCY_READ_BUFFER_DEG),
+        bdot10k_key = if batched {
+            format!("'{BDOT10K_ADJACENCY_KEY}'")
+        } else {
+            "?".to_string()
+        },
+        egib_key = if batched {
+            format!("'{EGIB_ADJACENCY_KEY}'")
+        } else {
+            "?".to_string()
+        },
         bdot10k_source = SOURCE_BUILDING_BDOT10K,
         egib_source = SOURCE_BUILDING_EGIB,
+        body = scope.body(
+            "buildings",
+            projection,
+            "(SELECT * FROM bdot10k_final UNION ALL SELECT * FROM egib_final) u",
+            "u.tx = e.tx AND u.ty = e.ty",
+            &cols
+        ),
     )
 }
 
-// Same shape as ADDRESSES_MVT_SQL/BUILDINGS_MVT_SQL above, reading the full
-// government tables (`prg_addresses`, `bdot10k_buildings`, `egib_buildings`)
-// instead of the `*_unmatched` serving tables, for the legend's "all" layer.
-// These three tables are in `server::REQUIRED_TABLES` -- `run` refuses to
-// start without them -- so, unlike the serving tables, no empty-table
-// fallback is needed here. They carry the same RTREE(geom) indexes the
-// serving tables do (created at import time; see `import::bdot10k`,
-// `import::egib`, `import::prg`), so the constant-argument `ST_Intersects`
-// form keeps this on the index for the same reason documented above. No tag
-// resolution here -- these layers show every government object, matched or
-// not, so there's nothing to "preview importing" for most of them.
-//
-// `reported` is the one exception to that "no resolution" rule, and it is
-// what makes these two layers the *only* place a user-reported object is
-// visible at all. An active report vetoes its object out of `*_unmatched`
-// (see `rule::reported_sql`), so the object vanishes from the `addresses`/
-// `buildings` layers and reappears only here, where it would otherwise be
-// indistinguishable from an ordinary matched record -- the frontend showed
-// it as plain "W rejestrze" with nothing saying why it stopped being
-// offered. The flag lets the popup say "Zgłoszony" instead.
-//
-// Three things about it:
-//
-// 1. The predicate is `rule::reported_sql`, the same builder both compare
-//    paths negate, so what the popup calls "reported" is by construction the
-//    same condition that removed the row from the serving table -- the
-//    "match rule has one home" property, extended to the read path.
-// 2. `CASE WHEN ... THEN TRUE END`, not a bare boolean: `ST_AsMVT` omits a
-//    NULL attribute from the feature that has it, so only the handful of
-//    reported features pay for the flag and every other feature's bytes are
-//    unchanged. Note what this does *not* mean: the layer's key dictionary
-//    still gains the string `reported` as soon as the column exists, whether
-//    or not any feature is flagged -- verified against a real tile, and the
-//    reason the tests below read the flag per row rather than grepping bytes.
-// 3. The `MATERIALIZED` CTEs are not decoration. Before this, each source's
-//    spatial filter sat directly in the scan and reached the RTREE index; a
-//    correlated `EXISTS` added alongside it gives the optimizer licence to
-//    re-plan the filtered scan into SEQ_SCAN + FILTER, exactly as a
-//    downstream `LEFT JOIN` does (see the ADDRESSES_MVT_SQL/BUILDINGS_MVT_SQL
-//    comment above). Computing the bbox-filtered candidate set first and
-//    correlating over *that* keeps the index scan.
-//    `mvt_bbox_filter_uses_the_rtree_index` asserts on the plan and is the
-//    only thing that would catch a regression here.
-//
-// Cache correctness: `POST /report` enqueues the object's z14 cell into
-// `tile_dirty_cells` as well as `match_dirty_cells` (see `reports::
-// enqueue_tiles_for_reports`), which is exactly what this attribute needs --
-// it is computed at serve time from `object_reports`, on layers that read the
-// raw source tables and so are never touched by a drain. The tile refresh
-// re-renders the 3x3 ring around the cell, which covers every tile that can
-// draw the object, since a surviving building's reach from its own centroid's
-// cell is <= 1 (`dataset::filter_oversized_geometry`). So the flag appears in
-// the same re-render that removes the object from the unmatched layer, not
-// before and not later. Revoke and expiry enqueue the same way.
-//
-// Both are built through a `projection` seam for the same reason
-// `compare::incremental` has one: `ST_AsMVT` returns opaque protobuf bytes, so
-// a test that only searches those bytes can see that a *key* exists but never
-// which features carry it -- a `reported` clause that flagged every building
-// would look identical to one that flagged the right one. Passing a plain
-// column list instead of the `ST_AsMVT(...)` call lets the tests read the flag
-// per row off the real generated SQL, wrapper aside.
 static ALL_ADDRESSES_MVT_SQL: LazyLock<String> =
-    LazyLock::new(|| all_addresses_sql(&as_mvt_sql("addresses_all")));
+    LazyLock::new(|| all_addresses_sql(&as_mvt_sql("addresses_all"), TileScope::Single));
 
-fn all_addresses_sql(projection: &str) -> String {
-    format!(
-        "
-    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
-    candidates AS MATERIALIZED (
-        SELECT a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc,
-               a.kod_pocztowy, a.wazny_od_lub_data_nadania, a.teryt_gmina, a.gmina
-        FROM prg_addresses a
-        WHERE ST_Intersects(a.geom, ST_MakeEnvelope(?, ?, ?, ?))
-    )
-    SELECT {projection}
-    FROM (
-        SELECT ST_AsMVTGeom(a.geom, bbox.geom, 4096, 256, true) AS geom,
+fn all_addresses_sql(projection: &str, scope: TileScope) -> String {
+    let cols = format!(
+        "ST_AsMVTGeom(a.geom, {box}, 4096, 256, true) AS geom,
                a.lokalny_id,
                a.numer_porzadkowy,
                a.ulica,
@@ -450,44 +613,46 @@ fn all_addresses_sql(projection: &str) -> String {
                a.wazny_od_lub_data_nadania::VARCHAR AS wazny_od_lub_data_nadania,
                a.teryt_gmina,
                a.gmina,
-               CASE WHEN {reported} THEN TRUE END AS reported
-        FROM candidates a, bbox
-    ) t
-    WHERE t.geom IS NOT NULL
-",
+               CASE WHEN {reported} THEN TRUE END AS reported",
+        box = scope.box_expr(),
         reported = reported_sql(&PRG, "a"),
+    );
+    format!(
+        "
+    {header}
+    candidates AS MATERIALIZED (
+        SELECT a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc,
+               a.kod_pocztowy, a.wazny_od_lub_data_nadania, a.teryt_gmina, a.gmina
+        FROM prg_addresses a
+        WHERE ST_Intersects(a.geom, {scan})
+    )
+{body}",
+        header = scope.header(),
+        scan = scope.scan_envelope(0.0),
+        body = scope.body(
+            "addresses_all",
+            projection,
+            "candidates a",
+            "ST_Intersects(a.geom, e.poly)",
+            &cols
+        ),
     )
 }
 
 static ALL_BUILDINGS_MVT_SQL: LazyLock<String> =
-    LazyLock::new(|| all_buildings_sql(&as_mvt_sql("buildings_all")));
+    LazyLock::new(|| all_buildings_sql(&as_mvt_sql("buildings_all"), TileScope::Single));
 
-fn all_buildings_sql(projection: &str) -> String {
-    format!(
-        "
-    WITH bbox AS (SELECT ST_Extent(ST_MakeEnvelope(?, ?, ?, ?)) AS geom),
-    bdot10k_candidates AS MATERIALIZED (
-        SELECT b.geom, b.PRZESTRZENNAZW, b.LOKALNYID, b.PRZEWAZAJACAFUNKCJABUDYNKU,
-               b.FUNKCJAOGOLNABUDYNKU, b.LICZBAKONDYGNACJI, b.KATEGORIAISTNIENIA,
-               b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA, b.KODKST,
-               b.ZRODLODANYCHGEOMETRYCZNYCH
-        FROM bdot10k_buildings b
-        WHERE ST_Intersects(b.geom, ST_MakeEnvelope(?, ?, ?, ?))
-    ),
-    egib_candidates AS MATERIALIZED (
-        SELECT b.geom, b.id_budynku, b.kondygnacje_nadziemne, b.kondygnacje_podziemne,
-               b.rodzaj
-        FROM egib_buildings b
-        WHERE ST_Intersects(b.geom, ST_MakeEnvelope(?, ?, ?, ?))
-    )
-    SELECT {projection}
-    FROM (
-        SELECT ST_AsMVTGeom(raw.geom, bbox.geom, 4096, 256, true) AS geom,
+fn all_buildings_sql(projection: &str, scope: TileScope) -> String {
+    let cols = format!(
+        "ST_AsMVTGeom(raw.geom, {box}, 4096, 256, true) AS geom,
                raw.id, raw.source, raw.PRZEWAZAJACAFUNKCJABUDYNKU, raw.FUNKCJAOGOLNABUDYNKU,
                raw.levels_above_ground, raw.KATEGORIAISTNIENIA, raw.NAZWA, raw.FSBUD,
                raw.INFORMACJADODATKOWA, raw.KODKST, raw.ZRODLODANYCHGEOMETRYCZNYCH,
-               raw.kondygnacje_podziemne, raw.rodzaj, raw.reported
-        FROM (
+               raw.kondygnacje_podziemne, raw.rodzaj, raw.reported",
+        box = scope.box_expr(),
+    );
+    let raw = format!(
+        "(
             SELECT b.geom, b.LOKALNYID AS id, 'bdot10k' AS source,
                    b.PRZEWAZAJACAFUNKCJABUDYNKU, b.FUNKCJAOGOLNABUDYNKU,
                    b.LICZBAKONDYGNACJI::INTEGER AS levels_above_ground,
@@ -506,12 +671,37 @@ fn all_buildings_sql(projection: &str) -> String {
                    b.kondygnacje_podziemne, b.rodzaj,
                    CASE WHEN {reported_egib} THEN TRUE END AS reported
             FROM egib_candidates b
-        ) raw, bbox
-    ) t
-    WHERE t.geom IS NOT NULL
-",
+        ) raw",
         reported_bdot10k = reported_sql(&BDOT10K, "b"),
         reported_egib = reported_sql(&EGIB, "b"),
+    );
+    format!(
+        "
+    {header}
+    bdot10k_candidates AS MATERIALIZED (
+        SELECT b.geom, b.PRZESTRZENNAZW, b.LOKALNYID, b.PRZEWAZAJACAFUNKCJABUDYNKU,
+               b.FUNKCJAOGOLNABUDYNKU, b.LICZBAKONDYGNACJI, b.KATEGORIAISTNIENIA,
+               b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA, b.KODKST,
+               b.ZRODLODANYCHGEOMETRYCZNYCH
+        FROM bdot10k_buildings b
+        WHERE ST_Intersects(b.geom, {scan})
+    ),
+    egib_candidates AS MATERIALIZED (
+        SELECT b.geom, b.id_budynku, b.kondygnacje_nadziemne, b.kondygnacje_podziemne,
+               b.rodzaj
+        FROM egib_buildings b
+        WHERE ST_Intersects(b.geom, {scan})
+    )
+{body}",
+        header = scope.header(),
+        scan = scope.scan_envelope(0.0),
+        body = scope.body(
+            "buildings_all",
+            projection,
+            &raw,
+            "ST_Intersects(raw.geom, e.poly)",
+            &cols
+        ),
     )
 }
 
@@ -995,6 +1185,124 @@ pub fn render_points_tiles(
     Ok(out)
 }
 
+/// [`render_z14_tile`]'s bulk form: every tile in `tiles`, four queries total
+/// instead of four per tile.
+///
+/// Measured against rendering the same tiles one at a time: **4.7x** across a
+/// random sample of eight z11 blocks (36.1 -> 7.7 ms/tile), and 11x on a rural
+/// block where the fixed per-query cost dominates. Projected over the ~140k
+/// z14 tiles the warm set covers, ~85 -> ~18 CPU-minutes.
+///
+/// Callers must hand it a **spatially compact** block -- `tile_warm` and
+/// `jobs::tile_refresh` both group by z11 ancestor, whose batch envelope *is*
+/// the z11 tile's envelope, so the source scans read exactly the area asked
+/// for. A scattered list would make the scans read its bounding box instead.
+///
+/// The whole batch fails together: one bad geometry takes its block's tiles
+/// with it rather than just its own. That is the same "leave them unwarmed /
+/// stale" outcome a per-tile failure already had, only coarser, and both
+/// callers treat it that way.
+pub fn render_z14_tiles(
+    conn: &Connection,
+    tiles: &[(u32, u32)],
+) -> anyhow::Result<Vec<RenderedTile>> {
+    if tiles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scope = TileScope::Batched(tiles);
+    // Same four layers in the same order as `render_z14_tile`: a tile is the
+    // concatenation of four single-layer tiles, since an MVT tile is just a
+    // repeated `layers` field.
+    let layers = [
+        addresses_sql(&as_mvt_sql("addresses"), scope),
+        buildings_sql(&as_mvt_sql("buildings"), scope),
+        all_addresses_sql(&as_mvt_sql("addresses_all"), scope),
+        all_buildings_sql(&as_mvt_sql("buildings_all"), scope),
+    ];
+
+    let mut parts: HashMap<(u32, u32), Vec<u8>> = HashMap::with_capacity(tiles.len());
+    for sql in &layers {
+        for (key, mvt) in query_batched_layer(conn, sql)? {
+            parts.entry(key).or_default().extend_from_slice(&mvt);
+        }
+    }
+    Ok(tiles
+        .iter()
+        .filter_map(|key| parts.remove(key).map(|mvt| (*key, mvt)))
+        .collect())
+}
+
+/// One batched layer query: `(tx, ty, mvt)` per requested tile.
+///
+/// Plain `prepare`, not `prepare_cached`: the text carries the batch's tile
+/// list, so it differs per call and caching it would miss every time while
+/// evicting the entries that do hit. See `query_mvt_layer`.
+fn query_batched_layer(conn: &Connection, sql: &str) -> anyhow::Result<Vec<RenderedTile>> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let tx: i32 = row.get(0)?;
+        let ty: i32 = row.get(1)?;
+        // NULL is unreachable -- an all-filtered group still emits its layer
+        // header -- but decoding it as empty rather than failing matches
+        // `query_mvt_layer`'s own NULL handling.
+        let mvt: Option<Vec<u8>> = row.get(2)?;
+        out.push(((tx as u32, ty as u32), mvt.unwrap_or_default()));
+    }
+    Ok(out)
+}
+
+/// A spatially compact run of same-zoom tiles, rendered by one query per layer.
+pub struct RenderBlock {
+    pub z: u32,
+    pub tiles: Vec<(u32, u32)>,
+}
+
+/// How many bits of tile coordinate a block spans: 3, so a block is the 8x8
+/// tiles under one common ancestor -- 64 of them.
+///
+/// **Grouping by ancestor rather than by a run of the sorted key list is what
+/// keeps the batch envelope tight.** A block's bounding box *is* its ancestor
+/// tile's box, so the batched source scans read exactly the area asked for; a
+/// run cut out of a sorted list is a tall thin strip whose box covers far more.
+/// 64 also bounds the result set, which is the other reason not to go wider: a
+/// dense 64-tile z14 block returns ~9.2 MB of MVT in one go, and 256 would be
+/// ~37 MB.
+pub const RENDER_BLOCK_SHIFT: u32 = 3;
+
+/// Group tile keys into blocks the batched renderers can take.
+///
+/// Same-zoom is not a nicety: [`render_block`] derives every tile's envelope
+/// and cell range from one `z`, so a block mixing zooms would render half its
+/// tiles at the wrong one rather than fail.
+pub fn render_blocks(keys: &[TileKey]) -> Vec<RenderBlock> {
+    let mut by_block: std::collections::BTreeMap<(u32, u32, u32), Vec<(u32, u32)>> =
+        std::collections::BTreeMap::new();
+    for &(z, x, y) in keys {
+        by_block
+            .entry((z, x >> RENDER_BLOCK_SHIFT, y >> RENDER_BLOCK_SHIFT))
+            .or_default()
+            .push((x, y));
+    }
+    by_block
+        .into_iter()
+        .map(|((z, _, _), tiles)| RenderBlock { z, tiles })
+        .collect()
+}
+
+/// Render one block, dispatching to the tier's batched query.
+///
+/// The bulk counterpart to [`render_tile`], and the only thing `tiles warm` and
+/// `jobs::tile_refresh` need to call.
+pub fn render_block(conn: &Connection, block: &RenderBlock) -> anyhow::Result<Vec<RenderedTile>> {
+    if block.z == CHANGE_CELL_ZOOM {
+        render_z14_tiles(conn, &block.tiles)
+    } else {
+        render_points_tiles(conn, block.z, &block.tiles)
+    }
+}
+
 /// Tier C (z14): the four-layer tile -- `addresses`, `buildings`,
 /// `addresses_all`, `buildings_all`, concatenated.
 ///
@@ -1130,12 +1438,30 @@ fn tile_body_response(
     resp
 }
 
+/// Run one `ST_AsMVT` query and return its blob.
+///
+/// **`prepare_cached`, and every caller must pass a *constant* `sql`.** DuckDB
+/// re-plans on every `prepare`, and planning the four z14 layer queries costs
+/// ~8 ms per tile independent of how much data the tile holds -- a large share
+/// of a sparse tile's whole render. Caching the statement removes most of it:
+/// `z14_render_cost_floor_across_densities` moved from 16.7-18.2 ms to
+/// 13.9-14.7 ms on one-object tiles, ~3 ms flat per tile, with the densest
+/// tiles unchanged inside noise. (A standalone DuckDB-CLI experiment suggested
+/// ~6 ms; the in-process figure is the one to believe.)
+///
+/// The cache is a per-connection LRU keyed on the SQL **text**, which is what
+/// makes the constant-text requirement load-bearing rather than stylistic. All
+/// five call sites qualify: the four z14 layers are `LazyLock<String>`s, and
+/// `agg_cells_sql` produces one text per zoom (seven in total). A caller whose
+/// text varied per request -- `points_mvt_sql`, which interpolates its tile
+/// list -- would miss every time *and* evict the entries that do hit, so
+/// `render_points_tiles` deliberately calls plain `prepare` instead.
 fn query_mvt_layer(
     conn: &duckdb::Connection,
     sql: &str,
     params: impl duckdb::Params,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let mut rows = stmt.query(params)?;
     match rows.next()? {
         Some(row) => {
@@ -2198,7 +2524,10 @@ mod tests {
             max_lon + ADJACENCY_READ_BUFFER_DEG,
             max_lat + ADJACENCY_READ_BUFFER_DEG,
         );
-        let sql = buildings_sql("t.id, t.\"source:building\", t.\"building:levels\"");
+        let sql = buildings_sql(
+            "t.id, t.\"source:building\", t.\"building:levels\"",
+            TileScope::Single,
+        );
         let conn = state.pool.get().unwrap();
         let mut stmt = conn.prepare(&sql).unwrap();
         let mut rows = stmt
@@ -2352,7 +2681,10 @@ mod tests {
         // bbox CTE, bdot10k_candidates, egib_candidates.
         reported_flags(
             state,
-            &all_buildings_sql("t.id, t.reported IS NOT NULL AS reported"),
+            &all_buildings_sql(
+                "t.id, t.reported IS NOT NULL AS reported",
+                TileScope::Single,
+            ),
             3,
         )
     }
@@ -2361,7 +2693,10 @@ mod tests {
         // bbox CTE, candidates.
         reported_flags(
             state,
-            &all_addresses_sql("t.lokalny_id, t.reported IS NOT NULL AS reported"),
+            &all_addresses_sql(
+                "t.lokalny_id, t.reported IS NOT NULL AS reported",
+                TileScope::Single,
+            ),
             2,
         )
     }
@@ -3112,6 +3447,176 @@ mod tests {
         }
     }
 
+    /// A z14 seed spread over two adjacent tiles, in every table the four
+    /// layers read.
+    ///
+    /// `bdot10k_buildings` gets a touching pair carrying the adjacency key, so
+    /// the `max_neighbours` path is actually exercised rather than trivially
+    /// returning zero -- that path is the one place `Batched` computes anything
+    /// differently (per (tile, row) rather than per row), so a seed that never
+    /// reached it would make this test agree for the wrong reason.
+    fn z14_seed(tiles: &[(u32, u32)]) -> String {
+        let mut sql = String::new();
+        for (i, &(x, y)) in tiles.iter().enumerate() {
+            let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(CHANGE_CELL_ZOOM, x, y);
+            let (lon, lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+            // A pair of small touching squares, so the second is the first's
+            // same-class neighbour.
+            let w = (max_lon - min_lon) / 16.0;
+            let poly = |x0: f64, y0: f64| {
+                format!(
+                    "ST_GeomFromText('POLYGON(({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))')",
+                    x1 = x0 + w,
+                    y1 = y0 + w
+                )
+            };
+            let (a, b) = (poly(lon, lat), poly(lon + w, lat));
+            sql.push_str(&format!(
+                "INSERT INTO bdot10k_unmatched
+                     (LOKALNYID, geom, cell_x, cell_y, computed_at, PRZESTRZENNAZW,
+                      funkcja_szczegolowa, funkcja_ogolna, liczba_kondygnacji)
+                 VALUES ('b{i}', {a}, {x}, {y}, now(), 'PL.PZGiK', '{key}', 'inny', 2);
+                 INSERT INTO egib_unmatched
+                     (id_budynku, geom, cell_x, cell_y, computed_at, rodzaj_kod,
+                      kondygnacje_nadziemne)
+                 VALUES ('e{i}', {b}, {x}, {y}, now(), '{ekey}', 1);
+                 INSERT INTO prg_unmatched
+                     (geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc,
+                      kod_pocztowy, teryt_miejscowosc, cell_x, cell_y, computed_at)
+                 VALUES (ST_Point({lon}, {lat}), 'a{i}', '{i}', 'Polna', 'Wies',
+                         '00-001', '0918123', {x}, {y}, now());
+                 INSERT INTO prg_addresses
+                     (lokalny_id, numer_porzadkowy, ulica, miejscowosc, geom)
+                 VALUES ('a{i}', '{i}', 'Polna', 'Wies', ST_Point({lon}, {lat}));
+                 INSERT INTO bdot10k_buildings
+                     (PRZESTRZENNAZW, LOKALNYID, geom, centroid,
+                      PRZEWAZAJACAFUNKCJABUDYNKU, LICZBAKONDYGNACJI)
+                 VALUES ('PL.PZGiK', 'b{i}', {a}, ST_Centroid({a}), '{key}', 2),
+                        ('PL.PZGiK', 'n{i}', {b}, ST_Centroid({b}), '{key}', 2);
+                 INSERT INTO egib_buildings
+                     (id_budynku, geom, centroid, rodzaj_kod, kondygnacje_nadziemne)
+                 VALUES ('e{i}', {b}, ST_Centroid({b}), '{ekey}', 1);\n",
+                key = BDOT10K_ADJACENCY_KEY,
+                ekey = EGIB_ADJACENCY_KEY,
+            ));
+        }
+        sql
+    }
+
+    /// A z14 tile rendered inside a batch is byte-identical to the same tile
+    /// rendered alone.
+    ///
+    /// This is the property that lets `Single` and `Batched` both exist: the
+    /// request path renders one tile, `tiles warm` and `jobs::tile_refresh`
+    /// render blocks, and neither may produce different bytes for the same
+    /// tile. It covers all four layers at once, since `render_tile` returns
+    /// them concatenated.
+    #[tokio::test]
+    async fn a_z14_tile_rendered_in_a_batch_is_byte_identical_to_one_rendered_alone() {
+        let tiles = [(8000u32, 4900u32), (8001, 4900), (8000, 4901)];
+        let state = make_state(&z14_seed(&tiles));
+        let conn = state.pool.get().unwrap();
+
+        let batched = render_z14_tiles(&conn, &tiles).unwrap();
+        assert_eq!(batched.len(), tiles.len(), "one entry per requested tile");
+        for ((x, y), mvt) in batched {
+            let alone = render_tile(&conn, CHANGE_CELL_ZOOM, x, y).unwrap();
+            assert_eq!(mvt, alone, "z14/{x}/{y} differs between the two paths");
+            assert!(!mvt.is_empty());
+        }
+    }
+
+    /// A batch must answer for a tile holding nothing, with the same four
+    /// layer headers a lone render produces.
+    ///
+    /// `GROUP BY` alone emits no row for such a tile, and a missing row is not
+    /// an empty tile -- it would surface as a 204 on a tier that must never
+    /// send one. `TileScope::body`'s `LEFT JOIN` + `FILTER` is what prevents
+    /// that, and this is the test that notices if either half goes.
+    #[tokio::test]
+    async fn a_z14_batch_answers_for_tiles_holding_nothing() {
+        let populated = (8000u32, 4900u32);
+        let state = make_state(&z14_seed(&[populated]));
+        let conn = state.pool.get().unwrap();
+
+        let empty = [(8100u32, 4950u32), (8101, 4950)];
+        let asked = [populated, empty[0], empty[1]];
+        let rendered = render_z14_tiles(&conn, &asked).unwrap();
+
+        assert_eq!(rendered.len(), 3);
+        for (key, mvt) in &rendered {
+            assert!(
+                !mvt.is_empty(),
+                "{key:?} holds nothing, but an empty tile is four layer headers, not zero bytes"
+            );
+            assert_eq!(
+                *mvt,
+                render_tile(&conn, CHANGE_CELL_ZOOM, key.0, key.1).unwrap()
+            );
+        }
+        let by_key: std::collections::HashMap<_, _> = rendered.into_iter().collect();
+        assert_eq!(
+            by_key[&empty[0]], by_key[&empty[1]],
+            "every empty z14 tile is the same four headers"
+        );
+        assert!(by_key[&populated].len() > by_key[&empty[0]].len());
+    }
+
+    /// Blocks are same-zoom, grouped by common ancestor, and never larger than
+    /// the 8x8 that ancestor holds.
+    ///
+    /// Same-zoom is the load-bearing half: `render_block` derives every tile's
+    /// envelope from one `z`, so a block mixing zooms would render half its
+    /// tiles at the wrong zoom rather than fail. Ancestor grouping is the other
+    /// half -- it is what keeps a batch's bounding box equal to the area its
+    /// tiles actually cover.
+    #[test]
+    fn render_blocks_group_same_zoom_tiles_under_a_common_ancestor() {
+        let mut keys: Vec<TileKey> = Vec::new();
+        // One full 8x8 z14 block. Both origins are multiples of 8, i.e. the
+        // block is ancestor-aligned -- an unaligned run of 64 straddles two
+        // blocks and is split, which is the behaviour and not a bug.
+        keys.extend((0..8).flat_map(|dx| (0..8).map(move |dy| (14, 8000 + dx, 4896 + dy))));
+        keys.push((14, 8008, 4896));
+        // Same x/y numbers at a different zoom must not join them.
+        keys.push((13, 8000, 4896));
+
+        let blocks = render_blocks(&keys);
+        assert_eq!(
+            blocks.iter().map(|b| b.tiles.len()).sum::<usize>(),
+            keys.len(),
+            "every key lands in exactly one block"
+        );
+        for b in &blocks {
+            assert!(b.tiles.len() <= 1 << (2 * RENDER_BLOCK_SHIFT));
+            for &(x, y) in &b.tiles {
+                assert_eq!(
+                    (x >> RENDER_BLOCK_SHIFT, y >> RENDER_BLOCK_SHIFT),
+                    (
+                        b.tiles[0].0 >> RENDER_BLOCK_SHIFT,
+                        b.tiles[0].1 >> RENDER_BLOCK_SHIFT
+                    ),
+                    "a block must not straddle its ancestor"
+                );
+            }
+        }
+        let mut shape: Vec<(u32, usize)> = blocks.iter().map(|b| (b.z, b.tiles.len())).collect();
+        shape.sort();
+        assert_eq!(shape, vec![(13, 1), (14, 1), (14, 64)]);
+
+        // An unaligned 8x8 run really does split, rather than being forced
+        // into one oversized block.
+        let unaligned: Vec<TileKey> = (0..8)
+            .flat_map(|dx| (0..8).map(move |dy| (14, 8000 + dx, 4900 + dy)))
+            .collect();
+        let mut split: Vec<usize> = render_blocks(&unaligned)
+            .iter()
+            .map(|b| b.tiles.len())
+            .collect();
+        split.sort();
+        assert_eq!(split, vec![32, 32]);
+    }
+
     // --- Determinism / ORDER BY benchmark ------------------------------------
     //
     // Ignored by default: needs the real ./osmpbudynkiv2.duckdb and exclusive
@@ -3153,6 +3658,71 @@ mod tests {
             }
         }
         differing
+    }
+
+    /// The verification the whole z14 batching change rests on: over real
+    /// blocks, every tile a batch produces is byte-identical to the same tile
+    /// rendered alone, and the batch is faster.
+    ///
+    /// Needs the real `./osmpbudynkiv2.duckdb` and exclusive access (stop any
+    /// `run` server). Blocks are chosen to cover the three cases that matter:
+    /// a dense city, a block with many *unmatched* buildings (the adjacency
+    /// path, which is the only thing `Batched` computes differently), and sea
+    /// (empty tiles, whose aggregate is a DuckDB crash away from wrong -- see
+    /// `TileScope::body`).
+    #[test]
+    #[ignore]
+    fn z14_batches_match_per_tile_renders_on_the_real_database() {
+        let Some(conn) = real_db() else { return };
+        // (label, z11 ancestor)
+        let blocks = [
+            ("Warsaw centre", 1143u32, 674u32),
+            ("dense unmatched", 1132, 687),
+            ("rural", 1105, 661),
+            ("Baltic (empty)", 1143, 650),
+        ];
+        for (label, bx, by) in blocks {
+            let tiles: Vec<(u32, u32)> = (0..8)
+                .flat_map(|dx| (0..8).map(move |dy| ((bx << 3) + dx, (by << 3) + dy)))
+                .collect();
+
+            let t = std::time::Instant::now();
+            let per_tile: Vec<Vec<u8>> = tiles
+                .iter()
+                .map(|&(x, y)| render_tile(&conn, CHANGE_CELL_ZOOM, x, y).unwrap())
+                .collect();
+            let per_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            let t = std::time::Instant::now();
+            let batched = render_z14_tiles(&conn, &tiles).unwrap();
+            let bat_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            assert_eq!(batched.len(), tiles.len(), "{label}: one entry per tile");
+            let mut differing = 0;
+            for (i, ((x, y), mvt)) in batched.iter().enumerate() {
+                assert_eq!((*x, *y), tiles[i], "{label}: order must follow the request");
+                if *mvt != per_tile[i] {
+                    differing += 1;
+                    println!(
+                        "  DIFFERS z14/{x}/{y}: {} vs {} B",
+                        per_tile[i].len(),
+                        mvt.len()
+                    );
+                }
+            }
+            let bytes: usize = per_tile.iter().map(|v| v.len()).sum();
+            println!(
+                "{label:<16} {} tiles  per-tile {per_ms:8.1} ms ({:6.2}/tile)  batched {bat_ms:7.1} ms ({:5.2}/tile)  {:4.1}x  {bytes} B  differing {differing}",
+                tiles.len(),
+                per_ms / tiles.len() as f64,
+                bat_ms / tiles.len() as f64,
+                per_ms / bat_ms,
+            );
+            assert_eq!(
+                differing, 0,
+                "{label}: batched output must be byte-identical"
+            );
+        }
     }
 
     /// What the batched points query buys, as a function of batch size.

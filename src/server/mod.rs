@@ -63,10 +63,13 @@ impl r2d2::ManageConnection for ClonedConnectionManager {
     /// connection without mutating it, so a panic elsewhere leaves nothing
     /// half-written for it to observe.
     fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
-        self.base
+        let conn = self
+            .base
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .try_clone()
+            .try_clone()?;
+        conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+        Ok(conn)
     }
 
     fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
@@ -82,10 +85,23 @@ pub type DbPool = Pool<ClonedConnectionManager>;
 
 /// Builds the shared pool from an already-open, already-initialized base
 /// connection (extensions loaded, schema created, `duckdb_init_commands` run
-/// — see `db::init_db`). No further per-connection setup is needed: extension
+/// — see `db::init_db`). Almost no per-connection setup is needed: extension
 /// loads, custom table/scalar function registrations, and `SET GLOBAL`
 /// settings are all instance-wide and already visible to every `try_clone()`
 /// (verified empirically — docs/duckdb_connection_visibility_investigation.md).
+/// The one exception is the prepared-statement cache, which is genuinely
+/// per-connection — see [`PREPARED_STATEMENT_CACHE_CAPACITY`] and
+/// `ClonedConnectionManager::connect`.
+/// Prepared statements kept per pooled connection.
+///
+/// `tiles::query_mvt_layer` relies on this: it caches on the SQL text, and a
+/// server connection cycles through eleven constant texts (the four z14 layers
+/// plus one `agg_cells_sql` per zoom z5..z11). duckdb-rs defaults to 16, which
+/// clears that but leaves no room, and an LRU that starts thrashing costs the
+/// ~8 ms/tile of planning back **silently** -- no error, just a slower server.
+/// Raised so a future query does not quietly reintroduce the cost.
+const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 32;
+
 pub fn build_pool(base_conn: Connection, pool_size: u32) -> Result<DbPool> {
     Pool::builder()
         .max_size(pool_size)

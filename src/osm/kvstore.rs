@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rocksdb::{
-    BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MergeOperands,
-    MultiThreaded, Options, WriteBatch, WriteOptions,
+    BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBWithThreadMode,
+    MergeOperands, MultiThreaded, Options, WriteBatch, WriteOptions,
 };
 
 use super::encoding;
@@ -60,7 +60,52 @@ const FORMAT_VERSION_KEY: &[u8] = b"format_version";
 pub const FORMAT_MISMATCH_MESSAGE: &str = "RocksDB store was built by an incompatible version — re-run `import osm` \
      to rebuild it (there is no in-place migration)";
 
-pub type RocksDB = DBWithThreadMode<MultiThreaded>;
+/// The block caches the store's column families were opened with.
+///
+/// These have to be owned by the handle rather than dropped at the end of
+/// [`open`], because [`clear`] and [`clear_tiles`] recreate a column family on
+/// a *live* database and `create_cf` takes a fresh `Options`. Without the
+/// original cache in hand, a recreated family silently falls back to RocksDB's
+/// own default -- which is the whole defect recorded in
+/// `docs/rocksdb_block_cache_not_applied.md`, reintroduced after every
+/// `tiles clear`. `Cache` is refcounted, so holding one here costs a pointer.
+struct Caches {
+    /// Shared by every column family except `CF_TILES`, which is what
+    /// `rocksdb_block_cache_mb`'s "shared across all column families" promise
+    /// means. Handing each family its own `new_lru_cache` would instead
+    /// multiply the configured budget by the family count.
+    shared: Cache,
+    /// `CF_TILES` alone, so a browsing session's tile blocks can never evict
+    /// the OSM node blocks `update osm` reads on every minutely diff.
+    tiles: Cache,
+}
+
+/// The store handle: a RocksDB database plus the caches it was opened with.
+///
+/// Derefs to the underlying database, so every `db.get_cf(...)` call site reads
+/// exactly as it did when this was a bare type alias.
+pub struct RocksDB {
+    db: DBWithThreadMode<MultiThreaded>,
+    caches: Caches,
+}
+
+impl std::ops::Deref for RocksDB {
+    type Target = DBWithThreadMode<MultiThreaded>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.db
+    }
+}
+
+/// Hand-written because `Cache` is not `Debug`, and only so `Result<RocksDB>`
+/// keeps working with `unwrap_err`. Prints nothing about the store's contents.
+impl std::fmt::Debug for RocksDB {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RocksDB")
+            .field("path", &self.db.path())
+            .finish()
+    }
+}
 
 /// Full merge for reverse-index CFs.
 /// Existing value (if any) is an encoded id-list: 4-byte LE count + N * 8-byte LE i64s.
@@ -100,28 +145,36 @@ fn id_list_partial_merge(
     Some(result)
 }
 
-/// Tile block-cache size used when column families are recreated outside
-/// [`open`] -- i.e. by [`clear`], which has no config in scope. A store being
-/// cleared is mid-`import osm` and serves no tiles, and the next [`open`]
-/// installs the configured size, so the only cost of the default being wrong
-/// is a differently-sized cache for the rest of that import.
-const DEFAULT_TILE_BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
-
-fn make_cf_opts(name: &str, write_buffer_bytes: usize, tile_block_cache_bytes: usize) -> Options {
+/// Per-column-family options.
+///
+/// **Every family must set a block-based table factory here, and the block
+/// cache rides on that factory.** A `ColumnFamilyDescriptor`'s options fully
+/// *replace* the DB-level options for every column-family-scoped setting rather
+/// than merging with them, and the table factory is one of those -- so a family
+/// that sets no factory silently gets `Options::default()`'s, which lazily
+/// builds its own 32 MB cache the first time it opens an SST. That is not a
+/// warning, a log line or an error; the only symptom is
+/// `Block cache ... capacity: 32.00 MB` in RocksDB's `LOG` and a cache that
+/// evicts constantly. Setting the factory on `db_opts` in [`open`] looks like
+/// it should work and does nothing at all. Measured in production against
+/// `rocksdb_block_cache_mb = 512`: three families on 32 MB apiece, all
+/// saturated. Full write-up in `docs/rocksdb_block_cache_not_applied.md`;
+/// guard is `every_column_family_opens_on_its_configured_block_cache`.
+fn make_cf_opts(name: &str, write_buffer_bytes: usize, caches: &Caches) -> Options {
     let mut cf_opts = Options::default();
+    let mut bbt = BlockBasedOptions::default();
+    bbt.set_block_cache(if name == CF_TILES {
+        &caches.tiles
+    } else {
+        &caches.shared
+    });
+    cf_opts.set_block_based_table_factory(&bbt);
     if name == CF_TILES {
         // Values arrive already gzipped by `server::tile_store`, so compressing
         // them again would burn CPU on every write and every compaction for
         // nothing. This is the one CF that opts out of the blanket Zstd below,
         // and it reads as an oversight without this comment.
         cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
-        // Its own block cache, so tile blocks can never evict OSM node blocks
-        // off the `update osm` hot path. Pre-compressed values mean this cache
-        // holds 3-4x more tiles per byte than raw MVT would.
-        let mut bbt = BlockBasedOptions::default();
-        let cache = rocksdb::Cache::new_lru_cache(tile_block_cache_bytes);
-        bbt.set_block_cache(&cache);
-        cf_opts.set_block_based_table_factory(&bbt);
         // Steady small request-path writes, not a bulk-load burst.
         cf_opts.set_max_write_buffer_number(2);
         if write_buffer_bytes > 0 {
@@ -168,34 +221,37 @@ pub fn open(
     db_opts.set_bytes_per_sync(1 << 20);
     db_opts.set_wal_bytes_per_sync(1 << 20);
 
-    let mut bbt = BlockBasedOptions::default();
-    let cache = rocksdb::Cache::new_lru_cache(
-        (block_cache_mb * 1024 * 1024)
-            .try_into()
-            .context("block_cache_mb overflow")?,
-    );
-    bbt.set_block_cache(&cache);
-    db_opts.set_block_based_table_factory(&bbt);
-
+    // Deliberately NOT `db_opts.set_block_based_table_factory(...)`: the
+    // per-family options below replace it wholesale, so a factory set here
+    // would be used by nothing. See `make_cf_opts`.
     let write_buffer_bytes: usize = (write_buffer_mb * 1024 * 1024)
         .try_into()
         .context("write_buffer_mb overflow")?;
-    let tile_block_cache_bytes: usize = (tile_block_cache_mb * 1024 * 1024)
-        .try_into()
-        .context("tile_block_cache_mb overflow")?;
+    let caches = Caches {
+        shared: Cache::new_lru_cache(
+            (block_cache_mb * 1024 * 1024)
+                .try_into()
+                .context("block_cache_mb overflow")?,
+        ),
+        tiles: Cache::new_lru_cache(
+            (tile_block_cache_mb * 1024 * 1024)
+                .try_into()
+                .context("tile_block_cache_mb overflow")?,
+        ),
+    };
 
     let cfs: Vec<ColumnFamilyDescriptor> = ALL_CFS
         .iter()
         .map(|name| {
-            ColumnFamilyDescriptor::new(
-                *name,
-                make_cf_opts(name, write_buffer_bytes, tile_block_cache_bytes),
-            )
+            ColumnFamilyDescriptor::new(*name, make_cf_opts(name, write_buffer_bytes, &caches))
         })
         .collect();
 
-    let db = DBWithThreadMode::open_cf_descriptors(&db_opts, path, cfs)
-        .context("Failed to open RocksDB")?;
+    let db = RocksDB {
+        db: DBWithThreadMode::open_cf_descriptors(&db_opts, path, cfs)
+            .context("Failed to open RocksDB")?,
+        caches,
+    };
 
     check_or_stamp_format_version(&db)?;
 
@@ -248,11 +304,8 @@ pub fn clear(db: &RocksDB) -> Result<()> {
     for name in ALL_CFS {
         db.drop_cf(name)
             .with_context(|| format!("Failed to drop CF {name}"))?;
-        db.create_cf(
-            *name,
-            &make_cf_opts(name, 0, DEFAULT_TILE_BLOCK_CACHE_BYTES),
-        )
-        .with_context(|| format!("Failed to recreate CF {name}"))?;
+        db.create_cf(*name, &make_cf_opts(name, 0, &db.caches))
+            .with_context(|| format!("Failed to recreate CF {name}"))?;
     }
     // The meta CF was just dropped along with the rest, so the version stamp
     // has to be rewritten or the next `open` would see a store with data and
@@ -272,11 +325,8 @@ pub fn clear(db: &RocksDB) -> Result<()> {
 pub fn clear_tiles(db: &RocksDB) -> Result<()> {
     db.drop_cf(CF_TILES)
         .with_context(|| format!("Failed to drop CF {CF_TILES}"))?;
-    db.create_cf(
-        CF_TILES,
-        &make_cf_opts(CF_TILES, 0, DEFAULT_TILE_BLOCK_CACHE_BYTES),
-    )
-    .with_context(|| format!("Failed to recreate CF {CF_TILES}"))?;
+    db.create_cf(CF_TILES, &make_cf_opts(CF_TILES, 0, &db.caches))
+        .with_context(|| format!("Failed to recreate CF {CF_TILES}"))?;
     Ok(())
 }
 
@@ -631,6 +681,67 @@ mod tests {
     /// `clear` drops every CF including `meta`, so it must re-stamp. Asserted
     /// on the stamp itself, not on a later `open` succeeding: `open` stamps an
     /// unstamped store on its own, so a reopen would pass either way.
+    /// Every family opens on the cache it was configured with, and the non-tile
+    /// families **share one pool**.
+    ///
+    /// Both halves are needed and they catch different regressions. Capacity
+    /// alone would pass if each family were handed its own
+    /// `Cache::new_lru_cache(block_cache_mb)` -- the budget would then be
+    /// multiplied by the family count while every capacity still read
+    /// correctly. Usage is what distinguishes one shared pool from N private
+    /// ones, and it only says anything once a read has actually populated a
+    /// block, which is why this flushes an SST first: a memtable read never
+    /// touches the block cache at all.
+    #[test]
+    fn every_column_family_opens_on_its_configured_block_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Neither size may be 32 MB: that is RocksDB's own default, so a
+        // family that silently fell back to it would still report the
+        // "configured" capacity and the check would pass for the wrong reason.
+        let db = open(tmp.path(), 48, 4, 8).unwrap();
+
+        for name in ALL_CFS {
+            let expected = if *name == CF_TILES { 8 } else { 48 } * 1024 * 1024;
+            let capacity = db
+                .property_int_value_cf(&cf(&db, name), "rocksdb.block-cache-capacity")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                capacity, expected,
+                "{name} must open on the configured cache, not RocksDB's silent 32 MB default"
+            );
+        }
+
+        // Populate the shared pool through one family: write, flush to an SST
+        // (the block cache is only consulted for SST reads), then read back.
+        put_node(&db, 1, 210_000_000, 520_000_000).unwrap();
+        db.flush_cf(&cf(&db, CF_NODES)).unwrap();
+        assert!(get_node(&db, 1).unwrap().is_some());
+
+        let usage = |name: &str| {
+            db.property_int_value_cf(&cf(&db, name), "rocksdb.block-cache-usage")
+                .unwrap()
+                .unwrap()
+        };
+        let shared = usage(CF_NODES);
+        assert!(shared > 0, "the read should have cached a block");
+        for name in ALL_CFS.iter().filter(|n| **n != CF_TILES) {
+            assert_eq!(
+                usage(name),
+                shared,
+                "{name} reports its own usage, so it is not sharing the OSM pool"
+            );
+        }
+        // Not zero: an empty family still reports a few dozen bytes of the
+        // cache's own bookkeeping. What matters is that it is a *different*
+        // pool, so a browsing session's tile blocks can never evict the OSM
+        // node blocks `update osm` reads on every minutely diff.
+        assert!(
+            usage(CF_TILES) < shared,
+            "tiles must be a separate pool from the OSM families"
+        );
+    }
+
     #[test]
     fn clear_restamps_the_format_version() {
         let tmp = TempDir::new().unwrap();

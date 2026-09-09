@@ -6,10 +6,11 @@ memory growth turned out to be unrelated — see the "Not the memory bug" sectio
 at the bottom — but the block cache the investigation went looking for was not
 there.
 
-Not fixed. The fix is small and mechanical (below); it is recorded here rather
-than applied blind because it *raises* the process's steady-state footprint by
-roughly 640 MB, and that wants to land alongside the memory-growth work rather
-than in the middle of it.
+**Fixed 2026-09-09.** The fix went in as described below, plus one case the
+original write-up did not anticipate — see *What actually landed*. Expect the
+steady-state footprint to rise by roughly 640 MB; that is the setting working,
+not a regression, and it wants watching against `MemoryCurrent` alongside the
+`MALLOC_CONF` experiment in `docs/memory_growth_investigation.md`.
 
 ---
 
@@ -153,3 +154,59 @@ memory growth. In the same production process RocksDB was near-idle overall —
 1.09M cumulative writes, 0.06 GB ingested, 0.02 GB compacted and 3.6 s of
 compaction CPU across the entire log — for a total footprint around 100 MB
 against a 9.7 GB RSS. See `docs/memory_growth_investigation.md`.
+
+
+---
+
+## What actually landed
+
+Two things beyond the sketch above.
+
+### The recreate path needed the cache too
+
+`clear` and `clear_tiles` drop and recreate a column family on a **live**
+database, and `create_cf` takes a fresh `Options`. Passing `make_cf_opts` a
+cache it can only get from `open`'s locals meant a recreated family fell back to
+RocksDB's default — so the defect would have come straight back after every
+`tiles clear`, on the one family that had been working. The fix above alone does
+not cover this.
+
+`RocksDB` is therefore no longer a bare type alias for
+`DBWithThreadMode<MultiThreaded>`. It is a struct owning the database plus the
+two `Cache` handles it was opened with, and it `Deref`s to the database so every
+existing `db.get_cf(...)` call site is unchanged. `Cache` is refcounted, so
+holding them costs a pointer each.
+
+Two caches, not one: the OSM families share `rocksdb_block_cache_mb` (the
+"shared across all column families" its doc comment already promised), and
+`CF_TILES` keeps its own `rocksdb_tile_block_cache_mb` so a browsing session's
+tile blocks can never evict the OSM node blocks `update osm` reads on every
+minutely diff.
+
+### The guard, and the trap in writing it
+
+`every_column_family_opens_on_its_configured_block_cache` asserts both halves,
+because they catch different regressions:
+
+- **capacity per family** — catches the factory going missing again;
+- **`rocksdb.block-cache-usage` identical across the OSM families** — catches a
+  future edit handing each family its own `new_lru_cache`, which would multiply
+  the configured budget by the family count while every *capacity* still read
+  correctly.
+
+Two things make the test non-obvious, both verified by reintroducing the bug and
+watching it fail:
+
+1. **The configured size must not be 32 MB.** That is RocksDB's own default, so
+   a family that silently fell back to it still reports the "configured"
+   capacity and the assertion passes for the wrong reason. The test uses 48 MB.
+   The first draft used 32 and was blind to exactly the symptom this document
+   opens with.
+2. **Usage only says anything after an SST read.** A memtable read never
+   consults the block cache, so the test writes a node, `flush_cf`s it to an
+   SST, and only then reads it back. Without the flush every family reports the
+   same near-zero usage and the sharing half passes vacuously.
+
+An empty family reports a few dozen bytes rather than zero (cache bookkeeping),
+so the tiles-are-separate assertion is `usage(CF_TILES) < shared`, not
+`== 0`.
