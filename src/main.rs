@@ -37,7 +37,23 @@ fn main() -> Result<()> {
     shutdown::install_handler();
 
     info!(db_path = %config.db_path, rocksdb_path = %config.rocksdb_path, "Initializing databases");
-    let kv = Arc::new(osm::kvstore::open(
+    // Exactly the commands that end in `compact_osm_families` -- see
+    // `open_for_bulk_load` for why only they get it.
+    let bulk_load = matches!(
+        cli.command,
+        Command::Import {
+            source: cli::ImportSource::Osm { .. } | cli::ImportSource::Full { .. }
+        } | Command::Init { .. }
+            | Command::Kv {
+                action: cli::KvAction::Compact
+            }
+    );
+    let open_kv = if bulk_load {
+        osm::kvstore::open_for_bulk_load
+    } else {
+        osm::kvstore::open
+    };
+    let kv = Arc::new(open_kv(
         Path::new(&config.rocksdb_path),
         config.rocksdb_block_cache_mb,
         config.rocksdb_write_buffer_mb,
@@ -131,6 +147,14 @@ fn main() -> Result<()> {
             clear_tile_store(&kv)?;
         }
         Command::Tiles { action } => server::tile_warm::run(&conn, kv.clone(), action, &config)?,
+        Command::Kv {
+            action: cli::KvAction::Compact,
+        } => {
+            // No `clear_tile_store`: compaction rewrites files, not values, so
+            // nothing a tile renders can change.
+            osm::kvstore::compact_osm_families(&kv)?;
+            info!("RocksDB compaction complete");
+        }
         Command::Run => {
             let rt = tokio::runtime::Runtime::new()?;
             let config = Arc::new(config);

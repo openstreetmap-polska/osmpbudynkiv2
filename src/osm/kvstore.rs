@@ -285,6 +285,54 @@ pub fn open(
     write_buffer_mb: u64,
     tile_block_cache_mb: u64,
 ) -> Result<RocksDB> {
+    open_with(
+        path,
+        block_cache_mb,
+        write_buffer_mb,
+        tile_block_cache_mb,
+        1,
+    )
+}
+
+/// [`open`], for the offline commands that end in [`compact_osm_families`]
+/// (`import osm`/`full`, `init`, `kv compact`): the same store with
+/// compactions allowed to split across every core.
+///
+/// Measured on a full Poland `import osm`, both from scratch on the same disk:
+/// 10m57s -> **8m04s**, all of it in the final compaction (4m07s -> 1m02s;
+/// `nodes` 76 -> 12 s, `node_to_ways` 154 -> 44 s), with the streaming pass
+/// identical and the store byte-for-byte the same size. `run` and everything
+/// else keep RocksDB's default of 1, which is what they were measured with --
+/// their compactions are small, and `run` shares its cores with requests.
+///
+/// It has to be set here, at open: RocksDB's per-call override
+/// (`CompactRangeOptions::max_subcompactions`) is not wrapped by
+/// `rust-rocksdb`, and neither is `SetDBOptions`.
+pub fn open_for_bulk_load(
+    path: &Path,
+    block_cache_mb: u64,
+    write_buffer_mb: u64,
+    tile_block_cache_mb: u64,
+) -> Result<RocksDB> {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4);
+    open_with(
+        path,
+        block_cache_mb,
+        write_buffer_mb,
+        tile_block_cache_mb,
+        cores,
+    )
+}
+
+fn open_with(
+    path: &Path,
+    block_cache_mb: u64,
+    write_buffer_mb: u64,
+    tile_block_cache_mb: u64,
+    max_subcompactions: u32,
+) -> Result<RocksDB> {
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
@@ -297,6 +345,7 @@ pub fn open(
         .unwrap_or(4)
         .max(4);
     db_opts.set_max_background_jobs(bg_jobs);
+    db_opts.set_max_subcompactions(max_subcompactions);
     db_opts.set_bytes_per_sync(1 << 20);
     db_opts.set_wal_bytes_per_sync(1 << 20);
     // A DB-level setting, so unlike the table factory below it is NOT
@@ -688,11 +737,76 @@ pub fn write_batch(db: &RocksDB, batch: &WriteBatch) -> Result<()> {
     Ok(())
 }
 
-/// Compact the reverse-index column families to collapse merge operands.
-/// Call after bulk import to optimize read performance.
-pub fn compact_reverse_indexes(db: &RocksDB) {
-    db.compact_range_cf(&cf(db, CF_NODE_TO_WAYS), None::<&[u8]>, None::<&[u8]>);
-    db.compact_range_cf(&cf(db, CF_WAY_TO_RELATIONS), None::<&[u8]>, None::<&[u8]>);
+/// Families `import osm` writes in id order. Their flushes never overlap, so
+/// RocksDB *trivially moves* each file down to the bottommost level instead of
+/// compacting it -- the import LOG shows ~320 `nodes` files moved and zero
+/// real compactions -- and nothing ever rewrites them afterwards. They need a
+/// forced bottommost compaction; see [`compact_osm_families`].
+const ID_ORDERED_FAMILIES: &[&str] = &[CF_NODES, CF_WAYS, CF_RELATIONS];
+
+/// Families written through the merge operator. Their operands overlap, so
+/// ordinary compaction already rewrites them; a plain `compact_range` is what
+/// collapses the remaining operands into single values.
+const REVERSE_INDEX_FAMILIES: &[&str] = &[CF_NODE_TO_WAYS, CF_WAY_TO_RELATIONS];
+
+/// Compact every OSM column family into its final shape. `import osm` runs
+/// this as its last RocksDB step; `kv compact` runs it by hand, which is how a
+/// store imported before this existed gets the benefit.
+///
+/// **The id-ordered families must be compacted with
+/// `BottommostLevelCompaction::Force`, and that is the whole point.** A plain
+/// `compact_range` skips files already sitting at the bottommost level with
+/// nothing above them to merge -- which, after import's trivial moves, is most
+/// of `nodes`. Forced, measured against the real Poland store:
+///
+/// - `nodes` 2,340 -> 1,959 MB (-16%), `ways` 664 -> 608 MB (-8.5%);
+/// - the `update osm` read path (way -> refs -> batched node coordinates)
+///   126-129 -> 85 ms warm (-33%), 272 -> 213 ms cold (-20%), because a lookup
+///   stops probing several levels;
+/// - about a minute inside a full import, opened with
+///   [`open_for_bulk_load`] (4 minutes without subcompactions).
+///
+/// The size drop comes from sequence numbers: a bottommost compaction zeroes
+/// them, a trivial move keeps each key's 8-byte trailer as written, and on a
+/// 16-byte node record that trailer is most of what zstd cannot squeeze.
+///
+/// The reverse indexes deliberately stay on a plain `compact_range`: forcing
+/// `node_to_ways` measured 1,289 -> 1,287 MB for 143 s, because the merge
+/// operator had already made import compact it for real.
+///
+/// Cancellation is checked **between** families only. RocksDB offers no way to
+/// abort a manual compaction in flight, so a Ctrl+C lets the current family
+/// finish (minutes, for `nodes`) -- which is also why stopping is safe: every
+/// family is either fully rewritten or untouched, never half-way.
+pub fn compact_osm_families(db: &RocksDB) -> Result<()> {
+    let sst_bytes = |name: &str| {
+        db.property_int_value_cf(&cf(db, name), "rocksdb.total-sst-files-size")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    };
+    let mut forced = rocksdb::CompactOptions::default();
+    forced.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+    let plain = rocksdb::CompactOptions::default();
+
+    let families = ID_ORDERED_FAMILIES
+        .iter()
+        .map(|n| (*n, &forced))
+        .chain(REVERSE_INDEX_FAMILIES.iter().map(|n| (*n, &plain)));
+    for (name, opts) in families {
+        crate::shutdown::check_requested()?;
+        let before = sst_bytes(name);
+        let t = std::time::Instant::now();
+        db.compact_range_cf_opt(&cf(db, name), None::<&[u8]>, None::<&[u8]>, opts);
+        tracing::info!(
+            family = name,
+            before_mb = before / (1 << 20),
+            after_mb = sst_bytes(name) / (1 << 20),
+            elapsed_s = t.elapsed().as_secs(),
+            "compacted RocksDB column family"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -849,6 +963,92 @@ mod tests {
             "an SST read should register as a block-cache miss -- are statistics enabled?"
         );
         assert!(after.shared_block_cache_usage_bytes > 0);
+    }
+
+    /// Recreates the shape `import osm` leaves `nodes` in: id-ordered writes,
+    /// flushed, then moved to the bottommost level by a plain `compact_range`
+    /// -- which, with nothing overlapping, is a trivial move that rewrites
+    /// nothing and keeps every key's sequence number. That is the state the
+    /// real store was measured in, and the one a plain compaction cannot fix.
+    fn a_trivially_moved_nodes_family() -> (TempDir, RocksDB) {
+        let (tmp, db) = open_tmp_db();
+        let mut batch = new_batch();
+        for id in 1..=5_000 {
+            batch_put_node(&db, &mut batch, id, 210_000_000 + id as i32, 520_000_000);
+        }
+        write_batch(&db, &batch).unwrap();
+        db.flush_cf(&cf(&db, CF_NODES)).unwrap();
+        db.compact_range_cf(&cf(&db, CF_NODES), None::<&[u8]>, None::<&[u8]>);
+        (tmp, db)
+    }
+
+    fn node_files(db: &RocksDB) -> Vec<rocksdb::LiveFile> {
+        db.live_files()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.column_family_name == CF_NODES)
+            .collect()
+    }
+
+    /// The id-ordered families must be compacted with
+    /// `BottommostLevelCompaction::Force`. A plain compaction leaves a
+    /// trivially moved file exactly as written -- same file, sequence numbers
+    /// intact -- and that file is where the measured 16% size and 33% read
+    /// cost come from. Asserted on the file itself rather than on its size,
+    /// which depends on how well a test fixture happens to compress.
+    #[test]
+    fn compaction_rewrites_id_ordered_data_a_plain_compaction_leaves_alone() {
+        let (_tmp, db) = a_trivially_moved_nodes_family();
+        let before = node_files(&db);
+        assert!(
+            before.iter().any(|f| f.largest_seqno > 0),
+            "fixture should start with sequence numbers intact, as import leaves them"
+        );
+
+        // The trap: a second plain compaction is a no-op on this shape.
+        db.compact_range_cf(&cf(&db, CF_NODES), None::<&[u8]>, None::<&[u8]>);
+        let names =
+            |files: &[rocksdb::LiveFile]| files.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&node_files(&db)), names(&before));
+
+        compact_osm_families(&db).unwrap();
+        let after = node_files(&db);
+        assert!(
+            after.iter().all(|f| !names(&before).contains(&f.name)),
+            "every nodes file should have been rewritten"
+        );
+        assert!(
+            after.iter().all(|f| f.largest_seqno == 0),
+            "a bottommost rewrite zeroes sequence numbers: {:?}",
+            after.iter().map(|f| f.largest_seqno).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            get_node(&db, 4_321).unwrap(),
+            Some((210_004_321, 520_000_000))
+        );
+    }
+
+    /// The reverse indexes are still compacted -- that is what collapses the
+    /// merge operands `import osm` writes -- even though they are not forced.
+    #[test]
+    fn compaction_still_collapses_reverse_index_merge_operands() {
+        let (_tmp, db) = open_tmp_db();
+        let mut batch = new_batch();
+        for way in [100, 101, 102] {
+            batch_merge_node_to_way(&db, &mut batch, 10, way);
+        }
+        write_batch(&db, &batch).unwrap();
+        db.flush_cf(&cf(&db, CF_NODE_TO_WAYS)).unwrap();
+
+        compact_osm_families(&db).unwrap();
+        let files: Vec<_> = db
+            .live_files()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.column_family_name == CF_NODE_TO_WAYS)
+            .collect();
+        assert_eq!(files.iter().map(|f| f.num_entries).sum::<u64>(), 1);
+        assert_eq!(get_node_to_ways(&db, 10).unwrap(), vec![100, 101, 102]);
     }
 
     #[test]

@@ -120,9 +120,10 @@ either.
 
 Level 3 vs 9, both force-compacted so the comparison is fair: `nodes` −1.1%,
 `ways` −3.1%, `node_to_ways` −13.9% — −218 MB overall — for 2.4–3.2× the
-compaction time and +1.5% on warm reads. And it would barely apply: `nodes` and
-`ways` are never compacted at import (below), so the level would only ever
-reach `node_to_ways`.
+compaction time and +1.5% on warm reads. Now that import ends with a forced
+compaction (below) the level would reach every family, but the two big wins it
+would buy there are the smallest (−1.1%, −3.1%), and 2.4–3.2× compaction time
+would put back most of the minute subcompactions took off the import.
 
 ### Fewer background jobs (12 → 4)
 
@@ -130,8 +131,8 @@ RocksDB spawns its pool eagerly at open: 12 jobs = 12 threads (3 high, 9 low),
 4 = 4. The motivation was jemalloc arena spread, but production's
 `MALLOC_CONF=narenas:4` already caps arenas regardless of thread count, and
 idle threads touch almost none of their stacks. Meanwhile the import is
-compaction-bound (the L0 stalls above) at 12, and `import osm` and `run` share
-`kvstore::open`.
+compaction-bound (the L0 stalls above) at 12, and `import osm` and `run` get
+the same `max_background_jobs` from `kvstore::open_with`.
 
 ### Cache sizes
 
@@ -141,28 +142,54 @@ tiles family is 1,070 MB, and the bench's uniform-ish tile sweep saturated the
 cache at 255 MB, which says nothing about real traffic). The `/status`
 counters above are what will answer it.
 
-## Found along the way, not implemented
+## Found along the way, and landed: a forced compaction after `import osm`
 
-**`nodes` and `ways` are never compacted after `import osm`.** They are written
-in id order, so every flush is non-overlapping and gets trivially *moved* down
-to L6: the import LOG shows ~320 `nodes` and ~33 `ways` files moved and zero
-real compactions (vs 68 for `node_to_ways`, whose merge operands overlap, plus
-`compact_reverse_indexes`). The store keeps several levels with overlapping
-ranges, and a forced full compaction of the two families measured:
+Not one of the ten, and worth more than any of them.
 
-- size: `nodes` 2,340 → 1,959 MB (−16%), `ways` 664 → 608 MB (−8.5%);
-  `node_to_ways` unchanged (1,289 → 1,287), as it already had been compacted
+**`nodes` and `ways` are never compacted by `import osm`.** They are written in
+id order, so every flush is non-overlapping and gets trivially *moved* down to
+L6: the import LOG shows ~320 `nodes` and ~33 `ways` files moved and zero real
+compactions (vs 68 for `node_to_ways`, whose merge operands overlap).
+`live_files()` on the real store shows the consequence directly — **all 179
+`nodes` files and all 30 `ways` files carry nonzero sequence numbers**, spread
+over three levels, while 20 of 21 `node_to_ways` files are already at zero.
+
+Forcing a bottommost compaction, on copies of the real store:
+
+- size: `nodes` 2,340 → 1,959 MB (−16%), `ways` 664 → 608 MB (−8.5%),
+  `node_to_ways` 1,289 → 1,287 (already compacted); every family ends in one
+  level with every sequence number zero — which is where the size comes from:
+  a bottommost compaction zeroes seqnos, and on a 16-byte node record the
+  8-byte trailer is most of what zstd cannot squeeze;
 - `update osm` read workload: **126–129 → 85 ms warm (−33%)**, 272 → 213–219 ms
-  cold (−20%), reproducible across interleaved runs;
-  `BlockCacheDataHit` 281,645 → 162,710 with misses unchanged — i.e. ~119k
-  fewer (cached) multi-level probes
-- cost: ~195 s (162 s `nodes` + 33 s `ways`) on this NVMe box
+  cold (−20%), reproducible across interleaved runs; `BlockCacheDataHit`
+  281,645 → 162,710 with misses unchanged, i.e. ~119k fewer (cached)
+  multi-level probes;
+- transient disk: +1.36 GB at peak (sampled every 2 s), net −439 MB.
 
-The size drop is most likely sequence-number zeroing (a bottommost compaction
-zeroes seqnos; trivially moved flush output keeps its nonzero 8-byte trailer,
-which matters on a 16-byte record) — inferred from which families shrank,
-not directly observed. It is also the real fix for the multi-level probing
-that made OSM filters look attractive, and it makes them pointless afterwards.
-The natural home is next to `compact_reverse_indexes` at the end of `import
-osm`. An existing store only benefits after a re-import (or a one-off forced
-compaction with exclusive access).
+It is also the real fix for the multi-level probing that made OSM filters look
+attractive, and it leaves them pointless (`BloomFilterUseful = 0` on the
+compacted copy).
+
+**Subcompactions make it cheap.** Single-threaded, the forced `nodes` + `ways`
+compaction took 218 s on a SATA SSD; with `max_subcompactions = 12`, 45 s, same
+output. A full Poland `import osm`, both runs from scratch on the same disk:
+
+| | subcompactions 1 | subcompactions 12 |
+|---|---|---|
+| whole import | 10m57s | **8m04s** |
+| streaming pass | 4m22s | 4m22s |
+| compaction step | 4m07s | **1m02s** |
+| final store | 3,888 MB | 3,888 MB |
+
+The old import already paid ~155 s for the plain `node_to_ways` compaction
+alone, so the new step is faster than the one it replaced.
+
+What landed (`kvstore::compact_osm_families`): a forced bottommost compaction of
+`nodes`, `ways`, `relations`; a plain one of the two reverse indexes (forcing
+`node_to_ways` measured −0.2% for 143 s). `import osm` ends with it, and
+`kv compact` runs it by hand — 50 s on the real store. The commands that run it
+open RocksDB with `max_subcompactions` = cores (`kvstore::open_for_bulk_load`);
+everything else, `run` included, keeps the default of 1 it was measured with.
+It has to be set at open: `rust-rocksdb` wraps neither
+`CompactRangeOptions::max_subcompactions` nor `SetDBOptions`.

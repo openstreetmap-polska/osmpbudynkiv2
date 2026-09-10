@@ -171,11 +171,15 @@ pub fn import(
         );
         check_shutdown()?;
 
+        // Last RocksDB step, after every pass that reads the store back. Not
+        // optional polish: without it `nodes` and `ways` keep the shape the
+        // streaming pass left them in -- see `compact_osm_families` for the
+        // measured cost of skipping it.
         let t = std::time::Instant::now();
-        kvstore::compact_reverse_indexes(kv);
+        kvstore::compact_osm_families(kv)?;
         info!(
             elapsed = %format_duration(t.elapsed()),
-            "Step done: compact reverse indexes"
+            "Step done: compact RocksDB"
         );
         check_shutdown()?;
 

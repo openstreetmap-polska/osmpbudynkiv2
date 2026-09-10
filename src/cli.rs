@@ -81,6 +81,11 @@ pub enum Command {
         #[command(subcommand)]
         action: TilesAction,
     },
+    /// Maintain the RocksDB store holding OSM node coordinates and structure
+    Kv {
+        #[command(subcommand)]
+        action: KvAction,
+    },
     /// Run HTTP service with background data updates
     Run,
 }
@@ -108,6 +113,21 @@ pub enum TilesAction {
     /// Empty the tile store. The escape hatch for a suspected missed
     /// invalidation; tiles re-render on demand afterwards.
     Clear,
+}
+
+#[derive(Subcommand)]
+pub enum KvAction {
+    /// Rewrite the OSM column families into their final, fully compacted
+    /// shape — the same step `import osm` ends with. Worth running once on a
+    /// store imported before that step existed: it shrinks `nodes` by ~16% and
+    /// makes `update osm`'s reads ~30% faster. Changes no data, so tiles and
+    /// match results are unaffected.
+    ///
+    /// Takes minutes (the `nodes` family alone was ~160 s on NVMe) and cannot
+    /// be interrupted mid-family: Ctrl+C stops after the current one. Requires
+    /// exclusive access to the store — do not run this while a `run` server
+    /// has it open.
+    Compact,
 }
 
 #[derive(Subcommand)]
