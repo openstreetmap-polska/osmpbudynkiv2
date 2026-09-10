@@ -101,6 +101,9 @@ binary, easy to deploy.
   z12–z14 tile the data covers (list derived from `cell_totals`, not a bbox, so
   sea and border tiles are skipped; already-stored tiles are skipped too, so an
   interrupted warm resumes); `clear` empties it
+- `kv compact` — rewrite the OSM RocksDB families into their compacted shape,
+  the same step `import osm` ends with (requires exclusive access). For a store
+  imported before that step existed; changes no data
 - `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package`,
   `/updates`, `POST /report`) plus background update, drain, tile-refresh and
   reconcile jobs
@@ -899,6 +902,36 @@ Four things:
    check the *resolved* feature set (`cargo tree -f "{p} [{f}]"`).
 4. The shutdown flag is polled once per blob (~8k elements), frequent enough to
    stay responsive without hammering an atomic millions of times.
+
+**Gotcha — `import osm` must end with a *forced* compaction, because the
+streaming pass leaves `nodes` and `ways` uncompacted.** They are written in id
+order, so every flush is non-overlapping and RocksDB *trivially moves* it down
+to the bottommost level: the import LOG shows ~320 `nodes` files moved and zero
+real compactions, and every one keeps its sequence numbers. The resulting store
+probes several levels per lookup and carries an 8-byte seqno trailer on a
+16-byte record. `kvstore::compact_osm_families` fixes both; `kv compact` runs it
+by hand for a store imported before it existed. Measured on the real store:
+`nodes` −16%, `ways` −8.5%, and `update osm`'s read path −33% warm. Three
+things:
+
+1. **`BottommostLevelCompaction::Force` is the active ingredient.** A plain
+   `compact_range` leaves a trivially moved bottommost file exactly as written —
+   same file, seqnos intact. The reverse indexes stay on a plain compaction
+   deliberately: their merge operands already forced real compactions at
+   import, and forcing `node_to_ways` measured −0.2% for 143 s. Guard:
+   `kvstore::tests::compaction_rewrites_id_ordered_data_a_plain_compaction_leaves_alone`.
+2. **The bulk commands open with `open_for_bulk_load`** (`max_subcompactions` =
+   cores) — `import osm`/`full`, `init`, `kv compact`, chosen in `main.rs`. A
+   full Poland import measured 10m57s → 8m04s, all of it in this step, which
+   is now faster than the plain reverse-index compaction it replaced. Every
+   other command, `run` included, keeps RocksDB's default of 1: it was never
+   measured with more, and `run` shares its cores with requests. It has to be
+   set at open because `rust-rocksdb` wraps neither the per-call override nor
+   `SetDBOptions`.
+3. **A family's compaction cannot be interrupted**, only the gaps between
+   them, so Ctrl+C can wait up to a minute (`nodes`). It needs ~1.4 GB of free
+   disk while it runs (measured peak), and a store it has already compacted
+   is simply rewritten again — harmless, just not free.
 
 **Gotcha — `import osm`'s replication stamp is written last, not first.**
 `import::osm::import` reads the PBF header's replication info immediately so a
