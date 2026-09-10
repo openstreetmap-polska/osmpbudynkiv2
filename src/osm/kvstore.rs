@@ -2,10 +2,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rocksdb::statistics::{StatsLevel, Ticker};
 use rocksdb::{
     BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBWithThreadMode,
     MergeOperands, MultiThreaded, Options, WriteBatch, WriteOptions,
 };
+use serde::Serialize;
 
 use super::encoding;
 
@@ -80,13 +82,68 @@ struct Caches {
     tiles: Cache,
 }
 
-/// The store handle: a RocksDB database plus the caches it was opened with.
+/// The store handle: a RocksDB database plus the caches and DB-level options
+/// it was opened with.
 ///
 /// Derefs to the underlying database, so every `db.get_cf(...)` call site reads
 /// exactly as it did when this was a bare type alias.
 pub struct RocksDB {
     db: DBWithThreadMode<MultiThreaded>,
     caches: Caches,
+    /// Kept for the same reason as `caches`: RocksDB's statistics live on the
+    /// `Options` object, not on the database, so [`RocksDB::stats`] can only
+    /// read a ticker back while the options `open` enabled them on are still
+    /// alive. Dropping them at the end of `open` would leave counters that are
+    /// collected but unreadable.
+    opts: Options,
+}
+
+/// Cumulative RocksDB counters since the store was opened, for `/status`.
+///
+/// **The tickers are database-wide, not per column family**: there is one
+/// `Statistics` object per database, so the block-cache hit/miss pair mixes
+/// tile reads with OSM reads even though the two sit on separate caches.
+/// Per-tier saturation is what the `*_block_cache_*` usage/capacity pairs are
+/// for -- they are read off each `Cache` directly. The bloom counters, by
+/// contrast, are effectively tiles-only, because `CF_TILES` is the only family
+/// with a filter (see [`make_cf_opts`]).
+///
+/// Collected at `StatsLevel::ExceptHistogramOrTimers` -- counters only.
+/// Measured against the real store: +1-2% on the `update osm` read path and
+/// +2-4% on tile-store gets (~0.15 us per get), negligible next to an HTTP
+/// response. Histograms or timers would cost more and nothing reads them.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct KvStats {
+    pub block_cache_data_hit: u64,
+    pub block_cache_data_miss: u64,
+    /// Lookups a filter answered "definitely absent", i.e. reads avoided.
+    pub bloom_filter_useful: u64,
+    /// Lookups a filter answered "may be present"...
+    pub bloom_filter_full_positive: u64,
+    /// ...and of those, how many really were. The gap between the two is the
+    /// false-positive count; at 10 bits per key it should sit near 1%.
+    pub bloom_filter_full_true_positive: u64,
+    pub shared_block_cache_usage_bytes: u64,
+    pub shared_block_cache_capacity_bytes: u64,
+    pub tiles_block_cache_usage_bytes: u64,
+    pub tiles_block_cache_capacity_bytes: u64,
+}
+
+impl RocksDB {
+    pub fn stats(&self) -> KvStats {
+        let t = |ticker| self.opts.get_ticker_count(ticker);
+        KvStats {
+            block_cache_data_hit: t(Ticker::BlockCacheDataHit),
+            block_cache_data_miss: t(Ticker::BlockCacheDataMiss),
+            bloom_filter_useful: t(Ticker::BloomFilterUseful),
+            bloom_filter_full_positive: t(Ticker::BloomFilterFullPositive),
+            bloom_filter_full_true_positive: t(Ticker::BloomFilterFullTruePositive),
+            shared_block_cache_usage_bytes: self.caches.shared.get_usage() as u64,
+            shared_block_cache_capacity_bytes: self.caches.shared.get_capacity() as u64,
+            tiles_block_cache_usage_bytes: self.caches.tiles.get_usage() as u64,
+            tiles_block_cache_capacity_bytes: self.caches.tiles.get_capacity() as u64,
+        }
+    }
 }
 
 impl std::ops::Deref for RocksDB {
@@ -160,6 +217,20 @@ fn id_list_partial_merge(
 /// `rocksdb_block_cache_mb = 512`: three families on 32 MB apiece, all
 /// saturated. Full write-up in `docs/rocksdb_block_cache_not_applied.md`;
 /// guard is `every_column_family_opens_on_its_configured_block_cache`.
+///
+/// **`CF_TILES` is the only family with a bloom filter, and both halves of
+/// that are measured.** `TileStore::may_exist` is `key_may_exist_cf`, which
+/// answers "yes" whenever it cannot decide without I/O -- so with no filter it
+/// is "yes" for every key inside an SST's key range. On the fully warmed
+/// store (182,503 tiles) it said yes for 58,816 of 58,946 absent z14 tiles,
+/// 99.78%, which made `tiles warm`'s resume skip the tiles it was meant to
+/// render and `tile_refresh` re-render tiles that were never stored. At 10
+/// bits per key that drops to ~1% for ~1.25 bytes a tile. The OSM families
+/// were measured too and deliberately get none: after `import osm` their
+/// lookups are overwhelmingly hits (97% of nodes are in a way; changed ways
+/// all exist), so on a compacted copy of the real store a filter avoided
+/// **zero** reads while adding 53 MB of filter memory. See
+/// `docs/rocksdb_tuning_measured.md`.
 fn make_cf_opts(name: &str, write_buffer_bytes: usize, caches: &Caches) -> Options {
     let mut cf_opts = Options::default();
     let mut bbt = BlockBasedOptions::default();
@@ -168,6 +239,14 @@ fn make_cf_opts(name: &str, write_buffer_bytes: usize, caches: &Caches) -> Optio
     } else {
         &caches.shared
     });
+    if name == CF_TILES {
+        // Written into each SST as it is written, so it does NOT retrofit an
+        // existing store: older files answer "may exist" for everything until
+        // they are rewritten, and a full `compact_range_cf` leaves
+        // already-bottommost files alone. `tiles clear` + `tiles warm` is the
+        // way to get accurate probes on a store written before this.
+        bbt.set_bloom_filter(10.0, false);
+    }
     cf_opts.set_block_based_table_factory(&bbt);
     if name == CF_TILES {
         // Values arrive already gzipped by `server::tile_store`, so compressing
@@ -220,6 +299,10 @@ pub fn open(
     db_opts.set_max_background_jobs(bg_jobs);
     db_opts.set_bytes_per_sync(1 << 20);
     db_opts.set_wal_bytes_per_sync(1 << 20);
+    // A DB-level setting, so unlike the table factory below it is NOT
+    // replaced by the per-family descriptors. Read back via `RocksDB::stats`.
+    db_opts.enable_statistics();
+    db_opts.set_statistics_level(StatsLevel::ExceptHistogramOrTimers);
 
     // Deliberately NOT `db_opts.set_block_based_table_factory(...)`: the
     // per-family options below replace it wholesale, so a factory set here
@@ -251,6 +334,7 @@ pub fn open(
         db: DBWithThreadMode::open_cf_descriptors(&db_opts, path, cfs)
             .context("Failed to open RocksDB")?,
         caches,
+        opts: db_opts,
     };
 
     check_or_stamp_format_version(&db)?;
@@ -740,6 +824,31 @@ mod tests {
             usage(CF_TILES) < shared,
             "tiles must be a separate pool from the OSM families"
         );
+    }
+
+    /// Statistics live on the `Options` object rather than the database, so
+    /// this pins both halves of making them usable: that `open` enables them,
+    /// and that the handle still holds the options once `open` has returned.
+    /// A read has to come off an SST for the block-cache counters to move --
+    /// a memtable read never consults the cache -- hence the flush.
+    #[test]
+    fn stats_count_block_cache_reads_after_open_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = open(tmp.path(), 48, 4, 8).unwrap();
+        let before = db.stats();
+        assert_eq!(before.shared_block_cache_capacity_bytes, 48 * 1024 * 1024);
+        assert_eq!(before.tiles_block_cache_capacity_bytes, 8 * 1024 * 1024);
+
+        put_node(&db, 1, 210_000_000, 520_000_000).unwrap();
+        db.flush_cf(&cf(&db, CF_NODES)).unwrap();
+        assert!(get_node(&db, 1).unwrap().is_some());
+
+        let after = db.stats();
+        assert!(
+            after.block_cache_data_miss > before.block_cache_data_miss,
+            "an SST read should register as a block-cache miss -- are statistics enabled?"
+        );
+        assert!(after.shared_block_cache_usage_bytes > 0);
     }
 
     #[test]

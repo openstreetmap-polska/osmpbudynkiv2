@@ -769,7 +769,7 @@ twice per drained cell. Both now wrap the source scan in a `candidates` CTE via 
 
 **Gotcha — the `tiles` column family is the one that opts out of everything
 the others do.** It holds rendered z12–z14 `/tiles` bodies
-(`server::tile_store`), and three of its settings look like oversights next to
+(`server::tile_store`), and four of its settings look like oversights next to
 the four OSM families:
 
 1. **Compression is `None`, not Zstd.** Values arrive already gzipped (see the
@@ -785,6 +785,16 @@ the four OSM families:
    whose mismatch decodes as a **miss** — the opposite policy to the one below,
    because the recovery costs differ by four orders of magnitude (one
    re-render vs a full re-import).
+4. **It is the only family with a bloom filter, and both halves are
+   measured.** `TileStore::may_exist` is `key_may_exist_cf`, which says "yes"
+   whenever it cannot decide without I/O — without a filter, 99.78% of absent
+   tiles on the warmed store, which silently broke `tiles warm`'s resume and
+   `tile_refresh`'s residency bound. The OSM families measured the opposite: a
+   filter avoided **zero** reads (their lookups are hits) for +53 MB. **A
+   filter does not retrofit** — it is written into each SST, and
+   `compact_range_cf` skips already-bottommost files — so a store written
+   before it needs `tiles clear` + `tiles warm`. The rejected tuning ideas and
+   their numbers: `docs/rocksdb_tuning_measured.md`.
 
 `kvstore::clear` drops it along with everything else, which is correct: a
 re-import rebuilds every OSM table, so every match decision changes anyway.
@@ -815,6 +825,10 @@ three saturated 32 MB caches. Write-up:
    live database, and without the original cache in hand the recreated family
    falls back to the 32 MB default — so the bug would return after every
    `tiles clear`. It `Deref`s to the database, so call sites are unaffected.
+   It owns its DB-level `Options` for the parallel reason: statistics live on
+   the options object, not the database, and `/status`'s `rocksdb.*` counters
+   (`RocksDB::stats`) are unreadable once it is dropped. Those counters are
+   database-wide, not per family.
 4. **The guard is
    `every_column_family_opens_on_its_configured_block_cache`**, and it must
    never be configured with 32 MB: that is RocksDB's default, so the capacity

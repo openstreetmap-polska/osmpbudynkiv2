@@ -226,6 +226,13 @@ pub struct StatusResponse {
     /// zero; a number that only grows means `tile_refresh` is not keeping up
     /// (or is disabled), and tiles are being served stale.
     pub tile_dirty_cells: i64,
+    /// RocksDB's own counters since process start -- see
+    /// `kvstore::KvStats`. The two questions it answers: is the `tiles`
+    /// bloom filter doing its job (`bloom_filter_*`, tiles-only in practice),
+    /// and is either block cache saturated (`*_usage_bytes` against
+    /// `*_capacity_bytes`, read per cache). The hit/miss pair is database-wide,
+    /// mixing tile and OSM reads. `null` only when no store is attached.
+    pub rocksdb: Option<crate::osm::kvstore::KvStats>,
     /// User reports by lifecycle state. `active` is the number currently
     /// vetoing objects out of the serving tables; a growing `expired` count is
     /// the registries fixing records people complained about.
@@ -241,6 +248,8 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let tile_store_misses = state.tile_store.misses();
     let tile_store_write_skips = state.tile_store.write_skips();
     let tile_store_bytes = state.tile_store.live_bytes();
+    // Atomic reads, same as the counters above -- no `spawn_blocking` needed.
+    let rocksdb = state.kv.as_ref().map(|kv| kv.stats());
     let (match_staleness, job_run_log, osm_replication, reports, tile_dirty_cells) =
         tokio::task::spawn_blocking(move || {
             (
@@ -266,6 +275,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         tile_store_write_skips,
         tile_store_bytes,
         tile_dirty_cells,
+        rocksdb,
         reports,
     })
 }

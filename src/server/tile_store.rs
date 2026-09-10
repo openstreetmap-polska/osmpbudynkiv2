@@ -335,7 +335,11 @@ impl TileStore {
         }
     }
 
-    /// Bloom-filter probe: no disk I/O, and **false positives are expected**.
+    /// Bloom-filter probe: no disk I/O, and **false positives are expected**
+    /// -- ~1% at the 10 bits per key `kvstore::make_cf_opts` gives `CF_TILES`.
+    /// That filter is load-bearing, not an optimisation: `key_may_exist_cf`
+    /// says "yes" whenever it cannot decide without I/O, so without one this
+    /// was "yes" for ~100% of absent tiles once they were flushed to disk.
     /// `jobs::tile_refresh` uses it to decide residency, where a false positive
     /// costs a tombstone for a key that was not there plus one tile rendered
     /// that was not resident -- which merely warms it. Do not "fix" this into
@@ -564,6 +568,47 @@ mod tests {
         let got = s.get((13, 5, 5)).expect("an empty tile is still stored");
         assert_eq!(got.body.orig_len, 0);
         assert!(got.body.decompress().unwrap().is_empty());
+    }
+
+    /// `may_exist` is only a residency probe because `CF_TILES` carries a
+    /// bloom filter (`kvstore::make_cf_opts`). Without one, `key_may_exist_cf`
+    /// answers "yes" for every key inside an SST's range: measured on the
+    /// fully warmed store, 99.78% of absent z14 tiles, which made `tiles
+    /// warm`'s resume skip the very tiles it had not rendered yet.
+    ///
+    /// The flush is the whole point. A memtable lookup is exact, so without it
+    /// this passes with or without the filter; and stored and absent keys are
+    /// interleaved so every absent key sits inside the SST's key range, where
+    /// only the filter can say no.
+    #[test]
+    fn may_exist_rejects_absent_tiles_once_they_are_on_disk() {
+        let dir = TempDir::new().unwrap();
+        let kv = Arc::new(kvstore::open(dir.path(), 8, 4, 8).unwrap());
+        let s = TileStore::new(kv.clone(), TFV, true);
+        let (etag, b) = body(b"tile");
+        for x in (0..4000u32).step_by(2) {
+            s.put((14, x, 5300), &etag, &b);
+        }
+        kv.flush_cf(&kv.cf_handle(kvstore::CF_TILES).unwrap())
+            .unwrap();
+
+        assert!(
+            (0..4000u32).step_by(2).all(|x| s.may_exist((14, x, 5300))),
+            "a filter has no false negatives: every stored tile must say yes"
+        );
+        let absent = 2000;
+        let false_positives = (1..4000u32)
+            .step_by(2)
+            .filter(|x| s.may_exist((14, *x, 5300)))
+            .count();
+        // ~1% at 10 bits per key; ~100% with no filter at all.
+        assert!(
+            false_positives < absent / 20,
+            "{false_positives} of {absent} absent tiles said \"may exist\" -- \
+             has CF_TILES lost its bloom filter?"
+        );
+        // And the filter is what answered, as `/status` would report it.
+        assert!(kv.stats().bloom_filter_useful >= (absent - false_positives) as u64);
     }
 
     #[test]

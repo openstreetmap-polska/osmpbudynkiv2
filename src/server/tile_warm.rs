@@ -120,9 +120,11 @@ fn warm(
 ) -> Result<()> {
     let all = covered_tiles(conn, bbox)?;
     // Skipping what is already stored is what makes an interrupted warm
-    // resumable rather than a restart. `may_exist` may say yes for a key that
-    // is absent; the cost is one tile not warmed, which the next request
-    // renders anyway.
+    // resumable rather than a restart. `may_exist` says yes for ~1% of absent
+    // keys; each costs one tile not warmed, which the next request renders
+    // anyway. That figure rests on `CF_TILES`'s bloom filter -- a store
+    // written before it existed answers yes for nearly every key in range, so
+    // a resume over it skips almost everything; `tiles clear` first.
     let todo: Vec<TileKey> = all.into_iter().filter(|k| !store.may_exist(*k)).collect();
     if todo.is_empty() {
         info!("tile store already warm, nothing to do");

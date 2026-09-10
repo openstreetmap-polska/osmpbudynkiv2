@@ -133,6 +133,11 @@ pub struct AppState {
     /// `TileStore::disabled()` (i.e. `config.cache.persist_tiles == false`) is
     /// a working no-op for the same reason `tile_cache` has one.
     pub tile_store: Arc<tile_store::TileStore>,
+    /// The RocksDB handle, for `/status`'s counters only -- nothing on the
+    /// request path reads through it (tiles go through `tile_store`).
+    /// Separate from `tile_store` because the counters are database-wide and
+    /// must stay readable when `persist_tiles = false`. `None` in tests.
+    pub kv: Option<Arc<crate::osm::kvstore::RocksDB>>,
 }
 
 impl AppState {
@@ -162,6 +167,7 @@ impl AppState {
             // z12..=z14 request then renders cold, which is exactly the
             // behaviour the tile tests want to assert against.
             tile_store: Arc::new(tile_store::TileStore::disabled()),
+            kv: None,
         }
     }
 }
@@ -309,6 +315,7 @@ pub async fn run(
     // Cloned before the scheduler takes ownership: the tile store needs the
     // same handle, and `TileStore` is what the request path reads through.
     let kv_for_tiles = kv.clone();
+    let kv_for_status = kv.clone();
     let scheduler = jobs::Scheduler::start(job_list, pool.clone(), kv, config.clone());
     let registry = scheduler.registry.clone();
     let shutdown_notify = scheduler.shutdown_notify();
@@ -338,6 +345,7 @@ pub async fn run(
         cache_headers,
         tile_cache,
         tile_store,
+        kv: Some(kv_for_status),
     };
 
     let app = build_router(state);
