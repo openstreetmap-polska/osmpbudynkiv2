@@ -107,14 +107,47 @@ pub fn update(
         None
     };
 
-    // `last_applied` starts at `current_seq` (nothing past it is applied
-    // yet) and is advanced by `apply_batch` as it works through each batch,
-    // one sequence at a time -- see that function's doc comment for why it
-    // moves mid-batch rather than only on commit. The prefetch thread reads
-    // it to stay within `prefetch_ahead` of real progress; `stop` is how the
-    // main thread tells the prefetcher to give up promptly on any exit path
-    // below, so `update()` never blocks its `join()` on a full backoff wait.
-    let last_applied = Arc::new(AtomicU64::new(current_seq));
+    // `fetch_frontier` is the highest sequence the apply loop has *claimed*
+    // -- the last sequence of the batch it is downloading right now, or of
+    // the last batch it finished. The prefetch thread reads it as both the
+    // floor it must stay above and the base of its window, and BOTH of those
+    // have to be a fetch-time quantity rather than an apply-time one.
+    //
+    // It used to be `last_applied`, advanced inside `apply_batch`, and that
+    // was a file-leaking bug rather than a cosmetic difference. A sequence's
+    // `.osc.gz` is deleted by `decompress_and_remove` the moment it is
+    // *fetched*, which is before the whole batch is even assembled and long
+    // before `apply_batch` runs -- so throughout the apply loop's fetch phase
+    // an apply-time floor still pointed at sequences the apply loop was
+    // downloading, consuming and deleting right then. The prefetcher
+    // therefore downloaded exactly those sequences concurrently, and since
+    // `do_download` renames its temp file onto the destination unconditionally
+    // (see the comment there about losing the rename race), the prefetcher's
+    // rename re-created a file the apply loop had already unlinked. Nothing
+    // ever looked at that sequence again, so it sat in `download_dir`
+    // forever: measured at exactly one orphaned file per steady-state tick,
+    // every tick, plus a 100% duplicate download rate against the
+    // replication server for the one sequence a steady-state tick needs.
+    //
+    // Claiming the batch up front fixes both at once: the prefetcher skips
+    // over anything at or below the frontier, so the two never target the
+    // same sequence, and at steady state (one pending sequence, wholly inside
+    // the first batch) it issues no requests at all -- there is by definition
+    // nothing to prefetch ahead of.
+    //
+    // Initialised to the *first* batch's end rather than `current_seq`,
+    // because the thread is spawned below before the loop runs: leaving the
+    // first batch unclaimed would let the prefetcher read a stale frontier
+    // and race the apply loop for batch 1 exactly as before.
+    //
+    // `stop` is how the main thread tells the prefetcher to give up promptly
+    // on any exit path below, so `update()` never blocks its `join()` on a
+    // full backoff wait.
+    let fetch_frontier = Arc::new(AtomicU64::new(batch_end_for(
+        current_seq + 1,
+        chunk_size,
+        latest_seq,
+    )));
     let stop = Arc::new(AtomicBool::new(false));
     // `prefetch_ahead == 0` disables prefetching outright (no thread spawned
     // at all), the same "0 means off, via config alone" idiom as
@@ -126,7 +159,7 @@ pub fn update(
             current_seq,
             latest_seq,
             osm_update_cfg.prefetch_ahead,
-            Arc::clone(&last_applied),
+            Arc::clone(&fetch_frontier),
             Arc::clone(&stop),
         )
     });
@@ -162,7 +195,14 @@ pub fn update(
                 return Ok(applied_so_far);
             }
 
-            let batch_end = (seq + chunk_size as u64 - 1).min(latest_seq);
+            let batch_end = batch_end_for(seq, chunk_size, latest_seq);
+            // Claim the whole batch before fetching any of it, so the
+            // prefetch thread stays off every sequence this iteration is
+            // about to download and delete -- see `fetch_frontier`'s
+            // declaration above for the leak this ordering closes. Storing
+            // it after the fetch loop, or per sequence inside it, would
+            // reopen that window.
+            fetch_frontier.store(batch_end, Ordering::SeqCst);
 
             // Fetch and parse the whole batch BEFORE opening the DuckDB
             // transaction in apply_batch -- see apply_batch's doc comment for
@@ -176,7 +216,7 @@ pub fn update(
                 )?);
             }
 
-            apply_batch(conn, kv, &batch, &latest_timestamp, &last_applied)?;
+            apply_batch(conn, kv, &batch, &latest_timestamp)?;
 
             let applied_count = batch.len() as u64;
             applied_so_far += applied_count;
@@ -279,11 +319,23 @@ fn catch_up_chunk_size(pending: u64, batch_commit_threshold: u64, batch_size: us
     }
 }
 
+/// Last sequence of the batch that starts at `seq`.
+///
+/// One home for the expression because `update()` needs it in two places
+/// that must not drift: once per loop iteration, and once up front to
+/// initialise `fetch_frontier` *before* the prefetch thread is spawned. If
+/// those two disagreed, the first batch would be fetched without having been
+/// claimed, which is precisely the duplicate-download-and-orphan window the
+/// frontier exists to close.
+fn batch_end_for(seq: u64, chunk_size: usize, latest_seq: u64) -> u64 {
+    (seq + chunk_size as u64 - 1).min(latest_seq)
+}
+
 /// How often the prefetch thread rechecks `stop` while waiting for its
 /// window to reopen (see [`spawn_prefetcher`]). Deliberately short and fixed
 /// rather than growing like `download_with_retry`'s backoff: there is no
 /// "increasing cost" to justify growth here, since the window reopens the
-/// moment `last_applied` advances -- a short fixed poll just bounds how long
+/// moment the fetch frontier advances -- a short fixed poll just bounds how long
 /// `update()`'s `join()` can be kept waiting once it sets `stop`.
 const PREFETCH_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -305,15 +357,32 @@ const PROGRESS_LOG_INTERVAL: u64 = 100;
 /// the apply loop remains the sole source of truth for what actually lands
 /// in the database.
 ///
-/// Bounded by `last_applied` so it never runs more than `prefetch_ahead`
-/// sequences ahead of real progress (memory/disk for `prefetch_ahead`
+/// Bounded by `fetch_frontier` so it never runs more than `prefetch_ahead`
+/// sequences ahead of the apply loop (memory/disk for `prefetch_ahead`
 /// buffered `.osc.gz` files, not the whole backlog), and by `latest_seq` so
 /// it never prefetches a sequence that doesn't exist yet. Also bounded
-/// *behind*: a `next` still sitting at or below `last_applied` is skipped
-/// straight to `last_applied + 1` rather than downloaded, since the apply
-/// loop has already consumed (and deleted) that sequence's file -- see the
-/// comment at the skip site for why this matters more than it looks like it
-/// should.
+/// *behind*, and that bound is the load-bearing one: a `next` at or below
+/// the frontier is skipped straight to `frontier + 1` rather than
+/// downloaded, because the apply loop owns everything up to the frontier --
+/// it has either already consumed and deleted that sequence's file or is
+/// downloading it synchronously right now.
+///
+/// **Both bounds must read a fetch-time counter, never an apply-time one.**
+/// This thread and the apply loop share one filename per sequence
+/// (`osc_local_file_name`), which is what makes the exists-check dedup work;
+/// the flip side is that both targeting one sequence at once is not a benign
+/// duplicate. `do_download` renames its temp file onto the destination
+/// unconditionally, so whichever finishes second re-creates the file --
+/// and if the apply loop finished first it has already run
+/// `decompress_and_remove`, leaving an orphan nothing will ever read.
+/// Against the old apply-time floor that happened on every steady-state
+/// tick, so `download_dir` grew by one file per tick forever. See
+/// `fetch_frontier`'s declaration in [`update`].
+///
+/// Whatever this thread downloads and the apply loop never reaches is
+/// unlinked by a cleanup pass after the loop -- see the comment there for
+/// why it is driven by this thread's own record rather than a directory
+/// scan.
 ///
 /// A download failure here is non-fatal and is logged at `debug!` rather
 /// than retried: `download_file_as_quiet` (via `download_with_retry`)
@@ -328,59 +397,116 @@ fn spawn_prefetcher(
     current_seq: u64,
     latest_seq: u64,
     prefetch_ahead: usize,
-    last_applied: Arc<AtomicU64>,
+    fetch_frontier: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut next = current_seq + 1;
+        // Every sequence this thread successfully downloaded, so the cleanup
+        // pass after the loop can unlink whatever the apply loop never got
+        // to. Bounded by `prefetch_ahead` live entries in practice and by
+        // the backlog length in the worst case, which is `u64`s either way.
+        let mut downloaded: Vec<u64> = Vec::new();
 
         while next <= latest_seq {
             if stop.load(Ordering::SeqCst) {
-                return;
+                // `break`, not `return` -- the cleanup below must run on
+                // this exit path too, and it is the *common* one for a
+                // cancelled or failed `update()`.
+                break;
             }
 
-            let applied = last_applied.load(Ordering::SeqCst);
-            if next <= applied {
-                // Already consumed by the apply loop -- which fetches a
-                // whole batch synchronously before calling `apply_batch`,
-                // then deletes each `.osc.gz` right after decompressing it
-                // (`decompress_and_remove`). If that batch's commit lands
-                // between two of this thread's window checks (very possible:
-                // `apply_batch` can finish well inside
-                // `PREFETCH_WINDOW_POLL_INTERVAL`), `last_applied` can jump
-                // past several `next` values this thread was sitting behind
-                // in one stride. Downloading them now would just be
-                // re-fetching bytes the apply loop already used and threw
-                // away -- nobody reads a prefetched file whose sequence is
-                // behind `last_applied`. Skip straight to the first
-                // not-yet-applied sequence instead of downloading one we
-                // know is stale.
-                next = applied + 1;
+            let frontier = fetch_frontier.load(Ordering::SeqCst);
+            if next <= frontier {
+                // At or below the frontier the apply loop owns this
+                // sequence: it has either already fetched, consumed and
+                // deleted it, or it is downloading it synchronously right
+                // now as part of the batch it has claimed. Either way this
+                // thread must not touch it. Downloading it anyway is not
+                // merely wasted bytes -- `do_download` renames its temp file
+                // onto the destination unconditionally, so a download
+                // finishing after the apply loop's `decompress_and_remove`
+                // re-creates a file nothing will ever read again. Skip
+                // straight past the whole claimed range rather than
+                // stepping through it one sequence at a time, since the
+                // frontier can jump by a whole batch between two of this
+                // thread's checks.
+                next = frontier + 1;
                 continue;
             }
 
-            let window_ceiling = applied + prefetch_ahead as u64;
+            let window_ceiling = frontier + prefetch_ahead as u64;
             if next > window_ceiling {
-                // Window full: wait for the apply loop to advance, checking
-                // `stop` between short sleeps rather than one long one, so a
-                // cancelled or failed update() doesn't block its join() for
-                // the whole wait.
+                // Window full: wait for the apply loop to claim its next
+                // batch, checking `stop` between short sleeps rather than
+                // one long one, so a cancelled or failed update() doesn't
+                // block its join() for the whole wait.
                 std::thread::sleep(PREFETCH_WINDOW_POLL_INTERVAL);
                 continue;
             }
 
             let path = sequence_to_path(next);
             let url = format!("{replication_base_url}/{path}");
-            if let Err(e) = download_file_as_quiet(&url, &download_dir, &osc_local_file_name(next))
-            {
-                debug!(
-                    seq = next,
-                    error = %e,
-                    "prefetch download failed; the apply loop will download it synchronously instead"
-                );
+            match download_file_as_quiet(&url, &download_dir, &osc_local_file_name(next)) {
+                Ok(_) => downloaded.push(next),
+                Err(e) => {
+                    debug!(
+                        seq = next,
+                        error = %e,
+                        "prefetch download failed; the apply loop will download it synchronously instead"
+                    );
+                }
             }
 
             next += 1;
+        }
+
+        // Wait until `update()` is finished before touching the directory.
+        //
+        // Reaching this point does NOT mean the apply loop is done: the
+        // download loop above also ends on its own once `next` passes
+        // `latest_seq`, which happens as soon as the frontier gets within
+        // `prefetch_ahead` of the head -- with the apply loop still working
+        // through the backlog behind it. Every entry in `downloaded` is
+        // then still wanted, and deleting it there is not a harmless
+        // no-op: at best the apply loop re-downloads the sequence, and at
+        // worst the unlink lands between its exists-check and
+        // `decompress_gz`'s open, failing the whole run with "Failed to
+        // open". Measured on a backlog of 100 with `prefetch_ahead` above
+        // it: 63 of 100 sequences re-downloaded.
+        //
+        // `update()` sets `stop` unconditionally on every exit path before
+        // it joins this thread, so this wait always ends, and once it does
+        // the apply loop has provably stopped fetching. Polled on the same
+        // short interval as the window wait, so the join it gates is never
+        // held up for long.
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(PREFETCH_WINDOW_POLL_INTERVAL);
+        }
+
+        // Remove every prefetched file the apply loop never consumed.
+        //
+        // Whatever it did consume is already gone (`decompress_and_remove`),
+        // so those unlinks are no-ops; what is left are sequences ahead of
+        // the frontier when `update()` stopped -- a shutdown, a supervisor
+        // timeout, or a failed batch. Without this they sit in
+        // `download_dir` until some later run happens to resume onto them,
+        // which for a run that stops for good is never, and the documented
+        // contract (`example_config.toml` on `cleanup_downloaded_files`) is
+        // that replication diffs are always cleaned up regardless of that
+        // setting.
+        //
+        // Deliberately driven by this thread's own record of what it wrote
+        // rather than by scanning `download_dir` for `*.osc.gz`: the
+        // directory is shared (with the apply loop, and potentially with
+        // another instance configured onto the same `download_dir`), and a
+        // scan cannot tell a file this run abandoned from one another run is
+        // about to consume. Running here rather than in `update()` after the
+        // join is also what covers the download still in flight when `stop`
+        // was set -- its rename lands before the loop breaks, so the
+        // sequence is already in `downloaded` by the time this runs.
+        for seq in downloaded {
+            let _ = std::fs::remove_file(download_dir.join(osc_local_file_name(seq)));
         }
     })
 }
@@ -473,6 +599,14 @@ fn fetch_and_parse_sequence(
 /// the whole batch from scratch rather than a partial one. There is no
 /// "resume from sequence N of this batch" state to maintain.
 ///
+/// This function no longer advances any prefetch-window counter. It used to
+/// bump a `last_applied` atomic per sequence so the prefetcher's window slid
+/// forward during a large batch instead of stalling until the commit; the
+/// window now rides on `update()`'s `fetch_frontier`, which is claimed
+/// *before* the batch is fetched and so slides forward strictly earlier. See
+/// that declaration for why an apply-time counter was not merely late but
+/// orphaned a downloaded file per tick.
+///
 /// **Crash-safety argument, and the one thing it rests on.** Every RocksDB
 /// primitive `apply_changes` calls is either an unconditional upsert/delete
 /// (`put_node`, `delete_way`, ...) or a read-modify-write set toggle
@@ -520,7 +654,6 @@ fn apply_batch(
     kv: &RocksDB,
     batch: &[FetchedSequence],
     timestamp: &str,
-    last_applied: &AtomicU64,
 ) -> Result<()> {
     let last_seq = batch
         .last()
@@ -532,15 +665,6 @@ fn apply_batch(
     let result = (|| -> Result<()> {
         for fetched in batch {
             apply_changes(conn, kv, &fetched.changes)?;
-            // Advance as each sequence is applied, not only once the whole
-            // batch commits -- "currently-being-applied", per this field's
-            // doc comment at its declaration in `update()`. This lets the
-            // prefetcher's window slide forward smoothly during a large
-            // batch instead of stalling until the batch's transaction
-            // commits; if the transaction later rolls back, `update()`
-            // propagates the error and joins the prefetcher immediately, so
-            // an optimistic bump here never has a chance to matter.
-            last_applied.store(fetched.seq, Ordering::SeqCst);
         }
 
         conn.execute_batch(&format!(
@@ -2960,7 +3084,6 @@ mod tests {
         // sequences creating a brand-new building at a distinct location, so
         // apply_batch does real INSERT + match_dirty_cells work inside a
         // transaction long enough to genuinely overlap the drain thread.
-        let last_applied = AtomicU64::new(0);
         let mut apply_errors: Vec<String> = Vec::new();
         for batch_idx in 0..10u64 {
             let seqs: Vec<FetchedSequence> = (0..3u64)
@@ -2969,7 +3092,7 @@ mod tests {
                     synthetic_building_sequence(seq, 20.0 + seq as f64 * 0.01, 40.0)
                 })
                 .collect();
-            if let Err(e) = apply_batch(&conn, &kv, &seqs, "2024-01-01T00:00:00Z", &last_applied) {
+            if let Err(e) = apply_batch(&conn, &kv, &seqs, "2024-01-01T00:00:00Z") {
                 apply_errors.push(format!("apply_batch({batch_idx}) errored: {e:#}"));
             }
         }
@@ -3085,37 +3208,64 @@ mod tests {
 
     /// Multi-connection, multi-request blocking mock server (unlike this
     /// file's other mock servers, which are all one-shot): answers
-    /// `GET /state.txt` with `state_body` and every other GET with
-    /// `osc_gz_body`, forever, on however many connections arrive. Needed
-    /// here because a single `update()` run now makes many requests --
-    /// `state.txt` once, plus one per distinct sequence from whichever of
-    /// the prefetch thread or the apply loop reaches it first, potentially
-    /// both for one sequence if they race.
+    /// `GET /state.txt` from `head`, read per request so one server can
+    /// serve several successive `update()` ticks with a moving replication
+    /// head, and every other GET with `osc_gz_body`, forever, on however
+    /// many connections arrive. Needed because a single `update()` run makes
+    /// many requests -- `state.txt` once, plus one per sequence.
+    ///
+    /// Returns the log of every sequence requested (`0` standing for
+    /// `state.txt`) rather than a bare counter, because the interesting
+    /// properties are per-sequence: *which* sequence was asked for twice
+    /// (the duplicate download that used to orphan a file), and whether the
+    /// log is strictly increasing (which would mean the prefetch thread
+    /// never ran ahead of the apply loop at all).
     fn spawn_replication_mock_server(
-        state_body: String,
+        head: Arc<AtomicU64>,
         osc_gz_body: Vec<u8>,
-    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<u64>>>) {
         use std::io::Write as _;
-        use std::sync::atomic::AtomicUsize;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let count_for_thread = request_count.clone();
+        let requested: Arc<std::sync::Mutex<Vec<u64>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_for_thread = Arc::clone(&requested);
 
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                count_for_thread.fetch_add(1, Ordering::SeqCst);
-                let state_body = state_body.clone();
                 let osc_gz_body = osc_gz_body.clone();
+                let log = Arc::clone(&log_for_thread);
+                let head = Arc::clone(&head);
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 4096];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..n]);
-                    let is_state = request.starts_with("GET /state.txt");
+                    let path = request
+                        .strip_prefix("GET ")
+                        .and_then(|r| r.split(' ').next())
+                        .unwrap_or("");
+                    let is_state = path.ends_with("state.txt");
+                    // `sequence_to_path` nests the zero-padded sequence
+                    // across three directory levels, so the digits of the
+                    // whole path *are* the sequence number.
+                    let seq: u64 = if is_state {
+                        0
+                    } else {
+                        path.chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                            .parse()
+                            .unwrap_or(u64::MAX)
+                    };
+                    log.lock().unwrap().push(seq);
 
                     if is_state {
+                        let state_body = format!(
+                            "sequenceNumber={}\ntimestamp=2024-01-01T00\\:00\\:00Z\n",
+                            head.load(Ordering::SeqCst)
+                        );
                         let headers = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             state_body.len()
@@ -3134,7 +3284,31 @@ mod tests {
             }
         });
 
-        (addr, request_count)
+        (addr, requested)
+    }
+
+    /// Every file sitting in `dir`, sorted. Used by the cleanup regressions
+    /// below, which assert on the *whole* directory rather than on the
+    /// absence of one expected name: the leak they pin was a file nobody
+    /// intended to create, so naming the file the assertion looks for would
+    /// be assuming the shape of the next bug.
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Sequences requested more than once, with their counts.
+    fn duplicate_requests(log: &[u64]) -> Vec<(u64, usize)> {
+        let mut counts: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+        for seq in log.iter().filter(|s| **s != 0) {
+            *counts.entry(*seq).or_default() += 1;
+        }
+        counts.into_iter().filter(|(_, c)| *c > 1).collect()
     }
 
     /// End-to-end coverage of the new `update()` loop: batching (several
@@ -3166,9 +3340,8 @@ mod tests {
         const PENDING: u64 = 13;
         const LATEST_SEQ: u64 = 1000 + PENDING;
         let osc_gz_body = gzip_bytes(EMPTY_OSC_XML.as_bytes());
-        let state_body =
-            format!("sequenceNumber={LATEST_SEQ}\ntimestamp=2024-01-01T00\\:00\\:00Z\n");
-        let (addr, request_count) = spawn_replication_mock_server(state_body, osc_gz_body);
+        let (addr, requested) =
+            spawn_replication_mock_server(Arc::new(AtomicU64::new(LATEST_SEQ)), osc_gz_body);
         let base_url = format!("http://{addr}");
 
         let download_dir = tempfile::tempdir().unwrap();
@@ -3203,16 +3376,21 @@ mod tests {
              cancellation, checked between batches, stopped the loop before batch 2"
         );
 
-        // The exists-check dedup must keep the prefetcher and the apply loop
-        // from each downloading every sequence independently: at most 1
-        // (state.txt) + PENDING (every sequence at most once) + a small
-        // slack for a genuine prefetch/apply race landing on the same
-        // sequence at the same time.
-        let requests = request_count.load(Ordering::SeqCst);
+        // The prefetcher and the apply loop must not each download the same
+        // sequence: at most 1 (state.txt) + PENDING, with no slack. There
+        // used to be slack here "for a genuine prefetch/apply race landing
+        // on the same sequence at the same time", and that race was the
+        // file-orphaning bug rather than an acceptable cost -- the apply
+        // loop claims each batch through `fetch_frontier` before fetching
+        // it, so the two can no longer target one sequence at all.
+        let log = requested.lock().unwrap().clone();
+        let requests = log.len();
         assert!(
-            requests <= 1 + PENDING as usize + 5,
+            requests <= 1 + PENDING as usize,
             "too many requests ({requests}) for {PENDING} pending sequences -- the \
-             exists-check dedup between the prefetcher and the apply loop looks broken"
+             prefetcher and the apply loop look like they are both downloading the \
+             same sequences; duplicates: {:?}",
+            duplicate_requests(&log)
         );
         // At least the 10 sequences actually applied must have been fetched
         // by someone (prefetcher or apply loop), plus state.txt (11 total).
@@ -3220,6 +3398,305 @@ mod tests {
             requests > 10,
             "fewer requests ({requests}) than sequences actually applied -- some \
              applied sequence's content came from nowhere"
+        );
+
+        Ok(())
+    }
+
+    /// Regression for the orphaned-`.osc.gz` leak: a steady-state tick must
+    /// leave `download_dir` empty, and must download the single sequence it
+    /// needs exactly once.
+    ///
+    /// This is the shape production runs in -- a minutely feed with one
+    /// pending sequence per tick -- and it is where the old apply-time
+    /// prefetch floor (`last_applied`, advanced inside `apply_batch`) failed
+    /// every single time. Both the prefetcher and the apply loop downloaded
+    /// the one pending sequence, the apply loop consumed and unlinked it in
+    /// `decompress_and_remove`, and the prefetcher's `do_download` then
+    /// renamed its own copy onto that same path. Nothing ever read that
+    /// sequence again, so the file stayed in `download_dir` -- the system
+    /// temp directory by default -- and one more joined it every tick.
+    ///
+    /// Ten ticks rather than one, asserting after each, because the failure
+    /// was cumulative: a single-tick assertion cannot tell "cleaned up" from
+    /// "replaced by the next tick's orphan".
+    ///
+    /// The request-count half is not a bonus assertion, it is the root
+    /// cause. One request per sequence means the two never targeted it
+    /// concurrently, which is what makes the unlink/rename race impossible
+    /// rather than merely unobserved on this run.
+    #[test]
+    fn steady_state_ticks_leave_no_downloaded_diff_behind() -> Result<()> {
+        let (conn, kv, _kv_dir) = setup_test_db_and_kv()?; // current_seq = 1000
+        const TICKS: u64 = 10;
+
+        let head = Arc::new(AtomicU64::new(1000));
+        let (addr, requested) =
+            spawn_replication_mock_server(Arc::clone(&head), gzip_bytes(EMPTY_OSC_XML.as_bytes()));
+        let base_url = format!("http://{addr}");
+
+        let download_dir = tempfile::tempdir().unwrap();
+        // Stock defaults throughout (prefetch_ahead = 8, batch_size = 20,
+        // batch_commit_threshold = 20): the leak needs no unusual tuning,
+        // and pinning it under the shipped configuration is the point.
+        let config = Config {
+            download_dir: Some(download_dir.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+
+        for tick in 1..=TICKS {
+            head.store(1000 + tick, Ordering::SeqCst);
+            update(&conn, &kv, &config, &base_url, false, &|| false)?;
+
+            assert_eq!(get_current_sequence(&conn)?, 1000 + tick);
+            assert_eq!(
+                files_in(download_dir.path()),
+                Vec::<String>::new(),
+                "tick {tick} left a downloaded replication diff behind in download_dir"
+            );
+        }
+
+        let log = requested.lock().unwrap().clone();
+        assert_eq!(
+            duplicate_requests(&log),
+            vec![],
+            "a sequence was downloaded more than once -- the prefetcher and the apply \
+             loop are both targeting it, which is what orphaned a file per tick"
+        );
+        // One state.txt plus one diff per tick, and nothing else.
+        assert_eq!(log.len(), (2 * TICKS) as usize);
+
+        Ok(())
+    }
+
+    /// Regression: sequences the prefetch thread downloaded but the apply
+    /// loop never reached must be unlinked when `update()` stops early.
+    ///
+    /// A cancelled run (a supervisor timeout, a shutdown, or a failed batch)
+    /// leaves the prefetcher up to `prefetch_ahead` sequences ahead of the
+    /// stamp. Those files are harmless in *content* -- replication diffs are
+    /// immutable, so a later run resuming onto them reads them happily, and
+    /// that is why this leak was bounded and self-healing where the
+    /// steady-state one above was neither. But a run that stops for good
+    /// never resumes, and the documented contract (`example_config.toml`, on
+    /// `cleanup_downloaded_files`) is that replication diffs are always
+    /// cleaned up regardless of that setting.
+    ///
+    /// `batch_commit_threshold` is set above `pending` so `chunk_size` is 1
+    /// and the apply loop advances one sequence at a time, which is what
+    /// lets the prefetcher genuinely get ahead of it and leave a backlog to
+    /// clean up.
+    #[test]
+    fn a_cancelled_update_cleans_up_prefetched_sequences_it_never_applied() -> Result<()> {
+        let (conn, kv, _kv_dir) = setup_test_db_and_kv()?; // current_seq = 1000
+        const APPLY_BEFORE_CANCEL: usize = 10;
+
+        let (addr, _requested) = spawn_replication_mock_server(
+            Arc::new(AtomicU64::new(1100)),
+            gzip_bytes(EMPTY_OSC_XML.as_bytes()),
+        );
+        let base_url = format!("http://{addr}");
+
+        let download_dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            download_dir: Some(download_dir.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        config.jobs.osm_update.batch_commit_threshold = 1000; // => chunk_size 1
+        config.jobs.osm_update.prefetch_ahead = 8;
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let is_cancelled = || calls.fetch_add(1, Ordering::SeqCst) >= APPLY_BEFORE_CANCEL;
+
+        update(&conn, &kv, &config, &base_url, false, &is_cancelled)?;
+
+        // Cancellation must have cut the run short well before the head,
+        // otherwise there was no prefetch backlog for the cleanup to have
+        // anything to do and this test would pass vacuously.
+        let stamp = get_current_sequence(&conn)?;
+        assert_eq!(stamp, 1000 + APPLY_BEFORE_CANCEL as u64);
+
+        assert_eq!(
+            files_in(download_dir.path()),
+            Vec::<String>::new(),
+            "a cancelled update left prefetched diffs in download_dir; the prefetch \
+             thread's cleanup pass must unlink whatever the apply loop never consumed"
+        );
+
+        Ok(())
+    }
+
+    /// The prefetch thread must stay out of the batch the apply loop has
+    /// claimed -- and must still be prefetching.
+    ///
+    /// Both halves are load-bearing. Not downloading a sequence twice is the
+    /// property that closes the leak, but `prefetch_ahead = 0` satisfies it
+    /// trivially, so on its own this test would keep passing if a later
+    /// change disabled prefetching outright. The inversion count is the
+    /// other half: a request for sequence N arriving before a request for
+    /// some sequence below N can only be the prefetch thread running ahead
+    /// of the apply loop, so a strictly increasing log means nothing was
+    /// prefetched. The `prefetch_ahead = 0` arm establishes that baseline
+    /// within the same test rather than asserting a bare `> 0` against an
+    /// assumption.
+    ///
+    /// **Why the duplicate bound is not zero.** The frontier removes the
+    /// *systematic* overlap -- the prefetcher never *starts* on a claimed
+    /// sequence -- but it is read before a download, not held across one, so
+    /// the apply loop can still catch up to a sequence the prefetcher is
+    /// already mid-download of and fetch it too. That residue is why the
+    /// prefetcher's cleanup pass is not merely tidiness: it records
+    /// everything it downloaded, so the copy such a race re-creates after
+    /// `decompress_and_remove` has run is unlinked before the thread exits.
+    /// The leftover-file count is therefore asserted at exactly zero while
+    /// the duplicate count is asserted as a bound -- measured 0 idle, 1 of
+    /// 100 under 12-way synthetic CPU load, against 16 of 100 systematic
+    /// before the frontier existed.
+    #[test]
+    fn the_prefetcher_stays_out_of_the_batch_the_apply_loop_claimed() -> Result<()> {
+        const PENDING: u64 = 100;
+
+        /// Requests that arrived after a strictly higher sequence had
+        /// already been requested.
+        fn inversions(log: &[u64]) -> usize {
+            let mut count = 0;
+            let mut highest = 0u64;
+            for &seq in log.iter().filter(|s| **s != 0) {
+                if seq < highest {
+                    count += 1;
+                }
+                highest = highest.max(seq);
+            }
+            count
+        }
+
+        let mut inversions_by_window = Vec::new();
+
+        for prefetch_ahead in [0usize, 8] {
+            let (conn, kv, _kv_dir) = setup_test_db_and_kv()?; // current_seq = 1000
+            let (addr, requested) = spawn_replication_mock_server(
+                Arc::new(AtomicU64::new(1000 + PENDING)),
+                gzip_bytes(EMPTY_OSC_XML.as_bytes()),
+            );
+            let download_dir = tempfile::tempdir().unwrap();
+            let mut config = Config {
+                download_dir: Some(download_dir.path().to_string_lossy().into_owned()),
+                ..Config::default()
+            };
+            config.jobs.osm_update.prefetch_ahead = prefetch_ahead;
+            config.jobs.osm_update.batch_commit_threshold = 10; // => batching engages
+            config.jobs.osm_update.batch_size = 20;
+
+            update(
+                &conn,
+                &kv,
+                &config,
+                &format!("http://{addr}"),
+                false,
+                &|| false,
+            )?;
+
+            assert_eq!(get_current_sequence(&conn)?, 1000 + PENDING);
+            assert_eq!(
+                files_in(download_dir.path()),
+                Vec::<String>::new(),
+                "prefetch_ahead={prefetch_ahead}: a completed catch-up left files behind"
+            );
+
+            // With the old apply-time floor this configuration downloaded
+            // 16 of the 100 sequences twice -- the first `prefetch_ahead` of
+            // every batch the apply loop claimed. Measured with the
+            // frontier: 0 idle, 1 under 12-way synthetic CPU load.
+            let log = requested.lock().unwrap().clone();
+            let duplicates = duplicate_requests(&log);
+            assert!(
+                duplicates.len() <= (PENDING / 20) as usize,
+                "prefetch_ahead={prefetch_ahead}: {} of {PENDING} sequences were \
+                 downloaded twice, which is the systematic overlap the frontier \
+                 exists to remove rather than the in-flight residue: {duplicates:?}",
+                duplicates.len()
+            );
+            inversions_by_window.push(inversions(&log));
+        }
+
+        assert_eq!(
+            inversions_by_window[0], 0,
+            "with prefetching off the apply loop walks sequences in order, so the \
+             request log must be strictly increasing -- if it is not, `inversions` is \
+             measuring something other than prefetch activity"
+        );
+        assert!(
+            inversions_by_window[1] > 0,
+            "with prefetch_ahead=8 nothing ever ran ahead of the apply loop: the \
+             duplicate-free result above is vacuous because prefetching is disabled"
+        );
+
+        Ok(())
+    }
+
+    /// The prefetch thread's cleanup pass must not run while the apply loop
+    /// is still fetching.
+    ///
+    /// Reaching the end of the download loop does not mean the run is over:
+    /// it also ends on its own once `next` passes `latest_seq`, which
+    /// happens as soon as the frontier gets within `prefetch_ahead` of the
+    /// head -- with the apply loop still working through the backlog behind
+    /// it. Everything the thread downloaded is then still wanted, so a
+    /// cleanup there deletes live files: the apply loop re-downloads them
+    /// at best, and at worst the unlink lands between its exists-check and
+    /// `decompress_gz`'s open and fails the whole run.
+    ///
+    /// `prefetch_ahead` above `pending` with `chunk_size` at 1 is the
+    /// sharpest form of that: the prefetcher grabs the entire backlog in one
+    /// go, exits its loop while the apply loop is still near the start, and
+    /// an ungated cleanup then wipes nearly all of it. That configuration
+    /// measured 63 of 100 sequences re-downloaded, reproducibly, which is
+    /// what this test's request count pins -- the run still *succeeded*
+    /// every time, so nothing but the request count catches it.
+    #[test]
+    fn the_prefetch_cleanup_does_not_delete_files_the_apply_loop_still_needs() -> Result<()> {
+        const PENDING: u64 = 100;
+
+        let (conn, kv, _kv_dir) = setup_test_db_and_kv()?; // current_seq = 1000
+        let (addr, requested) = spawn_replication_mock_server(
+            Arc::new(AtomicU64::new(1000 + PENDING)),
+            gzip_bytes(EMPTY_OSC_XML.as_bytes()),
+        );
+        let download_dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            download_dir: Some(download_dir.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        config.jobs.osm_update.batch_commit_threshold = 1000; // => chunk_size 1
+        config.jobs.osm_update.prefetch_ahead = 200; // deliberately > PENDING
+
+        update(
+            &conn,
+            &kv,
+            &config,
+            &format!("http://{addr}"),
+            false,
+            &|| false,
+        )?;
+
+        assert_eq!(get_current_sequence(&conn)?, 1000 + PENDING);
+
+        assert_eq!(files_in(download_dir.path()), Vec::<String>::new());
+
+        // An ungated cleanup re-downloaded 63 of the 100 sequences here. The
+        // gated one measured 0 duplicates idle and 2 under 12-way synthetic
+        // CPU load -- the in-flight-prefetch residue documented on
+        // `the_prefetcher_stays_out_of_the_batch_the_apply_loop_claimed`.
+        // Bounded rather than zero for that reason, an order of magnitude
+        // below the signature it has to catch.
+        let log = requested.lock().unwrap().clone();
+        let duplicates = duplicate_requests(&log);
+        assert!(
+            duplicates.len() <= (PENDING / 10) as usize,
+            "{} of {PENDING} sequences were downloaded twice -- the prefetch thread's \
+             cleanup pass looks like it is deleting files the apply loop had not \
+             consumed yet: {duplicates:?}",
+            duplicates.len()
         );
 
         Ok(())

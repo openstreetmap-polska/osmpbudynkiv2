@@ -1279,18 +1279,76 @@ global flag as well.
    which is what makes `in_transaction`'s `ROLLBACK`-after-error work on the way
    out.
 
-**Gotcha — the prefetch thread's dedup has a floor, not just a ceiling.**
-`update::osm`'s prefetcher and the apply loop share a download directory, so
-whichever downloads a sequence first, the other finds it on disk and skips the
-network call — but the apply loop *deletes* each `.osc.gz` right after
-decompressing it, and `apply_batch` fetches a whole batch before recursing, so
-`last_applied` can jump by an entire batch in one stride. If that commit lands
-inside a single 50 ms poll interval, the prefetcher wakes to a window that jumped
-past several `next` values it was sitting behind and re-downloads every one for
-real, because their files are gone. `spawn_prefetcher` skips `next` straight to
-`last_applied + 1` whenever `next <= last_applied`. Reproduced empirically under
-sustained CPU load; without it the same waste hits the real OSM replication server
-during a fast catch-up burst.
+**Gotcha — the prefetch thread's window has a floor as well as a ceiling, and
+both must read a *fetch-time* counter.** `update::osm`'s prefetcher and the
+apply loop share a download directory and one filename per sequence
+(`osc_local_file_name`), so whichever downloads a sequence first, the other
+finds it on disk and skips the network call. That dedup is also the trap: two
+parties targeting one sequence at once is not a benign duplicate, because
+`download::do_download` renames its temp file onto the destination
+*unconditionally* — its own comment reasons that the loser of the rename race
+merely wastes identical bytes, which is wrong once the winner has since
+*unlinked* that path. The apply loop unlinks each `.osc.gz` in
+`decompress_and_remove` the moment it is **fetched**, well before
+`apply_batch` runs, so a prefetch finishing after that re-creates a file
+nothing will ever read again.
+
+`update()`'s `fetch_frontier` is therefore the highest sequence the apply loop
+has **claimed** — stored with `batch_end` *before* the batch's fetch loop, and
+initialised to the first batch's end *before the thread is spawned* (via
+`batch_end_for`, which exists to keep those two expressions from drifting).
+The prefetcher skips `next` straight to `frontier + 1` whenever
+`next <= frontier`, and takes its ceiling from the frontier too, so the
+disk bound counts *unconsumed* files.
+
+**It used to be `last_applied`, advanced inside `apply_batch`, and that leaked
+a file per tick.** An apply-time floor still points at sequences the apply
+loop is fetching-and-deleting right now, so throughout every batch's fetch
+phase the prefetcher was aimed exactly there. Measured, stock defaults: a
+steady-state tick (one pending sequence) orphaned **one file, on 10 of 10
+ticks, monotonically** — `download_dir` is `std::env::temp_dir()` by default,
+so ~1440 files/day on a minutely feed — while downloading that one sequence
+**twice** (30 HTTP requests for 10 ticks, now 20). A 100-sequence catch-up
+orphaned 15 files and made 117 requests, now 0 and 101. Guards:
+`steady_state_ticks_leave_no_downloaded_diff_behind` and
+`the_prefetcher_never_downloads_a_sequence_the_apply_loop_claimed`. The latter
+asserts duplicate-freedom **and** that the request log has inversions, because
+`prefetch_ahead = 0` satisfies duplicate-freedom vacuously.
+
+**A residue survives by design, and the cleanup pass is what makes it
+harmless.** The frontier is read before a download, not held across one, so
+the apply loop can still catch up to a sequence the prefetcher is already
+mid-download of — measured at 1–2 per 100 under 12-way synthetic CPU load,
+against 16 of 100 systematic before. Such a download re-creates the file
+after `decompress_and_remove` has run, exactly as before; what stops it
+leaking is that the prefetcher records everything it downloaded and unlinks
+it on the way out. So **leftover files are asserted at exactly zero and
+duplicate downloads only as a bound** — do not tighten the latter to zero,
+and do not treat the cleanup pass as tidiness that could be dropped.
+
+**The prefetcher also unlinks what it downloaded and the apply loop never
+reached**, in the same pass after its own loop (so `break`, never `return`,
+on `stop`). That backlog — up to `prefetch_ahead` sequences past the stamp after
+a shutdown, supervisor timeout or failed batch — is bounded and self-healing,
+since replication diffs are immutable and a resuming run reads them off disk
+happily; it is cleaned anyway because a run that stops for good never resumes
+and `example_config.toml` promises replication diffs are cleaned up regardless
+of `cleanup_downloaded_files`. **Driven by the thread's own record of what it
+wrote, never a `*.osc.gz` scan of `download_dir`** — the directory is shared
+with the apply loop and possibly another instance, and a scan cannot tell a
+file this run abandoned from one another run is about to consume. **And it
+waits on `stop` first**, because falling out of the download loop does *not*
+mean the run is over: that loop also ends on its own once `next` passes
+`latest_seq`, which happens as soon as the frontier is within
+`prefetch_ahead` of the head, with the apply loop still behind it — so an
+ungated cleanup deletes live files (measured: `prefetch_ahead` above the
+backlog re-downloaded **63 of 100** sequences, and an unlink landing between
+the apply loop's exists-check and `decompress_gz`'s open fails the run
+outright). Guards:
+`a_cancelled_update_cleans_up_prefetched_sequences_it_never_applied` and
+`the_prefetch_cleanup_does_not_delete_files_the_apply_loop_still_needs` —
+the latter pins a run that *succeeds* either way, so only its request count
+sees the difference.
 
 **Gotcha — two ordering rules in the server's shutdown path, each fixing a silent
 hang.** (1) `run` binds `axum::serve(...).await`'s result instead of `?`-ing it,
