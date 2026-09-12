@@ -374,40 +374,72 @@ fn check_cancelled(source: &str, stage: &str, is_cancelled: &dyn Fn() -> bool) -
     bail!("Cancelled before {stage} ({reason})")
 }
 
-/// Column names of `table`, in `column_index` order (i.e. declaration
-/// order), via `duckdb_columns()`.
+/// Column names of `table` **paired with their declared types**, in
+/// `column_index` order (i.e. declaration order), via `duckdb_columns()`.
 ///
 /// Ordered deliberately, not a set: the apply's `INSERT INTO {live} SELECT
 /// s.* ...` (see [`refresh`]) is positional, so two tables with the same
 /// columns in a different order are just as fatal to it as two tables with
 /// genuinely different columns — see [`check_column_shapes_match`].
-fn ordered_column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
+///
+/// The type travels with the name because a type-only drift is precisely the
+/// "silently write columns into the wrong places if the new shape happened to
+/// still typecheck positionally" case [`check_column_shapes_match`] exists to
+/// catch, and a name-only comparison cannot see it. Since the diff moved to
+/// `DatasetSpec::content_hash_sql` it is also no longer benign: row-wise
+/// `IS DISTINCT FROM` coerces a live `INTEGER` 1 and a staged `DOUBLE` 1.0
+/// into equality, but their hashes differ, so an unnoticed type change would
+/// report every row in the source as modified — a national rewrite that
+/// dirties every z14 cell, which is the exact outcome BDOT10k's
+/// `compared_columns` were measured to avoid.
+fn ordered_column_names(conn: &Connection, table: &str) -> Result<Vec<(String, String)>> {
     let mut stmt = conn
         .prepare(
-            "SELECT column_name FROM duckdb_columns()
+            "SELECT column_name, data_type FROM duckdb_columns()
              WHERE table_name = ? ORDER BY column_index",
         )
         .with_context(|| format!("Failed to prepare column listing for {table}"))?;
     let rows = stmt
-        .query_map(duckdb::params![table], |r| r.get::<_, String>(0))
+        .query_map(duckdb::params![table], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
         .with_context(|| format!("Failed to list columns for {table}"))?;
-    let mut names = Vec::new();
+    let mut columns = Vec::new();
     for row in rows {
-        names.push(row.with_context(|| format!("Failed to read column name for {table}"))?);
+        columns.push(row.with_context(|| format!("Failed to read column shape for {table}"))?);
     }
-    Ok(names)
+    Ok(columns)
+}
+
+/// Render one `ordered_column_names` entry for the mismatch message as
+/// `name TYPE`, so a type-only difference is visible in the error rather than
+/// showing two identical-looking lists.
+fn describe_columns(columns: &[(String, String)]) -> String {
+    columns
+        .iter()
+        .map(|(name, ty)| format!("{name} {ty}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Bail loudly if `spec.table` (live) and `spec.staging_table()` (staging)
-/// don't have the exact same columns in the exact same order.
+/// don't have the exact same columns, with the same types, in the exact same
+/// order.
 ///
 /// The apply is positional (`INSERT INTO {live} SELECT s.* ...`), so a loader
-/// whose output shape changed — a column added, dropped, renamed, or
+/// whose output shape changed — a column added, dropped, renamed, retyped, or
 /// reordered — would otherwise fail deep inside it with an opaque arity/type
 /// error that does not name the actual cause, or silently write columns into
 /// the wrong places if the new shape happened to still typecheck positionally.
 /// A reorder is therefore as fatal as an addition, and this check turns both
 /// into one loud, named failure.
+///
+/// A **type** change is the quietest member of that set: it never breaks the
+/// apply at all, since the positional `INSERT` just coerces. It is checked
+/// because the diff no longer coerces — see `ordered_column_names` for the
+/// numeric case that reads as 100% churn — and because a live table built by
+/// an older `import` is the only way to reach it, which is exactly the
+/// situation the "re-run `import <source>`" remedy below addresses.
 ///
 /// Called once, early in [`refresh`], after the staging table exists and the
 /// empty-snapshot guard has passed, but before the diff runs — there is no
@@ -420,8 +452,8 @@ fn check_column_shapes_match(conn: &Connection, spec: &DatasetSpec) -> Result<()
             "{}: staging and live column sets differ (live: [{}], staging: [{}]) — \
              the loader's output shape changed. Re-run `import {}` to rebuild the live table.",
             spec.name,
-            live_cols.join(", "),
-            staging_cols.join(", "),
+            describe_columns(&live_cols),
+            describe_columns(&staging_cols),
             spec.name,
         );
     }
@@ -1011,6 +1043,51 @@ mod tests {
         let err = refresh(&conn, &TEST_SPEC, bad_loader, None, &|| false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("test"), "error should name the source: {msg}");
+
+        let live_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live_rows, 3, "live table must be untouched");
+    }
+
+    /// Same columns, same order, one of them retyped. This is the quietest
+    /// member of the shape-drift family and the only one the apply itself
+    /// would survive: `INSERT INTO {live} SELECT s.* ...` simply coerces.
+    ///
+    /// It bails anyway because the *diff* does not coerce. `diff::compute`
+    /// compares `DatasetSpec::content_hash_sql`, and DuckDB hashes a `DOUBLE`
+    /// 1.0 differently from an `INTEGER` 1 even though row-wise
+    /// `IS DISTINCT FROM` calls them equal -- so without this guard a loader
+    /// that retyped a compared column would report every row in the source as
+    /// modified, rewrite the whole live table and dirty every z14 cell in
+    /// Poland, with nothing anywhere naming the cause. The fixture uses a
+    /// *compared* column (`a`) for that reason.
+    ///
+    /// Asserts the type names reach the message: the two column lists are
+    /// otherwise character-identical, so an operator reading the error would
+    /// see two lists that look the same and no hint of what differs.
+    #[test]
+    fn retyped_staging_column_bails_with_a_named_error() {
+        let conn = conn_with_live(LIVE_ROWS);
+        // `live.a` is VARCHAR (see `conn_with_live`); this stages it as
+        // INTEGER, with the column set and order otherwise untouched.
+        let bad_loader = |conn: &Connection, target: &str| -> Result<crate::dataset::LoadStats> {
+            conn.execute_batch(&format!(
+                "CREATE TABLE {target} AS
+                 SELECT id, 7::INTEGER AS a, ST_Point(lon, lat) AS geom
+                 FROM (VALUES ('keep',21.0,52.0)) t(id,lon,lat)"
+            ))?;
+            Ok(crate::dataset::LoadStats::default())
+        };
+
+        let err = refresh(&conn, &TEST_SPEC, bad_loader, None, &|| false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("test"), "error should name the source: {msg}");
+        assert!(
+            msg.contains("VARCHAR") && msg.contains("INTEGER"),
+            "error must show the types, since the column names alone are \
+             identical on both sides: {msg}"
+        );
 
         let live_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM live", [], |r| r.get(0))

@@ -82,9 +82,21 @@ impl DatasetSpec {
     /// SQL predicate that is true when the record under alias `a` differs
     /// from the record under alias `b` in a way this source cares about.
     ///
-    /// This is the ONE place the comparison is written; see
-    /// `docs/superpowers/plans/2026-08-14-key-based-diff.md` for the
-    /// measurements behind each source's `compared_columns` /
+    /// **This is the definition of "modified", and it deliberately has no
+    /// production caller — do not delete it as dead code.** `update::diff`
+    /// evaluates [`content_hash_sql`](Self::content_hash_sql) instead, because
+    /// this predicate reads both rows and so forces every compared column
+    /// (EGIB's polygon geometry included) through the diff's hash join as
+    /// payload. What keeps that substitution honest is
+    /// `tests::signature_changes_exactly_when_the_diff_says_modified`, which
+    /// asserts row by row that the hash and the signature both differ exactly
+    /// when THIS predicate says the record changed. Delete it and the other
+    /// two expressions have nothing to be correct *against*: they would only
+    /// be pinned to each other, and could drift together silently.
+    ///
+    /// Read the rest of this comment as the specification the other two
+    /// implement. See `docs/superpowers/plans/2026-08-14-key-based-diff.md`
+    /// for the measurements behind each source's `compared_columns` /
     /// `compare_geometry` choice. Shape: a row-wise
     /// `(a.c1, a.c2, ...) IS DISTINCT FROM (b.c1, b.c2, ...)` over
     /// `compared_columns`, plus `OR ST_AsWKB(a.geom) IS DISTINCT FROM
@@ -101,6 +113,10 @@ impl DatasetSpec {
     /// `a.geom IS DISTINCT FROM b.geom` — measured on the real 17.5M-row
     /// EGIB table: native GEOMETRY comparison took 24.18s against 2.50s for
     /// `ST_AsWKB`, for the identical answer.
+    // Reference definition, exercised only by the equivalence tests that pin
+    // `content_hash_sql` and `content_signature_sql` to it — see the doc
+    // comment above for why that is deliberate and why it must stay.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn changed_predicate_sql(&self, a: &str, b: &str) -> String {
         let attrs = if self.compared_columns.is_empty() {
             None
@@ -226,6 +242,101 @@ impl DatasetSpec {
         }
 
         format!("md5(concat({}))", parts.join(&format!(", {SEPARATOR}, ")))
+    }
+
+    /// A cheap digest of the same content [`changed_predicate_sql`] compares,
+    /// for use as a *join payload* rather than as a comparison in its own
+    /// right. Built from the same `compared_columns` + `compare_geometry`, so
+    /// each source's measured column choices are inherited here too, and
+    /// pinned to the other two by
+    /// `tests::signature_changes_exactly_when_the_diff_says_modified`.
+    ///
+    /// **Why this exists at all, given the other two.** `update::diff::compute`
+    /// classifies "modified" by joining staging to live on the key and applying
+    /// `changed_predicate_sql` above the join. The predicate reads both sides,
+    /// so every compared column has to be carried through the hash join as
+    /// payload -- for EGIB that is the full polygon geometry of 17.6M rows.
+    /// Projecting each side down to `(key, hash)` first collapses that payload
+    /// to 8 bytes per row.
+    ///
+    /// Measured on real staging pairs rebuilt from a production database copy,
+    /// at the production settings (`memory_limit = '4GB'`, `threads = 3`),
+    /// whole three-statement diff, three interleaved runs of each form:
+    ///
+    /// | source  | payload-carrying    | hashed              |
+    /// |---------|---------------------|---------------------|
+    /// | EGIB    | 21.3 / 46.3 / 52.0s | 6.40 / 6.38 / 6.44s |
+    /// | BDOT10k | 25.0 / 47.2 / 47.4s | 4.80 / 4.63 / 5.05s |
+    ///
+    /// **The spread is the finding, not noise.** The payload-carrying form runs
+    /// *at* the memory ceiling, so its wall time is set by how much it happens
+    /// to spill; the hashed form sits well under it and lands within 0.06s of
+    /// itself every run. Results were identical in every run (EGIB 122,785
+    /// modified / 5,850 removed; BDOT10k 77,635 / 5,476).
+    ///
+    /// The memory floor is the honest measure, and it moves further than the
+    /// clock does: the EGIB modified-diff alone runs in 3.4s at a **256 MB**
+    /// limit, where the payload-carrying form is an `Out of Memory Error`. Do
+    /// not read peak RSS at a *fixed* limit as the working set -- DuckDB's
+    /// buffer manager expands into whatever it is given, so the hashed EGIB
+    /// diff measures slightly *higher* RSS (4.50 GB vs 4.15 GB) purely because
+    /// it finishes sooner and caches more table data with the room it freed.
+    /// BDOT10k, whose payload is ten VARCHARs rather than geometry, does show
+    /// the drop directly: 4.08 GB -> 3.09 GB.
+    ///
+    /// **Not `content_signature_sql`**, for two reasons. It is
+    /// `md5(concat(..., hex(ST_AsWKB(geom))))`, which builds a large VARCHAR
+    /// per row and is documented as `O(active reports)`, never `O(source
+    /// table)`. More importantly its value is *stored* in `object_reports` and
+    /// compared across releases, so it must stay byte-stable forever; `hash()`
+    /// is DuckDB's internal hash with no such guarantee. That costs nothing
+    /// here because both sides are hashed by the same expression in the same
+    /// query in the same process -- but sharing one expression between a
+    /// transient comparison and a persisted one would quietly make DuckDB's
+    /// hash stability load-bearing.
+    ///
+    /// **The collision bound is per-key, not birthday.** Two hashes are only
+    /// ever compared for records that already matched on the key, so a missed
+    /// modification needs one specific pair of values to collide: 2^-64 per
+    /// record, not `n^2 / 2^65` over the table. That is the whole reason a
+    /// 64-bit hash is enough here.
+    ///
+    /// NULL handling needs none of `content_signature_sql`'s sentinel
+    /// machinery: DuckDB's variadic `hash` is positional and hashes NULL to a
+    /// fixed non-NULL value, so `hash('x', NULL)` and `hash(NULL, 'x')` differ
+    /// (verified, not assumed) -- the transposition trap that concat's
+    /// NULL-skipping opens. Callers still compare with `IS DISTINCT FROM`,
+    /// which is correct whether or not the hash itself is ever NULL.
+    ///
+    /// One behaviour difference from `changed_predicate_sql` worth knowing:
+    /// row-wise `IS DISTINCT FROM` coerces across numeric types, so a live
+    /// `INTEGER` 1 and a staged `DOUBLE` 1.0 compare equal, while their hashes
+    /// do not. Integer *widths* are safe (`TINYINT`/`INTEGER`/`BIGINT` of one
+    /// value hash identically), so this is only reachable if a loader changes a
+    /// column's type without changing its name --
+    /// `update::dataset::check_column_shapes_match` compares types for exactly
+    /// this reason.
+    pub fn content_hash_sql(&self, alias: &str) -> String {
+        let mut parts: Vec<String> = self
+            .compared_columns
+            .iter()
+            .map(|c| format!("{alias}.{c}"))
+            .collect();
+
+        if self.compare_geometry {
+            parts.push(format!("ST_AsWKB({alias}.geom)"));
+        }
+
+        // Nothing is compared, so nothing can ever change -- mirroring
+        // `changed_predicate_sql`'s `(FALSE)` arm. `hash()` with no arguments
+        // is a binder error, so this case needs its own constant, and it has
+        // to be one that compares equal to itself: the caller's
+        // `IS DISTINCT FROM` must come out false for every row.
+        if parts.is_empty() {
+            return "hash(NULL)".to_string();
+        }
+
+        format!("hash({})", parts.join(", "))
     }
 }
 
@@ -764,6 +875,13 @@ mod tests {
     /// If it were less sensitive, a corrected record would stay vetoed forever.
     /// Neither failure produces an error; both are silent, which is why this is
     /// a property test over a matrix rather than a couple of examples.
+    ///
+    /// `content_hash_sql` is held to the same property in the same matrix, for
+    /// a different consumer: it is what `update::diff::compute` actually
+    /// evaluates to populate `diff_modified`, so a disagreement there is not a
+    /// lapsed report but a missed or invented change in the serving tables.
+    /// Three expressions, one definition of "modified" -- which only stays
+    /// true if all three are checked against each other rather than pairwise.
     #[test]
     fn signature_changes_exactly_when_the_diff_says_modified() {
         use crate::db::init_db;
@@ -817,24 +935,32 @@ mod tests {
                 geom_kind: GeomKind::Point,
             };
             let sql = format!(
-                "SELECT l.id, {changed}, {sig_s} IS DISTINCT FROM {sig_l}
+                "SELECT l.id, {changed}, {sig_s} IS DISTINCT FROM {sig_l},
+                        {hash_s} IS DISTINCT FROM {hash_l}
                  FROM l JOIN s USING (id) ORDER BY l.id",
                 changed = spec.changed_predicate_sql("s", "l"),
                 sig_s = spec.content_signature_sql("s"),
                 sig_l = spec.content_signature_sql("l"),
+                hash_s = spec.content_hash_sql("s"),
+                hash_l = spec.content_hash_sql("l"),
             );
             let mut stmt = conn.prepare(&sql).unwrap();
-            let rows: Vec<(String, bool, bool)> = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            let rows: Vec<(String, bool, bool, bool)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .unwrap()
                 .map(|r| r.unwrap())
                 .collect();
             assert_eq!(rows.len(), 9, "every fixture row must be compared");
-            for (id, diff_says_changed, signature_differs) in rows {
+            for (id, diff_says_changed, signature_differs, hash_differs) in rows {
                 assert_eq!(
                     diff_says_changed, signature_differs,
                     "compare_geometry={compare_geometry}, row '{id}': the diff and the \
                      signature disagree about whether this record changed"
+                );
+                assert_eq!(
+                    diff_says_changed, hash_differs,
+                    "compare_geometry={compare_geometry}, row '{id}': the diff and the \
+                     content hash disagree about whether this record changed"
                 );
             }
         }
@@ -1450,9 +1576,100 @@ mod tests {
     /// is what prevents that, so pin that the predicate text never mentions
     /// `geom` -- a future reader "fixing" `compare_geometry` back to `true`
     /// on the const should fail this test.
+    ///
+    /// `content_hash_sql` is checked alongside it, and is in fact the half
+    /// that bites: it is what `update::diff` actually evaluates, so pinning
+    /// only the predicate would leave the executed expression unguarded.
+    /// `content_signature_sql` is deliberately not checked here -- it spells
+    /// geometry as `hex(ST_AsWKB(...))`, and `signature_changes_exactly_when_
+    /// the_diff_says_modified` already ties it to the same `compare_geometry`.
     #[test]
     fn bdot10k_predicate_does_not_mention_geometry() {
         assert!(!BDOT10K.changed_predicate_sql("s", "l").contains("geom"));
+        assert!(
+            !BDOT10K.content_hash_sql("t").contains("geom"),
+            "the diff evaluates content_hash_sql, so it is the expression that \
+             must not reintroduce BDOT10k's geometry churn"
+        );
+    }
+
+    #[test]
+    fn content_hash_sql_single_column_no_geometry() {
+        let spec = DatasetSpec {
+            name: "test",
+            table: "t",
+            key_columns: &["id"],
+            compared_columns: &["rodzaj"],
+            compare_geometry: false,
+            geom_kind: GeomKind::Point,
+        };
+        assert_eq!(spec.content_hash_sql("s"), "hash(s.rodzaj)");
+    }
+
+    #[test]
+    fn content_hash_sql_multi_column_with_geometry() {
+        let spec = DatasetSpec {
+            name: "test",
+            table: "t",
+            key_columns: &["id"],
+            compared_columns: &["rodzaj", "kondygnacje_nadziemne", "kondygnacje_podziemne"],
+            compare_geometry: true,
+            geom_kind: GeomKind::Polygon,
+        };
+        assert_eq!(
+            spec.content_hash_sql("s"),
+            "hash(s.rodzaj, s.kondygnacje_nadziemne, s.kondygnacje_podziemne, \
+             ST_AsWKB(s.geom))"
+        );
+    }
+
+    /// The empty-compared-set arm has to be a value that is NOT distinct from
+    /// itself, because the diff compares two copies of it with `IS DISTINCT
+    /// FROM`. `changed_predicate_sql`'s matching arm is the literal `(FALSE)`;
+    /// this one has to reach the same outcome through a value. Asserted as
+    /// behaviour against DuckDB, not as text, since "`hash(NULL)` equals
+    /// `hash(NULL)`" is the property that matters and a different constant
+    /// would be fine if it held.
+    #[test]
+    fn content_hash_sql_with_nothing_compared_never_reports_a_change() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let spec = DatasetSpec {
+            name: "test",
+            table: "t",
+            key_columns: &["id"],
+            compared_columns: &[],
+            compare_geometry: false,
+            geom_kind: GeomKind::Point,
+        };
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE s (id VARCHAR, a VARCHAR);
+             CREATE TABLE l (id VARCHAR, a VARCHAR);
+             INSERT INTO s VALUES ('x', 'one'), ('y', NULL);
+             INSERT INTO l VALUES ('x', 'DIFFERENT'), ('y', 'ALSO DIFFERENT');",
+        )
+        .unwrap();
+
+        let changed: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM s JOIN l USING (id) WHERE {} IS DISTINCT FROM {}",
+                    spec.content_hash_sql("s"),
+                    spec.content_hash_sql("l"),
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            changed, 0,
+            "with nothing in the compared set, no record can ever be modified — \
+             mirroring changed_predicate_sql's (FALSE) arm"
+        );
     }
 
     /// PRG's version columns (`wersja_id`, `poczatek_wersji_obiektu`) are

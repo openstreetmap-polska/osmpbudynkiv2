@@ -161,10 +161,53 @@ and comparing a *named list* of columns — never a whole-row hash, which cannot
 tell a record changing from its *serialization* changing (a routine BDOT10k
 re-export rewrote all 16,344,762 rows). Both halves live on `DatasetSpec`
 (`src/dataset.rs`): `key_columns` for identity, `compared_columns` +
-`compare_geometry` for change. `DatasetSpec::changed_predicate_sql` is the single
-home for the comparison text. The three configurations look inconsistent from
+`compare_geometry` for change. The three configurations look inconsistent from
 outside; each is deliberate. Measurements:
 `docs/superpowers/plans/2026-08-14-key-based-diff.md`.
+
+**Gotcha — "modified" has one *definition* and three *expressions*, and the one
+the diff runs is not the one that defines it.** All three are generated from the
+same `compared_columns` + `compare_geometry`, which is what keeps each source's
+measured column choices inherited everywhere for free:
+
+| expression | who runs it | stability |
+|---|---|---|
+| `changed_predicate_sql` | **nobody** — the definition, exercised only by tests | — |
+| `content_hash_sql` | `update::diff::compute` | transient, per query |
+| `content_signature_sql` | `reports::reconcile_source` | **stored in `object_reports`; must never change** |
+
+1. **`changed_predicate_sql` has no production caller and must not be deleted
+   as dead code** (it carries `#[cfg_attr(not(test), allow(dead_code))]` saying
+   so). It is what the other two are correct *against*:
+   `dataset::tests::signature_changes_exactly_when_the_diff_says_modified`
+   asserts row by row that both differ exactly when it does. Delete it and the
+   remaining two are pinned only to each other, free to drift together in
+   silence.
+2. **The diff hashes each side *before* the join** — `(key, hash)` subqueries
+   joined on the key, never `JOIN ... WHERE changed_predicate`, which would drag
+   every compared column (EGIB's 17.6M polygons included) through the hash join
+   as payload. That was the `Out of Memory Error` of 2026-09-12. The subqueries
+   must stay **inline**: materializing them into temp tables gives back the
+   entire win (measured). Only `diff_modified` needs it — the two `ANTI JOIN`s
+   already project keys alone. Pinned structurally by
+   `diff::tests::the_modified_diff_hashes_each_side_before_joining`, because the
+   answer is identical either way and no functional test can see the difference.
+3. **This is still not a whole-row hash**, the thing the paragraph above
+   forbids. It hashes exactly the curated `compared_columns`, so BDOT10k's
+   geometry churn stays excluded —
+   `dataset::tests::bdot10k_predicate_does_not_mention_geometry` checks
+   `content_hash_sql` alongside the predicate, and it is the half that bites,
+   being the expression that actually runs.
+4. **A 64-bit hash is sound here because the bound is per-key, not birthday.**
+   Two digests are only ever compared for records that already matched on the
+   key, so a missed modification needs one specific pair to collide: 2^-64 per
+   record, not `n^2 / 2^65` over the table.
+5. **`content_signature_sql` is deliberately not reused for the diff.** It is
+   `md5(concat(..., hex(ST_AsWKB(geom))))`, documented as `O(active reports)`
+   and never `O(source table)` — but the real reason is that its value is
+   persisted, so it must stay byte-stable across releases forever. `hash()` is
+   DuckDB's internal hash with no such promise, which costs nothing inside one
+   query and would be a trap if the two shared an expression.
 
 - **BDOT10k — `compare_geometry: false`.** BDOT10k periodically re-serializes
   every geometry wholesale (0.94%, 4.5%, then **100%** of rows across measured
@@ -213,7 +256,15 @@ surfaces as an ordinary modification and self-heals per record); BDOT10k is the
 sharp one, since geometry is outside its predicate too.
 `update::dataset::check_column_shapes_match` compares staging and live column
 lists (**ordered** — the apply's `INSERT ... SELECT s.*` is positional, so a
-reordering is as fatal as an addition) and bails before the diff runs.
+reordering is as fatal as an addition) and bails before the diff runs. It
+compares **types as well as names**, which guards something the apply itself
+would survive: a positional `INSERT` simply coerces, but the diff no longer
+coerces either, since `content_hash_sql` hashes a `DOUBLE` 1.0 differently from
+an `INTEGER` 1 where row-wise `IS DISTINCT FROM` called them equal. Unguarded,
+a loader that retyped a compared column would report every row in the source as
+modified — a national rewrite dirtying every z14 cell, with nothing naming the
+cause. Integer *widths* are safe (`TINYINT`/`INTEGER`/`BIGINT` of one value hash
+identically), so only a genuine type change trips it.
 
 ### The match rule and its three vetoes
 

@@ -30,26 +30,31 @@ pub struct DiffCounts {
 /// (not folded into a single `id` column), which is what lets a composite
 /// key such as BDOT10k's `(PRZESTRZENNAZW, LOKALNYID)` work with a plain
 /// `USING (...)` join at every consumer.
+///
+/// **`diff_modified` compares `DatasetSpec::content_hash_sql`, projected on
+/// each side *before* the join, rather than `changed_predicate_sql` above
+/// it** — see that method's doc comment for why, and for the per-key
+/// collision bound that makes a 64-bit hash sound here. The two are pinned
+/// equivalent by `dataset::tests::signature_changes_exactly_when_the_diff_
+/// says_modified`, so `changed_predicate_sql` remains the definition of
+/// "modified" and this is only how it is evaluated.
+///
+/// Three things about that shape are load-bearing:
+///
+/// 1. **The subqueries must stay inline.** Materializing the two `(key, hash)`
+///    projections into temp tables first gives the optimizer nothing and costs
+///    two 16M-row temp-table writes: measured on the real BDOT10k pair, 26.4s
+///    against 28.7s for the original — i.e. it gives back the entire win.
+/// 2. **Only `diff_modified` needs it.** The two `ANTI JOIN`s already project
+///    keys alone, so there is no payload to trim and wrapping them would be
+///    pure noise.
+/// 3. **`__sig` is compared with `IS DISTINCT FROM`, not `<>`.** DuckDB's
+///    `hash` never returns NULL today, which makes the two equivalent, but the
+///    `(FALSE)`-equivalent arm of `content_hash_sql` and any future NULL-valued
+///    digest both depend on the NULL-safe form.
 pub fn compute(conn: &Connection, spec: &DatasetSpec) -> Result<DiffCounts> {
-    let live = spec.table;
-    let staging = spec.staging_table();
-    let keys = spec.key_columns.join(", ");
-    let changed_predicate = spec.changed_predicate_sql("s", "l");
-
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS diff_added;
-         DROP TABLE IF EXISTS diff_removed;
-         DROP TABLE IF EXISTS diff_modified;
-
-         CREATE TEMP TABLE diff_added AS
-             SELECT {keys} FROM {staging} ANTI JOIN {live} USING ({keys});
-         CREATE TEMP TABLE diff_removed AS
-             SELECT {keys} FROM {live} ANTI JOIN {staging} USING ({keys});
-         CREATE TEMP TABLE diff_modified AS
-             SELECT {keys} FROM {staging} s JOIN {live} l USING ({keys})
-             WHERE {changed_predicate};"
-    ))
-    .with_context(|| format!("Failed to compute diff for {}", spec.name))?;
+    conn.execute_batch(&build_sql(spec))
+        .with_context(|| format!("Failed to compute diff for {}", spec.name))?;
 
     let count = |table: &str| -> Result<i64> {
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -63,6 +68,39 @@ pub fn compute(conn: &Connection, spec: &DatasetSpec) -> Result<DiffCounts> {
         modified: count("diff_modified")?,
         removed: count("diff_removed")?,
     })
+}
+
+/// The batch [`compute`] runs, as a value.
+///
+/// A seam, not decoration: it is the only way a test can assert on — or an
+/// operator `EXPLAIN` — the SQL that actually runs, rather than a copy of it
+/// that can drift. `diff_modified`'s shape in particular is a performance
+/// invariant that no functional test can see (the answer is identical either
+/// way), so `tests::the_modified_diff_hashes_each_side_before_joining` pins it
+/// structurally here.
+fn build_sql(spec: &DatasetSpec) -> String {
+    let live = spec.table;
+    let staging = spec.staging_table();
+    let keys = spec.key_columns.join(", ");
+    let content_hash = spec.content_hash_sql("t");
+
+    format!(
+        "DROP TABLE IF EXISTS diff_added;
+         DROP TABLE IF EXISTS diff_removed;
+         DROP TABLE IF EXISTS diff_modified;
+
+         CREATE TEMP TABLE diff_added AS
+             SELECT {keys} FROM {staging} ANTI JOIN {live} USING ({keys});
+         CREATE TEMP TABLE diff_removed AS
+             SELECT {keys} FROM {live} ANTI JOIN {staging} USING ({keys});
+         CREATE TEMP TABLE diff_modified AS
+             SELECT {keys} FROM
+                 (SELECT {keys}, {content_hash} AS __sig FROM {staging} t) s
+                 JOIN
+                 (SELECT {keys}, {content_hash} AS __sig FROM {live} t) l
+                 USING ({keys})
+             WHERE s.__sig IS DISTINCT FROM l.__sig;"
+    )
 }
 
 #[cfg(test)]
@@ -112,6 +150,50 @@ mod tests {
             .unwrap();
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
         rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// A performance invariant with no functional symptom: the payload-carrying
+    /// form (`FROM staging s JOIN live l USING (key) WHERE changed_predicate`)
+    /// returns byte-identical results, so every other test in this file passes
+    /// either way. What it costs is the whole reason this shape exists — on the
+    /// real EGIB pair, at the production `memory_limit = '4GB'` / `threads = 3`,
+    /// the three-statement diff measured 21–52s (it runs at the memory ceiling,
+    /// so the time tracks how much it spills) against a steady 6.4s, and the
+    /// modified-diff alone is an `Out of Memory Error` at a 256 MB limit where
+    /// this form finishes in 3.4s. Full table in
+    /// `DatasetSpec::content_hash_sql`.
+    ///
+    /// Asserted on the generated text, since that is the only observable: both
+    /// source scans must appear wrapped in a `__sig` projection, and neither
+    /// compared column may appear bare at the top level where it would have to
+    /// travel through the join as payload. Geometry is the sharpest case, so it
+    /// gets its own assertion via EGIB.
+    #[test]
+    fn the_modified_diff_hashes_each_side_before_joining() {
+        let sql = build_sql(&crate::dataset::EGIB);
+        let modified = sql
+            .split("CREATE TEMP TABLE diff_modified AS")
+            .nth(1)
+            .expect("build_sql must still create diff_modified");
+
+        assert_eq!(
+            modified.matches("AS __sig FROM").count(),
+            2,
+            "both staging and live must be projected to (key, hash) before the \
+             join, not joined and then filtered: {modified}"
+        );
+        assert!(
+            !modified.contains("l.geom") && !modified.contains("s.geom"),
+            "geometry must only be reachable inside the hashed subqueries — a \
+             `geom` under the join aliases means it is hash-join payload again, \
+             which is the 17.6M-polygon cost this shape exists to avoid: \
+             {modified}"
+        );
+        assert!(
+            modified.contains("s.__sig IS DISTINCT FROM l.__sig"),
+            "the comparison must be the NULL-safe form over the two digests: \
+             {modified}"
+        );
     }
 
     #[test]
