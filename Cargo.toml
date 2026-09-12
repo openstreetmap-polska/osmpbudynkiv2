@@ -31,6 +31,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = "6"
 rocksdb = { package = "rust-rocksdb", version = "0.52", default-features = false, features = ["zstd", "jemalloc"] }
 osmpbf = "0.3.8"
+# Only ever pulled in by the `heap-profiling` feature. `rust-rocksdb`'s
+# `jemalloc` feature already depends on this exact crate, so naming it here does
+# not add a second allocator -- cargo unifies the features onto the one build,
+# which is the whole mechanism: it turns `--enable-prof` on for the jemalloc
+# that is *already* linked. See docs/heap_profiling.md.
+tikv-jemalloc-sys = { version = "0.7", features = ["profiling"], optional = true }
+
+[features]
+# Build the (unprefixed, Rust-heap-and-GEOS-backing) jemalloc with profiling
+# compiled in. Off by default: a profiling-capable jemalloc is only activated by
+# `MALLOC_CONF=prof:true` at runtime, but the feature still changes the built
+# artifact, so release builds must not carry it silently.
+heap-profiling = ["dep:tikv-jemalloc-sys"]
 
 [dev-dependencies]
 assert_cmd = "2"
