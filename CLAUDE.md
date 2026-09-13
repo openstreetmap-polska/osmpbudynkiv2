@@ -681,7 +681,9 @@ deletes, losing the object entirely. `LoadStats::merge_oversized` folds both
 counts into the one `LoadStats` each loader returns, self-reported to
 `job_run_log` under `import:<source>` / `update:<source>` and read back by
 `/status`. Note the reporting asymmetry: PRG's `update_prg` shares the same
-`refresh()` that self-reports, so `update:prg` appears (with no skip clause);
+`refresh()` that self-reports, so `update:prg` appears (never with a geometry
+clause — PRG's own skip reasons are `missing-coordinates`, null-key and
+duplicate-key);
 `import:prg` does not, since PRG's import path never goes through `refresh()`;
 `import:osm` self-reports directly, and its message carries a *repaired*-geometry
 clause where the others report rows *skipped*. A refresh whose ETag is unchanged
@@ -763,6 +765,19 @@ the table rebuilt and `compare` (or `queue reconcile` + drain) re-run; until the
 the column reads NULL. The one `ALTER TABLE` in the codebase
 (`dataset::drop_ordering_column`) runs against a table the *same load's own*
 `CREATE TABLE AS SELECT` built moments earlier, never a pre-existing database.
+
+**Gotcha — never hand DuckDB an Arrow batch through duckdb-rs's `arrow()`
+table function on a repeated path.** `arrow_recordbatch_to_query_params` (and
+its `_arraydata_`/`_ffi_` siblings) push every batch into a process-global store
+that is **never freed**. `import::prg::stream_gml_into` called it once per
+2,048-row batch, so the server kept every parsed PRG address alive: **~2.8 GiB
+per daily `update prg`**, from v0.1.2 until heap profiling found it. A CLI
+`import` leaks the same bytes but exits, so tests and imports never show it.
+Load batches with `Appender::append_record_batch` (`appender-arrow` feature)
+into a table from `import::prg::create_table_for_schema`. Its column types come
+from the same `to_duckdb_logical_type_for_field` the Appender types its chunks
+with, so they cannot drift apart. `ArrowVTab` is still registered in `db.rs`,
+unused. Write-up: `docs/prg_arrow_batch_leak.md`.
 
 **Gotcha — the government loaders store only the columns anything reads.** They
 project an explicit column list, not `SELECT *`/`EXCLUDE`/`REPLACE` — a source

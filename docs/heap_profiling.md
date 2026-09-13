@@ -158,3 +158,10 @@ From the investigation so far, in rough order of prior probability:
 
 Neither is confirmed. The point of the diff is to decide between them, not to
 confirm a guess.
+
+**Outcome, 2026-09-13:** it was neither of these guesses. It was the Rust heap,
+but in a daily job rather than per request: `update prg` kept every Arrow batch
+in duckdb-rs's never-freed store. See `docs/prg_arrow_batch_leak.md`, which also
+covers two things this doc did not anticipate. The `jeprof` script has to be
+generated from `jeprof.in`, and the profiles' `MAPPED_LIBRARIES` path has to be
+rewritten before frames resolve off-host.

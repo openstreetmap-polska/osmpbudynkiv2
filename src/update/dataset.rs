@@ -291,10 +291,10 @@ pub fn refresh(
 }
 
 /// Human-readable message for the `job_run_log` row. Uses
-/// `dataset::format_skip_clause` for all four skip reasons -- see
+/// `dataset::format_skip_clause` for all five skip reasons -- see
 /// `dataset::LoadStats` for why a loader can drop rows for invalid
-/// geometry, oversized geometry, a NULL record key, or a duplicate record
-/// key.
+/// geometry, oversized geometry, missing coordinates, a NULL record key, or a
+/// duplicate record key.
 fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> String {
     let mut msg = format!(
         "added {} modified {} removed {}",
@@ -314,6 +314,14 @@ fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> 
             "oversized-geometry",
             stats.skipped_oversized_geometry,
             &stats.skipped_oversized_example_ids,
+        ));
+    }
+    if stats.skipped_missing_coordinates > 0 {
+        msg.push_str("; ");
+        msg.push_str(&crate::dataset::format_skip_clause(
+            "missing-coordinates",
+            stats.skipped_missing_coordinates,
+            &stats.skipped_missing_coordinates_example_ids,
         ));
     }
     if stats.skipped_null_key > 0 {
@@ -475,6 +483,35 @@ mod tests {
         compare_geometry: true,
         geom_kind: GeomKind::Point,
     };
+
+    /// The job-log summary reports every reason a loader dropped rows.
+    /// `missing-coordinates` is PRG's; before it existed, `update:prg` could
+    /// lose addresses while its message read as a clean `added 0 modified 0
+    /// removed 0`.
+    #[test]
+    fn summary_reports_rows_skipped_for_missing_coordinates() {
+        let counts = DiffCounts {
+            added: 3,
+            modified: 0,
+            removed: 1,
+        };
+        let stats = crate::dataset::LoadStats {
+            skipped_missing_coordinates: 2,
+            skipped_missing_coordinates_example_ids: vec!["a".into(), "b".into()],
+            skipped_null_key: 5,
+            ..Default::default()
+        };
+        assert_eq!(
+            summarize_refresh(&counts, &stats),
+            "added 3 modified 0 removed 1; skipped 2 missing-coordinates rows (ids: a, b); \
+             skipped 5 null-key rows"
+        );
+        assert_eq!(
+            summarize_refresh(&counts, &Default::default()),
+            "added 3 modified 0 removed 1",
+            "a clean load adds no clause"
+        );
+    }
 
     fn conn_with_live(rows: &str) -> Connection {
         let init = vec![

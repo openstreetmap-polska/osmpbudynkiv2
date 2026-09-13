@@ -261,3 +261,13 @@ confounds any RSS reading from this window. It needs restarting from a healthy
 baseline once the spatial extension is patched and the ceilings are re-sized.
 Nothing above changes the arena-retention finding, which stands on the `pmap`
 data from the *previous* four-day run.
+
+---
+
+## Resolution (2026-09-13)
+
+It was a genuine leak, and the refresh-driven hypothesis was right about
+*when* but not *which*. `update prg` retained every parsed Arrow batch in
+duckdb-rs's never-freed ArrowVTab store, about 2.8 GiB per daily run. The
+building refreshes were innocent. Measurements, profile diffs and the fix:
+`docs/prg_arrow_batch_leak.md`.

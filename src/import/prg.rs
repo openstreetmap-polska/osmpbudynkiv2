@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;
-use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
+use duckdb::arrow::datatypes::Schema;
+use duckdb::core::LogicalTypeId;
+use duckdb::vtab::arrow::to_duckdb_logical_type_for_field;
 use prg_convert::terc::Terc;
 use prg_convert::{get_address_parser_2021_zip, get_teryt_mapping};
 use tracing::info;
@@ -55,10 +57,11 @@ pub fn import(
     // `import prg` has no `job_run_log` integration the way `update prg`'s
     // `refresh` -> `summarize_refresh` does, so this `info!` is the only
     // operator-visible signal that `materialize_into` silently dropped a row
-    // for having a NULL or duplicate `lokalny_id` -- surface both counts
-    // rather than discarding the returned `LoadStats`.
+    // for having no coordinates or a NULL or duplicate `lokalny_id` --
+    // surface every count rather than discarding the returned `LoadStats`.
     info!(
         elapsed = %format_duration(t.elapsed()),
+        skipped_missing_coordinates = stats.skipped_missing_coordinates,
         skipped_null_key = stats.skipped_null_key,
         skipped_duplicate_key = stats.skipped_duplicate_key,
         "Step done: build prg_addresses with geom column"
@@ -239,6 +242,19 @@ fn cleanup_if_downloaded(zip_path: &Path, should_delete: bool) {
 /// batches into `raw_table`, creating it from the first batch's schema and
 /// appending the rest. Drops any leftover `raw_table` from a previous run
 /// first.
+///
+/// **Batches go through the `Appender`, never `SELECT * FROM arrow(?, ?)`.**
+/// `duckdb::vtab::arrow::arrow_recordbatch_to_query_params` pushes every batch
+/// into a process-global store that is never freed (its own doc comment says
+/// so: "Memory grows monotonically"), so calling it per batch retained the
+/// entire parsed PRG snapshot -- ~2.8 GiB of Arrow string buffers -- for the
+/// life of the server, once per daily `update prg`. Found by heap profiling in
+/// production; see `docs/prg_arrow_batch_leak.md`. A one-off `import prg`
+/// leaked the same bytes but exited, which is why nothing noticed.
+///
+/// The table is created by [`create_table_for_schema`] rather than a
+/// `CREATE TABLE AS SELECT` over the first batch, because that CTAS needs the
+/// same leaking function.
 fn stream_gml_into(
     conn: &Connection,
     zip_path: &Path,
@@ -270,7 +286,10 @@ fn stream_gml_into(
         .with_context(|| format!("Failed to drop existing {raw_table}"))?;
 
     let t = std::time::Instant::now();
-    let mut table_created = false;
+    // Created lazily on the first non-empty batch: the parser's schema is only
+    // known from a batch, and an `Appender` cannot be opened on a table that
+    // does not exist yet.
+    let mut appender: Option<duckdb::Appender<'_>> = None;
     let mut total_rows: usize = 0;
     for (n, &idx) in gml_indices.iter().enumerate() {
         // Checked once per voivodeship entry as well as once per batch below
@@ -311,32 +330,77 @@ fn stream_gml_into(
                 continue;
             }
             total_rows += batch.num_rows();
-            let params = arrow_recordbatch_to_query_params(batch);
-            if !table_created {
-                conn.execute(
-                    &format!("CREATE TABLE {raw_table} AS SELECT * FROM arrow(?, ?)"),
-                    params,
-                )
-                .with_context(|| format!("Failed to create {raw_table} from first arrow batch"))?;
-                table_created = true;
-            } else {
-                conn.execute(
-                    &format!("INSERT INTO {raw_table} SELECT * FROM arrow(?, ?)"),
-                    params,
-                )
-                .with_context(|| format!("Failed to insert PRG batch into {raw_table}"))?;
-            }
+            let app = match appender.as_mut() {
+                Some(app) => app,
+                None => {
+                    create_table_for_schema(conn, raw_table, &batch.schema())?;
+                    appender.insert(
+                        conn.appender(raw_table)
+                            .with_context(|| format!("Failed to open appender on {raw_table}"))?,
+                    )
+                }
+            };
+            app.append_record_batch(batch)
+                .with_context(|| format!("Failed to append PRG batch to {raw_table}"))?;
         }
     }
-    if !table_created {
+    let Some(mut appender) = appender else {
         bail!("PRG parser yielded no rows");
-    }
+    };
+    // Explicit, not left to `Drop`: the appender buffers rows and flushes the
+    // remainder on drop, where a failure can only be swallowed. `materialize_into`
+    // would then build from a silently truncated `raw_table`.
+    appender
+        .flush()
+        .with_context(|| format!("Failed to flush PRG rows into {raw_table}"))?;
     info!(
         rows = total_rows,
         elapsed = %format_duration(t.elapsed()),
         "Step done: stream PRG batches into staging table"
     );
 
+    Ok(())
+}
+
+/// `CREATE TABLE {table}` with one column per field of `schema`.
+///
+/// Column types come from `to_duckdb_logical_type_for_field` -- the exact
+/// function `Appender::append_record_batch` uses to type the data chunks it
+/// appends -- so the table matches the chunks by construction instead of by a
+/// second, hand-written Arrow-to-SQL mapping that could drift from it. The only
+/// thing restated here is the `LogicalTypeId` -> SQL keyword spelling, and an
+/// id with no entry fails loudly rather than guessing: a new `prg_convert`
+/// column type must be added deliberately.
+fn create_table_for_schema(conn: &Connection, table: &str, schema: &Schema) -> Result<()> {
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let id = to_duckdb_logical_type_for_field(field)
+            .map_err(|e| anyhow::anyhow!("PRG column {:?}: {e}", field.name()))?
+            .id();
+        let sql_type = match id {
+            LogicalTypeId::Varchar => "VARCHAR",
+            LogicalTypeId::Double => "DOUBLE",
+            LogicalTypeId::Float => "FLOAT",
+            LogicalTypeId::Boolean => "BOOLEAN",
+            LogicalTypeId::Tinyint => "TINYINT",
+            LogicalTypeId::Smallint => "SMALLINT",
+            LogicalTypeId::Integer => "INTEGER",
+            LogicalTypeId::Bigint => "BIGINT",
+            LogicalTypeId::Date => "DATE",
+            LogicalTypeId::Timestamp => "TIMESTAMP",
+            LogicalTypeId::TimestampTZ => "TIMESTAMPTZ",
+            other => bail!(
+                "PRG column {:?} maps to DuckDB type {other:?}, which create_table_for_schema has no SQL spelling for",
+                field.name()
+            ),
+        };
+        columns.push(format!(
+            "\"{}\" {sql_type}",
+            field.name().replace('"', "\"\"")
+        ));
+    }
+    conn.execute_batch(&format!("CREATE TABLE {table} ({})", columns.join(", ")))
+        .with_context(|| format!("Failed to create {table} from the PRG arrow schema"))?;
     Ok(())
 }
 
@@ -436,6 +500,39 @@ pub fn materialize_into(
         )
         .with_context(|| format!("Failed to count NULL-keyed rows in {raw_table}"))?;
 
+    // The other row `inner`'s WHERE drops: no coordinates to build `geom`
+    // from. Before this was counted, a PRG snapshot could lose addresses here
+    // with `update:prg`'s job log saying nothing at all, where BDOT10k/EGIB
+    // report every row they drop. Keyed rows only (`AND {non_null}`), so it
+    // stays disjoint from the null-key count above. Same "before the batch
+    // drops `raw_table`" constraint.
+    let missing_coordinates_sql =
+        format!("(dlugosc_geograficzna IS NULL OR szerokosc_geograficzna IS NULL) AND {non_null}");
+    let skipped_missing_coordinates: i64 = conn
+        .query_row(
+            &format!("SELECT count(*) FROM {raw_table} WHERE {missing_coordinates_sql}"),
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("Failed to count coordinate-less rows in {raw_table}"))?;
+    let mut skipped_missing_coordinates_example_ids = Vec::new();
+    if skipped_missing_coordinates > 0 {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT lokalny_id FROM {raw_table} WHERE {missing_coordinates_sql} \
+                 LIMIT {}",
+                crate::dataset::MAX_EXAMPLE_IDS
+            ))
+            .with_context(|| format!("Failed to prepare coordinate-less id scan on {raw_table}"))?;
+        for id in stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .with_context(|| format!("Failed to scan coordinate-less ids in {raw_table}"))?
+        {
+            skipped_missing_coordinates_example_ids
+                .push(id.context("Failed to read coordinate-less id")?);
+        }
+    }
+
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS {target_table};
          CREATE TABLE {target_table} AS {inner};
@@ -464,6 +561,8 @@ pub fn materialize_into(
         "lokalny_id",
     )?;
     unique.skipped_null_key = null_key_rows;
+    unique.skipped_missing_coordinates = skipped_missing_coordinates;
+    unique.skipped_missing_coordinates_example_ids = skipped_missing_coordinates_example_ids;
 
     // `wersja_id` has served its only purpose (ranking the dedup above) --
     // nothing reads it downstream, so it does not survive into the stored
@@ -746,6 +845,53 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM prg_out", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "the NULL-keyed row must not survive");
+    }
+
+    /// A keyed row with no coordinates cannot become a point, so it is
+    /// dropped -- and, unlike before, *counted*, so `update:prg`'s job log
+    /// reports it the way BDOT10k/EGIB report every row they drop. A row
+    /// missing both its key and its coordinates counts as null-key only.
+    #[test]
+    fn materialize_counts_rows_without_coordinates() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE prg_raw (
+                 lokalny_id VARCHAR,
+                 wersja_id INTEGER,
+                 ulica VARCHAR,
+                 dlugosc_geograficzna DOUBLE,
+                 szerokosc_geograficzna DOUBLE,
+                 numer_porzadkowy VARCHAR,
+                 miejscowosc VARCHAR,
+                 kod_pocztowy VARCHAR,
+                 teryt_miejscowosc VARCHAR,
+                 teryt_gmina VARCHAR,
+                 gmina VARCHAR,
+                 wazny_od_lub_data_nadania DATE
+             );
+             INSERT INTO prg_raw VALUES
+                 ('has-both', 1, 'ok', 21.0, 52.0, '1', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL),
+                 ('no-lon', 1, 'x', NULL, 52.0, '2', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL),
+                 ('no-lat', 1, 'x', 21.0, NULL, '3', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL),
+                 (NULL, 1, 'x', NULL, NULL, '4', 'Test', '00-000', '1465011', '1465011', 'Test Gmina', NULL);",
+        )
+        .unwrap();
+
+        let stats = materialize_into(&conn, "prg_out", "prg_raw").unwrap();
+
+        assert_eq!(stats.skipped_missing_coordinates, 2);
+        let mut ids = stats.skipped_missing_coordinates_example_ids.clone();
+        ids.sort();
+        assert_eq!(ids, vec!["no-lat".to_string(), "no-lon".to_string()]);
+        assert_eq!(
+            stats.skipped_null_key, 1,
+            "the keyless row counts under null-key only"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prg_out", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     /// Part of `docs/superpowers/plans/2026-08-14-column-trimming.md`'s

@@ -490,15 +490,16 @@ pub fn null_key_sql(key_columns: &[&str]) -> String {
         .join(" OR ")
 }
 
-/// Rows a dataset loader dropped rather than staging, for one of four
+/// Rows a dataset loader dropped rather than staging, for one of five
 /// reasons: geometry that failed `ST_IsValid` (`ST_AsMVTGeom` cannot
 /// tolerate invalid geometry, see docs/invalid_geometry_tile_500s.md),
 /// geometry whose bbox spans at least one full z14 cell in either axis (see
 /// `filter_oversized_geometry` -- a corrupted merge of two unrelated
-/// features, not a real building), a NULL record key (see
+/// features, not a real building), no coordinates to build a point from
+/// (PRG only, see `import::prg::materialize_into`), a NULL record key (see
 /// [`non_null_key_sql`] -- a record with no identifier cannot be diffed or
 /// deduplicated), or a duplicate record key (see [`deduplicate_by_key`]).
-/// All four reasons drop rather than repair.
+/// All five reasons drop rather than repair.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadStats {
     pub skipped_invalid_geometry: i64,
@@ -510,6 +511,14 @@ pub struct LoadStats {
     /// Same cap and ordering caveat as `skipped_example_ids`, for the
     /// oversized-geometry reason.
     pub skipped_oversized_example_ids: Vec<String>,
+    /// PRG rows with a NULL longitude or latitude, which `materialize_into`
+    /// cannot turn into a point. Counted only among rows that *have* a key,
+    /// so a row missing both lands under `skipped_null_key` alone and the
+    /// reasons stay disjoint.
+    pub skipped_missing_coordinates: i64,
+    /// Same cap and ordering caveat as `skipped_example_ids`, for the
+    /// missing-coordinates reason.
+    pub skipped_missing_coordinates_example_ids: Vec<String>,
     /// Rows dropped for having a NULL record key (`non_null_key_sql`). No
     /// example-ids field, unlike every other reason: the id column *is* what
     /// is missing, so the list would be a column of NULLs.

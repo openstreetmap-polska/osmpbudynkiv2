@@ -13,7 +13,7 @@ ctrlc = { version = "3", features = ["termination"] }
 # (`third_party/jemalloc`), which the published crate excludes, and the `bundled`
 # amalgamation backend has no jemalloc sources at all. `bundled-cmake` builds via
 # CMake with `ENABLE_JEMALLOC=ON` by default. See CLAUDE.md's jemalloc gotcha.
-duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.10505.0", features = ["bundled-cmake", "vtab", "vtab-arrow", "vscalar", "r2d2"] }
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.10505.0", features = ["bundled-cmake", "vtab", "vtab-arrow", "appender-arrow", "vscalar", "r2d2"] }
 r2d2 = "0.8"
 flate2 = "1"
 prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.7.0", default-features = false, features = ["download"] }
