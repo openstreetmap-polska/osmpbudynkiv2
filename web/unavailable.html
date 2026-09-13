@@ -1,0 +1,146 @@
+<!doctype html>
+<!--
+  Served by the reverse proxy (Caddy), NOT by this server: it is what a
+  browser gets when the backend does not answer. So it must be fully
+  self-contained -- inline CSS, inline favicon, no fonts/vendor/app.js --
+  because every other request to this host fails for the same reason this
+  page is being shown. Colours mirror the tokens in style.css by hand.
+  The script polls /health and reloads once the backend answers again.
+-->
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>Usługa chwilowo niedostępna – osmpbudynkiv2</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%2317324d'/%3E%3CclipPath id='r'%3E%3Crect x='32' y='10' width='22' height='42'/%3E%3C/clipPath%3E%3Cpolygon points='32,12 50,26 50,50 14,50 14,26' fill='none' stroke='%23fffdf8' stroke-width='2.5' stroke-linejoin='round'/%3E%3Cpolygon points='32,12 50,26 50,50 14,50 14,26' fill='%23c81e1e' opacity='0.85' clip-path='url(%23r)'/%3E%3Cline x1='32' y1='12' x2='32' y2='50' stroke='%23fffdf8' stroke-width='2'/%3E%3C/svg%3E" />
+  <style>
+    :root {
+      --ink: #1c2321;
+      --ink-soft: #4a5049;
+      --paper: #f7f4ec;
+      --paper-raised: #fffdf8;
+      --line: #d6d0bd;
+      --accent: #17324d;
+      --danger: #a8402a;
+      --ok: #1f7a45;
+      --font-label: ui-sans-serif, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      --font-data: ui-monospace, "SFMono-Regular", "IBM Plex Mono", Menlo, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #eae6da;
+        --ink-soft: #b8b2a0;
+        --paper: #1a1d17;
+        --paper-raised: #23261f;
+        --line: #3a3c32;
+        --accent: #a9c4dd;
+        --danger: #e07a62;
+        --ok: #5cc48a;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      display: grid;
+      place-items: center;
+      padding: 1rem;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--font-label);
+      line-height: 1.5;
+    }
+    main {
+      width: 100%;
+      max-width: 32rem;
+      padding: 2rem;
+      background: var(--paper-raised);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+    .logo { width: 48px; height: 48px; display: block; margin-bottom: 1rem; }
+    h1 { margin: 0 0 0.75rem; font-size: 1.35rem; line-height: 1.25; }
+    p { margin: 0 0 0.75rem; color: var(--ink-soft); }
+    a { color: var(--accent); }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin: 1.25rem 0 0;
+      padding-top: 1rem;
+      border-top: 1px solid var(--line);
+      font-family: var(--font-data);
+      font-size: 0.8rem;
+      color: var(--ink-soft);
+    }
+    .dot {
+      flex: none;
+      width: 0.6rem;
+      height: 0.6rem;
+      border-radius: 50%;
+      background: var(--danger);
+    }
+    .status.up .dot { background: var(--ok); }
+    button {
+      margin-left: auto;
+      font: inherit;
+      padding: 0.3rem 0.75rem;
+      color: var(--accent);
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+      <rect width="64" height="64" rx="12" fill="#17324d"/>
+      <clipPath id="rightHalf"><rect x="32" y="10" width="22" height="42"/></clipPath>
+      <polygon points="32,12 50,26 50,50 14,50 14,26" fill="none" stroke="#fffdf8" stroke-width="2.5" stroke-linejoin="round"/>
+      <polygon points="32,12 50,26 50,50 14,50 14,26" fill="#c81e1e" opacity="0.85" clip-path="url(#rightHalf)"/>
+      <line x1="32" y1="12" x2="32" y2="50" stroke="#fffdf8" stroke-width="2"/>
+    </svg>
+    <h1>Usługa jest chwilowo niedostępna</h1>
+    <p>Serwer aplikacji <strong>osmpbudynkiv2</strong> nie odpowiada. Najczęściej oznacza to aktualizację lub restart i trwa kilka minut, ale może potrwać do paru godzin w przypadku prac polegających na przeładowaniu całej bazy danych.</p>
+    <p>Strona sama się odświeży, gdy usługa znów będzie dostępna.</p>
+    <p class="status" id="status" role="status" aria-live="polite">
+      <span class="dot" aria-hidden="true"></span>
+      <span id="status-text">Serwer niedostępny</span>
+      <button type="button" id="retry">Sprawdź teraz</button>
+    </p>
+  </main>
+  <script>
+    (function () {
+      var INTERVAL_MS = 30000;
+      var statusEl = document.getElementById("status");
+      var textEl = document.getElementById("status-text");
+      var timer = null;
+
+      function check() {
+        clearTimeout(timer);
+        textEl.textContent = "Sprawdzanie…";
+        // While the backend is down the proxy answers /health with this page
+        // and a 5xx, so res.ok alone is the signal.
+        fetch("/health", { cache: "no-store" })
+          .then(function (res) {
+            if (!res.ok) throw new Error(String(res.status));
+            statusEl.classList.add("up");
+            textEl.textContent = "Usługa działa – odświeżanie…";
+            location.reload();
+          })
+          .catch(function () {
+            textEl.textContent = "Serwer niedostępny · ostatnia próba " +
+              new Date().toLocaleTimeString("pl-PL");
+            timer = setTimeout(check, INTERVAL_MS);
+          });
+      }
+
+      document.getElementById("retry").addEventListener("click", check);
+      timer = setTimeout(check, INTERVAL_MS);
+    })();
+  </script>
+</body>
+</html>
