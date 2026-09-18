@@ -130,8 +130,9 @@ pub fn update(
     // replication server for the one sequence a steady-state tick needs.
     //
     // Claiming the batch up front fixes both at once: the prefetcher skips
-    // over anything at or below the frontier, so the two never target the
-    // same sequence, and at steady state (one pending sequence, wholly inside
+    // over anything at or below the frontier, so it never *starts* on a
+    // sequence the apply loop owns (and `PrefetchInFlight` covers the one it
+    // started just before the claim), and at steady state (one pending sequence, wholly inside
     // the first batch) it issues no requests at all -- there is by definition
     // nothing to prefetch ahead of.
     //
@@ -149,6 +150,7 @@ pub fn update(
         latest_seq,
     )));
     let stop = Arc::new(AtomicBool::new(false));
+    let in_flight = Arc::new(PrefetchInFlight::default());
     // `prefetch_ahead == 0` disables prefetching outright (no thread spawned
     // at all), the same "0 means off, via config alone" idiom as
     // `TileCache::new(0)`.
@@ -160,6 +162,7 @@ pub fn update(
             latest_seq,
             osm_update_cfg.prefetch_ahead,
             Arc::clone(&fetch_frontier),
+            Arc::clone(&in_flight),
             Arc::clone(&stop),
         )
     });
@@ -209,6 +212,11 @@ pub fn update(
             // why that bound matters.
             let mut batch = Vec::with_capacity((batch_end - seq + 1) as usize);
             for s in seq..=batch_end {
+                // The frontier above stops the prefetcher *starting* any of
+                // this batch, but not a download it started just before;
+                // wait that one out rather than fetching it a second time.
+                // See `PrefetchInFlight`.
+                in_flight.wait_while_downloading(s);
                 batch.push(fetch_and_parse_sequence(
                     s,
                     replication_base_url,
@@ -339,6 +347,70 @@ fn batch_end_for(seq: u64, chunk_size: usize, latest_seq: u64) -> u64 {
 /// `update()`'s `join()` can be kept waiting once it sets `stop`.
 const PREFETCH_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// The one sequence the prefetch thread is downloading right now, so the
+/// apply loop waits for that download instead of racing it.
+///
+/// `fetch_frontier` alone cannot close this: the prefetcher reads the
+/// frontier, finds `next` unclaimed and starts downloading it, and if the
+/// apply loop then claims `next` before that download lands, it finds no
+/// file on disk and downloads the sequence itself. Idle, the prefetcher is
+/// far enough ahead that this almost never happens; under CPU load the
+/// prefetch thread is starved, the apply loop catches up, and the two run
+/// in lockstep with a duplicate on nearly every step (measured: 11 of 100
+/// sequences under 12-way synthetic load, which made the duplicate-bound
+/// tests flaky). Each duplicate also re-created, via `do_download`'s
+/// unconditional rename, a file the apply loop had already consumed.
+///
+/// The handshake is a store-then-load on each side, serialised by the
+/// mutex: the prefetcher records `next` and re-reads the frontier in one
+/// critical section ([`Self::claim`]), while the apply loop stores the
+/// frontier *before* taking the lock to check this slot
+/// ([`Self::wait_while_downloading`]). Whichever critical section runs
+/// second sees the other side's write, so either the prefetcher backs off
+/// or the apply loop waits -- never neither.
+#[derive(Default)]
+struct PrefetchInFlight {
+    seq: std::sync::Mutex<Option<u64>>,
+    done: std::sync::Condvar,
+}
+
+impl PrefetchInFlight {
+    /// Record `seq` as in flight, unless the apply loop has already claimed
+    /// it. The frontier must be read under the lock -- reading it before
+    /// would reopen exactly the window this type exists to close.
+    ///
+    /// Released when the returned guard drops, so a panicking download
+    /// cannot leave the apply loop waiting forever.
+    fn claim<'a>(&'a self, seq: u64, fetch_frontier: &AtomicU64) -> Option<InFlightGuard<'a>> {
+        let mut slot = self.seq.lock().unwrap();
+        if seq <= fetch_frontier.load(Ordering::SeqCst) {
+            return None;
+        }
+        *slot = Some(seq);
+        Some(InFlightGuard(self))
+    }
+
+    /// Block while the prefetcher is downloading `seq`. The caller must have
+    /// already stored a frontier covering `seq`. Once this returns the file
+    /// is either on disk or the prefetch failed, and either way the caller's
+    /// own `download_file_as_quiet` does the right thing.
+    fn wait_while_downloading(&self, seq: u64) {
+        let slot = self.seq.lock().unwrap();
+        let _unused = self.done.wait_while(slot, |s| *s == Some(seq)).unwrap();
+    }
+}
+
+struct InFlightGuard<'a>(&'a PrefetchInFlight);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        // `unwrap_or_else(into_inner)`: this can run during a panic unwind,
+        // and a poisoned lock must still be cleared rather than double-panic.
+        *self.0.seq.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.0.done.notify_all();
+    }
+}
+
 /// How many applied sequences between "Progress" log lines when there is no
 /// progress bar (i.e. the background job). See the call site in `update()`
 /// for why this is compared as a bucket rather than by exact divisibility.
@@ -391,6 +463,7 @@ const PROGRESS_LOG_INTERVAL: u64 = 100;
 /// window chasing one stubborn sequence for no benefit -- the apply loop's
 /// own download call is the authority regardless, and just downloads the
 /// sequence itself if the prefetch never landed.
+#[allow(clippy::too_many_arguments)]
 fn spawn_prefetcher(
     replication_base_url: String,
     download_dir: PathBuf,
@@ -398,6 +471,7 @@ fn spawn_prefetcher(
     latest_seq: u64,
     prefetch_ahead: usize,
     fetch_frontier: Arc<AtomicU64>,
+    in_flight: Arc<PrefetchInFlight>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -445,9 +519,17 @@ fn spawn_prefetcher(
                 continue;
             }
 
+            // The frontier may have moved past `next` since it was read
+            // above; `claim` re-checks it under the lock the apply loop
+            // waits on. On refusal, loop round so the skip above applies.
+            let Some(guard) = in_flight.claim(next, &fetch_frontier) else {
+                continue;
+            };
             let path = sequence_to_path(next);
             let url = format!("{replication_base_url}/{path}");
-            match download_file_as_quiet(&url, &download_dir, &osc_local_file_name(next)) {
+            let result = download_file_as_quiet(&url, &download_dir, &osc_local_file_name(next));
+            drop(guard);
+            match result {
                 Ok(_) => downloaded.push(next),
                 Err(e) => {
                     debug!(
@@ -4977,7 +5059,8 @@ mod tests {
         // on the same sequence at the same time", and that race was the
         // file-orphaning bug rather than an acceptable cost -- the apply
         // loop claims each batch through `fetch_frontier` before fetching
-        // it, so the two can no longer target one sequence at all.
+        // it, and waits out a prefetch already in flight on a claimed
+        // sequence (`PrefetchInFlight`), so the two never both fetch one.
         let log = requested.lock().unwrap().clone();
         let requests = log.len();
         assert!(
@@ -5135,18 +5218,16 @@ mod tests {
     /// within the same test rather than asserting a bare `> 0` against an
     /// assumption.
     ///
-    /// **Why the duplicate bound is not zero.** The frontier removes the
-    /// *systematic* overlap -- the prefetcher never *starts* on a claimed
-    /// sequence -- but it is read before a download, not held across one, so
-    /// the apply loop can still catch up to a sequence the prefetcher is
-    /// already mid-download of and fetch it too. That residue is why the
-    /// prefetcher's cleanup pass is not merely tidiness: it records
-    /// everything it downloaded, so the copy such a race re-creates after
-    /// `decompress_and_remove` has run is unlinked before the thread exits.
-    /// The leftover-file count is therefore asserted at exactly zero while
-    /// the duplicate count is asserted as a bound -- measured 0 idle, 1 of
-    /// 100 under 12-way synthetic CPU load, against 16 of 100 systematic
-    /// before the frontier existed.
+    /// **Why the duplicate count is exactly zero, not a bound.** The
+    /// frontier removes the *systematic* overlap (16 of 100 before it
+    /// existed), but it is read before a download, not held across one, so
+    /// on its own the apply loop could still catch up to a sequence the
+    /// prefetcher was mid-download of and fetch it too. That residue used
+    /// to be tolerated as a bound calibrated at one CPU load, and it was not
+    /// a bound at all: it grows with how long a starved prefetch thread
+    /// runs in lockstep with the apply loop, and exceeded the bound under
+    /// load. `PrefetchInFlight` makes the apply loop wait out that download
+    /// instead, so any duplicate here is a regression.
     #[test]
     fn the_prefetcher_stays_out_of_the_batch_the_apply_loop_claimed() -> Result<()> {
         const PENDING: u64 = 100;
@@ -5200,16 +5281,13 @@ mod tests {
 
             // With the old apply-time floor this configuration downloaded
             // 16 of the 100 sequences twice -- the first `prefetch_ahead` of
-            // every batch the apply loop claimed. Measured with the
-            // frontier: 0 idle, 1 under 12-way synthetic CPU load.
+            // every batch the apply loop claimed.
             let log = requested.lock().unwrap().clone();
-            let duplicates = duplicate_requests(&log);
-            assert!(
-                duplicates.len() <= (PENDING / 20) as usize,
-                "prefetch_ahead={prefetch_ahead}: {} of {PENDING} sequences were \
-                 downloaded twice, which is the systematic overlap the frontier \
-                 exists to remove rather than the in-flight residue: {duplicates:?}",
-                duplicates.len()
+            assert_eq!(
+                duplicate_requests(&log),
+                Vec::new(),
+                "prefetch_ahead={prefetch_ahead}: sequences downloaded twice -- the \
+                 prefetcher and the apply loop both fetched them"
             );
             inversions_by_window.push(inversions(&log));
         }
@@ -5278,20 +5356,16 @@ mod tests {
 
         assert_eq!(files_in(download_dir.path()), Vec::<String>::new());
 
-        // An ungated cleanup re-downloaded 63 of the 100 sequences here. The
-        // gated one measured 0 duplicates idle and 2 under 12-way synthetic
-        // CPU load -- the in-flight-prefetch residue documented on
-        // `the_prefetcher_stays_out_of_the_batch_the_apply_loop_claimed`.
-        // Bounded rather than zero for that reason, an order of magnitude
-        // below the signature it has to catch.
+        // An ungated cleanup re-downloaded 63 of the 100 sequences here.
+        // Exactly zero, not a bound: see
+        // `the_prefetcher_stays_out_of_the_batch_the_apply_loop_claimed` for
+        // why the in-flight race no longer produces any duplicates at all.
         let log = requested.lock().unwrap().clone();
-        let duplicates = duplicate_requests(&log);
-        assert!(
-            duplicates.len() <= (PENDING / 10) as usize,
-            "{} of {PENDING} sequences were downloaded twice -- the prefetch thread's \
-             cleanup pass looks like it is deleting files the apply loop had not \
-             consumed yet: {duplicates:?}",
-            duplicates.len()
+        assert_eq!(
+            duplicate_requests(&log),
+            Vec::new(),
+            "sequences downloaded twice -- the prefetch thread's cleanup pass looks \
+             like it is deleting files the apply loop had not consumed yet"
         );
 
         Ok(())

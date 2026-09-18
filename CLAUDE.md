@@ -1378,20 +1378,23 @@ so ~1440 files/day on a minutely feed — while downloading that one sequence
 **twice** (30 HTTP requests for 10 ticks, now 20). A 100-sequence catch-up
 orphaned 15 files and made 117 requests, now 0 and 101. Guards:
 `steady_state_ticks_leave_no_downloaded_diff_behind` and
-`the_prefetcher_never_downloads_a_sequence_the_apply_loop_claimed`. The latter
+`the_prefetcher_stays_out_of_the_batch_the_apply_loop_claimed`. The latter
 asserts duplicate-freedom **and** that the request log has inversions, because
 `prefetch_ahead = 0` satisfies duplicate-freedom vacuously.
 
-**A residue survives by design, and the cleanup pass is what makes it
-harmless.** The frontier is read before a download, not held across one, so
-the apply loop can still catch up to a sequence the prefetcher is already
-mid-download of — measured at 1–2 per 100 under 12-way synthetic CPU load,
-against 16 of 100 systematic before. Such a download re-creates the file
-after `decompress_and_remove` has run, exactly as before; what stops it
-leaking is that the prefetcher records everything it downloaded and unlinks
-it on the way out. So **leftover files are asserted at exactly zero and
-duplicate downloads only as a bound** — do not tighten the latter to zero,
-and do not treat the cleanup pass as tidiness that could be dropped.
+**The frontier alone leaves an in-flight race, and `PrefetchInFlight` closes
+it.** The frontier is read before a download, not held across one, so the
+apply loop could claim a sequence the prefetcher was already mid-download of
+and fetch it too. That used to be tolerated as a duplicate-count *bound*, and
+it was the source of CPU-load flakiness: under load the starved prefetch
+thread runs in lockstep with the apply loop and duplicates on nearly every
+step (11 of 100 measured), so no fixed bound holds. Now the prefetcher records
+its one in-flight sequence and re-reads the frontier under a mutex, and the
+apply loop — after storing the frontier — waits out a download of a sequence
+it claimed. Each side writes before it reads the other's value, so at least
+one always sees the other. **Duplicate downloads are asserted at exactly zero**; a
+bound there would hide a regression of this handshake. With the wait removed,
+the tests fail in 3 of 5 runs on 4 pinned, loaded cores.
 
 **The prefetcher also unlinks what it downloaded and the apply loop never
 reached**, in the same pass after its own loop (so `break`, never `return`,
