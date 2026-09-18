@@ -928,6 +928,94 @@ fn tag_value(tags: &[(String, String)], key: &str) -> Option<String> {
     tags.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
+/// What a rebuild re-inserts: `(building, housenumber, street, city, postcode,
+/// former)`, where `city` is already `COALESCE(addr:city, addr:place)` and
+/// `former` is the lifecycle `(key, value)`.
+type RebuildTags = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<(String, String)>,
+);
+
+/// A stored `osm_addresses` row's `(housenumber, street, city, postcode)`.
+type StoredAddress = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// The tags of a way/relation that is being rebuilt only because a node or
+/// member way under it moved, so the changeset carries no tags for it: read
+/// back from the rows it already has, which must be done BEFORE the rebuild
+/// deletes them. `None` means it has no row at all, so there is nothing to
+/// rebuild.
+///
+/// **Every value is the stored one, never a placeholder.** The rebuild deletes
+/// and re-inserts, so whatever this returns *is* the new row. This used to
+/// return only existence -- `building = 'yes'` and an address of
+/// `housenumber = ''` with NULL street/city/postcode -- so a node nudged by
+/// 3 cm blanked the address of every building sharing it, and the PRG address
+/// it was matching reappeared as unmatched (Niezapominajki 11, Pruszków, OSM
+/// way 1081685388). An existing database keeps the blanked rows until
+/// `import osm` is re-run; the tag values exist nowhere else in this system.
+fn stored_rebuild_tags(
+    conn: &Connection,
+    osm_id: i64,
+    osm_type: &str,
+) -> Result<Option<RebuildTags>> {
+    let building: Option<String> = conn
+        .query_row(
+            "SELECT COALESCE(building, 'yes') FROM osm_buildings WHERE osm_id = ? AND osm_type = ?",
+            duckdb::params![osm_id, osm_type],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let address: Option<StoredAddress> = conn
+        .query_row(
+            "SELECT housenumber, street, city, postcode FROM osm_addresses
+             WHERE osm_id = ? AND osm_type = ?",
+            duckdb::params![osm_id, osm_type],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    // Keep the stored key/value so the re-insert uses the SAME lifecycle key.
+    let former: Option<(String, String)> = conn
+        .query_row(
+            "SELECT lifecycle_key, lifecycle_value FROM osm_former_buildings
+             WHERE osm_id = ? AND osm_type = ?",
+            duckdb::params![osm_id, osm_type],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    // Load-bearing: without `&& former.is_none()`, a former-building object
+    // whose geometry moved would return here before the delete/re-insert, so
+    // its row would keep stale pre-move geometry.
+    if building.is_none() && address.is_none() && former.is_none() {
+        return Ok(None);
+    }
+    // A stored address row always has a housenumber (every insert site
+    // requires one), so `Some` here is what re-inserts it.
+    let (housenumber, street, city, postcode) = match address {
+        Some((hn, street, city, postcode)) => {
+            (hn.or_else(|| Some(String::new())), street, city, postcode)
+        }
+        None => (None, None, None, None),
+    };
+    Ok(Some((
+        building,
+        housenumber,
+        street,
+        city,
+        postcode,
+        former,
+    )))
+}
+
 fn rebuild_way_geometry(
     conn: &Connection,
     kv: &RocksDB,
@@ -939,8 +1027,8 @@ fn rebuild_way_geometry(
         return Ok(());
     }
 
-    // Determine tags: from the change if directly affected, else from DuckDB existence.
-    // For indirectly affected ways, check DuckDB BEFORE deleting old entries.
+    // Determine tags: from the change if directly affected, else from the rows it
+    // already has (`stored_rebuild_tags`), read BEFORE the delete below.
     let way_change = way_changes.iter().find(|w| w.id == way_id);
     let (building_tag, housenumber, street, city, postcode, former) = match way_change {
         Some(wc) => (
@@ -956,57 +1044,10 @@ fn rebuild_way_geometry(
                 )
             }),
         ),
-        None => {
-            let has_building: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way')",
-                    [way_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
-            let has_address: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM osm_addresses WHERE osm_id = ? AND osm_type = 'way')",
-                    [way_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
-            // Unlike has_building/has_address, keep the stored key/value rather
-            // than throwing them away: the tag determination further down
-            // still needs them to re-insert with the SAME lifecycle key, not a
-            // hardcoded default the way the building arm does with 'yes'.
-            let former: Option<(String, String)> = conn
-                .query_row(
-                    "SELECT lifecycle_key, lifecycle_value FROM osm_former_buildings
-                     WHERE osm_id = ? AND osm_type = 'way'",
-                    [way_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-
-            // Load-bearing: without `&& former.is_none()`, a former-building
-            // way whose node moved would return here before the delete/
-            // re-insert below, so its row would keep stale pre-move geometry.
-            if !has_building && !has_address && former.is_none() {
-                return Ok(());
-            }
-            (
-                if has_building {
-                    Some("yes".to_string())
-                } else {
-                    None
-                },
-                if has_address {
-                    Some(String::new())
-                } else {
-                    None
-                },
-                None,
-                None,
-                None,
-                former,
-            )
-        }
+        None => match stored_rebuild_tags(conn, way_id, "way")? {
+            Some(tags) => tags,
+            None => return Ok(()),
+        },
     };
 
     // No early return when all of building/address/former are absent: that is
@@ -1185,8 +1226,8 @@ fn rebuild_relation_geometry(
         None => return Ok(()),
     };
 
-    // Determine tags: from the change if directly affected, else from DuckDB existence.
-    // Check DuckDB BEFORE deleting old entries.
+    // Determine tags: from the change if directly affected, else from the rows it
+    // already has (`stored_rebuild_tags`), read BEFORE the delete below.
     let rel_change = relation_changes.iter().find(|r| r.id == relation_id);
     let (building_tag, housenumber, street, city, postcode, former) = match rel_change {
         Some(rc) => (
@@ -1202,55 +1243,10 @@ fn rebuild_relation_geometry(
                 )
             }),
         ),
-        None => {
-            let has_building: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM osm_buildings WHERE osm_id = ? AND osm_type = 'relation')",
-                    [relation_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
-            let has_address: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM osm_addresses WHERE osm_id = ? AND osm_type = 'relation')",
-                    [relation_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
-            // Keep the stored key/value, mirroring rebuild_way_geometry's
-            // inferred arm -- do not collapse to a hardcoded default.
-            let former: Option<(String, String)> = conn
-                .query_row(
-                    "SELECT lifecycle_key, lifecycle_value FROM osm_former_buildings
-                     WHERE osm_id = ? AND osm_type = 'relation'",
-                    [relation_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-
-            // Load-bearing, same as rebuild_way_geometry: without
-            // `&& former.is_none()`, a former-building relation whose member
-            // way moved would return here before the delete/re-insert below.
-            if !has_building && !has_address && former.is_none() {
-                return Ok(());
-            }
-            (
-                if has_building {
-                    Some("yes".to_string())
-                } else {
-                    None
-                },
-                if has_address {
-                    Some(String::new())
-                } else {
-                    None
-                },
-                None,
-                None,
-                None,
-                former,
-            )
-        }
+        None => match stored_rebuild_tags(conn, relation_id, "relation")? {
+            Some(tags) => tags,
+            None => return Ok(()),
+        },
     };
 
     // No early return when all of building/address/former are absent -- the
@@ -1733,6 +1729,128 @@ mod tests {
         )?;
         assert_eq!(count, 1, "Building should still exist after node modify");
 
+        Ok(())
+    }
+
+    /// Read back `(building, housenumber, street, city, postcode)` for one
+    /// object, NULL-safe on every column.
+    fn stored_building_and_address(
+        conn: &Connection,
+        osm_id: i64,
+        osm_type: &str,
+    ) -> Result<(Option<String>, StoredAddress)> {
+        Ok(conn.query_row(
+            "SELECT (SELECT building FROM osm_buildings WHERE osm_id = ?1 AND osm_type = ?2),
+                    a.housenumber, a.street, a.city, a.postcode
+             FROM (SELECT 1) LEFT JOIN osm_addresses a ON a.osm_id = ?1 AND a.osm_type = ?2",
+            duckdb::params![osm_id, osm_type],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+                ))
+            },
+        )?)
+    }
+
+    /// The Niezapominajki 11 regression: a node shared by an addressed
+    /// building moves, the way itself is not in the changeset, so
+    /// `rebuild_way_geometry` takes the inferred arm -- which used to
+    /// re-insert the address as `housenumber = ''` with NULL street/city/
+    /// postcode and the building as `'yes'`, silently un-matching the PRG
+    /// address next to it.
+    #[test]
+    fn test_apply_node_move_keeps_the_way_s_stored_tags() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        conn.execute_batch(
+            "UPDATE osm_buildings SET building = 'house' WHERE osm_id = 100 AND osm_type = 'way';
+             INSERT INTO osm_addresses VALUES
+                 (100, 'way', '11', 'Niezapominajki', 'Pruszków', '05-800', ST_Point(20.0005, 50.0005));",
+        )?;
+
+        let changes = OsmChange {
+            nodes: vec![NodeChange {
+                action: ChangeAction::Modify,
+                id: 1,
+                lon: 19.9999,
+                lat: 49.9999,
+                tags: vec![],
+            }],
+            ..Default::default()
+        };
+        apply_changes(&conn, &kv, &changes)?;
+
+        assert_eq!(
+            stored_building_and_address(&conn, 100, "way")?,
+            (
+                Some("house".into()),
+                (
+                    Some("11".into()),
+                    Some("Niezapominajki".into()),
+                    Some("Pruszków".into()),
+                    Some("05-800".into())
+                ),
+            )
+        );
+        let x_min: f64 = conn.query_row(
+            "SELECT ST_XMin(geom) FROM osm_buildings WHERE osm_id = 100 AND osm_type = 'way'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            x_min < 20.0,
+            "geometry must still be rebuilt, got xmin={x_min}"
+        );
+        Ok(())
+    }
+
+    /// The relation twin of `test_apply_node_move_keeps_the_way_s_stored_tags`:
+    /// the node moves, member way 100 is rebuilt, and the cascade rebuilds
+    /// relation 200 through `rebuild_relation_geometry`'s inferred arm.
+    #[test]
+    fn test_apply_node_move_keeps_the_relation_s_stored_tags() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        kvstore::put_relation(
+            &kv,
+            200,
+            &[(
+                100,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(&kv, 100, 200)?;
+        conn.execute_batch(
+            "INSERT INTO osm_buildings
+                 SELECT 200, 'relation', 'apartments', geom FROM osm_buildings WHERE osm_id = 100;
+             INSERT INTO osm_addresses VALUES
+                 (200, 'relation', '7A', 'Lipowa', 'Reguły', NULL, ST_Point(20.0005, 50.0005));",
+        )?;
+
+        let changes = OsmChange {
+            nodes: vec![NodeChange {
+                action: ChangeAction::Modify,
+                id: 1,
+                lon: 19.9999,
+                lat: 49.9999,
+                tags: vec![],
+            }],
+            ..Default::default()
+        };
+        apply_changes(&conn, &kv, &changes)?;
+
+        assert_eq!(
+            stored_building_and_address(&conn, 200, "relation")?,
+            (
+                Some("apartments".into()),
+                (
+                    Some("7A".into()),
+                    Some("Lipowa".into()),
+                    Some("Reguły".into()),
+                    None
+                ),
+            )
+        );
         Ok(())
     }
 

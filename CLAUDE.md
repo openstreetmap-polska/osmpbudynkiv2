@@ -345,7 +345,12 @@ building it substantially overlaps.
    *inferred* tag-determination arms of `rebuild_way_geometry` /
    `rebuild_relation_geometry`. The inferred arm is the one to watch: its early
    return must consider the former key too, or a former-building way whose node
-   moved keeps a stale pre-move geometry forever. `Layer::Buildings` is the
+   moved keeps a stale pre-move geometry forever. And since it deletes and
+   re-inserts, it must re-insert the **stored values**
+   (`update::osm::stored_rebuild_tags`), never placeholders: it used to write
+   `housenumber = ''` and `building = 'yes'`, so any node move blanked the
+   addresses of every building sharing that node, un-matching the PRG addresses
+   they covered (303 rows in the local DB after a few days of diffs). `Layer::Buildings` is the
    correct dirty-cell layer (its `flush` maps to `bdot10k` + `egib`).
    `prg_unmatched` is deliberately unreachable from this table — "former building
    ⇒ nearby address is bogus too" needs its own design, not a drive-by wire-up.
