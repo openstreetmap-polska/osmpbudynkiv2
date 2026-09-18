@@ -568,6 +568,53 @@ grid-key neighbourhood (a different 0.005° grid) and
 `server::tile_dirty::tiles_for_cell`'s z14 invalidation ring (exact by the
 `filter_oversized_geometry` invariant — **must not be narrowed**).
 
+**Gotcha — `update osm` applies each object's *last version* only, collapsed
+across the whole batch.** One `.osc` can hold an object's whole lifecycle
+(create → modify → delete → undelete), and two uploads in one minute put two
+versions of a way in one file. The rebuild used to take tags from the *first*
+matching `WayChange`/`RelationChange` while the node list ended at the last one,
+so an address or a `demolished:building` retag added in v3 was silently lost
+until the object's next edit. `OsmChange::collapse` (`src/osm/replication.rs`) is
+the fix, and `apply_batch` runs it over the whole batch before `apply_collapsed`.
+Four things:
+
+1. **Order is by `version`, never file position** — the feed does not promise
+   ascending versions. A missing `version` parses as 0, and the sort is *stable*,
+   so ties go to the later sequence, then the later element; that is the
+   pre-collapse behaviour. It is also why `apply_batch`'s input must stay sorted
+   by `seq`.
+2. **Dropping intermediate versions is exact, not an approximation**: every
+   write depends only on the stored and final states (the argument is on
+   `collapse`). So an intermediate position is never enqueued —
+   `a_batch_collapses_positions_that_were_never_committed` pins that and fails
+   if the batch collapse is lost.
+3. **`apply_collapsed` assumes one change per id** and looks tags up in a
+   `HashMap`. Anything feeding it must go through `collapse`; `apply_changes` is
+   the test-only wrapper that does. Guards: `a_way_edited_twice_in_one_diff_is_served_with_its_last_version_s_tags`,
+   `a_way_s_versions_out_of_file_order_are_applied_by_version_number`.
+4. **The parser keeps every version** — collapsing is the apply side's job
+   (`test_parse_osc_keeps_every_version_in_document_order`).
+
+**Gotcha — an OSM object at the extract's edge is ignored with a warning, never
+built from what is present.** The feed is a Poland-filtered diff, so a way can
+reference nodes that never reached us, and a relation can reference such a way.
+`unresolved_way_members` checks before any insert; an object that would be
+stored (building, former-building or address tags) but cannot be fully resolved
+is skipped with a `WARN Ignoring way/…: way/… is missing node/…` naming every
+missing id. Three points:
+
+1. **A relation is skipped whole**, never built from its resolvable members — a
+   partial multipolygon is a wrong footprint that would suppress or unsuppress
+   government buildings. `import osm` does *not* follow this rule (it builds
+   relations from whatever members resolve), so a border relation imported
+   partially disappears, with the warning, on its next edit.
+2. **It does not come back when the missing node arrives later.** Only node refs
+   are stored, not tags, and the inferred rebuild has no row to read tags from.
+   It returns on its next direct edit or `import osm` — accepted, and pinned by
+   `a_way_whose_missing_node_arrives_in_a_later_diff_stays_ignored`.
+3. **A served object that becomes unresolvable is removed and its cell
+   enqueued**, not left at its old geometry — the check runs after the delete.
+
 ### Mappings
 
 **Gotcha — the street-name mapping is a match input, and that is why its loader

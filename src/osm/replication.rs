@@ -15,6 +15,9 @@ pub enum ChangeAction {
 pub struct NodeChange {
     pub action: ChangeAction,
     pub id: i64,
+    /// The element's `version` attribute; 0 when absent. See
+    /// [`OsmChange::collapse`].
+    pub version: u64,
     pub lon: f64,
     pub lat: f64,
     pub tags: Vec<(String, String)>,
@@ -25,6 +28,9 @@ pub struct NodeChange {
 pub struct WayChange {
     pub action: ChangeAction,
     pub id: i64,
+    /// The element's `version` attribute; 0 when absent. See
+    /// [`OsmChange::collapse`].
+    pub version: u64,
     pub node_refs: Vec<i64>,
     pub tags: Vec<(String, String)>,
 }
@@ -42,6 +48,9 @@ pub struct RelationMember {
 pub struct RelationChange {
     pub action: ChangeAction,
     pub id: i64,
+    /// The element's `version` attribute; 0 when absent. See
+    /// [`OsmChange::collapse`].
+    pub version: u64,
     pub members: Vec<RelationMember>,
     pub tags: Vec<(String, String)>,
 }
@@ -52,6 +61,62 @@ pub struct OsmChange {
     pub nodes: Vec<NodeChange>,
     pub ways: Vec<WayChange>,
     pub relations: Vec<RelationChange>,
+}
+
+impl OsmChange {
+    /// Reduce `parts`, a sequence of diffs given oldest first, to **one change
+    /// per object**: the one with the highest `version`. Ties, including the
+    /// all-zero case of a feed that omits `version`, go to the one that comes
+    /// last in `parts` and in document order, which means the sort must be
+    /// stable.
+    ///
+    /// Why dropping the intermediate versions loses nothing: applying a diff
+    /// takes each object from its *stored* state to its *final* one, and every
+    /// write depends only on those two. Tags and rows come from the final
+    /// version. The reverse indexes drop the stored refs and add the final
+    /// ones, and an intermediate ref list was never stored. Dirty cells cover
+    /// the stored row's cell and the final row's cell, and an intermediate
+    /// position was never served. Create followed by delete becomes a delete
+    /// of something never stored, which is a no-op. Delete followed by
+    /// undelete becomes a modify.
+    ///
+    /// This makes "one change per id" structural, rather than depending on
+    /// which lookup (`find` or `rfind`) the rebuild uses. It also means
+    /// versions are ordered by number rather than by file position, which
+    /// the feed does not promise. Collapsing a whole batch instead of each
+    /// sequence gives the same result with fewer writes, so a node edited in
+    /// 20 sequences of a catch-up is written once. The output is sorted by
+    /// id, not in document order; objects of one type never depend on each
+    /// other's application order, since every geometry rebuild runs after
+    /// all of them are applied.
+    pub fn collapse<'a>(parts: impl IntoIterator<Item = &'a OsmChange> + Clone) -> OsmChange {
+        OsmChange {
+            nodes: latest_per_id(parts.clone().into_iter().flat_map(|c| &c.nodes), |n| {
+                (n.id, n.version)
+            }),
+            ways: latest_per_id(parts.clone().into_iter().flat_map(|c| &c.ways), |w| {
+                (w.id, w.version)
+            }),
+            relations: latest_per_id(parts.into_iter().flat_map(|c| &c.relations), |r| {
+                (r.id, r.version)
+            }),
+        }
+    }
+}
+
+/// Stable-sort by `(id, version)` and keep the last entry of each id.
+fn latest_per_id<'a, T: Clone + 'a>(
+    items: impl Iterator<Item = &'a T>,
+    key: impl Fn(&T) -> (i64, u64),
+) -> Vec<T> {
+    let mut sorted: Vec<&T> = items.collect();
+    sorted.sort_by_key(|t| key(t));
+    sorted
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| sorted.get(i + 1).is_none_or(|next| key(next).0 != key(t).0))
+        .map(|(_, t)| (*t).clone())
+        .collect()
 }
 
 /// Parse an OsmChange XML string into structured changes.
@@ -80,6 +145,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let action =
                             current_action.context("Node element outside of action block")?;
                         let mut id = 0i64;
+                        let mut version = 0u64;
                         let mut lon = 0.0f64;
                         let mut lat = 0.0f64;
                         for attr in e.attributes().flatten() {
@@ -87,6 +153,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                             let val = std::str::from_utf8(&attr.value)?;
                             match key {
                                 "id" => id = val.parse()?,
+                                "version" => version = val.parse()?,
                                 "lon" => lon = val.parse()?,
                                 "lat" => lat = val.parse()?,
                                 _ => {}
@@ -95,6 +162,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         current_node = Some(NodeChange {
                             action,
                             id,
+                            version,
                             lon,
                             lat,
                             tags: Vec::new(),
@@ -104,16 +172,20 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let action =
                             current_action.context("Way element outside of action block")?;
                         let mut id = 0i64;
+                        let mut version = 0u64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
                             let val = std::str::from_utf8(&attr.value)?;
-                            if key == "id" {
-                                id = val.parse()?;
+                            match key {
+                                "id" => id = val.parse()?,
+                                "version" => version = val.parse()?,
+                                _ => {}
                             }
                         }
                         current_way = Some(WayChange {
                             action,
                             id,
+                            version,
                             node_refs: Vec::new(),
                             tags: Vec::new(),
                         });
@@ -122,16 +194,20 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let action =
                             current_action.context("Relation element outside of action block")?;
                         let mut id = 0i64;
+                        let mut version = 0u64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
                             let val = std::str::from_utf8(&attr.value)?;
-                            if key == "id" {
-                                id = val.parse()?;
+                            match key {
+                                "id" => id = val.parse()?,
+                                "version" => version = val.parse()?,
+                                _ => {}
                             }
                         }
                         current_relation = Some(RelationChange {
                             action,
                             id,
+                            version,
                             members: Vec::new(),
                             tags: Vec::new(),
                         });
@@ -203,6 +279,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let action =
                             current_action.context("Node element outside of action block")?;
                         let mut id = 0i64;
+                        let mut version = 0u64;
                         let mut lon = 0.0f64;
                         let mut lat = 0.0f64;
                         for attr in e.attributes().flatten() {
@@ -210,6 +287,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                             let val = std::str::from_utf8(&attr.value)?;
                             match key {
                                 "id" => id = val.parse()?,
+                                "version" => version = val.parse()?,
                                 "lon" => lon = val.parse()?,
                                 "lat" => lat = val.parse()?,
                                 _ => {}
@@ -218,6 +296,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         change.nodes.push(NodeChange {
                             action,
                             id,
+                            version,
                             lon,
                             lat,
                             tags: Vec::new(),
@@ -228,16 +307,20 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let action =
                             current_action.context("Way element outside of action block")?;
                         let mut id = 0i64;
+                        let mut version = 0u64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
                             let val = std::str::from_utf8(&attr.value)?;
-                            if key == "id" {
-                                id = val.parse()?;
+                            match key {
+                                "id" => id = val.parse()?,
+                                "version" => version = val.parse()?,
+                                _ => {}
                             }
                         }
                         change.ways.push(WayChange {
                             action,
                             id,
+                            version,
                             node_refs: Vec::new(),
                             tags: Vec::new(),
                         });
@@ -247,16 +330,20 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let action =
                             current_action.context("Relation element outside of action block")?;
                         let mut id = 0i64;
+                        let mut version = 0u64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
                             let val = std::str::from_utf8(&attr.value)?;
-                            if key == "id" {
-                                id = val.parse()?;
+                            match key {
+                                "id" => id = val.parse()?,
+                                "version" => version = val.parse()?,
+                                _ => {}
                             }
                         }
                         change.relations.push(RelationChange {
                             action,
                             id,
+                            version,
                             members: Vec::new(),
                             tags: Vec::new(),
                         });
@@ -433,6 +520,132 @@ mod tests {
         assert_eq!(deleted_ways.len(), 1);
         assert_eq!(deleted_ways[0].id, 201);
 
+        Ok(())
+    }
+
+    /// One `.osc` can carry an object's whole lifecycle. `OsmChange::collapse`
+    /// relies on every version surviving parsing, in document order and with
+    /// its own action, coordinates and tags -- including a self-closing
+    /// untagged node inside `<modify>`, the commonest shape in real diffs.
+    #[test]
+    fn test_parse_osc_keeps_every_version_in_document_order() -> Result<()> {
+        let change = parse_osc(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="2" version="1" lon="7.0" lat="7.0"><tag k="amenity" v="bench"/></node>
+  </create>
+  <modify>
+    <node id="2" version="2" lon="3.0" lat="3.0"/>
+  </modify>
+  <delete>
+    <node id="2" version="3"/>
+  </delete>
+  <modify>
+    <node id="2" version="4" lon="8.0" lat="8.0"><tag k="natural" v="tree"/></node>
+    <way id="1" version="2"><nd ref="2"/><tag k="building" v="yes"/></way>
+    <way id="1" version="3"><nd ref="2"/><nd ref="3"/><tag k="building" v="house"/></way>
+  </modify>
+</osmChange>"#,
+        )?;
+
+        let nodes: Vec<_> = change
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.action, n.lon, n.tags.clone()))
+            .collect();
+        assert_eq!(
+            nodes,
+            vec![
+                (
+                    2,
+                    ChangeAction::Create,
+                    7.0,
+                    vec![("amenity".into(), "bench".into())]
+                ),
+                (2, ChangeAction::Modify, 3.0, vec![]),
+                (2, ChangeAction::Delete, 0.0, vec![]),
+                (
+                    2,
+                    ChangeAction::Modify,
+                    8.0,
+                    vec![("natural".into(), "tree".into())]
+                ),
+            ]
+        );
+        let ways: Vec<_> = change
+            .ways
+            .iter()
+            .map(|w| (w.id, w.node_refs.clone(), w.tags.clone()))
+            .collect();
+        assert_eq!(
+            ways,
+            vec![
+                (1, vec![2], vec![("building".into(), "yes".into())]),
+                (1, vec![2, 3], vec![("building".into(), "house".into())]),
+            ]
+        );
+        Ok(())
+    }
+
+    /// `collapse` orders versions by number, not by position in the file, and
+    /// keeps exactly one change per object.
+    #[test]
+    fn collapse_keeps_the_highest_version_of_each_object_regardless_of_file_order() -> Result<()> {
+        let change = parse_osc(
+            r#"<osmChange version="0.6">
+  <modify>
+    <way id="1" version="3"><nd ref="9"/><tag k="building" v="house"/></way>
+    <way id="1" version="2"><nd ref="8"/><tag k="building" v="yes"/></way>
+    <way id="7" version="1"><nd ref="7"/></way>
+  </modify>
+  <create>
+    <node id="2" version="1" lon="1.0" lat="1.0"/>
+  </create>
+  <delete>
+    <node id="2" version="2"/>
+  </delete>
+</osmChange>"#,
+        )?;
+        let collapsed = OsmChange::collapse([&change]);
+
+        let ways: Vec<_> = collapsed
+            .ways
+            .iter()
+            .map(|w| (w.id, w.version, w.node_refs.clone()))
+            .collect();
+        assert_eq!(ways, vec![(1, 3, vec![9]), (7, 1, vec![7])]);
+        let nodes: Vec<_> = collapsed.nodes.iter().map(|n| (n.id, n.action)).collect();
+        assert_eq!(nodes, vec![(2, ChangeAction::Delete)]);
+        Ok(())
+    }
+
+    /// Across a batch, a later sequence's version wins. With no `version`
+    /// attribute (every version 0), the last one in batch-then-document order
+    /// wins, i.e. the ordering the apply loop used before collapsing existed.
+    #[test]
+    fn collapse_across_parts_prefers_the_later_part_on_a_version_tie() -> Result<()> {
+        let first = parse_osc(
+            r#"<osmChange version="0.6"><modify>
+    <way id="5" version="2"><tag k="building" v="yes"/></way>
+    <way id="6"><tag k="building" v="a"/></way>
+    <way id="6"><tag k="building" v="b"/></way>
+</modify></osmChange>"#,
+        )?;
+        let second = parse_osc(
+            r#"<osmChange version="0.6"><modify>
+    <way id="5" version="3"><tag k="building" v="house"/></way>
+    <way id="6"><tag k="building" v="c"/></way>
+</modify></osmChange>"#,
+        )?;
+        let collapsed = OsmChange::collapse([&first, &second]);
+
+        let ways: Vec<_> = collapsed
+            .ways
+            .iter()
+            .map(|w| (w.id, w.tags[0].1.as_str()))
+            .collect();
+        assert_eq!(ways, vec![(5, "house"), (6, "c")]);
         Ok(())
     }
 

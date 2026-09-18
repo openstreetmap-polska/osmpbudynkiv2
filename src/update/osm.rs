@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use duckdb::{Connection, OptionalExt};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::download::{download_file_as_quiet, download_file_quiet};
@@ -575,11 +575,13 @@ fn fetch_and_parse_sequence(
 /// transaction, stamping `metadata` once with the batch's *last* sequence.
 ///
 /// `batch` must be non-empty and sorted ascending by `seq` -- `update()`'s
-/// caller loop guarantees both. Steady state and any catch-up small enough
+/// caller loop guarantees both. The order is load-bearing: `OsmChange::collapse`
+/// breaks a version tie in favour of the later sequence. Steady state and any
+/// catch-up small enough
 /// to stay under `batch_commit_threshold` always call this with a
 /// single-element batch (`catch_up_chunk_size` returns `1`), which is
 /// exactly the pre-batching `apply_sequence` behaviour: one BEGIN, one
-/// `apply_changes`, one metadata stamp, one COMMIT.
+/// `apply_collapsed`, one metadata stamp, one COMMIT.
 ///
 /// **Why fetching happens before `BEGIN`.** `update()`'s caller loop fetches
 /// and parses the whole batch (network + gzip + XML) *before* calling this
@@ -608,7 +610,7 @@ fn fetch_and_parse_sequence(
 /// orphaned a downloaded file per tick.
 ///
 /// **Crash-safety argument, and the one thing it rests on.** Every RocksDB
-/// primitive `apply_changes` calls is either an unconditional upsert/delete
+/// primitive `apply_collapsed` calls is either an unconditional upsert/delete
 /// (`put_node`, `delete_way`, ...) or a read-modify-write set toggle
 /// (`add_node_to_ways`/`remove_node_to_ways`, `src/osm/kvstore.rs:260-313`).
 /// All of those are idempotent, so replaying the *entire* batch on top of
@@ -626,10 +628,11 @@ fn fetch_and_parse_sequence(
 /// of it in `src/import/osm.rs` (~lines 303 and 636, the *import* path's
 /// bulk-load). A list-append merge is NOT idempotent -- replaying one would
 /// duplicate ids in the reverse index. The argument above holds only because
-/// `apply_changes` (this *update* path) exclusively uses the get-modify-put
+/// `apply_collapsed` (this *update* path) exclusively uses the get-modify-put
 /// functions and never a merge; `replaying_a_batch_over_a_partially_written_kv_store_converges_to_the_golden_state`
 /// (this file's test module) pins the resulting convergence directly against
-/// `apply_changes`, not a description of it.
+/// `apply_collapsed` (through the test-only `apply_changes` wrapper), not a
+/// description of it.
 ///
 /// **Concurrency risk.** Committing a whole batch at once holds the write
 /// transaction long enough to overlap the `match_refresh` drain.
@@ -663,9 +666,13 @@ fn apply_batch(
     conn.execute_batch("BEGIN TRANSACTION")?;
 
     let result = (|| -> Result<()> {
-        for fetched in batch {
-            apply_changes(conn, kv, &fetched.changes)?;
-        }
+        // One collapsed change set for the whole batch, not one per
+        // sequence. See `OsmChange::collapse` for why that is equivalent.
+        apply_collapsed(
+            conn,
+            kv,
+            &OsmChange::collapse(batch.iter().map(|f| &f.changes)),
+        )?;
 
         conn.execute_batch(&format!(
             "DELETE FROM metadata WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp');
@@ -734,7 +741,28 @@ fn decompress_gz(path: &Path) -> Result<String> {
     Ok(xml)
 }
 
+/// Apply one diff on its own: the unit tests' entry point. Production goes
+/// through `apply_batch`, which collapses a whole batch at once.
+#[cfg(test)]
 fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result<()> {
+    apply_collapsed(conn, kv, &OsmChange::collapse([changes]))
+}
+
+/// Apply a change set that holds **at most one change per object**, i.e. the
+/// output of `OsmChange::collapse`. The rebuilds look an object's tags up by
+/// id, so a second version of the same id would be ambiguous. That was the
+/// "first version wins" bug, when this was a `find` over an uncollapsed diff.
+fn apply_collapsed(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result<()> {
+    let way_changes: HashMap<i64, &WayChange> = changes.ways.iter().map(|w| (w.id, w)).collect();
+    let relation_changes: HashMap<i64, &RelationChange> =
+        changes.relations.iter().map(|r| (r.id, r)).collect();
+    debug_assert_eq!(way_changes.len(), changes.ways.len(), "uncollapsed ways");
+    debug_assert_eq!(
+        relation_changes.len(),
+        changes.relations.len(),
+        "uncollapsed relations"
+    );
+
     let mut affected_way_ids: HashSet<i64> = HashSet::new();
     let mut affected_relation_ids: HashSet<i64> = HashSet::new();
     let mut dirty = DirtyCells::new();
@@ -905,7 +933,7 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
 
     // --- Rebuild affected way geometries ---
     for &way_id in &affected_way_ids {
-        rebuild_way_geometry(conn, kv, way_id, &changes.ways, &mut dirty)?;
+        rebuild_way_geometry(conn, kv, way_id, &way_changes, &mut dirty)?;
     }
 
     // Cascade way changes to relations
@@ -916,7 +944,7 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
 
     // --- Rebuild affected relation geometries ---
     for &relation_id in &affected_relation_ids {
-        rebuild_relation_geometry(conn, kv, relation_id, &changes.relations, &mut dirty)?;
+        rebuild_relation_geometry(conn, kv, relation_id, &relation_changes, &mut dirty)?;
     }
 
     dirty.flush(conn)?;
@@ -1016,11 +1044,85 @@ fn stored_rebuild_tags(
     )))
 }
 
+/// A way that cannot be turned into a geometry: absent from the store
+/// (`missing_nodes` is `None`), or present but referencing nodes that are not
+/// (`Some(ids)`).
+#[derive(Debug, PartialEq)]
+struct UnresolvedWay {
+    way_id: i64,
+    missing_nodes: Option<Vec<i64>>,
+}
+
+/// The ways among `way_ids` that cannot be resolved to coordinates, with the
+/// node ids each one is missing.
+///
+/// This is the extract's edge. The feed is a diff that has already been
+/// filtered to Poland, so a way crossing the border can reference nodes that
+/// never reached us, either in the PBF or in any diff. Such an object is
+/// **ignored with a warning, never built from whatever part is present**: a
+/// partial multipolygon would be a wrong footprint, and it would suppress or
+/// un-suppress government buildings on the strength of that. A node arriving
+/// later does not bring the object back, because only its node refs are
+/// stored and not its tags. It returns on its next direct edit, or on
+/// `import osm`.
+fn unresolved_way_members(kv: &RocksDB, way_ids: &[i64]) -> Result<Vec<UnresolvedWay>> {
+    let mut unresolved = Vec::new();
+    for &way_id in way_ids {
+        let Some(refs) = kvstore::get_way(kv, way_id)? else {
+            unresolved.push(UnresolvedWay {
+                way_id,
+                missing_nodes: None,
+            });
+            continue;
+        };
+        // One multi-get answers the common case; per-node lookups only run
+        // to name the missing ids once something is known to be missing.
+        if kvstore::multi_get_nodes_wkb_coords(kv, &refs)?.is_some() {
+            continue;
+        }
+        let mut missing = Vec::new();
+        for &node_id in &refs {
+            if !missing.contains(&node_id)
+                && kvstore::multi_get_nodes_wkb_coords(kv, &[node_id])?.is_none()
+            {
+                missing.push(node_id);
+            }
+        }
+        unresolved.push(UnresolvedWay {
+            way_id,
+            missing_nodes: Some(missing),
+        });
+    }
+    Ok(unresolved)
+}
+
+/// The log line naming what could not be resolved, e.g. `way/7 is missing
+/// node/1, node/2; way/8 is not in the store`. Ids are listed in full, so the
+/// operator can look each one up.
+fn describe_unresolved(unresolved: &[UnresolvedWay]) -> String {
+    let parts: Vec<String> = unresolved
+        .iter()
+        .map(|u| match &u.missing_nodes {
+            None => format!("way/{} is not in the store", u.way_id),
+            Some(nodes) => format!(
+                "way/{} is missing {}",
+                u.way_id,
+                nodes
+                    .iter()
+                    .map(|n| format!("node/{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })
+        .collect();
+    format!("{} (outside the extract?)", parts.join("; "))
+}
+
 fn rebuild_way_geometry(
     conn: &Connection,
     kv: &RocksDB,
     way_id: i64,
-    way_changes: &[WayChange],
+    way_changes: &HashMap<i64, &WayChange>,
     dirty: &mut DirtyCells,
 ) -> Result<()> {
     if kvstore::get_way(kv, way_id)?.is_none() {
@@ -1029,7 +1131,7 @@ fn rebuild_way_geometry(
 
     // Determine tags: from the change if directly affected, else from the rows it
     // already has (`stored_rebuild_tags`), read BEFORE the delete below.
-    let way_change = way_changes.iter().find(|w| w.id == way_id);
+    let way_change = way_changes.get(&way_id);
     let (building_tag, housenumber, street, city, postcode, former) = match way_change {
         Some(wc) => (
             tag_value(&wc.tags, "building"),
@@ -1079,6 +1181,17 @@ fn rebuild_way_geometry(
         "DELETE FROM osm_former_buildings WHERE osm_id = ? AND osm_type = 'way'",
         [way_id],
     )?;
+
+    if building_tag.is_some() || former.is_some() || housenumber.is_some() {
+        let unresolved = unresolved_way_members(kv, &[way_id])?;
+        if !unresolved.is_empty() {
+            warn!(
+                "Ignoring way/{way_id}: {}",
+                describe_unresolved(&unresolved)
+            );
+            return Ok(());
+        }
+    }
 
     if building_tag.is_some() {
         let building = building_tag.as_deref().unwrap_or("yes");
@@ -1218,7 +1331,7 @@ fn rebuild_relation_geometry(
     conn: &Connection,
     kv: &RocksDB,
     relation_id: i64,
-    relation_changes: &[RelationChange],
+    relation_changes: &HashMap<i64, &RelationChange>,
     dirty: &mut DirtyCells,
 ) -> Result<()> {
     let members = match kvstore::get_relation(kv, relation_id)? {
@@ -1228,7 +1341,7 @@ fn rebuild_relation_geometry(
 
     // Determine tags: from the change if directly affected, else from the rows it
     // already has (`stored_rebuild_tags`), read BEFORE the delete below.
-    let rel_change = relation_changes.iter().find(|r| r.id == relation_id);
+    let rel_change = relation_changes.get(&relation_id);
     let (building_tag, housenumber, street, city, postcode, former) = match rel_change {
         Some(rc) => (
             tag_value(&rc.tags, "building"),
@@ -1296,6 +1409,18 @@ fn rebuild_relation_geometry(
 
     if way_members.is_empty() {
         return Ok(());
+    }
+
+    if building_tag.is_some() || former.is_some() || housenumber.is_some() {
+        let way_ids: Vec<i64> = way_members.iter().map(|(wid, _)| *wid).collect();
+        let unresolved = unresolved_way_members(kv, &way_ids)?;
+        if !unresolved.is_empty() {
+            warn!(
+                "Ignoring relation/{relation_id}: {}",
+                describe_unresolved(&unresolved)
+            );
+            return Ok(());
+        }
     }
 
     let values_sql: String = way_members
@@ -1493,6 +1618,7 @@ mod tests {
             &OsmChange {
                 ways: vec![WayChange {
                     action: ChangeAction::Create,
+                    version: 1,
                     id: 900,
                     node_refs: refs,
                     tags: vec![("building".into(), "service".into())],
@@ -1531,6 +1657,7 @@ mod tests {
             &OsmChange {
                 ways: vec![WayChange {
                     action: ChangeAction::Create,
+                    version: 1,
                     id: 910,
                     node_refs: refs,
                     tags: vec![("building".into(), "yes".into())],
@@ -1574,6 +1701,7 @@ mod tests {
             &OsmChange {
                 relations: vec![RelationChange {
                     action: ChangeAction::Create,
+                    version: 1,
                     id: 210,
                     members: vec![RelationMember {
                         member_type: "way".into(),
@@ -1631,6 +1759,7 @@ mod tests {
         let changes = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: 10,
                 lon: 21.0,
                 lat: 51.0,
@@ -1666,6 +1795,7 @@ mod tests {
         let create = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: 20,
                 lon: 21.0,
                 lat: 51.0,
@@ -1678,6 +1808,7 @@ mod tests {
         let delete = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Delete,
+                version: 1,
                 id: 20,
                 lon: 0.0,
                 lat: 0.0,
@@ -1706,6 +1837,7 @@ mod tests {
         let changes = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Modify,
+                version: 1,
                 id: 1,
                 lon: 20.0005,
                 lat: 50.0005,
@@ -1771,6 +1903,7 @@ mod tests {
         let changes = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Modify,
+                version: 1,
                 id: 1,
                 lon: 19.9999,
                 lat: 49.9999,
@@ -1830,6 +1963,7 @@ mod tests {
         let changes = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Modify,
+                version: 1,
                 id: 1,
                 lon: 19.9999,
                 lat: 49.9999,
@@ -1861,6 +1995,7 @@ mod tests {
         let changes = OsmChange {
             ways: vec![WayChange {
                 action: ChangeAction::Delete,
+                version: 1,
                 id: 100,
                 node_refs: vec![],
                 tags: vec![],
@@ -1920,6 +2055,7 @@ mod tests {
         let changes = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: 10,
                 lon,
                 lat,
@@ -1981,6 +2117,7 @@ mod tests {
         let changes = OsmChange {
             ways: vec![WayChange {
                 action: ChangeAction::Delete,
+                version: 1,
                 id: 100,
                 node_refs: vec![],
                 tags: vec![],
@@ -2262,6 +2399,7 @@ mod tests {
         let changes = OsmChange {
             ways: vec![WayChange {
                 action: ChangeAction::Modify,
+                version: 1,
                 id: 100,
                 node_refs: vec![1, 2, 3, 4, 1],
                 // building=yes removed by the editor; nothing served left.
@@ -2325,6 +2463,7 @@ mod tests {
         let changes = OsmChange {
             relations: vec![RelationChange {
                 action: ChangeAction::Modify,
+                version: 1,
                 id: 200,
                 members: vec![RelationMember {
                     member_type: "way".into(),
@@ -2548,6 +2687,7 @@ mod tests {
         let changes = OsmChange {
             ways: vec![WayChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: 300,
                 node_refs: vec![1, 2, 3, 4, 1],
                 tags: vec![("demolished:building".into(), "house".into())],
@@ -2613,6 +2753,7 @@ mod tests {
         let changes = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Modify,
+                version: 1,
                 id: 11,
                 lon: 22.5,
                 lat: 51.0,
@@ -2676,6 +2817,7 @@ mod tests {
         let changes = OsmChange {
             ways: vec![WayChange {
                 action: ChangeAction::Delete,
+                version: 1,
                 id: 160,
                 node_refs: vec![],
                 tags: vec![],
@@ -2708,6 +2850,1333 @@ mod tests {
 
         assert!(kvstore::get_way(&kv, 160)?.is_none());
 
+        Ok(())
+    }
+
+    // --- Replication lifecycle cases ---
+    //
+    // One `.osc` can carry an object's whole history (create -> modify ->
+    // delete -> undelete), a geometry can change without its owner being in
+    // the diff at all, and the extract's edge means referenced nodes may be
+    // absent. The tests below pin each of those shapes; the case list was
+    // derived from praszuk/osm-replication-osc-poly-filter's integration tests.
+
+    fn count(conn: &Connection, sql: &str) -> Result<i64> {
+        Ok(conn.query_row(sql, [], |r| r.get(0))?)
+    }
+
+    fn z14_cell(lon: f64, lat: f64) -> (i32, i32) {
+        let (x, y) = crate::tile_math::lonlat_to_tile(lon, lat, crate::tile_math::CHANGE_CELL_ZOOM);
+        (x as i32, y as i32)
+    }
+
+    fn z14_cell_midpoint(cx: i32, cy: i32) -> (f64, f64) {
+        let (min_lon, min_lat, max_lon, max_lat) = crate::tile_math::tile_to_bbox(
+            crate::tile_math::CHANGE_CELL_ZOOM,
+            cx as u32,
+            cy as u32,
+        );
+        ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0)
+    }
+
+    fn queued_in_cell(conn: &Connection, source: &str, cell: (i32, i32)) -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM match_dirty_cells WHERE source = ? AND cell_x = ? AND cell_y = ?",
+            duckdb::params![source, cell.0, cell.1],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Relation 200 = way 100 (the fixture square) plus way 101, a second
+    /// square around (21.0, 51.0) built from nodes 11-14, both `outer`, with
+    /// a served `building=yes` row covering both.
+    fn seed_two_way_relation(conn: &Connection, kv: &RocksDB) -> Result<()> {
+        kvstore::put_node(kv, 11, dm(21.0), dm(51.0))?;
+        kvstore::put_node(kv, 12, dm(21.001), dm(51.0))?;
+        kvstore::put_node(kv, 13, dm(21.001), dm(51.001))?;
+        kvstore::put_node(kv, 14, dm(21.0), dm(51.001))?;
+        kvstore::put_way(kv, 101, &[11, 12, 13, 14, 11])?;
+        for &nid in &[11i64, 12, 13, 14] {
+            kvstore::add_node_to_ways(kv, nid, 101)?;
+        }
+        let outer = encoding::encode_member_role("outer");
+        let way = encoding::encode_member_type("way");
+        kvstore::put_relation(kv, 200, &[(100, way, outer), (101, way, outer)])?;
+        kvstore::add_way_to_relations(kv, 100, 200)?;
+        kvstore::add_way_to_relations(kv, 101, 200)?;
+        conn.execute_batch(
+            "INSERT INTO osm_buildings VALUES (200, 'relation', 'yes', ST_Union(
+                 ST_MakeEnvelope(20.0, 50.0, 20.001, 50.001),
+                 ST_MakeEnvelope(21.0, 51.0, 21.001, 51.001)));",
+        )?;
+        Ok(())
+    }
+
+    /// Two versions of one way in a single diff (two uploads inside the same
+    /// minute). The node list is written per version, so the KV store ends at
+    /// the last one -- the tags must too. `rebuild_way_geometry` picking the
+    /// *first* matching `WayChange` would serve v2's tags: `building=yes` and
+    /// no address, so the PRG address this way now carries stays unmatched.
+    #[test]
+    fn a_way_edited_twice_in_one_diff_is_served_with_its_last_version_s_tags() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <modify>
+    <way id="100" version="2">
+      <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/>
+      <tag k="building" v="yes"/>
+    </way>
+    <way id="100" version="3">
+      <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/>
+      <tag k="building" v="house"/>
+      <tag k="addr:housenumber" v="11"/>
+      <tag k="addr:street" v="Lipowa"/>
+    </way>
+  </modify>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert_eq!(
+            stored_building_and_address(&conn, 100, "way")?,
+            (
+                Some("house".into()),
+                (Some("11".into()), Some("Lipowa".into()), None, None)
+            ),
+            "the way must be served with its LAST version's tags"
+        );
+        Ok(())
+    }
+
+    /// The veto-side consequence of the same bug: v3 retags the way as
+    /// demolished. Serving v2's tags would keep a live building that covers
+    /// the government building and never create the former-building row.
+    #[test]
+    fn a_way_retagged_demolished_in_the_second_version_of_one_diff_leaves_no_live_building()
+    -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <modify>
+    <way id="100" version="2">
+      <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/>
+      <tag k="building" v="yes"/>
+      <tag k="note" v="about to be demolished"/>
+    </way>
+    <way id="100" version="3">
+      <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/>
+      <tag k="demolished:building" v="yes"/>
+    </way>
+  </modify>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 100"
+            )?,
+            0,
+            "the final version is not a live building"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_former_buildings WHERE osm_id = 100 AND osm_type = 'way'"
+            )?,
+            1,
+            "the final version is a former building"
+        );
+        Ok(())
+    }
+
+    /// The feed does not promise versions in ascending file order. v3 comes
+    /// first in the file here, so going by file position would end at v2. Both
+    /// the tags and the node list (and with it the reverse index) must come
+    /// from v3.
+    #[test]
+    fn a_way_s_versions_out_of_file_order_are_applied_by_version_number() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <create>
+    <node id="5" version="1" lon="19.9995" lat="50.0012"/>
+  </create>
+  <modify>
+    <way id="100" version="3">
+      <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="5"/><nd ref="1"/>
+      <tag k="building" v="house"/>
+      <tag k="addr:housenumber" v="11"/>
+    </way>
+    <way id="100" version="2">
+      <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/>
+      <tag k="building" v="yes"/>
+    </way>
+  </modify>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert_eq!(
+            stored_building_and_address(&conn, 100, "way")?,
+            (Some("house".into()), (Some("11".into()), None, None, None))
+        );
+        assert_eq!(kvstore::get_way(&kv, 100)?, Some(vec![1, 2, 3, 5, 1]));
+        assert!(kvstore::get_node_to_ways(&kv, 5)?.contains(&100));
+        assert!(!kvstore::get_node_to_ways(&kv, 4)?.contains(&100));
+        Ok(())
+    }
+
+    /// The relation twin: v3 strips `building`, so nothing may be served.
+    #[test]
+    fn a_relation_edited_twice_in_one_diff_is_served_with_its_last_version_s_tags() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        kvstore::put_relation(
+            &kv,
+            200,
+            &[(
+                100,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(&kv, 100, 200)?;
+        conn.execute_batch(
+            "INSERT INTO osm_buildings
+                 SELECT 200, 'relation', 'yes', geom FROM osm_buildings WHERE osm_id = 100;",
+        )?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <modify>
+    <relation id="200" version="2">
+      <member type="way" ref="100" role="outer"/>
+      <tag k="type" v="multipolygon"/>
+      <tag k="building" v="yes"/>
+    </relation>
+    <relation id="200" version="3">
+      <member type="way" ref="100" role="outer"/>
+      <tag k="type" v="multipolygon"/>
+    </relation>
+  </modify>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 200 AND osm_type = 'relation'"
+            )?,
+            0,
+            "the relation's final version carries no building tag"
+        );
+        Ok(())
+    }
+
+    /// Create and delete inside one diff: nothing may survive, including the
+    /// reverse index -- a stale `node_to_ways` entry would make every later
+    /// edit of those node ids try to rebuild a way that no longer exists.
+    #[test]
+    fn a_way_created_and_deleted_in_one_diff_leaves_nothing_behind() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <create>
+    <node id="30" version="1" lon="22.0" lat="52.0"/>
+    <node id="31" version="1" lon="22.001" lat="52.0"/>
+    <node id="32" version="1" lon="22.001" lat="52.001"/>
+    <way id="400" version="1">
+      <nd ref="30"/><nd ref="31"/><nd ref="32"/><nd ref="30"/>
+      <tag k="building" v="yes"/>
+      <tag k="addr:housenumber" v="1"/>
+    </way>
+  </create>
+  <delete>
+    <way id="400" version="2"/>
+    <node id="30" version="2"/>
+    <node id="31" version="2"/>
+    <node id="32" version="2"/>
+  </delete>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert!(kvstore::get_way(&kv, 400)?.is_none());
+        for nid in [30i64, 31, 32] {
+            assert!(
+                kvstore::get_node(&kv, nid)?.is_none(),
+                "node {nid} survived"
+            );
+            assert!(
+                !kvstore::get_node_to_ways(&kv, nid)?.contains(&400),
+                "node {nid} still maps to the deleted way"
+            );
+        }
+        for table in ["osm_buildings", "osm_addresses", "osm_former_buildings"] {
+            assert_eq!(
+                count(
+                    &conn,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE osm_id = 400")
+                )?,
+                0,
+                "{table} kept a row for a way that no longer exists"
+            );
+        }
+        Ok(())
+    }
+
+    /// Create -> delete -> modify (an undelete) in one diff: the node exists
+    /// at its final version's position with its final version's tags.
+    #[test]
+    fn a_node_undeleted_in_the_same_diff_is_served_at_its_final_state() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <create>
+    <node id="40" version="1" lon="21.0" lat="51.0">
+      <tag k="addr:housenumber" v="1"/>
+    </node>
+  </create>
+  <delete>
+    <node id="40" version="2"/>
+  </delete>
+  <modify>
+    <node id="40" version="3" lon="21.5" lat="51.5">
+      <tag k="addr:housenumber" v="2"/>
+    </node>
+  </modify>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        let (lon, _) = kvstore::get_node(&kv, 40)?.expect("the undeleted node must exist");
+        assert!((encoding::decimicro_to_f64(lon) - 21.5).abs() < 1e-9);
+        let (n, hn, x): (i64, String, f64) = conn.query_row(
+            "SELECT COUNT(*) OVER (), housenumber, ST_X(geom) FROM osm_addresses WHERE osm_id = 40",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!((n, hn.as_str()), (1, "2"));
+        assert!(
+            (x - 21.5).abs() < 1e-9,
+            "address must sit at the final position"
+        );
+        Ok(())
+    }
+
+    /// Create -> modify -> delete in one diff: nothing survives.
+    #[test]
+    fn a_node_created_modified_and_deleted_in_one_diff_leaves_nothing_behind() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <create>
+    <node id="41" version="1" lon="21.0" lat="51.0">
+      <tag k="addr:housenumber" v="1"/>
+    </node>
+  </create>
+  <modify>
+    <node id="41" version="2" lon="21.1" lat="51.1">
+      <tag k="addr:housenumber" v="1"/>
+    </node>
+  </modify>
+  <delete>
+    <node id="41" version="3"/>
+  </delete>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert!(kvstore::get_node(&kv, 41)?.is_none());
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_addresses WHERE osm_id = 41"
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    /// An address node stripped of `addr:housenumber` stops being an address,
+    /// and the cell it left must be enqueued so the PRG address it matched
+    /// comes back as unmatched.
+    #[test]
+    fn a_node_losing_its_address_tags_removes_the_row_and_enqueues_its_cell() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let (lon, lat) = z14_cell_midpoint(z14_cell(21.0, 51.0).0, z14_cell(21.0, 51.0).1);
+        let node = |action, tags| OsmChange {
+            nodes: vec![NodeChange {
+                action,
+                version: 1,
+                id: 42,
+                lon,
+                lat,
+                tags,
+            }],
+            ..Default::default()
+        };
+        apply_changes(
+            &conn,
+            &kv,
+            &node(
+                ChangeAction::Create,
+                vec![("addr:housenumber".into(), "5".into())],
+            ),
+        )?;
+        conn.execute_batch("DELETE FROM match_dirty_cells")?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &node(
+                ChangeAction::Modify,
+                vec![("amenity".into(), "bench".into())],
+            ),
+        )?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_addresses WHERE osm_id = 42"
+            )?,
+            0
+        );
+        assert_eq!(queued_in_cell(&conn, "prg", z14_cell(lon, lat))?, 1);
+        Ok(())
+    }
+
+    /// An address node moved across cells dirties both: the one it left (its
+    /// old match is gone) and the one it entered.
+    #[test]
+    fn an_address_node_moved_to_another_cell_enqueues_both_cells() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let from = z14_cell(21.0, 51.0);
+        let to = (from.0 + 5, from.1);
+        let (lon_a, lat_a) = z14_cell_midpoint(from.0, from.1);
+        let (lon_b, lat_b) = z14_cell_midpoint(to.0, to.1);
+        let node = |action, lon, lat| OsmChange {
+            nodes: vec![NodeChange {
+                action,
+                version: 1,
+                id: 43,
+                lon,
+                lat,
+                tags: vec![("addr:housenumber".into(), "5".into())],
+            }],
+            ..Default::default()
+        };
+        apply_changes(&conn, &kv, &node(ChangeAction::Create, lon_a, lat_a))?;
+        conn.execute_batch("DELETE FROM match_dirty_cells")?;
+
+        apply_changes(&conn, &kv, &node(ChangeAction::Modify, lon_b, lat_b))?;
+
+        assert_eq!(queued_in_cell(&conn, "prg", from)?, 1, "the cell it left");
+        assert_eq!(queued_in_cell(&conn, "prg", to)?, 1, "the cell it entered");
+        Ok(())
+    }
+
+    /// A way whose node list changes (node 4 swapped for a node 5 created in
+    /// the same diff) must end with a reverse index matching the new list:
+    /// node 5 maps to the way, node 4 no longer does -- so a later edit of
+    /// node 4 must not rebuild, or dirty cells for, a way that dropped it.
+    #[test]
+    fn a_node_removed_from_a_way_no_longer_rebuilds_it() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <create>
+    <node id="5" version="1" lon="19.9995" lat="50.0012"/>
+  </create>
+  <modify>
+    <way id="100" version="2">
+      <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="5"/><nd ref="1"/>
+      <tag k="building" v="yes"/>
+    </way>
+  </modify>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert!(kvstore::get_node_to_ways(&kv, 5)?.contains(&100));
+        assert!(!kvstore::get_node_to_ways(&kv, 4)?.contains(&100));
+        let x_min: f64 = conn.query_row(
+            "SELECT ST_XMin(geom) FROM osm_buildings WHERE osm_id = 100",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(
+            x_min < 20.0,
+            "geometry must use the new node, got xmin={x_min}"
+        );
+
+        conn.execute_batch("DELETE FROM match_dirty_cells")?;
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: vec![NodeChange {
+                    action: ChangeAction::Modify,
+                    version: 1,
+                    id: 4,
+                    lon: 20.0,
+                    lat: 50.0011,
+                    tags: vec![],
+                }],
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source IN ('bdot10k', 'egib')"
+            )?,
+            0,
+            "moving a node the way no longer uses must not touch the way"
+        );
+        Ok(())
+    }
+
+    /// A node shared by two building ways (a party wall) moves: both ways
+    /// are rebuilt, neither is in the diff.
+    #[test]
+    fn a_node_shared_by_two_building_ways_rebuilds_both() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        // Way 101 shares way 100's east edge (nodes 2 and 3).
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <create>
+    <node id="5" version="1" lon="20.002" lat="50.0"/>
+    <node id="6" version="1" lon="20.002" lat="50.001"/>
+    <way id="101" version="1">
+      <nd ref="2"/><nd ref="5"/><nd ref="6"/><nd ref="3"/><nd ref="2"/>
+      <tag k="building" v="garage"/>
+    </way>
+  </create>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: vec![NodeChange {
+                    action: ChangeAction::Modify,
+                    version: 1,
+                    id: 2,
+                    lon: 20.001,
+                    lat: 49.9995,
+                    tags: vec![],
+                }],
+                ..Default::default()
+            },
+        )?;
+
+        for (way_id, building) in [(100, "yes"), (101, "garage")] {
+            let (b, y_min): (String, f64) = conn.query_row(
+                "SELECT building, ST_YMin(geom) FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way'",
+                [way_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!(b, building, "way {way_id} must keep its tags");
+            assert!(
+                y_min < 50.0,
+                "way {way_id} must reflect the moved shared node, got ymin={y_min}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A member way's node LIST changes (not just a node position) and the
+    /// relation is not in the diff: the relation is rebuilt from the new
+    /// list, keeping its stored tags.
+    #[test]
+    fn a_member_way_s_new_node_list_rebuilds_the_relation_with_stored_tags() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        kvstore::put_relation(
+            &kv,
+            200,
+            &[(
+                100,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(&kv, 100, 200)?;
+        conn.execute_batch(
+            "DELETE FROM osm_buildings WHERE osm_id = 100;
+             INSERT INTO osm_buildings VALUES (200, 'relation', 'apartments',
+                 ST_MakeEnvelope(20.0, 50.0, 20.001, 50.001));",
+        )?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <create>
+    <node id="5" version="1" lon="19.999" lat="50.001"/>
+  </create>
+  <modify>
+    <way id="100" version="2">
+      <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="5"/><nd ref="1"/>
+    </way>
+  </modify>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        let (building, x_min): (String, f64) = conn.query_row(
+            "SELECT building, ST_XMin(geom) FROM osm_buildings WHERE osm_id = 200 AND osm_type = 'relation'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(building, "apartments");
+        assert!(x_min < 20.0, "relation must use the member's new node list");
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 100"
+            )?,
+            0,
+            "the untagged member way is not a building itself"
+        );
+        Ok(())
+    }
+
+    /// A relation that drops a member way: its geometry shrinks to the
+    /// remaining member, and the dropped way no longer maps to it -- so a
+    /// later edit of the dropped way must not rebuild (and dirty the far-away
+    /// cell of) the relation.
+    #[test]
+    fn a_way_dropped_from_a_relation_no_longer_rebuilds_it() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        seed_two_way_relation(&conn, &kv)?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <modify>
+    <relation id="200" version="2">
+      <member type="way" ref="101" role="outer"/>
+      <tag k="type" v="multipolygon"/>
+      <tag k="building" v="yes"/>
+    </relation>
+  </modify>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert!(!kvstore::get_way_to_relations(&kv, 100)?.contains(&200));
+        let x_min: f64 = conn.query_row(
+            "SELECT ST_XMin(geom) FROM osm_buildings WHERE osm_id = 200 AND osm_type = 'relation'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(x_min >= 21.0, "the dropped member must leave the geometry");
+
+        conn.execute_batch("DELETE FROM match_dirty_cells")?;
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: vec![NodeChange {
+                    action: ChangeAction::Modify,
+                    version: 1,
+                    id: 1,
+                    lon: 19.9999,
+                    lat: 50.0,
+                    tags: vec![],
+                }],
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            queued_in_cell(&conn, "bdot10k", z14_cell(21.0005, 51.0005))?,
+            0,
+            "editing the dropped way must not rebuild the relation"
+        );
+        Ok(())
+    }
+
+    /// Deleting a member way together with the relation edit that drops it
+    /// (the API refuses to delete a way still in a relation, so they arrive
+    /// together): the relation is rebuilt from the remaining member.
+    #[test]
+    fn a_member_way_deleted_with_its_relation_edit_leaves_the_rest_served() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        seed_two_way_relation(&conn, &kv)?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <modify>
+    <relation id="200" version="2">
+      <member type="way" ref="100" role="outer"/>
+      <tag k="type" v="multipolygon"/>
+      <tag k="building" v="yes"/>
+    </relation>
+  </modify>
+  <delete>
+    <way id="101" version="2"/>
+  </delete>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        let x_max: f64 = conn.query_row(
+            "SELECT ST_XMax(geom) FROM osm_buildings WHERE osm_id = 200 AND osm_type = 'relation'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(
+            x_max < 20.5,
+            "the deleted member must leave the geometry, got xmax={x_max}"
+        );
+        assert!(kvstore::get_way(&kv, 101)?.is_none());
+        assert!(kvstore::get_way_to_relations(&kv, 101)?.is_empty());
+        Ok(())
+    }
+
+    /// Nodes, an untagged closed way and the multipolygon relation using it,
+    /// all created in one diff: relations are applied after ways, so the
+    /// relation must see its member.
+    #[test]
+    fn a_relation_built_from_ways_created_in_the_same_diff_is_served() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <create>
+    <node id="50" version="1" lon="22.0" lat="52.0"/>
+    <node id="51" version="1" lon="22.001" lat="52.0"/>
+    <node id="52" version="1" lon="22.001" lat="52.001"/>
+    <node id="53" version="1" lon="22.0" lat="52.001"/>
+    <way id="500" version="1">
+      <nd ref="50"/><nd ref="51"/><nd ref="52"/><nd ref="53"/><nd ref="50"/>
+    </way>
+    <relation id="600" version="1">
+      <member type="way" ref="500" role="outer"/>
+      <tag k="type" v="multipolygon"/>
+      <tag k="building" v="school"/>
+    </relation>
+  </create>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        let (building, area): (String, f64) = conn.query_row(
+            "SELECT building, ST_Area(geom) FROM osm_buildings WHERE osm_id = 600 AND osm_type = 'relation'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(building, "school");
+        assert!(area > 0.0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 500"
+            )?,
+            0,
+            "the untagged member way is not a building itself"
+        );
+        Ok(())
+    }
+
+    /// The extract's edge: a way referencing a node that is not in the store
+    /// (never in the PBF, never in a diff) cannot be built. That must be a
+    /// silent skip, not an error that fails the whole batch.
+    #[test]
+    fn a_way_referencing_a_node_outside_the_store_is_skipped_without_error() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                ways: vec![WayChange {
+                    action: ChangeAction::Create,
+                    version: 1,
+                    id: 700,
+                    node_refs: vec![1, 2, 3, 999, 1],
+                    tags: vec![("building".into(), "yes".into())],
+                }],
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 700"
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    /// The accepted cost of ignoring border objects: once the missing node
+    /// arrives in a later diff, the way does NOT come back. The way is not in
+    /// that diff, and its tags were never stored because it had no row, so
+    /// there is nothing to rebuild it from. It returns on its next direct
+    /// edit. See `unresolved_way_members`.
+    #[test]
+    fn a_way_whose_missing_node_arrives_in_a_later_diff_stays_ignored() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                ways: vec![WayChange {
+                    action: ChangeAction::Create,
+                    version: 1,
+                    id: 700,
+                    node_refs: vec![1, 2, 3, 999, 1],
+                    tags: vec![("building".into(), "yes".into())],
+                }],
+                ..Default::default()
+            },
+        )?;
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: vec![NodeChange {
+                    action: ChangeAction::Modify,
+                    version: 1,
+                    id: 999,
+                    lon: 20.0,
+                    lat: 50.0015,
+                    tags: vec![],
+                }],
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 700"
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    /// A served way edited to reference a node outside the store is removed,
+    /// not left at its old geometry, and the cell it left is enqueued, so the
+    /// government building it matched is re-evaluated.
+    #[test]
+    fn a_served_way_that_becomes_unresolvable_is_removed_and_enqueued() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                ways: vec![WayChange {
+                    action: ChangeAction::Modify,
+                    version: 1,
+                    id: 100,
+                    node_refs: vec![1, 2, 3, 999, 1],
+                    tags: vec![("building".into(), "yes".into())],
+                }],
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 100"
+            )?,
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'bdot10k'"
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    /// A multipolygon with one unresolvable member is ignored entirely,
+    /// never built from the members that are present: the result would be a
+    /// wrong footprint.
+    #[test]
+    fn a_relation_with_an_unresolvable_member_is_ignored_not_built_partially() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        seed_two_way_relation(&conn, &kv)?;
+        // Way 101's node 13 is beyond the extract's edge.
+        kvstore::delete_node(&kv, 13)?;
+
+        let osc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6" generator="test">
+  <modify>
+    <relation id="200" version="2">
+      <member type="way" ref="100" role="outer"/>
+      <member type="way" ref="101" role="outer"/>
+      <tag k="type" v="multipolygon"/>
+      <tag k="building" v="yes"/>
+    </relation>
+  </modify>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 200 AND osm_type = 'relation'"
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    /// What the warning names: every unresolvable way, each missing node once
+    /// in ref order, and a way absent from the store entirely. Resolvable
+    /// ways are left out.
+    #[test]
+    fn unresolved_way_members_names_each_way_and_its_missing_nodes() -> Result<()> {
+        let (_conn, kv, _dir) = setup_test_db_and_kv()?;
+        kvstore::put_way(&kv, 700, &[1, 999, 2, 998, 999, 1])?;
+
+        let unresolved = unresolved_way_members(&kv, &[100, 700, 12345])?;
+        assert_eq!(
+            unresolved,
+            vec![
+                UnresolvedWay {
+                    way_id: 700,
+                    missing_nodes: Some(vec![999, 998]),
+                },
+                UnresolvedWay {
+                    way_id: 12345,
+                    missing_nodes: None,
+                },
+            ]
+        );
+        assert_eq!(
+            describe_unresolved(&unresolved),
+            "way/700 is missing node/999, node/998; way/12345 is not in the store (outside the extract?)"
+        );
+        Ok(())
+    }
+
+    /// Several sequences in one batch are applied in order, so a later
+    /// sequence's edit of an object wins over an earlier one's, and the
+    /// stamp is the last sequence.
+    #[test]
+    fn a_batch_applies_its_sequences_in_order() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let way = |version, tags: Vec<(&str, &str)>| OsmChange {
+            ways: vec![WayChange {
+                action: ChangeAction::Modify,
+                version,
+                id: 100,
+                node_refs: vec![1, 2, 3, 4, 1],
+                tags: tags
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }],
+            ..Default::default()
+        };
+        apply_batch(
+            &conn,
+            &kv,
+            &[
+                FetchedSequence {
+                    seq: 1001,
+                    changes: way(2, vec![("building", "yes")]),
+                },
+                FetchedSequence {
+                    seq: 1002,
+                    changes: way(3, vec![("building", "house"), ("addr:housenumber", "3")]),
+                },
+            ],
+            "2026-09-18T00:00:00Z",
+        )?;
+
+        assert_eq!(
+            stored_building_and_address(&conn, 100, "way")?,
+            (Some("house".into()), (Some("3".into()), None, None, None))
+        );
+        assert_eq!(get_current_sequence(&conn)?, 1002);
+        Ok(())
+    }
+
+    /// The batch is collapsed as a whole, not sequence by sequence. An address
+    /// served in cell A moves to B in one sequence and on to C in the next.
+    /// B was never committed, so nothing was ever served there, and only A
+    /// (what it left) and C (where it ended) need recomputing. A per-sequence
+    /// apply would also enqueue B. That is harmless extra work, but seeing B
+    /// here means the batch collapse is no longer in effect.
+    #[test]
+    fn a_batch_collapses_positions_that_were_never_committed() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let a = z14_cell(21.0, 51.0);
+        let b = (a.0 + 5, a.1);
+        let c = (a.0 + 10, a.1);
+        let node_at = |version, cell: (i32, i32)| {
+            let (lon, lat) = z14_cell_midpoint(cell.0, cell.1);
+            OsmChange {
+                nodes: vec![NodeChange {
+                    action: ChangeAction::Modify,
+                    version,
+                    id: 44,
+                    lon,
+                    lat,
+                    tags: vec![("addr:housenumber".into(), "5".into())],
+                }],
+                ..Default::default()
+            }
+        };
+        apply_changes(&conn, &kv, &node_at(1, a))?;
+        conn.execute_batch("DELETE FROM match_dirty_cells")?;
+
+        apply_batch(
+            &conn,
+            &kv,
+            &[
+                FetchedSequence {
+                    seq: 1001,
+                    changes: node_at(2, b),
+                },
+                FetchedSequence {
+                    seq: 1002,
+                    changes: node_at(3, c),
+                },
+            ],
+            "2026-09-18T00:00:00Z",
+        )?;
+
+        assert_eq!(queued_in_cell(&conn, "prg", a)?, 1, "the cell it left");
+        assert_eq!(queued_in_cell(&conn, "prg", c)?, 1, "the cell it ended in");
+        assert_eq!(
+            queued_in_cell(&conn, "prg", b)?,
+            0,
+            "an intermediate position inside one batch was never served"
+        );
+        let x: f64 = conn.query_row(
+            "SELECT ST_X(geom) FROM osm_addresses WHERE osm_id = 44",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!((x - z14_cell_midpoint(c.0, c.1).0).abs() < 1e-9);
+        Ok(())
+    }
+
+    // --- Type x step coverage gaps ---
+
+    /// Relation 200 = way 100 as `outer`, served as a building with an
+    /// address, reverse index in place.
+    fn seed_served_relation(conn: &Connection, kv: &RocksDB) -> Result<()> {
+        kvstore::put_relation(
+            kv,
+            200,
+            &[(
+                100,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(kv, 100, 200)?;
+        conn.execute_batch(
+            "INSERT INTO osm_buildings
+                 SELECT 200, 'relation', 'yes', geom FROM osm_buildings WHERE osm_id = 100;
+             INSERT INTO osm_addresses VALUES
+                 (200, 'relation', '7', 'Lipowa', NULL, NULL, ST_Point(20.0005, 50.0005));",
+        )?;
+        Ok(())
+    }
+
+    /// Deleting an address node must enqueue the cell it left, so the PRG
+    /// address it matched comes back. `test_apply_node_delete` only checks
+    /// that the row is gone.
+    #[test]
+    fn a_deleted_address_node_enqueues_the_cell_it_left() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let cell = z14_cell(21.0, 51.0);
+        let (lon, lat) = z14_cell_midpoint(cell.0, cell.1);
+        let node = |action, version| OsmChange {
+            nodes: vec![NodeChange {
+                action,
+                version,
+                id: 45,
+                lon,
+                lat,
+                tags: vec![("addr:housenumber".into(), "5".into())],
+            }],
+            ..Default::default()
+        };
+        apply_changes(&conn, &kv, &node(ChangeAction::Create, 1))?;
+        conn.execute_batch("DELETE FROM match_dirty_cells")?;
+
+        apply_changes(&conn, &kv, &node(ChangeAction::Delete, 2))?;
+
+        assert_eq!(queued_in_cell(&conn, "prg", cell)?, 1);
+        Ok(())
+    }
+
+    /// Deleting an addressed building way removes the address row too, and
+    /// enqueues the address source as well as the building ones.
+    #[test]
+    fn a_deleted_addressed_way_removes_its_address_and_enqueues_prg() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        conn.execute_batch(
+            "INSERT INTO osm_addresses VALUES
+                 (100, 'way', '11', 'Lipowa', NULL, NULL, ST_Point(20.0005, 50.0005));",
+        )?;
+        let osc =
+            r#"<osmChange version="0.6"><delete><way id="100" version="2"/></delete></osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_addresses WHERE osm_id = 100"
+            )?,
+            0
+        );
+        assert!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'prg'"
+            )? > 0
+        );
+        Ok(())
+    }
+
+    /// The reverse of the demolished retag: `demolished:building` back to a
+    /// live `building`. The former row must go, or it keeps suppressing the
+    /// government building while OSM also counts as covering it.
+    #[test]
+    fn a_way_retagged_from_demolished_back_to_building_swaps_rows() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let way = |version, tag: (&str, &str)| OsmChange {
+            ways: vec![WayChange {
+                action: ChangeAction::Modify,
+                version,
+                id: 100,
+                node_refs: vec![1, 2, 3, 4, 1],
+                tags: vec![(tag.0.into(), tag.1.into())],
+            }],
+            ..Default::default()
+        };
+        apply_changes(&conn, &kv, &way(2, ("demolished:building", "yes")))?;
+        conn.execute_batch("DELETE FROM match_dirty_cells")?;
+
+        apply_changes(&conn, &kv, &way(3, ("building", "house")))?;
+
+        assert_eq!(
+            stored_building_and_address(&conn, 100, "way")?.0,
+            Some("house".into())
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_former_buildings WHERE osm_id = 100"
+            )?,
+            0
+        );
+        assert!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM match_dirty_cells WHERE source = 'bdot10k'"
+            )? > 0
+        );
+        Ok(())
+    }
+
+    /// Relation delete had no test at all: rows in every table, the stored
+    /// members, the way -> relation reverse index, and the cells it left.
+    #[test]
+    fn a_relation_delete_removes_its_rows_reverse_index_and_enqueues() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        seed_served_relation(&conn, &kv)?;
+        let osc = r#"<osmChange version="0.6"><delete><relation id="200" version="2"/></delete></osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert!(kvstore::get_relation(&kv, 200)?.is_none());
+        assert!(!kvstore::get_way_to_relations(&kv, 100)?.contains(&200));
+        for table in ["osm_buildings", "osm_addresses", "osm_former_buildings"] {
+            assert_eq!(
+                count(
+                    &conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE osm_id = 200 AND osm_type = 'relation'"
+                    )
+                )?,
+                0,
+                "{table} kept a row for the deleted relation"
+            );
+        }
+        for source in ["bdot10k", "egib", "prg"] {
+            assert!(
+                count(
+                    &conn,
+                    &format!("SELECT COUNT(*) FROM match_dirty_cells WHERE source = '{source}'")
+                )? > 0,
+                "the relation's cell must be enqueued for {source}"
+            );
+        }
+        // The member way itself is untouched.
+        assert_eq!(
+            stored_building_and_address(&conn, 100, "way")?.0,
+            Some("yes".into())
+        );
+        Ok(())
+    }
+
+    /// Relation create and delete in one diff: nothing survives, including the
+    /// reverse index entry the create added.
+    #[test]
+    fn a_relation_created_and_deleted_in_one_diff_leaves_nothing_behind() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<osmChange version="0.6">
+  <create>
+    <relation id="210" version="1">
+      <member type="way" ref="100" role="outer"/>
+      <tag k="type" v="multipolygon"/>
+      <tag k="building" v="yes"/>
+    </relation>
+  </create>
+  <delete>
+    <relation id="210" version="2"/>
+  </delete>
+</osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert!(kvstore::get_relation(&kv, 210)?.is_none());
+        assert!(!kvstore::get_way_to_relations(&kv, 100)?.contains(&210));
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 210"
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    /// The relation arm of the live -> demolished retag.
+    #[test]
+    fn a_relation_retagged_demolished_swaps_rows() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        seed_served_relation(&conn, &kv)?;
+        let osc = r#"<osmChange version="0.6"><modify>
+    <relation id="200" version="2">
+      <member type="way" ref="100" role="outer"/>
+      <tag k="type" v="multipolygon"/>
+      <tag k="demolished:building" v="yes"/>
+    </relation>
+</modify></osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 200 AND osm_type = 'relation'"
+            )?,
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_former_buildings WHERE osm_id = 200 AND osm_type = 'relation'"
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    /// Every other relation test is a single outer ring. An `inner` member
+    /// must be cut out of the footprint, or a courtyard building covers (and
+    /// matches) the government objects standing in its courtyard.
+    #[test]
+    fn a_relation_with_an_inner_ring_is_built_with_a_hole() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        // Eighths-of-a-thousandth coordinates, exact enough that the areas
+        // compare cleanly.
+        let osc = r#"<osmChange version="0.6"><create>
+    <node id="60" version="1" lon="20.00025" lat="50.00025"/>
+    <node id="61" version="1" lon="20.00075" lat="50.00025"/>
+    <node id="62" version="1" lon="20.00075" lat="50.00075"/>
+    <node id="63" version="1" lon="20.00025" lat="50.00075"/>
+    <way id="102" version="1">
+      <nd ref="60"/><nd ref="61"/><nd ref="62"/><nd ref="63"/><nd ref="60"/>
+    </way>
+    <relation id="220" version="1">
+      <member type="way" ref="100" role="outer"/>
+      <member type="way" ref="102" role="inner"/>
+      <tag k="type" v="multipolygon"/>
+      <tag k="building" v="yes"/>
+    </relation>
+</create></osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        let (area, courtyard_covered): (f64, bool) = conn.query_row(
+            "SELECT ST_Area(geom), ST_Contains(geom, ST_Point(20.0005, 50.0005))
+             FROM osm_buildings WHERE osm_id = 220 AND osm_type = 'relation'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert!(!courtyard_covered, "the courtyard must be a hole");
+        assert!(
+            (area - (1e-6 - 2.5e-7)).abs() < 1e-11,
+            "area must be outer minus inner, got {area}"
+        );
+        Ok(())
+    }
+
+    /// The relation arm of the inferred former-building rebuild (the way arm
+    /// is `test_apply_node_move_on_former_building_way_keeps_row_with_moved_geometry`).
+    #[test]
+    fn a_node_move_under_a_former_building_relation_keeps_its_row() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        kvstore::put_relation(
+            &kv,
+            230,
+            &[(
+                100,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(&kv, 100, 230)?;
+        conn.execute_batch(
+            "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+             SELECT 230, 'relation', 'ruins:building', 'yes', geom FROM osm_buildings WHERE osm_id = 100;",
+        )?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: vec![NodeChange {
+                    action: ChangeAction::Modify,
+                    version: 2,
+                    id: 1,
+                    lon: 19.999,
+                    lat: 50.0,
+                    tags: vec![],
+                }],
+                ..Default::default()
+            },
+        )?;
+
+        let (key, x_min): (String, f64) = conn.query_row(
+            "SELECT lifecycle_key, ST_XMin(geom) FROM osm_former_buildings
+             WHERE osm_id = 230 AND osm_type = 'relation'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(key, "ruins:building");
+        assert!(x_min < 20.0, "geometry must reflect the moved node");
+        Ok(())
+    }
+
+    /// A building-tagged relation with no way members (only a node and a
+    /// sub-relation; nested relations are not resolved) has no footprint to
+    /// build. That is a skip, not an error failing the batch.
+    #[test]
+    fn a_building_relation_without_way_members_is_skipped_without_error() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let osc = r#"<osmChange version="0.6"><create>
+    <relation id="240" version="1">
+      <member type="node" ref="1" role=""/>
+      <member type="relation" ref="200" role="outer"/>
+      <tag k="type" v="multipolygon"/>
+      <tag k="building" v="yes"/>
+    </relation>
+</create></osmChange>"#;
+        apply_changes(&conn, &kv, &parse_osc(osc)?)?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 240"
+            )?,
+            0
+        );
         Ok(())
     }
 
@@ -2996,6 +4465,7 @@ mod tests {
         let seq0 = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: 950,
                 lon: 25.0,
                 lat: 55.0,
@@ -3006,6 +4476,7 @@ mod tests {
         let seq1 = OsmChange {
             ways: vec![WayChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: 960,
                 node_refs: vec![1, 2, 3, 4, 1],
                 tags: vec![("building".into(), "yes".into())],
@@ -3015,6 +4486,7 @@ mod tests {
         let seq2 = OsmChange {
             nodes: vec![NodeChange {
                 action: ChangeAction::Modify,
+                version: 1,
                 id: 2,
                 lon: 20.0015,
                 lat: 50.0002,
@@ -3263,6 +4735,7 @@ mod tests {
         let nodes = vec![
             NodeChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: n(1),
                 lon: lon0,
                 lat: lat0,
@@ -3270,6 +4743,7 @@ mod tests {
             },
             NodeChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: n(2),
                 lon: lon0 + d,
                 lat: lat0,
@@ -3277,6 +4751,7 @@ mod tests {
             },
             NodeChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: n(3),
                 lon: lon0 + d,
                 lat: lat0 + d,
@@ -3284,6 +4759,7 @@ mod tests {
             },
             NodeChange {
                 action: ChangeAction::Create,
+                version: 1,
                 id: n(4),
                 lon: lon0,
                 lat: lat0 + d,
@@ -3292,6 +4768,7 @@ mod tests {
         ];
         let way = WayChange {
             action: ChangeAction::Create,
+            version: 1,
             id: n(5),
             node_refs: vec![n(1), n(2), n(3), n(4), n(1)],
             tags: vec![("building".into(), "yes".into())],
