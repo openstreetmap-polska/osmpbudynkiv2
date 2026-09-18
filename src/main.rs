@@ -3,6 +3,7 @@ mod compare;
 mod config;
 mod dataset;
 mod db;
+mod db_memory;
 mod download;
 mod import;
 mod job_log;

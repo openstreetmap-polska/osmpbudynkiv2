@@ -615,6 +615,13 @@ mod tests {
         assert_eq!(jobs[0]["state"], "idle");
         assert_eq!(jobs[0]["run_count"], 7);
         assert_eq!(jobs[0]["last_outcome"]["kind"], "Success");
+        let mem = &v["duckdb_memory"];
+        assert!(
+            mem["memory_limit"].is_string(),
+            "duckdb_memory missing: {v}"
+        );
+        assert!(mem["memory_usage_bytes"].is_i64());
+        assert!(mem["by_tag"].is_array());
     }
 
     /// The static frontend is mounted as a `fallback_service`, so it must

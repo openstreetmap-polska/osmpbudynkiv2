@@ -199,6 +199,22 @@ fn report_counts_or_default(state: &AppState) -> crate::reports::ReportCounts {
     }
 }
 
+/// Same swallow-into-`None` contract as every other `/status` sub-read.
+fn duckdb_memory_or_default(state: &AppState) -> Option<crate::db_memory::DuckDbMemory> {
+    let outcome = state
+        .pool
+        .get()
+        .map_err(anyhow::Error::from)
+        .and_then(|conn| crate::db_memory::read(&conn));
+    match outcome {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read duckdb_memory() for /status");
+            None
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub jobs: Vec<JobStatus>,
@@ -237,6 +253,11 @@ pub struct StatusResponse {
     /// vetoing objects out of the serving tables; a growing `expired` count is
     /// the registries fixing records people complained about.
     pub reports: crate::reports::ReportCounts,
+    /// DuckDB's buffer-pool usage by tag (`duckdb_memory()`), against its
+    /// `memory_limit`. The one view of DuckDB's memory this process has: the
+    /// heap profiles cannot see DuckDB's allocator, and nothing outside can
+    /// open the database. See `db_memory`. `null` if the read failed.
+    pub duckdb_memory: Option<crate::db_memory::DuckDbMemory>,
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
@@ -250,7 +271,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let tile_store_bytes = state.tile_store.live_bytes();
     // Atomic reads, same as the counters above -- no `spawn_blocking` needed.
     let rocksdb = state.kv.as_ref().map(|kv| kv.stats());
-    let (match_staleness, job_run_log, osm_replication, reports, tile_dirty_cells) =
+    let (match_staleness, job_run_log, osm_replication, reports, tile_dirty_cells, duckdb_memory) =
         tokio::task::spawn_blocking(move || {
             (
                 match_staleness_or_default(&state),
@@ -258,6 +279,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
                 osm_replication_state_or_default(&state),
                 report_counts_or_default(&state),
                 tile_dirty_cells_or_default(&state),
+                duckdb_memory_or_default(&state),
             )
         })
         .await
@@ -277,6 +299,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         tile_dirty_cells,
         rocksdb,
         reports,
+        duckdb_memory,
     })
 }
 

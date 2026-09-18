@@ -65,7 +65,17 @@ impl Job for DatasetUpdateJob {
             .pool
             .get()
             .context("failed to acquire pool connection")?;
-        crate::update::run(
+        // DuckDB's per-tag memory on both sides of the refresh, read under
+        // the lock so no other refresh can skew it. A day's pair of lines is
+        // the time series `db_memory` exists for: a baseline creeping up from
+        // one day to the next shows the retention, and the tag shows where
+        // it is. Taken after a failure too, which is when it matters most.
+        tracing::info!(
+            job = self.name,
+            duckdb_memory = %crate::db_memory::summary_or_note(&conn),
+            "DuckDB memory before refresh"
+        );
+        let result = crate::update::run(
             &conn,
             &ctx.kv,
             self.source(),
@@ -73,7 +83,14 @@ impl Job for DatasetUpdateJob {
             &ctx.config.download_urls,
             false,
             &|| ctx.is_cancelled(),
-        )
+        );
+        tracing::info!(
+            job = self.name,
+            ok = result.is_ok(),
+            duckdb_memory = %crate::db_memory::summary_or_note(&conn),
+            "DuckDB memory after refresh"
+        );
+        result
     }
 
     /// One key, matching what `update::dataset::refresh` (via
