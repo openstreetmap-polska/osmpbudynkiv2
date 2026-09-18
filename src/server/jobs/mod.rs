@@ -402,8 +402,18 @@ pub(crate) async fn supervise(
 
         let outcome = match tokio::time::timeout(cfg.timeout, &mut handle).await {
             Ok(Ok(Ok(()))) => JobOutcome::Success,
-            Ok(Ok(Err(e))) => JobOutcome::Error(format!("{e:#}")),
-            Ok(Err(join_err)) => JobOutcome::Error(format!("task panicked: {join_err}")),
+            // Logged here as well as recorded in the registry. Before this, a
+            // failed run reached only `/status`. Three days of failed dataset
+            // refreshes (2026-09-15..17) left no WARN or ERROR in the journal.
+            Ok(Ok(Err(e))) => {
+                let message = format!("{e:#}");
+                tracing::error!(job = name, error = %message, "job failed");
+                JobOutcome::Error(message)
+            }
+            Ok(Err(join_err)) => {
+                tracing::error!(job = name, error = %join_err, "job panicked");
+                JobOutcome::Error(format!("task panicked: {join_err}"))
+            }
             Err(_elapsed) => {
                 cancel.store(true, Ordering::SeqCst);
                 warn!(
@@ -418,7 +428,7 @@ pub(crate) async fn supervise(
                         tracing::info!(job = name, "job completed AFTER timeout was recorded");
                     }
                     Ok(Err(e)) => {
-                        tracing::info!(job = name, error = %e, "job errored after timeout");
+                        tracing::error!(job = name, error = %format!("{e:#}"), "job failed after timeout");
                     }
                     Err(e) => {
                         tracing::error!(job = name, error = %e, "job panicked after timeout");
