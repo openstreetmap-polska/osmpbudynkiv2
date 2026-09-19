@@ -105,7 +105,9 @@ binary, easy to deploy.
   the same step `import osm` ends with (requires exclusive access). For a store
   imported before that step existed; changes no data
 - `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package`,
-  `/updates`, `POST /report`) plus background update, drain, tile-refresh and
+  `/updates`, `POST /report`, `/josm_plugins/v2/nearest_building` — a
+  compatibility endpoint for josm-plbuildings-server, shape pinned in
+  `server::josm_plugins`) plus background update, drain, tile-refresh and
   reconcile jobs
 
 **Storage:** DuckDB for geospatial queries and processed data; RocksDB for raw

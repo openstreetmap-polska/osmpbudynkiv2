@@ -1,5 +1,6 @@
 mod http_cache;
 pub mod jobs;
+mod josm_plugins;
 mod package;
 mod reports;
 mod tile_cache;
@@ -439,6 +440,10 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::get(package::get_package).post(package::post_package),
         )
         .route("/updates", axum::routing::get(updates::get_updates))
+        .route(
+            "/josm_plugins/v2/nearest_building",
+            axum::routing::get(josm_plugins::get_nearest_building),
+        )
         // The one endpoint an anonymous client can write through. It sets no
         // Cache-Control of its own, so the outermost `if_not_present` layer
         // below stamps it `no-store` -- which is what we want: a cached report

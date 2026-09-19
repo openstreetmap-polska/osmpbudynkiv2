@@ -33,7 +33,7 @@ pub enum Dataset {
 pub const ALL_DATASETS: [Dataset; 3] = [Dataset::Prg, Dataset::Bdot10k, Dataset::Egib];
 
 impl Dataset {
-    fn sql_name(self) -> &'static str {
+    pub(super) fn sql_name(self) -> &'static str {
         match self {
             Dataset::Prg => "prg",
             Dataset::Bdot10k => "bdot10k",
@@ -355,7 +355,7 @@ pub fn building_tags(resolved: Option<&str>, source: &str) -> BTreeMap<String, S
 /// and a missing value are both treated as nothing to report, the same as a
 /// `None` resolved tags string falling back to `building=yes` rather than
 /// asserting something the source didn't actually state.
-fn with_building_levels(
+pub(super) fn with_building_levels(
     mut tags: BTreeMap<String, String>,
     levels: Option<i32>,
 ) -> BTreeMap<String, String> {
@@ -496,9 +496,8 @@ pub fn unmatched_egib_buildings(
         x2 + ADJACENCY_READ_BUFFER_DEG,
         y2 + ADJACENCY_READ_BUFFER_DEG,
     );
-    let sql = format!(
-        "WITH pkg AS (
-             SELECT b.rowid AS rid, b.geom,
+    let pkg = format!(
+        "SELECT b.rowid AS rid, b.geom,
                     ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
                     b.rodzaj_kod, b.kondygnacje_nadziemne
              FROM egib_unmatched b
@@ -511,7 +510,43 @@ pub fn unmatched_egib_buildings(
              -- ST_MakeValid: see the comment in unmatched_addresses above --
              -- the request polygon may be a self-intersecting user-drawn ring.
              WHERE ST_Intersects(b.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-               AND ST_Intersects(b.geom, ST_MakeValid(ST_GeomFromGeoJSON(?)))
+               AND ST_Intersects(b.geom, ST_MakeValid(ST_GeomFromGeoJSON(?)))"
+    );
+    let sql = egib_building_tags_sql(&pkg, (nx1, ny1, nx2, ny2));
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare package egib building query")?;
+    let rows = stmt
+        .query_map([area.polygon_geojson.as_str()], |row| {
+            Ok(UnmatchedBuildingRow {
+                geometry_geojson: row.get(0)?,
+                tags: row.get(1)?,
+                levels: row.get(2)?,
+            })
+        })
+        .context("Failed to run package egib building query")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("Failed to read package egib building row")?);
+    }
+    Ok(out)
+}
+
+/// The EGIB half of the building-type resolution, shared by `/package`
+/// (`unmatched_egib_buildings`) and the JOSM plugin endpoint
+/// (`server::josm_plugins`), so the two can never tag the same building
+/// differently. `pkg_sql` is the body of the `pkg` CTE and must project
+/// `rid, geom, cx, cy, rodzaj_kod, kondygnacje_nadziemne` -- `cx`/`cy` being
+/// the building's centroid, compared against `egib_buildings.centroid` to
+/// exclude the building from its own neighbour count. `nb_envelope` is
+/// `(xmin, ymin, xmax, ymax)` of the adjacency read, already buffered by
+/// `ADJACENCY_READ_BUFFER_DEG`; formatted into the SQL text so the read stays
+/// an RTREE scan. Output columns: GeoJSON geometry, resolved tags, storeys.
+pub(crate) fn egib_building_tags_sql(pkg_sql: &str, nb_envelope: (f64, f64, f64, f64)) -> String {
+    let (nx1, ny1, nx2, ny2) = nb_envelope;
+    format!(
+        "WITH pkg AS (
+             {pkg_sql}
          ), nb AS (
              SELECT geom, ST_X(centroid) AS cx, ST_Y(centroid) AS cy
              FROM egib_buildings
@@ -539,24 +574,53 @@ pub fn unmatched_egib_buildings(
                     + (m.max_neighbours IS NOT NULL)::INT DESC
              LIMIT 1
          ) t ON TRUE"
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .context("Failed to prepare package egib building query")?;
-    let rows = stmt
-        .query_map([area.polygon_geojson.as_str()], |row| {
-            Ok(UnmatchedBuildingRow {
-                geometry_geojson: row.get(0)?,
-                tags: row.get(1)?,
-                levels: row.get(2)?,
-            })
-        })
-        .context("Failed to run package egib building query")?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.context("Failed to read package egib building row")?);
-    }
-    Ok(out)
+    )
+}
+
+/// The BDOT10k half of the building-type resolution, shared by `/package`
+/// (`unmatched_bdot10k_buildings`) and the JOSM plugin endpoint
+/// (`server::josm_plugins`). Same contract as `egib_building_tags_sql`, with
+/// `pkg_sql` projecting `rid, geom, cx, cy, funkcja_szczegolowa,
+/// funkcja_ogolna, liczba_kondygnacji` (the serving table's names -- a caller
+/// reading the raw `bdot10k_buildings` aliases them).
+pub(crate) fn bdot10k_building_tags_sql(
+    pkg_sql: &str,
+    nb_envelope: (f64, f64, f64, f64),
+) -> String {
+    let (nx1, ny1, nx2, ny2) = nb_envelope;
+    format!(
+        "WITH pkg AS (
+             {pkg_sql}
+         ), nb AS (
+             SELECT geom, ST_X(centroid) AS cx, ST_Y(centroid) AS cy
+             FROM bdot10k_buildings
+             WHERE ST_Intersects(geom, ST_MakeEnvelope({nx1}, {ny1}, {nx2}, {ny2}))
+               AND lower(trim(PRZEWAZAJACAFUNKCJABUDYNKU)) = '{BDOT10K_ADJACENCY_KEY}'
+         ), cnt AS (
+             SELECT p.rid, count(*) AS neighbours
+             FROM pkg p JOIN nb
+               ON (p.cx <> nb.cx OR p.cy <> nb.cy)
+              AND ST_Intersects(p.geom, nb.geom)
+             GROUP BY p.rid
+         )
+         SELECT ST_AsGeoJSON(pkg.geom), t.tags, pkg.liczba_kondygnacji
+         FROM pkg
+         LEFT JOIN cnt USING (rid)
+         LEFT JOIN LATERAL (
+             SELECT m.tags
+             FROM bdot10k_building_types m
+             WHERE ((m.tier = 1 AND m.key = lower(trim(pkg.funkcja_szczegolowa)))
+                 OR (m.tier = 2 AND m.key = lower(trim(pkg.funkcja_ogolna))))
+               AND (m.min_levels IS NULL OR pkg.liczba_kondygnacji >= m.min_levels)
+               AND (m.max_levels IS NULL OR pkg.liczba_kondygnacji <= m.max_levels)
+               AND (m.max_neighbours IS NULL OR coalesce(cnt.neighbours, 0) <= m.max_neighbours)
+             ORDER BY m.tier ASC,
+                      (m.min_levels IS NOT NULL)::INT
+                    + (m.max_levels IS NOT NULL)::INT
+                    + (m.max_neighbours IS NOT NULL)::INT DESC
+             LIMIT 1
+         ) t ON TRUE"
+    )
 }
 
 /// Buffer around the request bbox used to read `nb` adjacency candidates, so
@@ -598,9 +662,8 @@ pub fn unmatched_bdot10k_buildings(
         x2 + ADJACENCY_READ_BUFFER_DEG,
         y2 + ADJACENCY_READ_BUFFER_DEG,
     );
-    let sql = format!(
-        "WITH pkg AS (
-             SELECT b.rowid AS rid, b.geom,
+    let pkg = format!(
+        "SELECT b.rowid AS rid, b.geom,
                     ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
                     b.funkcja_szczegolowa, b.funkcja_ogolna, b.liczba_kondygnacji
              FROM bdot10k_unmatched b
@@ -611,37 +674,9 @@ pub fn unmatched_bdot10k_buildings(
              -- ST_MakeValid: see the comment in unmatched_addresses above --
              -- the request polygon may be a self-intersecting user-drawn ring.
              WHERE ST_Intersects(b.geom, ST_MakeEnvelope({x1}, {y1}, {x2}, {y2}))
-               AND ST_Intersects(b.geom, ST_MakeValid(ST_GeomFromGeoJSON(?)))
-         ), nb AS (
-             SELECT geom, ST_X(centroid) AS cx, ST_Y(centroid) AS cy
-             FROM bdot10k_buildings
-             WHERE ST_Intersects(geom, ST_MakeEnvelope({nx1}, {ny1}, {nx2}, {ny2}))
-               AND lower(trim(PRZEWAZAJACAFUNKCJABUDYNKU)) = '{BDOT10K_ADJACENCY_KEY}'
-         ), cnt AS (
-             SELECT p.rid, count(*) AS neighbours
-             FROM pkg p JOIN nb
-               ON (p.cx <> nb.cx OR p.cy <> nb.cy)
-              AND ST_Intersects(p.geom, nb.geom)
-             GROUP BY p.rid
-         )
-         SELECT ST_AsGeoJSON(pkg.geom), t.tags, pkg.liczba_kondygnacji
-         FROM pkg
-         LEFT JOIN cnt USING (rid)
-         LEFT JOIN LATERAL (
-             SELECT m.tags
-             FROM bdot10k_building_types m
-             WHERE ((m.tier = 1 AND m.key = lower(trim(pkg.funkcja_szczegolowa)))
-                 OR (m.tier = 2 AND m.key = lower(trim(pkg.funkcja_ogolna))))
-               AND (m.min_levels IS NULL OR pkg.liczba_kondygnacji >= m.min_levels)
-               AND (m.max_levels IS NULL OR pkg.liczba_kondygnacji <= m.max_levels)
-               AND (m.max_neighbours IS NULL OR coalesce(cnt.neighbours, 0) <= m.max_neighbours)
-             ORDER BY m.tier ASC,
-                      (m.min_levels IS NOT NULL)::INT
-                    + (m.max_levels IS NOT NULL)::INT
-                    + (m.max_neighbours IS NOT NULL)::INT DESC
-             LIMIT 1
-         ) t ON TRUE"
+               AND ST_Intersects(b.geom, ST_MakeValid(ST_GeomFromGeoJSON(?)))"
     );
+    let sql = bdot10k_building_tags_sql(&pkg, (nx1, ny1, nx2, ny2));
     let mut stmt = conn
         .prepare(&sql)
         .context("Failed to prepare package bdot10k building query")?;
@@ -871,7 +906,13 @@ fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> 
         }
     }
     drop(conn);
-    log_export(state, area, datasets, address_count, building_count);
+    log_export(
+        state,
+        &area.polygon_geojson,
+        datasets,
+        address_count,
+        building_count,
+    );
     let collection = FeatureCollection {
         kind: "FeatureCollection",
         features,
@@ -886,9 +927,9 @@ fn build_package(state: &AppState, area: &RequestArea, datasets: &[Dataset]) -> 
 /// every other query -- see docs/duckdb_connection_visibility_investigation.md
 /// for why a single shared pool (rather than a separate read-only pool) makes
 /// this write immediately visible to `/updates`.
-fn log_export(
+pub(super) fn log_export(
     state: &AppState,
-    area: &RequestArea,
+    area_geojson: &str,
     datasets: &[Dataset],
     address_count: i32,
     building_count: i32,
@@ -917,13 +958,13 @@ fn log_export(
     );
     if let Err(e) = conn.execute(
         &sql,
-        duckdb::params![area.polygon_geojson, address_count, building_count],
+        duckdb::params![area_geojson, address_count, building_count],
     ) {
         tracing::warn!(error = %e, "failed to log package export");
     }
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
+pub(super) fn error_response(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({ "error": message }).to_string();
     (
         status,
@@ -2130,7 +2171,7 @@ mod tests {
         // Hold the pool's only connection so log_export's own pool.get() call
         // has nothing available and times out.
         let held = pool.get().unwrap();
-        log_export(&state, &test_area(), &ALL_DATASETS, 1, 2);
+        log_export(&state, &test_area().polygon_geojson, &ALL_DATASETS, 1, 2);
         drop(held);
 
         let conn = pool.get().unwrap();
