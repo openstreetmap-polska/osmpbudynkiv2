@@ -20,9 +20,16 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const rootStyle = getComputedStyle(document.documentElement);
   const buildingContextColor = rootStyle.getPropertyValue("--building-all").trim();
   const buildingAccentColor = rootStyle.getPropertyValue("--building-unmatched").trim();
+  const buildingUnmatchedOutlineColor = rootStyle
+    .getPropertyValue("--building-unmatched-outline")
+    .trim();
   const buildingAllOutlineColor = rootStyle.getPropertyValue("--building-outline-all").trim();
   const addressAllColor = rootStyle.getPropertyValue("--address-all").trim();
+  const addressAllOutlineColor = rootStyle.getPropertyValue("--address-all-outline").trim();
   const addressUnmatchedColor = rootStyle.getPropertyValue("--address-unmatched").trim();
+  const addressUnmatchedOutlineColor = rootStyle
+    .getPropertyValue("--address-unmatched-outline")
+    .trim();
   const paperRaisedColor = rootStyle.getPropertyValue("--paper-raised").trim();
   const inkColor = rootStyle.getPropertyValue("--ink").trim();
   // Sequential ramp for the z5-11 aggregate grid (low -> high density), used
@@ -312,7 +319,10 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       minzoom: 14,
       filter: sourceFilter(DEFAULT_BUILDING_SOURCE),
       layout: { visibility: "none" },
-      paint: { "line-color": buildingAccentColor, "line-width": 1.4 },
+      paint: {
+        "line-color": buildingUnmatchedOutlineColor,
+        "line-width": ["interpolate", ["linear"], ["zoom"], 14, 0.6, 18, 1.4],
+      },
     },
   ];
 
@@ -611,6 +621,10 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           paint: {
             "circle-color": addressAllColor,
             "circle-radius": ["interpolate", ["linear"], ["zoom"], 14, 2, 18, 4.5],
+            // The outline, not the fill, is what separates a pale dot from the
+            // grey buildings-all fill under it -- see --address-all in style.css.
+            "circle-stroke-color": addressAllOutlineColor,
+            "circle-stroke-width": 0.8,
           },
         },
         {
@@ -623,7 +637,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           paint: {
             "circle-color": addressUnmatchedColor,
             "circle-radius": ["interpolate", ["linear"], ["zoom"], 14, 3, 18, 7],
-            "circle-stroke-color": "#fffdf8",
+            "circle-stroke-color": addressUnmatchedOutlineColor,
             "circle-stroke-width": 1.2,
           },
         },

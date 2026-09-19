@@ -7,12 +7,47 @@
   --line-strong: #b7ae94;
   --building-all: #5b6570;
   --building-unmatched: #c81e1e;
+  /* buildings-unmatched-outline. A darker shade of the fill rather than a new
+     hue, because its job is edges: it used to be --building-unmatched itself,
+     which measured dE 4.7-8.9 against its own 0.9-opacity fill, so a row of
+     unmatched garages sharing walls rendered as one red strip. This one
+     measures >= 18.3 under every CVD simulation (Machado 2009, OKLab), and
+     >= 32.9 against --building-outline-all.
+     A pale outline (#fffdf8) was tried in-browser and rejected despite a
+     stronger edge (dE >= 40). At z15 a 0.8px pale line eats most of a
+     3-4px garage, so rows turned into pink stripes, and under protan/deutan
+     simulation they all but vanished into the basemap's land colour.
+     Yellow, --updates orange and --draw-outline teal were rejected on
+     measurement: each either adds a hue or drops under 10 for one CVD type. */
+  --building-unmatched-outline: #7f1d1d;
   /* buildings-all-outline only. Not redefined for dark mode -- like the
      ratio ramp above, this paints onto the OSM raster basemap, which is
      always light, so a literal black reads the same in both UI themes. */
   --building-outline-all: #000000;
-  --address-all: #6f5a9e;
-  --address-unmatched: #1a56db;
+  /* Address layers. The rule is "neutral = every address, saturated =
+     unmatched", with lightness and an outline carrying the difference, never
+     hue alone. This replaced a purple (#6f5a9e) all / blue (#1a56db)
+     unmatched pair that users with colour-vision deficiency reported they
+     could not tell apart. Those two hues differ mostly in how much red they
+     carry, which is exactly the channel protan/deutan vision loses. Measured
+     (OKLab dE, Machado 2009 at severity 1.0, target >= 8): the old pair was
+     10.2 protan / 11.5 deutan / 9.0 tritan. Its dark-mode variants, painted
+     over the always-light basemap, measured 6.7 deutan. The new pair measures
+     33.2 / 36.2 / 31.3, and red unmatched buildings vs blue unmatched
+     addresses stays >= 20.9 under every simulation.
+     A light fill alone would dissolve into the 30% grey building-all fill it
+     often sits on (dE ~4), so addresses-all-circle carries a dark outline
+     (--address-all-outline). Unmatched keeps its light ring
+     (--address-unmatched-outline), so the two also differ in shape: a solid
+     disc with a light ring vs a pale disc with a dark ring.
+     None of the building/address tokens are redefined for dark mode, for
+     the same reason as --ratio-0.._4 below: they paint onto the OSM raster,
+     which is light in both themes. The legend swatches draw the same rings,
+     so they stay readable on the dark panel too. */
+  --address-all: #a8aeb6;
+  --address-all-outline: #4b5563;
+  --address-unmatched: #1e40af;
+  --address-unmatched-outline: #fffdf8;
   --accent: #17324d;
   --accent-soft: #23496b;
   --danger: #a8402a;
@@ -92,8 +127,8 @@
      spoken for by a *live* map layer -- --ramp-1.._5 is close but is the
      z5-13 aggregate grid's density ramp, a different section of the legend
      shown at a different scale, and --building-unmatched's red plus
-     --address-unmatched's blue are both taken. Redefined for dark mode like
-     the building/address colours (unlike --ratio-0.._4/--draw-outline/
+     --address-unmatched's blue are both taken. Redefined for dark mode
+     (unlike the building/address tokens, --ratio-0.._4, --draw-outline and
      --building-outline-all, which stay fixed because they're anchored to the
      always-light OSM raster specifically) since this also has to read
      clearly as a legend swatch against the panel's own dark background. */
@@ -135,10 +170,6 @@
     --paper-raised: #23261f;
     --line: #3a3c32;
     --line-strong: #55583e;
-    --building-all: #aab4bf;
-    --building-unmatched: #ff6b5e;
-    --address-all: #9d89c9;
-    --address-unmatched: #6fa8f5;
     --accent: #a9c4dd;
     --accent-soft: #cddaea;
     --ramp-1: #ffd873;
@@ -629,7 +660,7 @@ body {
 
 .swatch[data-swatch="buildings"].swatch-unmatched {
   background: color-mix(in srgb, var(--building-unmatched) 85%, transparent);
-  border-left-color: var(--building-unmatched);
+  border-left-color: var(--building-unmatched-outline);
 }
 .swatch[data-swatch="buildings"].swatch-all {
   background: color-mix(in srgb, var(--building-all) 30%, transparent);
@@ -639,18 +670,18 @@ body {
 .swatch[data-swatch="addresses"] {
   border-radius: 50%;
 }
+/* Both address swatches mirror their map layer exactly: a solid disc plus
+   the circle-stroke that layer paints (see --address-all-outline in :root).
+   `border` (not just border-left) replaces .swatch's 3px left edge with a
+   full ring. The ring is what keeps the dark blue swatch readable on the
+   dark-mode panel. */
 .swatch[data-swatch="addresses"].swatch-unmatched {
   background: var(--address-unmatched);
-  border-left-color: var(--address-unmatched);
+  border: 1.5px solid var(--address-unmatched-outline);
 }
-/* Full opacity, border-left the same color as the fill (so it reads as a
-   plain disc, not a ringed one) -- matches addresses-all-circle on the map,
-   which paints a solid var(--address-all) fill with no stroke. This used to
-   be a 55%-alpha fill with a solid border, which didn't match what the layer
-   actually renders. */
 .swatch[data-swatch="addresses"].swatch-all {
   background: var(--address-all);
-  border-left-color: var(--address-all);
+  border: 1.5px solid var(--address-all-outline);
 }
 
 /* updates-fill/updates-outline both paint at var(--updates) -- see the
