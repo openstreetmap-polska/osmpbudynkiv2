@@ -38,8 +38,10 @@ impl Drop for ScratchGuard<'_> {
             "DROP TABLE IF EXISTS {};
              DROP TABLE IF EXISTS diff_added;
              DROP TABLE IF EXISTS diff_removed;
-             DROP TABLE IF EXISTS diff_modified;",
-            self.staging
+             DROP TABLE IF EXISTS diff_modified;
+             DROP TABLE IF EXISTS {};",
+            self.staging,
+            crate::update::changeset::CHANGED_CELLS_TABLE
         );
         if let Err(e) = self.conn.execute_batch(&sql) {
             warn!(staging = %self.staging, error = %e, "failed to drop refresh scratch tables");
@@ -157,6 +159,13 @@ pub fn refresh(
             .collect::<Vec<_>>()
             .join(" AND ");
         let keys_using = keys.join(", ");
+
+        // Built before BEGIN: the `live` half reads the pre-update geometry
+        // of removed/modified rows, and it is a temp table, so nothing
+        // durable lands outside the apply transaction. All three consumers
+        // below read it instead of re-deriving it, which is what keeps the
+        // apply's cost proportional to the delta rather than to the table.
+        crate::update::changeset::create_changed_cells(conn, spec)?;
 
         conn.execute_batch("BEGIN TRANSACTION")
             .context("Failed to begin apply transaction")?;

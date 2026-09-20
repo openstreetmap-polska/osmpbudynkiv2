@@ -755,40 +755,104 @@ pub fn filter_oversized_geometry(
 /// snapshots), which is exactly what makes it dangerous: it would land with
 /// a future export, not show up in review.
 ///
-/// **No tiebreak column, deliberately (2026-08-14).** 843 of 851 EGIB
-/// duplicate groups tie on `czas_pozyskania`, so which row survives is
-/// whatever the scan happened to order first. Cost of that: if scan order
-/// for a tying group flips between an import and a later refresh, that
-/// group's row reports as *modified* once -- bounded at ~843 rows per EGIB
-/// refresh against 17.5M, and self-correcting. If EGIB refresh churn ever
-/// shows a persistent ~843-row floor, this is the cause and a tiebreak is
-/// the fix.
+/// **The tiebreak is `DatasetSpec::content_signature_sql`, and without one
+/// the load is not deterministic.** A 2026-08-14 note here weighed leaving it
+/// out: 843 of 851 EGIB duplicate groups tie on `czas_pozyskania`, so the
+/// survivor is whatever the scan ordered first, and it judged the cost "~843
+/// rows per EGIB refresh, self-correcting". The first half was right and the
+/// second was not. Measured 2026-09-20: two imports of the *same* EGIB file
+/// kept a different row for **162** of those keys, and it does not
+/// self-correct -- applying the phantom delta only moves live to whatever
+/// staging picked, and the next staging load re-randomizes, so a fresh ~150
+/// arrive every refresh, each dirtying its cell for a record that never
+/// changed. Nothing local detects it: the row count, the key set and every
+/// guard in this function are identical either way. It surfaces a layer up as
+/// `update::diff::compute` reporting modifications between a live table and a
+/// staging table built from identical bytes, and it can reach users --
+/// `reports::reconcile_source` retires a report when the record's signature
+/// moves, so a report on one of the 289 genuinely-ambiguous EGIB records
+/// could be expired by a refresh that changed nothing.
+///
+/// **Why the signature specifically.** Ranking by it means two rows can only
+/// still tie when they are indistinguishable *to the diff*, so the choice
+/// between them cannot produce a modification -- exactly the property needed,
+/// and stronger than "approximately stable". It is already the one home for
+/// what a source compares, so each source inherits its measured column
+/// choices for free, and it is already contractually byte-stable across
+/// releases (it is persisted in `object_reports`), which matters here because
+/// the dedup's choice is persisted too: an expression that drifted between
+/// releases would rewrite these rows once on upgrade. Note `rowid` is NOT a
+/// usable tiebreak -- rowid assignment is itself parallel-order dependent
+/// under `preserve_insertion_order = false`.
+///
+/// **The cost is the scan projection, not the ranking.** Only duplicate rows
+/// are ranked (2,462 of 17.59M for EGIB), but naming any geometry expression
+/// pulls `geom` into the probe side's projection, so the table's geometry is
+/// read. Measured cold on the real EGIB table (`BASE_TABLE` residency): no
+/// tiebreak 0.78s / 138 MiB; whole row 2.63-2.99s / 3,022-3,088 MiB;
+/// `hash(geom)` 2.25-2.32s / 2,692-2,715 MiB; **signature 2.11-2.57s /
+/// 2,744-2,756 MiB**. Hashing the geometry barely helps because the column
+/// read dominates. In the pipeline it is far cheaper than cold numbers
+/// suggest -- the dedup runs immediately after the CTAS that wrote that
+/// geometry -- and the residency is `BASE_TABLE`, i.e. evictable, so it
+/// cannot reproduce the non-evictable `ART_INDEX` exhaustion of
+/// `docs/duckdb_index_memory.md`; a full refresh still completes under
+/// `memory_limit = '1.2GB'`.
+///
+/// **This is self-tuning per source, which is the point of using the spec
+/// rather than one hand-picked expression.** Each source's signature mentions
+/// geometry only if that source compares it, so each pays only what it must.
+/// Measured per source (no tiebreak -> signature -> whole row, `BASE_TABLE`):
+///
+/// | source | none | signature | whole row |
+/// |---|---|---|---|
+/// | EGIB (17.59M, polygons, compares geom) | 138 MiB | 2,744 MiB | 3,055 MiB |
+/// | BDOT10k (16.35M, polygons, excludes geom) | 309 MiB | **370 MiB** | 3,457 MiB |
+/// | PRG (8.6M, points, compares geom) | 197 MiB | **439 MiB** | 439 MiB |
+///
+/// BDOT10k is the case that makes the point: +61 MiB here against +3,148 MiB
+/// for a whole-row tiebreak, because its `compare_geometry: false` keeps
+/// `geom` out of the expression entirely. It needs nothing more anyway,
+/// having just 2 duplicate groups, both with distinct `WERSJA`. PRG lands at
+/// the same cost as the whole row, since its row is little more than the
+/// compared columns plus a POINT -- and it has 0 duplicate keys in the
+/// measured snapshot.
+///
+/// The residual, worth stating: for a source that excludes geometry from its
+/// signature, two rows tying on it may still differ geometrically, leaving
+/// the stored geometry arbitrary. That cannot cause a phantom modification --
+/// the diff does not look at it -- and for BDOT10k it is unreachable today.
+///
+/// Rejected alternatives, measured: the compared *scalars* alone cost nothing
+/// but resolve only 39 of the 289 ambiguous EGIB groups, since these
+/// duplicates differ mainly in geometry; the stored `centroid` leaves 3
+/// ambiguous at 463 MiB, the option to revisit if buffer-pool headroom ever
+/// outweighs exactness; and parquet's `file_row_number` is stable within one
+/// file but not across exports -- and the live side is always built from the
+/// previous export, so it would reinstate the phantoms it was meant to
+/// remove.
 ///
 /// **`NULLS LAST` is spelled out** rather than left to DuckDB's default,
 /// because `default_null_order` is settable and this project overrides
 /// `duckdb_init_commands` wholesale. A NULL version must never win over a
 /// dated one.
 ///
-/// **`rowid` is safe here** despite CLAUDE.md's "serving tables store rows,
-/// not id references" warning -- that invariant is about *storing* a rowid
-/// across a DELETE+INSERT; this one lives and dies inside a single DELETE
-/// statement.
-///
-/// Runs strictly after the table is built. Like [`non_null_key_sql`], this is
-/// a row filter -- it changes which rows exist, never the content of a
-/// surviving row -- so it needs nothing further to stay correct as the
-/// load-time steps around it change.
-///
 /// **Must run after `filter_invalid_geometry` and
 /// `filter_oversized_geometry`.** A duplicate pair whose newest member has
 /// bad geometry must fall back to the older, valid member instead of being
 /// collapsed down to a row one of those filters then deletes -- losing the
 /// object entirely.
+/// The alias [`deduplicate_by_key`] binds the scanned table to, and therefore
+/// the alias a caller must build its `tiebreak_sql` against. Named rather than
+/// spelled `"t"` at four call sites, so the coupling cannot drift.
+pub const DEDUP_ROW_ALIAS: &str = "t";
+
 pub fn deduplicate_by_key(
     conn: &duckdb::Connection,
     table: &str,
     key_columns: &[&str],
     order_by: &str,
+    tiebreak_sql: &str,
     id_column: &str,
 ) -> anyhow::Result<LoadStats> {
     use anyhow::Context;
@@ -801,9 +865,9 @@ pub fn deduplicate_by_key(
             GROUP BY {keys} HAVING count(*) > 1
           ),
           ranked AS (
-            SELECT t.rowid AS rid,
-                   row_number() OVER (PARTITION BY {keys} ORDER BY {order_by} NULLS LAST) AS rn
-            FROM {table} t JOIN dup_keys USING ({keys})
+            SELECT {DEDUP_ROW_ALIAS}.rowid AS rid,
+                   row_number() OVER (PARTITION BY {keys} ORDER BY {order_by} NULLS LAST, {tiebreak_sql}) AS rn
+            FROM {table} {DEDUP_ROW_ALIAS} JOIN dup_keys USING ({keys})
           )
           SELECT rid FROM ranked WHERE rn > 1
         )"
@@ -1400,8 +1464,15 @@ mod tests {
         )
         .unwrap();
 
-        let stats =
-            deduplicate_by_key(&conn, "t", &["id_budynku"], "wersja DESC", "id_budynku").unwrap();
+        let stats = deduplicate_by_key(
+            &conn,
+            "t",
+            &["id_budynku"],
+            "wersja DESC",
+            "t.geom",
+            "id_budynku",
+        )
+        .unwrap();
 
         assert_eq!(stats.skipped_duplicate_key, 1);
         assert_eq!(stats.skipped_duplicate_example_ids, vec!["dup".to_string()]);
@@ -1430,8 +1501,15 @@ mod tests {
         )
         .unwrap();
 
-        let stats =
-            deduplicate_by_key(&conn, "t", &["id_budynku"], "wersja DESC", "id_budynku").unwrap();
+        let stats = deduplicate_by_key(
+            &conn,
+            "t",
+            &["id_budynku"],
+            "wersja DESC",
+            "t.geom",
+            "id_budynku",
+        )
+        .unwrap();
         assert_eq!(stats.skipped_duplicate_key, 1);
 
         let count: i64 = conn
@@ -1455,8 +1533,15 @@ mod tests {
         )
         .unwrap();
 
-        let stats =
-            deduplicate_by_key(&conn, "t", &["id_budynku"], "wersja DESC", "id_budynku").unwrap();
+        let stats = deduplicate_by_key(
+            &conn,
+            "t",
+            &["id_budynku"],
+            "wersja DESC",
+            "t.geom",
+            "id_budynku",
+        )
+        .unwrap();
 
         assert_eq!(stats, LoadStats::default());
         let count: i64 = conn
@@ -1466,6 +1551,48 @@ mod tests {
     }
 
     /// BDOT10k's two-column key: the same `LOKALNYID` under two different
+    /// A version tie must be broken by content, not by scan order. Without a
+    /// tiebreak this is the case that made two loads of one file disagree (162
+    /// EGIB keys, measured) -- and it is invisible from row counts, so assert
+    /// on *which* row survived, and that repeating the load on an identical
+    /// table picks the same one. Row order is reversed on the second table so
+    /// a scan-order-dependent implementation has to disagree.
+    #[test]
+    fn deduplicate_by_key_breaks_a_version_tie_on_content_not_scan_order() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let tiebreak = format!("md5(COALESCE({DEDUP_ROW_ALIAS}.payload, ''))");
+
+        let mut survivors = Vec::new();
+        for rows in [
+            "('dup', 1, 'alpha'), ('dup', 1, 'beta')",
+            "('dup', 1, 'beta'), ('dup', 1, 'alpha')",
+        ] {
+            let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE t (id VARCHAR, wersja INTEGER, payload VARCHAR);
+                 INSERT INTO t VALUES {rows};"
+            ))
+            .unwrap();
+
+            let stats =
+                deduplicate_by_key(&conn, "t", &["id"], "wersja DESC", &tiebreak, "id").unwrap();
+            assert_eq!(stats.skipped_duplicate_key, 1);
+
+            survivors.push(
+                conn.query_row("SELECT payload FROM t", [], |r| r.get::<_, String>(0))
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(
+            survivors[0], survivors[1],
+            "the surviving row must be decided by content, not by insertion order"
+        );
+    }
+
     /// `PRZESTRZENNAZW` values is not a duplicate and must not be collapsed.
     #[test]
     fn deduplicate_by_key_composite_key() {
@@ -1488,6 +1615,7 @@ mod tests {
             "t",
             &["przestrzennazw", "lokalnyid"],
             "wersja DESC",
+            "t.geom",
             "lokalnyid",
         )
         .unwrap();

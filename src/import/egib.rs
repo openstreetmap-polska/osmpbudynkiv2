@@ -75,6 +75,9 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
         target_table,
         crate::dataset::EGIB.key_columns,
         "czas_pozyskania DESC",
+        // Deterministic tiebreak: two rows can only still tie when the diff
+        // cannot tell them apart. See `deduplicate_by_key`'s doc comment.
+        &crate::dataset::EGIB.content_signature_sql(crate::dataset::DEDUP_ROW_ALIAS),
         "id_budynku",
     )?;
     unique.skipped_null_key = null_key_rows;

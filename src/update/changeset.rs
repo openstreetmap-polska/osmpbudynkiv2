@@ -4,11 +4,84 @@ use duckdb::Connection;
 use crate::dataset::DatasetSpec;
 use crate::tile_math::CHANGE_CELL_ZOOM;
 
+/// Temp table holding this refresh's per-row cell set, built once by
+/// [`create_changed_cells`] and read by all three consumers.
+pub const CHANGED_CELLS_TABLE: &str = "refresh_changed_cells";
+
+/// Materialize, once, the (kind, cell) row set that `insert_change_areas` and
+/// both halves of `insert_dirty_cells` all need.
+///
+/// **Why this is a table and not three copies of one SELECT.** The cell set is
+/// derived by joining the diff tables back against `live`/`staging`, and
+/// neither carries an index on the key columns -- the only indexes in the
+/// schema are the RTREE ones on `geom`/`centroid` -- so every such join is a
+/// full scan of a 16-18M row table. Spelling the four-way union out at each
+/// consumer cost twelve of those scans per apply, whether the delta held
+/// 115 rows or 170,000: measured on the real EGIB tables, that was the bulk of
+/// a churn-independent apply floor. Building it once costs two scans and the
+/// consumers then read a table of roughly `churn` rows.
+///
+/// **Two scans, not four.** `staging` is read once for added+modified and
+/// `live` once for removed+modified, with `kind` carried through the join
+/// rather than fixed per branch. The row set is identical to the four-branch
+/// form: `diff_added` and `diff_modified` are disjoint by construction (the
+/// former is an ANTI JOIN on keys absent from `live`, the latter an inner join
+/// on keys present in both), as are `diff_removed` and `diff_modified`.
+///
+/// **`UNION ALL`, deliberately.** A modified row contributes its cell twice --
+/// once from `live`, once from `staging` -- which is what lets
+/// `insert_change_areas` count an object that moved in both the cell it left
+/// and the cell it entered, and what makes a modified-but-stationary object
+/// count 2 for its cell. See `insert_change_areas`' doc. The two queue
+/// consumers apply their own `DISTINCT`, so deduplicating here would change
+/// the change-area counts while leaving the queues identical.
+///
+/// Must run **before** the apply transaction's delta: the `live` half reads
+/// the pre-update geometry of removed and modified rows, which the DELETE
+/// would otherwise have thrown away. It is a temp table, so building it
+/// outside the caller's transaction lands nothing durable.
+pub fn create_changed_cells(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
+    let live = spec.table;
+    let staging = spec.staging_table();
+    let keys = spec.key_columns.join(", ");
+
+    let point_live = spec.representative_point_sql("l");
+    let point_stg = spec.representative_point_sql("s");
+    let sx = crate::tile_math::cell_x_sql(&point_stg);
+    let sy = crate::tile_math::cell_y_sql(&point_stg);
+    let lx = crate::tile_math::cell_x_sql(&point_live);
+    let ly = crate::tile_math::cell_y_sql(&point_live);
+
+    let sql = format!(
+        "DROP TABLE IF EXISTS {CHANGED_CELLS_TABLE};
+         CREATE TEMP TABLE {CHANGED_CELLS_TABLE} AS
+         SELECT d.kind AS kind, {sx} AS cell_x, {sy} AS cell_y
+         FROM {staging} s JOIN (
+             SELECT {keys}, 'added' AS kind FROM diff_added
+             UNION ALL
+             SELECT {keys}, 'modified' AS kind FROM diff_modified
+         ) d USING ({keys})
+         WHERE s.geom IS NOT NULL
+         UNION ALL
+         SELECT d.kind AS kind, {lx} AS cell_x, {ly} AS cell_y
+         FROM {live} l JOIN (
+             SELECT {keys}, 'removed' AS kind FROM diff_removed
+             UNION ALL
+             SELECT {keys}, 'modified' AS kind FROM diff_modified
+         ) d USING ({keys})
+         WHERE l.geom IS NOT NULL"
+    );
+
+    conn.execute_batch(&sql)
+        .with_context(|| format!("Failed to build changed-cell set for {}", spec.name))
+}
+
 /// Aggregate the diff tables into per-tile change counts and insert them
 /// into `dataset_change_areas`. Returns the number of cell rows written.
 ///
 /// Must be called inside the caller's transaction so the changeset commits
-/// atomically with the data delta it describes.
+/// atomically with the data delta it describes, and after
+/// [`create_changed_cells`] has built the row set it reads.
 ///
 /// Contributions:
 /// - added: new geometry (from staging)
@@ -22,21 +95,10 @@ use crate::tile_math::CHANGE_CELL_ZOOM;
 /// The counts measure churn events touching a cell, not distinct objects: a
 /// modified object that did NOT move contributes its cell twice (once from
 /// live, once from staging), so that cell's `modified` is 2 for one object.
-/// That is intended — consumers use these cells to decide what to re-render,
+/// That is intended -- consumers use these cells to decide what to re-render,
 /// not to report object counts.
 pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i64) -> Result<i64> {
-    let live = spec.table;
-    let staging = spec.staging_table();
-    let keys = spec.key_columns.join(", ");
     let z = CHANGE_CELL_ZOOM;
-
-    let point_live = spec.representative_point_sql("l");
-    let point_stg = spec.representative_point_sql("s");
-
-    let sx = crate::tile_math::cell_x_sql(&point_stg);
-    let sy = crate::tile_math::cell_y_sql(&point_stg);
-    let lx = crate::tile_math::cell_x_sql(&point_live);
-    let ly = crate::tile_math::cell_y_sql(&point_live);
 
     let sql = format!(
         "INSERT INTO dataset_change_areas
@@ -45,23 +107,7 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
                 COUNT(*) FILTER (WHERE kind = 'modified')::INTEGER,
                 COUNT(*) FILTER (WHERE kind = 'removed')::INTEGER,
                 now()
-         FROM (
-             SELECT 'added' AS kind, {sx} AS cell_x, {sy} AS cell_y
-             FROM {staging} s JOIN diff_added d USING ({keys})
-             WHERE s.geom IS NOT NULL
-             UNION ALL
-             SELECT 'removed', {lx}, {ly}
-             FROM {live} l JOIN diff_removed d USING ({keys})
-             WHERE l.geom IS NOT NULL
-             UNION ALL
-             SELECT 'modified', {sx}, {sy}
-             FROM {staging} s JOIN diff_modified d USING ({keys})
-             WHERE s.geom IS NOT NULL
-             UNION ALL
-             SELECT 'modified', {lx}, {ly}
-             FROM {live} l JOIN diff_modified d USING ({keys})
-             WHERE l.geom IS NOT NULL
-         )
+         FROM {CHANGED_CELLS_TABLE}
          GROUP BY cell_x, cell_y",
         source = spec.name,
     );
@@ -79,9 +125,10 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
 
 /// Enqueue one dirty-cell row per distinct z14 cell this refresh touches
 /// (added from staging, removed/modified from both live and staging). Must run
-/// inside the apply transaction so the queue commits atomically with the delta.
+/// inside the apply transaction so the queue commits atomically with the delta,
+/// and after [`create_changed_cells`] has built the row set it reads.
 ///
-/// Feeds **both** queues from one scan of the same cell set, and the tile half
+/// Feeds **both** queues from the one materialized cell set, and the tile half
 /// is not redundant with the match half. A refresh rewrites the raw source
 /// tables, which `/tiles`' `addresses_all`/`buildings_all` layers read
 /// directly -- so those layers are stale the moment the apply commits, before
@@ -89,33 +136,12 @@ pub fn insert_change_areas(conn: &Connection, spec: &DatasetSpec, snapshot_id: i
 /// window where the legend layers show the old rows; and a refresh whose delta
 /// changes no match decision would never close it at all.
 pub fn insert_dirty_cells(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
-    let live = spec.table;
-    let staging = spec.staging_table();
-    let keys = spec.key_columns.join(", ");
     let z = crate::tile_math::CHANGE_CELL_ZOOM;
-    let point_live = spec.representative_point_sql("l");
-    let point_stg = spec.representative_point_sql("s");
-    let sx = crate::tile_math::cell_x_sql(&point_stg);
-    let sy = crate::tile_math::cell_y_sql(&point_stg);
-    let lx = crate::tile_math::cell_x_sql(&point_live);
-    let ly = crate::tile_math::cell_y_sql(&point_live);
 
     let sql = format!(
         "INSERT INTO match_dirty_cells
          SELECT DISTINCT '{source}', {z}, cell_x, cell_y, now()
-         FROM (
-             SELECT {sx} AS cell_x, {sy} AS cell_y
-             FROM {staging} s JOIN diff_added d USING ({keys}) WHERE s.geom IS NOT NULL
-             UNION
-             SELECT {lx}, {ly}
-             FROM {live} l JOIN diff_removed d USING ({keys}) WHERE l.geom IS NOT NULL
-             UNION
-             SELECT {sx}, {sy}
-             FROM {staging} s JOIN diff_modified d USING ({keys}) WHERE s.geom IS NOT NULL
-             UNION
-             SELECT {lx}, {ly}
-             FROM {live} l JOIN diff_modified d USING ({keys}) WHERE l.geom IS NOT NULL
-         )",
+         FROM {CHANGED_CELLS_TABLE}",
         source = spec.name,
     );
     conn.execute_batch(&sql)
@@ -124,21 +150,7 @@ pub fn insert_dirty_cells(conn: &Connection, spec: &DatasetSpec) -> Result<()> {
     let tile_sql = crate::server::tile_dirty::enqueue_from_select_sql(
         "cell_x",
         "cell_y",
-        &format!(
-            "FROM (
-                 SELECT {sx} AS cell_x, {sy} AS cell_y
-                 FROM {staging} s JOIN diff_added d USING ({keys}) WHERE s.geom IS NOT NULL
-                 UNION
-                 SELECT {lx}, {ly}
-                 FROM {live} l JOIN diff_removed d USING ({keys}) WHERE l.geom IS NOT NULL
-                 UNION
-                 SELECT {sx}, {sy}
-                 FROM {staging} s JOIN diff_modified d USING ({keys}) WHERE s.geom IS NOT NULL
-                 UNION
-                 SELECT {lx}, {ly}
-                 FROM {live} l JOIN diff_modified d USING ({keys}) WHERE l.geom IS NOT NULL
-             )"
-        ),
+        &format!("FROM {CHANGED_CELLS_TABLE}"),
     );
     conn.execute_batch(&tile_sql)
         .with_context(|| format!("Failed to enqueue dirty tiles for {}", spec.name))
@@ -187,6 +199,9 @@ mod tests {
              CREATE TEMP TABLE diff_modified AS SELECT 'mov' AS id;",
         )
         .unwrap();
+        // Production order: the cell set is materialized once, before the
+        // apply transaction, and every consumer below reads it.
+        create_changed_cells(&conn, &TEST_SPEC).unwrap();
         conn
     }
 
@@ -249,6 +264,7 @@ mod tests {
         )
         .unwrap();
 
+        create_changed_cells(&conn, &TEST_SPEC).unwrap();
         insert_change_areas(&conn, &TEST_SPEC, 7).unwrap();
 
         let (home_x, home_y) = lonlat_to_tile(21.0, 52.0, CHANGE_CELL_ZOOM);
@@ -348,6 +364,7 @@ mod tests {
         )
         .unwrap();
 
+        create_changed_cells(&conn, &TEST_SPEC).unwrap();
         insert_dirty_cells(&conn, &TEST_SPEC).unwrap();
 
         let mut expected: Vec<(i32, i32)> = [

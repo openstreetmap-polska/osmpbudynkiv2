@@ -558,6 +558,9 @@ pub fn materialize_into(
         target_table,
         crate::dataset::PRG.key_columns,
         "wersja_id DESC",
+        // Deterministic tiebreak: two rows can only still tie when the diff
+        // cannot tell them apart. See `deduplicate_by_key`'s doc comment.
+        &crate::dataset::PRG.content_signature_sql(crate::dataset::DEDUP_ROW_ALIAS),
         "lokalny_id",
     )?;
     unique.skipped_null_key = null_key_rows;
