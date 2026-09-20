@@ -1216,6 +1216,60 @@ mod tests {
         );
     }
 
+    /// The test above deliberately keeps every row in one cell, which means
+    /// it cannot see WHICH diff branch supplied that cell.
+    /// `changeset::tests::every_diff_branch_contributes_its_cell_to_both_queues`
+    /// pins all four branches directly; this is the end-to-end half, driving
+    /// a real `refresh` so the enqueue is observed after the apply
+    /// transaction committed rather than against hand-built `diff_*` tables.
+    ///
+    /// The fixture moves `mov` between cells, so the tile queue has to carry
+    /// the cell it LEFT as well as the one it entered -- an object leaving a
+    /// tile changes that tile just as much as one arriving in it.
+    #[test]
+    fn a_refresh_that_moves_a_row_enqueues_the_tile_cell_it_left_as_well() {
+        use crate::tile_math::{CHANGE_CELL_ZOOM, lonlat_to_tile};
+
+        let live = "SELECT * FROM (VALUES ('mov','v1',21.0,52.0)) t(id,a,lon,lat)";
+        let moved = "SELECT * FROM (VALUES ('mov','v1',19.0,50.0)) t(id,a,lon,lat)";
+        let conn = conn_with_live(live);
+
+        let counts = refresh(&conn, &TEST_SPEC, loader(moved), None, &|| false).unwrap();
+        assert_eq!(
+            counts,
+            DiffCounts {
+                added: 0,
+                modified: 1,
+                removed: 0
+            },
+            "precondition: TEST_SPEC compares geometry, so a pure move is a modification"
+        );
+
+        let mut expected: Vec<(i32, i32)> = [(21.0, 52.0), (19.0, 50.0)]
+            .iter()
+            .map(|(lon, lat)| {
+                let (x, y) = lonlat_to_tile(*lon, *lat, CHANGE_CELL_ZOOM);
+                (x as i32, y as i32)
+            })
+            .collect();
+        expected.sort_unstable();
+
+        let mut cells: Vec<(i32, i32)> = {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT cell_x, cell_y FROM tile_dirty_cells")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        cells.sort_unstable();
+        assert_eq!(
+            cells, expected,
+            "both the origin and the destination tile must be invalidated"
+        );
+    }
+
     /// Pins the in-transaction placement: an aborted refresh applied nothing
     /// -- `insert_dirty_cells` never ran -- so it must not claim any tile
     /// changed either.

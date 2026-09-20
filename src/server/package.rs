@@ -2161,16 +2161,35 @@ mod tests {
             )",
         )
         .unwrap();
+        // `connection_timeout` is the budget `log_export`'s own `pool.get()`
+        // will spend before giving up, so it has to be short or this test
+        // stalls for it. It must NOT be the budget for *creating* the pool's
+        // connection, which is what `Pool::build` would make it: `build` is
+        // `build_unchecked` + `wait_for_initialization`, and that wait
+        // deadlines on this same field (r2d2 0.8.10, `lib.rs:392`). Cloning a
+        // DuckDB connection with the spatial extension loaded does not
+        // reliably finish inside 10 ms once the r2d2 worker thread has been
+        // scheduled, so `build().unwrap()` panicked here in ~5% of runs --
+        // before the code under test had run at all.
+        //
+        // `build_unchecked` does not wait, and `get_timeout` takes a budget of
+        // its own, so establishing the connection and exhausting the pool stop
+        // sharing one number.
         let pool = r2d2::Pool::builder()
             .max_size(1)
             .connection_timeout(std::time::Duration::from_millis(10))
-            .build(crate::server::ClonedConnectionManager::new(conn))
-            .unwrap();
+            .build_unchecked(crate::server::ClonedConnectionManager::new(conn));
         let state = AppState::for_tests(pool.clone());
 
         // Hold the pool's only connection so log_export's own pool.get() call
-        // has nothing available and times out.
-        let held = pool.get().unwrap();
+        // has nothing available and times out. Establishing it is the slow
+        // step, hence the generous timeout; every later `get()` in this test
+        // hands back this same idle connection (`is_valid` is
+        // `execute_batch("")` and `has_broken` is always false), so those keep
+        // the configured 10 ms.
+        let held = pool
+            .get_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
         log_export(&state, &test_area().polygon_geojson, &ALL_DATASETS, 1, 2);
         drop(held);
 

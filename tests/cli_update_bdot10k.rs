@@ -44,6 +44,25 @@ fn test_update_bdot10k_applies_delta_and_records_changeset() {
         .assert()
         .success();
 
+    // The v2 fixture drops the lexicographically smallest LOKALNYID and bumps
+    // the largest one's storey count (see fixtures/scripts/prepare_update_
+    // fixtures.sh). Read both out of v1 now, so the assertions below can name
+    // the exact rows rather than inferring the delta from a row count -- which
+    // cannot tell "the right row was removed" from "some row was removed".
+    let (removed_id, modified_id, storeys_before): (String, String, Option<i16>) = {
+        let conn = duckdb::Connection::open(&db_path).unwrap();
+        conn.execute_batch("INSTALL spatial; LOAD spatial;")
+            .unwrap();
+        conn.query_row(
+            "SELECT min(LOKALNYID), max(LOKALNYID),
+                    max_by(LICZBAKONDYGNACJI, LOKALNYID)
+             FROM bdot10k_buildings",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+
     cmd()
         .args([
             "--config",
@@ -84,6 +103,32 @@ fn test_update_bdot10k_applies_delta_and_records_changeset() {
         )
         .unwrap();
     assert_eq!(added_present, 1);
+
+    // The DELETE half of the apply actually removed the right row...
+    let removed_left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bdot10k_buildings WHERE LOKALNYID = ?",
+            duckdb::params![removed_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(removed_left, 0, "the removed record must be gone");
+
+    // ...and the INSERT half wrote the modified record's NEW value, not the
+    // old one. Without this, the DELETE+INSERT could re-insert the live row
+    // and the counts above would still read 1/1/1.
+    let storeys_after: Option<i16> = conn
+        .query_row(
+            "SELECT LICZBAKONDYGNACJI FROM bdot10k_buildings WHERE LOKALNYID = ?",
+            duckdb::params![modified_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        storeys_after,
+        Some(storeys_before.unwrap_or(0) + 1),
+        "the modified record must carry v2's storey count"
+    );
 
     let cells: i64 = conn
         .query_row("SELECT COUNT(*) FROM dataset_change_areas", [], |r| {

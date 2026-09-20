@@ -100,3 +100,9 @@ COPY (
 "
 
 echo "Wrote bdot10k_v2.parquet and egib_v2.parquet"
+
+# PRG's snapshot is GML inside a zip, not a parquet file, so its v2 is built by
+# a script of its own rather than a DuckDB one-liner. Same 1/1/1 delta shape as
+# the two above, but its "modified" row is a pure geometry move -- see that
+# script's docstring for why.
+uv run "$(dirname "$0")/prepare_prg_update_fixture.py"

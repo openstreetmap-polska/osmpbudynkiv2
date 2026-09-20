@@ -4262,6 +4262,530 @@ mod tests {
         Ok(())
     }
 
+    // --- Post-insert enqueue: where an object ARRIVES ---------------------
+    //
+    // Both rebuild functions call `note_existing` twice per layer: once
+    // before the DELETE (the cell the object is leaving) and once after each
+    // INSERT (the cell it now occupies). Every test above that asserts an
+    // enqueue happens to use a fixture where the object already had a row in
+    // the same cell, so the pre-delete call alone produces the expected
+    // number and the post-insert call is invisible -- deleting all six
+    // post-insert calls left the whole suite green when this section was
+    // written (mutation-checked, 2026-09-20).
+    //
+    // Only two shapes can see them, and both are real production cases:
+    // a brand-new object (no prior row for the pre-delete call to find), and
+    // an object whose geometry moved into a different cell (pre-delete
+    // records the old cell, post-insert the new one). The create case is the
+    // sharp one: a newly mapped OSM building that fails to dirty its cell
+    // leaves the government building it now covers sitting in
+    // `<source>_unmatched`, so the importer offers it again and a duplicate
+    // lands in OSM. `queue reconcile`'s daily sweep bounds that to a day.
+    //
+    // The same fixtures pin the *pre-delete* calls for the address and
+    // former-building layers, which were equally unpinned: only the
+    // `osm_buildings` pre-delete call had a de-tag test covering it.
+
+    /// Half-width, in degrees, of the square ways these tests build (~22 m).
+    /// Small enough that the square plus `Layer::Addresses`' 0.003 deg read
+    /// buffer still fits inside one z14 cell when centred on that cell's
+    /// midpoint -- the property `dirty_cells::tests::
+    /// note_point_address_at_cell_centre_stays_in_one_cell` pins directly.
+    const SQUARE_HALF_DEG: f64 = 0.0002;
+
+    /// A closed square way in the KV store, centred on (lon, lat), with its
+    /// node -> way reverse index in place so a node move cascades to it.
+    fn seed_square_way(
+        kv: &RocksDB,
+        way_id: i64,
+        first_node: i64,
+        lon: f64,
+        lat: f64,
+    ) -> Result<()> {
+        let refs = seed_ring(kv, first_node, &square_corners(lon, lat))?;
+        kvstore::put_way(kv, way_id, &refs)?;
+        for &nid in &refs[..4] {
+            kvstore::add_node_to_ways(kv, nid, way_id)?;
+        }
+        Ok(())
+    }
+
+    fn square_corners(lon: f64, lat: f64) -> [(f64, f64); 4] {
+        let h = SQUARE_HALF_DEG;
+        [
+            (lon - h, lat - h),
+            (lon + h, lat - h),
+            (lon + h, lat + h),
+            (lon - h, lat + h),
+        ]
+    }
+
+    /// `NodeChange`s moving [`seed_square_way`]'s four nodes to a square
+    /// around a new centre. The way itself stays out of the changeset, so
+    /// the rebuild takes the INFERRED arm and reads its tags back out of the
+    /// rows it already has -- the production-common shape.
+    fn move_square_nodes(first_node: i64, lon: f64, lat: f64) -> Vec<NodeChange> {
+        square_corners(lon, lat)
+            .iter()
+            .enumerate()
+            .map(|(i, (x, y))| NodeChange {
+                action: ChangeAction::Modify,
+                version: 2,
+                id: first_node + i as i64,
+                lon: *x,
+                lat: *y,
+                tags: vec![],
+            })
+            .collect()
+    }
+
+    fn create_square_nodes(first_node: i64, lon: f64, lat: f64) -> Vec<NodeChange> {
+        square_corners(lon, lat)
+            .iter()
+            .enumerate()
+            .map(|(i, (x, y))| NodeChange {
+                action: ChangeAction::Create,
+                version: 1,
+                id: first_node + i as i64,
+                lon: *x,
+                lat: *y,
+                tags: vec![],
+            })
+            .collect()
+    }
+
+    fn square_refs(first_node: i64) -> Vec<i64> {
+        vec![
+            first_node,
+            first_node + 1,
+            first_node + 2,
+            first_node + 3,
+            first_node,
+        ]
+    }
+
+    fn square_envelope_sql(lon: f64, lat: f64) -> String {
+        let h = SQUARE_HALF_DEG;
+        format!(
+            "ST_MakeEnvelope({}, {}, {}, {})",
+            lon - h,
+            lat - h,
+            lon + h,
+            lat + h
+        )
+    }
+
+    /// The distinct cells enqueued for `source`, in a stable order.
+    /// `queued_in_cell` above answers "is this one cell queued"; these tests
+    /// need the whole set, because the failure they guard against is a
+    /// *missing* cell alongside a present one.
+    fn queued_cells(conn: &Connection, source: &str) -> Result<Vec<(i32, i32)>> {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT cell_x, cell_y FROM match_dirty_cells WHERE source = ?
+             ORDER BY cell_x, cell_y",
+        )?;
+        let rows = stmt.query_map(duckdb::params![source], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// A z14 cell and the lon/lat a test square should be centred on to sit
+    /// well inside it.
+    struct Cell {
+        cell: (i32, i32),
+        lon: f64,
+        lat: f64,
+    }
+
+    /// Two horizontally adjacent z14 cells. Adjacent in x only, so
+    /// `queued_cells`' `ORDER BY cell_x, cell_y` puts `home` before `away`
+    /// and the expected vectors below can be written literally.
+    fn home_and_away() -> (Cell, Cell) {
+        let at = |cell: (i32, i32)| {
+            let (lon, lat) = z14_cell_midpoint(cell.0, cell.1);
+            Cell { cell, lon, lat }
+        };
+        let home = z14_cell(21.0, 51.0);
+        (at(home), at((home.0 + 1, home.1)))
+    }
+
+    /// A building way that did not exist before: nothing for the pre-delete
+    /// `note_existing` to find, so the cell can only reach the queue through
+    /// the call after the INSERT. Without it the government building this way
+    /// now covers is never recomputed and keeps being offered for import.
+    #[test]
+    fn a_newly_created_building_way_enqueues_the_cell_it_arrived_in() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let (_home, away) = home_and_away();
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: create_square_nodes(900, away.lon, away.lat),
+                ways: vec![WayChange {
+                    action: ChangeAction::Create,
+                    version: 1,
+                    id: 300,
+                    node_refs: square_refs(900),
+                    tags: vec![("building".into(), "house".into())],
+                }],
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 300 AND osm_type = 'way'"
+            )?,
+            1,
+            "precondition: the way must actually have been served"
+        );
+        for source in ["bdot10k", "egib"] {
+            assert_eq!(
+                queued_cells(&conn, source)?,
+                vec![away.cell],
+                "{source} must be told about the cell the new building landed in"
+            );
+        }
+        assert_eq!(
+            queued_cells(&conn, "prg")?,
+            vec![],
+            "a building-only create must not enqueue the address source"
+        );
+        Ok(())
+    }
+
+    /// A served, addressed building way whose nodes all move into the
+    /// neighbouring cell. Both halves have to fire: the pre-delete call for
+    /// the cell it left (whose government building becomes uncovered) and the
+    /// post-insert call for the cell it entered (whose government building
+    /// becomes covered). Covers the `osm_buildings` and `osm_addresses`
+    /// layers of `rebuild_way_geometry` at once, since one way carries both.
+    #[test]
+    fn a_building_way_moved_to_another_cell_enqueues_both_cells() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let (home, away) = home_and_away();
+
+        seed_square_way(&kv, 300, 900, home.lon, home.lat)?;
+        conn.execute_batch(&format!(
+            "INSERT INTO osm_buildings VALUES (300, 'way', 'house', {env});
+             INSERT INTO osm_addresses VALUES
+                 (300, 'way', '7', 'Lipowa', NULL, NULL, ST_Point({hlon}, {hlat}));",
+            hlon = home.lon,
+            hlat = home.lat,
+            env = square_envelope_sql(home.lon, home.lat),
+        ))?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: move_square_nodes(900, away.lon, away.lat),
+                ..Default::default()
+            },
+        )?;
+
+        let moved: f64 = conn.query_row(
+            "SELECT ST_XMin(geom) FROM osm_buildings WHERE osm_id = 300 AND osm_type = 'way'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(
+            moved > home.lon,
+            "precondition: the rebuild must have moved the building east"
+        );
+
+        for source in ["bdot10k", "egib", "prg"] {
+            assert_eq!(
+                queued_cells(&conn, source)?,
+                vec![home.cell, away.cell],
+                "{source} must be told about the cell the building left AND the one it entered"
+            );
+        }
+        Ok(())
+    }
+
+    /// The same move for a former-building way, which travels its own pair of
+    /// `note_existing` calls against `osm_former_buildings`. A stale veto is
+    /// the mirror failure of a stale building: the cell it left keeps
+    /// suppressing a government building nothing covers any more.
+    #[test]
+    fn a_former_building_way_moved_to_another_cell_enqueues_both_cells() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let (home, away) = home_and_away();
+
+        seed_square_way(&kv, 300, 900, home.lon, home.lat)?;
+        conn.execute_batch(&format!(
+            "INSERT INTO osm_former_buildings VALUES
+                 (300, 'way', 'demolished:building', 'house', {env});",
+            env = square_envelope_sql(home.lon, home.lat),
+        ))?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: move_square_nodes(900, away.lon, away.lat),
+                ..Default::default()
+            },
+        )?;
+
+        let (key, x_min): (String, f64) = conn.query_row(
+            "SELECT lifecycle_key, ST_XMin(geom) FROM osm_former_buildings
+             WHERE osm_id = 300 AND osm_type = 'way'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(key, "demolished:building", "the row must survive the move");
+        assert!(
+            x_min > home.lon,
+            "precondition: the veto must have moved east"
+        );
+
+        for source in ["bdot10k", "egib"] {
+            assert_eq!(
+                queued_cells(&conn, source)?,
+                vec![home.cell, away.cell],
+                "{source} must be told about both the vacated and the entered cell"
+            );
+        }
+        assert_eq!(
+            queued_cells(&conn, "prg")?,
+            vec![],
+            "a former-building move must not enqueue the address source"
+        );
+        Ok(())
+    }
+
+    /// `rebuild_relation_geometry`'s post-insert call, via the same "nothing
+    /// existed before" shape as the way test above. The member way carries no
+    /// tags of its own, so every queue row here comes from the relation.
+    #[test]
+    fn a_newly_created_building_relation_enqueues_the_cell_it_arrived_in() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let (_home, away) = home_and_away();
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: create_square_nodes(900, away.lon, away.lat),
+                ways: vec![WayChange {
+                    action: ChangeAction::Create,
+                    version: 1,
+                    id: 301,
+                    node_refs: square_refs(900),
+                    tags: vec![],
+                }],
+                relations: vec![RelationChange {
+                    action: ChangeAction::Create,
+                    version: 1,
+                    id: 400,
+                    members: vec![RelationMember {
+                        member_type: "way".into(),
+                        member_ref: 301,
+                        role: "outer".into(),
+                    }],
+                    tags: vec![
+                        ("type".into(), "multipolygon".into()),
+                        ("building".into(), "house".into()),
+                    ],
+                }],
+            },
+        )?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_buildings WHERE osm_id = 400 AND osm_type = 'relation'"
+            )?,
+            1,
+            "precondition: the relation must actually have been served"
+        );
+        for source in ["bdot10k", "egib"] {
+            assert_eq!(
+                queued_cells(&conn, source)?,
+                vec![away.cell],
+                "{source} must be told about the cell the new relation landed in"
+            );
+        }
+        Ok(())
+    }
+
+    /// The relation twin of `a_building_way_moved_to_another_cell_enqueues_
+    /// both_cells`: the member way moves, the relation is reached through the
+    /// way -> relation cascade, and both its building and address rows have to
+    /// name the cell they left as well as the one they entered.
+    #[test]
+    fn a_building_relation_moved_to_another_cell_enqueues_both_cells() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let (home, away) = home_and_away();
+
+        seed_square_way(&kv, 301, 900, home.lon, home.lat)?;
+        kvstore::put_relation(
+            &kv,
+            400,
+            &[(
+                301,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(&kv, 301, 400)?;
+        conn.execute_batch(&format!(
+            "INSERT INTO osm_buildings VALUES (400, 'relation', 'house', {env});
+             INSERT INTO osm_addresses VALUES
+                 (400, 'relation', '7', 'Lipowa', NULL, NULL, ST_Point({hlon}, {hlat}));",
+            hlon = home.lon,
+            hlat = home.lat,
+            env = square_envelope_sql(home.lon, home.lat),
+        ))?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: move_square_nodes(900, away.lon, away.lat),
+                ..Default::default()
+            },
+        )?;
+
+        let moved: f64 = conn.query_row(
+            "SELECT ST_XMin(geom) FROM osm_buildings WHERE osm_id = 400 AND osm_type = 'relation'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(
+            moved > home.lon,
+            "precondition: the relation rebuild must have moved the building east"
+        );
+
+        for source in ["bdot10k", "egib", "prg"] {
+            assert_eq!(
+                queued_cells(&conn, source)?,
+                vec![home.cell, away.cell],
+                "{source} must be told about the cell the relation left AND the one it entered"
+            );
+        }
+        Ok(())
+    }
+
+    /// The relation twin of the former-building way move.
+    #[test]
+    fn a_former_building_relation_moved_to_another_cell_enqueues_both_cells() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let (home, away) = home_and_away();
+
+        seed_square_way(&kv, 301, 900, home.lon, home.lat)?;
+        kvstore::put_relation(
+            &kv,
+            400,
+            &[(
+                301,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(&kv, 301, 400)?;
+        conn.execute_batch(&format!(
+            "INSERT INTO osm_former_buildings VALUES
+                 (400, 'relation', 'ruins:building', 'yes', {env});",
+            env = square_envelope_sql(home.lon, home.lat),
+        ))?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                nodes: move_square_nodes(900, away.lon, away.lat),
+                ..Default::default()
+            },
+        )?;
+
+        let x_min: f64 = conn.query_row(
+            "SELECT ST_XMin(geom) FROM osm_former_buildings
+             WHERE osm_id = 400 AND osm_type = 'relation'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(
+            x_min > home.lon,
+            "precondition: the veto must have moved east"
+        );
+
+        for source in ["bdot10k", "egib"] {
+            assert_eq!(
+                queued_cells(&conn, source)?,
+                vec![home.cell, away.cell],
+                "{source} must be told about both the vacated and the entered cell"
+            );
+        }
+        Ok(())
+    }
+
+    /// The relation delete arm notes three tables before deleting from them;
+    /// `a_relation_delete_removes_its_rows_reverse_index_and_enqueues` covers
+    /// the first two, but a relation carrying ONLY a former-building row
+    /// leaves both of those empty, so the cell can only reach the queue
+    /// through the `osm_former_buildings` call. Dropping a demolished-building
+    /// relation lifts a veto: the government building it was suppressing has
+    /// to be reconsidered.
+    #[test]
+    fn a_relation_delete_removes_its_former_building_row_and_enqueues() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        let (home, _away) = home_and_away();
+
+        seed_square_way(&kv, 301, 900, home.lon, home.lat)?;
+        kvstore::put_relation(
+            &kv,
+            400,
+            &[(
+                301,
+                encoding::encode_member_type("way"),
+                encoding::encode_member_role("outer"),
+            )],
+        )?;
+        kvstore::add_way_to_relations(&kv, 301, 400)?;
+        conn.execute_batch(&format!(
+            "INSERT INTO osm_former_buildings VALUES
+                 (400, 'relation', 'demolished:building', 'house', {env});",
+            env = square_envelope_sql(home.lon, home.lat),
+        ))?;
+
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                relations: vec![RelationChange {
+                    action: ChangeAction::Delete,
+                    version: 2,
+                    id: 400,
+                    members: vec![],
+                    tags: vec![],
+                }],
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM osm_former_buildings WHERE osm_id = 400"
+            )?,
+            0,
+            "the former-building row must be gone"
+        );
+        for source in ["bdot10k", "egib"] {
+            assert_eq!(
+                queued_cells(&conn, source)?,
+                vec![home.cell],
+                "{source} must be told the veto was lifted here"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn osc_local_file_name_is_unique_per_sequence() {
         // Direct regression for the on-disk filename collision bug:

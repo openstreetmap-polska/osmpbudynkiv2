@@ -312,4 +312,84 @@ mod tests {
         assert!(cells.contains(&("test".to_string(), home_x as i32, home_y as i32)));
         assert!(cells.contains(&("test".to_string(), dest_x as i32, dest_y as i32)));
     }
+
+    /// `insert_dirty_cells` spells its four-branch UNION out twice -- once
+    /// for `match_dirty_cells`, once for `tile_dirty_cells` -- so the two can
+    /// drift. Nothing noticed: deleting three of the four branches from the
+    /// TILE copy alone left the whole suite green (mutation-checked,
+    /// 2026-09-20), because every fixture that looked at the tile queue put
+    /// every row at one point, so any single surviving branch produced the
+    /// expected cell.
+    ///
+    /// Here each branch is the ONLY contributor of its own cell: `add`
+    /// arrives in A (staging/diff_added), `del` leaves from B (live/
+    /// diff_removed), and `mov` travels D -> C (live and staging sides of
+    /// diff_modified). Dropping any one branch from either copy loses exactly
+    /// one cell, and asserting the two queues hold the SAME set is what keeps
+    /// the duplication honest.
+    #[test]
+    fn every_diff_branch_contributes_its_cell_to_both_queues() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE live AS
+                 SELECT * FROM (VALUES
+                     ('del', ST_Point(19.0, 50.0)),
+                     ('mov', ST_Point(15.0, 46.0))
+                 ) t(id, geom);
+             CREATE TABLE live__staging AS
+                 SELECT * FROM (VALUES
+                     ('add', ST_Point(21.0, 52.0)),
+                     ('mov', ST_Point(17.0, 48.0))
+                 ) t(id, geom);
+             CREATE TEMP TABLE diff_added    AS SELECT 'add' AS id;
+             CREATE TEMP TABLE diff_removed  AS SELECT 'del' AS id;
+             CREATE TEMP TABLE diff_modified AS SELECT 'mov' AS id;",
+        )
+        .unwrap();
+
+        insert_dirty_cells(&conn, &TEST_SPEC).unwrap();
+
+        let mut expected: Vec<(i32, i32)> = [
+            (21.0, 52.0), // added, from staging
+            (19.0, 50.0), // removed, from live
+            (17.0, 48.0), // modified, from staging (the cell it entered)
+            (15.0, 46.0), // modified, from live (the cell it left)
+        ]
+        .iter()
+        .map(|(lon, lat)| {
+            let (x, y) = lonlat_to_tile(*lon, *lat, CHANGE_CELL_ZOOM);
+            (x as i32, y as i32)
+        })
+        .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            expected.len(),
+            4,
+            "the fixture's four points must not share a cell"
+        );
+
+        let read = |sql: &str| -> Vec<(i32, i32)> {
+            let mut s = conn.prepare(sql).unwrap();
+            let mut v: Vec<(i32, i32)> = s
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        assert_eq!(
+            read("SELECT DISTINCT cell_x, cell_y FROM match_dirty_cells WHERE source = 'test'"),
+            expected,
+            "every branch must reach the match queue"
+        );
+        assert_eq!(
+            read("SELECT DISTINCT cell_x, cell_y FROM tile_dirty_cells"),
+            expected,
+            "every branch must reach the tile queue too -- the `*_all` layers \
+             read the raw tables, so they are stale the moment the apply commits"
+        );
+    }
 }

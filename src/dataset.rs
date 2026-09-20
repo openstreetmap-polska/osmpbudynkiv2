@@ -1602,6 +1602,45 @@ mod tests {
         );
     }
 
+    /// The mirror of the BDOT10k test above, and it was missing: nothing
+    /// pinned the EGIB spec at all, so flipping `compare_geometry` to `false`
+    /// there -- a plausible "make it consistent with BDOT10k" edit -- passed
+    /// the whole suite. It is not a symmetric choice. 617,207 EGIB records
+    /// have all three compared attributes NULL, so geometry is their ONLY
+    /// signal that anything changed; without it those records freeze at
+    /// whatever they were first imported as, silently and forever.
+    ///
+    /// The export-noise columns are pinned in the same place, since they are
+    /// the other half of the same measured decision: `czas_pozyskania` churns
+    /// on 99.7% of rows per export and `pozostale_atrybuty` on 32.8% (it
+    /// carries a per-export `gml_id`), so admitting either reports a national
+    /// rewrite as a national modification.
+    ///
+    /// Geometry must be spelled `ST_AsWKB(...)`, never a bare `GEOMETRY`
+    /// comparison: 24.18s against 2.50s on the real 17.5M-row table for the
+    /// identical answer.
+    #[test]
+    fn egib_predicate_compares_geometry_as_wkb_and_omits_the_export_noise_columns() {
+        for sql in [
+            EGIB.changed_predicate_sql("s", "l"),
+            EGIB.content_hash_sql("t"),
+        ] {
+            assert!(
+                sql.contains("ST_AsWKB"),
+                "EGIB must compare geometry -- 617,207 records have no other \
+                 signal of change -- and must do it as WKB, got: {sql}"
+            );
+            assert!(
+                !sql.contains("czas_pozyskania"),
+                "czas_pozyskania churns on 99.7% of rows per export, got: {sql}"
+            );
+            assert!(
+                !sql.contains("pozostale_atrybuty"),
+                "pozostale_atrybuty carries a per-export gml_id, got: {sql}"
+            );
+        }
+    }
+
     #[test]
     fn content_hash_sql_single_column_no_geometry() {
         let spec = DatasetSpec {
