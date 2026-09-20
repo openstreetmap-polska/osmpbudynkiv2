@@ -203,6 +203,47 @@ impl Default for RetentionPruneConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
+pub struct BackupConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    /// See `JobConfig::run_on_start`.
+    pub run_on_start: bool,
+    /// Directory the dumps are written to. Created if missing. Put it on the
+    /// same filesystem the server can write to unattended, and expose it with
+    /// a static file server (see `example_config.toml`) rather than adding a
+    /// route here -- a dump served by the reverse proxy stays reachable while
+    /// this process is down, which is exactly when it is wanted.
+    pub dir: String,
+    /// How long a timestamped dump is kept. `0` disables pruning entirely.
+    ///
+    /// The newest dump is never pruned whatever its age: dumps are only
+    /// written when the content changed, so a table nobody has reported
+    /// against in `keep_days` would otherwise delete its own last copy.
+    pub keep_days: u64,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            // Opt-in: it writes files to a path the operator chooses, and a
+            // default-on job would start dropping them into the working
+            // directory of every `run` anywhere.
+            enabled: false,
+            // Hourly rather than daily. The dump is small and written only
+            // when something changed, so the interval costs almost nothing
+            // and buys a tighter bound on how much can be lost.
+            interval_seconds: 3600,
+            timeout_seconds: 60,
+            run_on_start: true,
+            dir: "backups".to_string(),
+            keep_days: 30,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
 pub struct MatchRefreshConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
@@ -441,6 +482,7 @@ impl Default for CacheConfig {
 pub struct JobsConfig {
     pub osm_update: OsmUpdateConfig,
     pub retention_prune: RetentionPruneConfig,
+    pub backup: BackupConfig,
     pub bdot10k_update: JobConfig,
     pub egib_update: JobConfig,
     pub prg_update: JobConfig,
@@ -465,6 +507,7 @@ impl Default for JobsConfig {
         Self {
             osm_update: OsmUpdateConfig::default(),
             retention_prune: RetentionPruneConfig::default(),
+            backup: BackupConfig::default(),
             bdot10k_update: daily(3600),
             egib_update: daily(3600),
             // PRG streams ~16 GML files out of a ~1.7GB zip, so it needs longer.

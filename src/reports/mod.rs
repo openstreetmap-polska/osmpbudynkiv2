@@ -605,6 +605,27 @@ pub fn list(
     Ok(out)
 }
 
+/// Serialise every report as JSONL: the one home for the dump format.
+///
+/// Both producers call this -- `reports export` on the CLI and the
+/// `backup` background job -- because `import_rows` below is the tested
+/// inverse of *this* text and nothing else. A second serializer somewhere
+/// else would be free to drift from it silently, and the symptom would be a
+/// backup that only fails at restore time.
+///
+/// `None` as the limit is load-bearing: an export that silently stopped at
+/// some default would be a dump missing rows, which is worse than no dump at
+/// all for being indistinguishable from a complete one.
+pub fn export_to_string(conn: &Connection) -> Result<String> {
+    let rows = list(conn, None, None, None, None)?;
+    let mut out = String::new();
+    for row in &rows {
+        out.push_str(&serde_json::to_string(row).context("Failed to serialise a report row")?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Re-insert reports from a `reports export` dump.
 ///
 /// Deliberately *not* an upsert and deliberately not id-preserving: ids are
@@ -753,22 +774,16 @@ pub fn run(conn: &Connection, action: crate::cli::ReportsAction) -> Result<()> {
             Ok(())
         }
         ReportsAction::Export { file } => {
-            // `None` = no LIMIT clause: an export that silently stopped at some
-            // default would be a backup missing rows, which is worse than no
-            // backup for being indistinguishable from a complete one.
-            let rows = list(conn, None, None, None, None)?;
-            let mut out = String::new();
-            for row in &rows {
-                out.push_str(&serde_json::to_string(row)?);
-                out.push('\n');
-            }
+            let out = export_to_string(conn)?;
+            // One row per line, so this counts rows without re-querying.
+            let rows = out.lines().count();
             if file.as_os_str() == "-" {
                 print!("{out}");
             } else {
                 std::fs::write(&file, out)
                     .with_context(|| format!("Failed to write {}", file.display()))?;
             }
-            tracing::info!(rows = rows.len(), file = %file.display(), "exported reports");
+            tracing::info!(rows, file = %file.display(), "exported reports");
             Ok(())
         }
         ReportsAction::Import { file } => {

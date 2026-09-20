@@ -435,6 +435,37 @@ cleanup after an abusive burst is time-scoped rather than actor-scoped:
 `reports revoke --since <ts> [--source S]`, with `reports.enabled = false` as the
 immediate stop.
 
+**Gotcha — the backup job exists because a cron job cannot do it, and "wrote a
+file" is not where it ends.** `server::jobs::backup` dumps `object_reports` to a
+directory on a schedule. DuckDB lets one process hold the database file and
+`run` holds it read-write, so an external `reports export` against the live file
+does not produce a stale dump — it cannot open the database at all, and neither
+can a *read-only* open (`IO Error: Could not set lock on file`). That is the
+whole reason this is a job and not a line in crontab. Four things:
+
+1. **The dump format has one home**, `reports::export_to_string`, called by both
+   the CLI arm and the job, because `reports::import_rows` is the tested inverse
+   of *that* text and a second serializer would drift from it silently — with
+   the symptom arriving at restore time.
+2. **A dated file is written only when the content changed**, so an hourly job
+   does not bury the directory in identical copies and a listing shows when
+   something actually happened. That rule makes the prune's exemption
+   load-bearing: **the newest dump is never pruned whatever its age**, or a
+   table nobody reported against for `keep_days` would delete its only copy.
+   `the_newest_dump_is_never_pruned_however_old_it_is` pins it.
+3. **Every file is written to a temporary and renamed into place**, since the
+   directory is served over HTTP while the job runs; and the temporary's suffix
+   deliberately does not end in `.jsonl`, so a half-written file can never be
+   picked up as the newest dump or pruned as a real one. `reports-latest.jsonl`
+   shares the prefix *and* the extension with the dated files, so every scan
+   excludes it by name — let it through and it sorts last, becoming the "newest
+   dump" for both the comparison and the prune.
+4. **Exposure is the reverse proxy's job, not this server's.** The dump is
+   public because nothing identifying the submitter is stored (see above), and
+   serving it from Caddy keeps it reachable while this process is down — which
+   is when it is wanted. Writing the file is also not yet a backup: it sits on
+   the same host as the database, so something off-host has to pull it.
+
 **Gotcha — BDOT10k buildings are pre-filtered by `KATEGORIAISTNIENIA` inside the
 shared match rule, not at import.** `rule::unmatched_buildings_sql` takes an
 `extra_filter`; both bdot10k paths pass `rule::BDOT10K_EKSPLOATOWANY_FILTER`, so

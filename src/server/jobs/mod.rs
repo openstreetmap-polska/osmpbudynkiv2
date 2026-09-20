@@ -6,6 +6,7 @@
 //! - On timeout we record `TimedOut` but KEEP awaiting the blocking handle
 //!   to preserve no-overlap (`spawn_blocking` cannot be aborted).
 
+pub mod backup;
 pub mod building_types_update;
 pub mod dataset_update;
 pub mod match_reconcile;

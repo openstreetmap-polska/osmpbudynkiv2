@@ -172,6 +172,45 @@ package_exports_days = 365
 # [changes].max_age_days -- rows older than that are never served anyway.
 change_areas_days = 90
 
+# Periodic dump of object_reports to a file outside the database.
+#
+# object_reports is the only table here that no `import` can rebuild -- user
+# submissions saying "do not propose this object" -- so it is the only thing
+# that needs backing up. The dump is the same JSONL `reports export` writes,
+# and `reports import <file>` is its inverse (ids are reallocated on import, so
+# a round trip is faithful in content but not in id).
+#
+# This has to run in-process: DuckDB lets one process hold the database file,
+# and `run` holds it read-write, so a cron'd `reports export` against the live
+# file cannot open the database at all -- not even read-only.
+#
+# Writing the file is not yet a backup: it lands on the same host as the
+# database. Serve this directory with the reverse proxy and pull it from
+# somewhere else on a schedule. A static file server in front of it also keeps
+# the dump reachable while this process is down, which is when it is wanted.
+#
+#   # Caddy
+#   handle_path /backups/* {
+#       root * /mnt/osmpbudynkiv2/backups
+#       file_server browse
+#   }
+[jobs.backup]
+enabled = false
+# Hourly. The dump is small and a dated file is only written when the content
+# changed, so the interval costs almost nothing and bounds what can be lost.
+interval_seconds = 3600
+timeout_seconds = 60
+run_on_start = true
+# Created if missing. Dumps land here as reports-<UTC timestamp>.jsonl, plus
+# reports-latest.jsonl, a stable name refreshed every run for a puller to
+# fetch without listing the directory first. Each file is written to a
+# temporary and renamed into place, so a client never sees a partial dump.
+dir = "backups"
+# How long a dated dump is kept. 0 disables pruning. The newest dump is never
+# pruned whatever its age -- dumps are only written when something changed, so
+# a quiet week would otherwise age out the only copy there is.
+keep_days = 30
+
 # Government dataset refreshes. Each downloads the current snapshot, diffs it
 # against the live table, and applies only the difference in a single
 # transaction, so HTTP readers are never disrupted.

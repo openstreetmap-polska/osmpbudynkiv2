@@ -211,6 +211,12 @@ pub async fn run(
         timeout: std::time::Duration::from_secs(config.jobs.retention_prune.timeout_seconds),
         run_on_start: config.jobs.retention_prune.run_on_start,
     };
+    let backup_cfg = jobs::JobConfigResolved {
+        enabled: config.jobs.backup.enabled,
+        interval: std::time::Duration::from_secs(config.jobs.backup.interval_seconds),
+        timeout: std::time::Duration::from_secs(config.jobs.backup.timeout_seconds),
+        run_on_start: config.jobs.backup.run_on_start,
+    };
     let job_list: Vec<(Arc<dyn jobs::Job>, jobs::JobConfigResolved)> = vec![
         (
             Arc::new(jobs::osm_update::OsmUpdateJob) as Arc<dyn jobs::Job>,
@@ -219,6 +225,13 @@ pub async fn run(
         (
             Arc::new(jobs::retention_prune::RetentionPruneJob) as Arc<dyn jobs::Job>,
             retention_prune_cfg,
+        ),
+        // Dumps object_reports to a file outside the database. Off by
+        // default (it writes to a configured directory); the only table here
+        // that no `import` can rebuild.
+        (
+            Arc::new(jobs::backup::BackupJob) as Arc<dyn jobs::Job>,
+            backup_cfg,
         ),
         (
             Arc::new(jobs::dataset_update::DatasetUpdateJob::new(
