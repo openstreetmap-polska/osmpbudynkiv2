@@ -13,6 +13,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="robots" content="noindex" />
   <title>Usługa chwilowo niedostępna – osmpbudynkiv2</title>
+  <!-- Same theme resolution as index.html's <head> script (stored choice >
+       system setting), so a visitor who picked a theme keeps it on this
+       page too. Same origin, so the stored choice is readable here. -->
+  <script>
+    (function () {
+      var theme = null;
+      try {
+        theme = localStorage.getItem("osmpbudynkiv2.theme");
+      } catch (e) {
+        /* Storage blocked: fall back to the system setting. */
+      }
+      if (theme !== "light" && theme !== "dark") {
+        theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      }
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%2317324d'/%3E%3CclipPath id='r'%3E%3Crect x='32' y='10' width='22' height='42'/%3E%3C/clipPath%3E%3Cpolygon points='32,12 50,26 50,50 14,50 14,26' fill='none' stroke='%23fffdf8' stroke-width='2.5' stroke-linejoin='round'/%3E%3Cpolygon points='32,12 50,26 50,50 14,50 14,26' fill='%23c81e1e' opacity='0.85' clip-path='url(%23r)'/%3E%3Cline x1='32' y1='12' x2='32' y2='50' stroke='%23fffdf8' stroke-width='2'/%3E%3C/svg%3E" />
   <style>
     :root {
@@ -27,17 +44,16 @@
       --font-label: ui-sans-serif, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
       --font-data: ui-monospace, "SFMono-Regular", "IBM Plex Mono", Menlo, Consolas, monospace;
     }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --ink: #eae6da;
-        --ink-soft: #b8b2a0;
-        --paper: #1a1d17;
-        --paper-raised: #23261f;
-        --line: #3a3c32;
-        --accent: #a9c4dd;
-        --danger: #e07a62;
-        --ok: #5cc48a;
-      }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --ink: #eae6da;
+      --ink-soft: #b8b2a0;
+      --paper: #1a1d17;
+      --paper-raised: #23261f;
+      --line: #3a3c32;
+      --accent: #a9c4dd;
+      --danger: #e07a62;
+      --ok: #5cc48a;
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; margin: 0; }

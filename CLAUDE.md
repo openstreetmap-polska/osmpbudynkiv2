@@ -139,8 +139,9 @@ preset sits exactly on `max_age_days`, which is the intended maximum, so
 z5–z11 tile, per the next point, not just this overlay. The window is otherwise
 free: it is a paint-time comparison against a raw `ts_*` the tile already
 carries, so switching presets costs no refetch and no restyle, and the picked
-preset rides in the `layers=` hash entry and `localStorage` (this frontend's
-only persisted preference). Two further consequences:
+preset rides in the `layers=` hash entry and `localStorage` (the only
+*hash* setting that persists; the view options below persist in
+`localStorage` alone). Two further consequences:
 
 - **Per-tile cost is linear in `max_age_days` and independent of the tile.**
   The table has no index and no useful cell ordering (`insert_change_areas`
@@ -1560,6 +1561,27 @@ is the single place undoing everything drawing mode changed (`dragPan`,
 without needing to know which mode was active; every exit path goes through it,
 which keeps "no path leaves the map stuck" true by construction.
 
+**Gotcha — the view options are per-viewer and deliberately stay out of the
+URL hash.** `#display-options-modal` (a building-area range, the two
+"Wszystkie" layers) is stored under `DISPLAY_OPTIONS_STORAGE_KEY` only, and
+defaults are stored as *nothing*. A shared link describes what to look at and
+must not hide the recipient's buildings. Because the options survive visits,
+the orange dot on "Opcje widoku" is load-bearing: without it a returning user
+sees buildings missing with nothing saying why. The area filter bounds the
+z14 tiles' `approx_area_m2`, so it cannot reach the z12–13 dots or the z5–11
+grid, and it never touches `/package`. It *does* reach bulk reporting, which
+is correct: `computeReportSelection` uses `queryRenderedFeatures`, which skips
+filtered-out features. The two-thumb slider is two stacked native range inputs
+indexing `AREA_STEPS` (the last position is "no upper limit", stored as
+`null`), and the text fields under it store *any* whole number — so the
+steps are the slider's vocabulary, not the state's. Two consequences: a thumb
+shows a typed value at the nearest step **outward** (`minThumbIndex` rounds
+down, `maxThumbIndex` up, so the fill never looks narrower than the applied
+range), and a thumb move sets **only its own bound** — rebuilding both from
+thumb positions would snap a typed 12 m² to 10. The inputs take pointer
+events **on their thumbs only** — without that the upper input swallows every
+press aimed at the lower thumb.
+
 **Gotcha — the `hidden` attribute loses to any class that sets `display`.**
 `.source-toggle` and `.ratio-legend` set `display: flex`, which ties the UA
 stylesheet's `[hidden] { display: none }` on specificity and wins because author
@@ -1577,3 +1599,16 @@ threw. Resolve real values from `getComputedStyle(document.documentElement)`
 `const …Color` bindings (`buildingAccentColor`, `addressUnmatchedColor`, …) at
 the top of its IIFE — so `style.css` stays the single source of truth for colors,
 light and dark included.
+
+**Gotcha — the theme is an attribute, and MapLibre never sees it change.** Dark
+tokens key on `:root[data-theme="dark"]`, never on the `prefers-color-scheme`
+media query: an inline script in `index.html`'s `<head>` resolves stored choice
+> system setting into that attribute before first paint (no flash), and
+`#theme-toggle` flips it. A dark-only CSS rule written against the media query
+instead would ignore an explicit light choice. `unavailable.html` carries its
+own copy of the script and tokens, since the proxy serves it when nothing else
+is reachable. The six tokens the dark block redefines are `let`, filled by
+`readThemeColors`; on a switch, `applyThemeToMap` pushes them into every paint
+property that used one. **A new paint use of a theme-dependent token needs a
+line there** — a missed one keeps the previous theme's colour until a reload,
+and nothing errors.

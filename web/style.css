@@ -106,6 +106,13 @@
   --ratio-3: #8a3f9e;
   --ratio-4: #5e1258;
   --ratio-unknown: #9b968a;
+  /* Cell outline of the z5-11 grid (agg-grid-fill's fill-outline-color).
+     Its own token rather than --paper-raised, which it used to borrow: that
+     one is a panel background and flips dark with the theme, turning the
+     outline into a heavy black mesh over the basemap -- which, like the ratio
+     ramp above, is light in both themes. Deliberately absent from the dark
+     block. */
+  --grid-outline: #fffdf8;
   /* "Draw an area to download" overlay (draw-fill, draw-outline-drawing,
      draw-outline-committed, draw-vertices, draw-rubberband layers in
      app.js). Same reasoning as --ratio-0.._4 and
@@ -162,28 +169,38 @@
   --font-data: ui-monospace, "SFMono-Regular", "IBM Plex Mono", Menlo, Consolas, monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --ink: #eae6da;
-    --ink-soft: #b8b2a0;
-    --paper: #1a1d17;
-    --paper-raised: #23261f;
-    --line: #3a3c32;
-    --line-strong: #55583e;
-    --accent: #a9c4dd;
-    --accent-soft: #cddaea;
-    --ramp-1: #ffd873;
-    --ramp-2: #ffab5c;
-    --ramp-3: #ff7d54;
-    --ramp-4: #ef5b6b;
-    --ramp-5: #b8496f;
-    --updates: #f0a03c;
-    --changes: #22d3ee;
-    /* --ratio-0.._4 are intentionally absent -- see their definition above:
-       they paint onto a basemap that is light in both themes. Only the
-       sentinel is re-tuned, since it also has to hold up in the legend. */
-    --ratio-unknown: #7d7869;
-  }
+/* Dark tokens key on data-theme, not on the prefers-color-scheme media query:
+   the inline script in index.html's <head> resolves stored choice > system
+   setting into this attribute before first paint, and the masthead toggle
+   flips it. Keying on the attribute is what lets one token list serve both
+   the system default and an explicit choice -- the media-query form would
+   need the whole block twice. color-scheme follows it so native scrollbars
+   and form controls match. */
+:root {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ink: #eae6da;
+  --ink-soft: #b8b2a0;
+  --paper: #1a1d17;
+  --paper-raised: #23261f;
+  --line: #3a3c32;
+  --line-strong: #55583e;
+  --accent: #a9c4dd;
+  --accent-soft: #cddaea;
+  --ramp-1: #ffd873;
+  --ramp-2: #ffab5c;
+  --ramp-3: #ff7d54;
+  --ramp-4: #ef5b6b;
+  --ramp-5: #b8496f;
+  --updates: #f0a03c;
+  --changes: #22d3ee;
+  /* --ratio-0.._4 are intentionally absent -- see their definition above:
+     they paint onto a basemap that is light in both themes. Only the
+     sentinel is re-tuned, since it also has to hold up in the legend. */
+  --ratio-unknown: #7d7869;
 }
 
 * {
@@ -256,6 +273,45 @@ body {
   font-family: var(--font-data);
 }
 
+/* Title plus the theme toggle, which sits at the row's far end so it reads
+   as a setting of the page rather than one of the actions below. */
+.masthead-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.theme-toggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.theme-toggle:hover {
+  color: var(--ink);
+  border-color: var(--line-strong);
+}
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.theme-icon {
+  width: 16px;
+  height: 16px;
+}
+/* The icon names the theme a click switches *to*. */
+:root[data-theme="dark"] .theme-icon-moon,
+:root:not([data-theme="dark"]) .theme-icon-sun {
+  display: none;
+}
+
 .masthead p {
   margin: 2px 0 0;
   font-size: 12px;
@@ -320,11 +376,13 @@ body {
   color: var(--paper);
 }
 
-/* Masthead action row ("Edytuj w JOSM", see .masthead-actions in index.html).
-   Its own button recipe rather than .download-btn's: that class is a
-   full-width stacked panel button, whereas this one sits inline in a text
-   block and has to hug its label. Filled accent (not .report-btn's outlined
-   secondary) because it is the one action this block offers. */
+/* Masthead action row ("Edytuj w JOSM", "Opcje widoku", see
+   .masthead-actions in index.html). Its own button recipe rather than
+   .download-btn's: that class is a full-width stacked panel button, whereas
+   these sit inline in a text block and have to hug their labels. "Edytuj w
+   JOSM" keeps the filled accent as the block's one *action*;
+   .masthead-btn-secondary below is outlined, since two filled buttons side
+   by side read as two equally-likely actions. */
 .masthead-actions {
   display: flex;
   flex-wrap: wrap;
@@ -347,6 +405,33 @@ body {
 .masthead-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+.masthead-btn-secondary {
+  position: relative;
+  background: var(--paper-raised);
+  color: var(--accent);
+}
+.masthead-btn-secondary:hover:not(:disabled) {
+  background: var(--paper);
+  color: var(--accent-soft);
+}
+/* "Something here is not the default" marker on #display-options-btn. On the
+   corner rather than inline so the label does not shift when it appears, and
+   ringed in the masthead's own background so it stays a distinct dot where
+   it overlaps the button's border. --updates rather than --accent: an accent
+   dot on an accent-outlined button disappears into the border it sits on. */
+.options-dot {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--updates);
+  box-shadow: 0 0 0 2px var(--paper);
+}
+.options-dot[hidden] {
+  display: none;
 }
 
 /* Status line under the actions row (remote-control failures, "za duży
@@ -452,6 +537,37 @@ body {
      was copied from); the section itself carries no padding of its own so
      the toggle button can be a flush, full-width click target. */
   padding: 0;
+  /* max-height + the flex/overflow pair below cap the panel instead of
+     letting it grow upward past the viewport. The legend is anchored to the
+     bottom edge and the masthead to the top, two independently-positioned
+     overlays with no shared layout, so on a short window an uncapped
+     expanded legend runs up under the masthead -- and its own toggle, at
+     its top, ends up above the viewport, so it can no longer be folded
+     back. The cap is the measured gap below the masthead
+     (--legend-max-height, set by updateLegendMaxHeight in app.js); `none`
+     until that first runs. The toggle stays outside the scroll region (only
+     #legend-body scrolls), so it stays reachable however far the content is
+     scrolled. Same on every width; the phone query below only changes the
+     fallback and the offsets. */
+  max-height: var(--legend-max-height, none);
+  display: flex;
+  flex-direction: column;
+}
+/* flex: none pins the toggle to its natural size -- without it, a flex
+   item's default flex-shrink:1 lets the column squash it once content
+   forces the container against its max-height, same failure mode as
+   #legend-body's min-height:0 below guards against. */
+.panel-legend #legend-toggle {
+  flex: none;
+}
+/* min-height: 0 overrides a flex item's default min-height:auto, which
+   would otherwise size #legend-body to its content and defeat the parent's
+   max-height instead of scrolling within it. flex: 1 1 auto lets it claim
+   whatever space #legend-toggle doesn't. */
+.panel-legend #legend-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .legend-group + .legend-group {
@@ -524,25 +640,6 @@ body {
   color: var(--paper-raised);
 }
 
-/* "Niskie zoomy" group (z5-13 metric pickers -- just "Kolor" now; "Dane" was
-   dropped in favor of the Budynki/Adresy toggles above). Distinct from
-   .source-toggle/.source-btn above (a connected, content-sized segmented
-   control) because individually bordered buttons that wrap via flexbox cope
-   better with uneven label lengths ("% braków" vs "Liczba"). */
-.legend-subrow {
-  margin-top: 8px;
-}
-
-.legend-subrow-label {
-  display: block;
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--ink-soft);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  margin-bottom: 4px;
-}
-
 /* Scale key for the aggregate grid's colour mode. #ratio-legend shows
    RATIO_STOPS for "% braków"; #count-legend shows the count quantiles for
    "Liczba" (its own bar/caption below) -- only one of the two is visible at
@@ -612,34 +709,6 @@ body {
     var(--ramp-5) 90%,
     var(--ramp-5)
   );
-}
-
-.metric-toggle {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.metric-btn {
-  flex: 1 1 auto;
-  min-width: 44px;
-  padding: 4px 6px;
-  font-family: var(--font-label);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  background: var(--paper);
-  color: var(--ink-soft);
-  border: 1px solid var(--line-strong);
-  border-radius: 3px;
-  text-align: center;
-  white-space: nowrap;
-  cursor: pointer;
-}
-.metric-btn[aria-pressed="true"] {
-  background: var(--accent);
-  color: var(--paper-raised);
-  border-color: var(--accent);
 }
 
 /* Static keys now -- visibility is driven by the single source-toggle above
@@ -791,7 +860,8 @@ button {
   border-color: var(--ok);
 }
 #download-feedback-title,
-#report-modal-title {
+#report-modal-title,
+#display-options-title {
   margin: 0 0 10px;
   font-size: 10px;
   font-weight: 700;
@@ -879,6 +949,201 @@ button {
   color: var(--ink);
 }
 
+/* ---- view options modal (#display-options-modal) ----
+   Shares .feedback-modal's box and backdrop. Wider than the default 360px so
+   the area slider has room for its fifteen steps to stay distinct. */
+#display-options-modal {
+  width: min(92vw, 400px);
+  max-width: min(92vw, 400px);
+}
+#display-options-modal .source-btn {
+  padding: 4px 9px;
+  font-size: 11px;
+}
+.options-group {
+  margin: 0 0 12px;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.options-group-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.options-group-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+#area-range-value {
+  font-family: var(--font-data);
+  font-size: 12px;
+  color: var(--accent);
+}
+
+/* Two-thumb range (#area-range): two native range inputs stacked over one
+   drawn track. The inputs are transparent and take no pointer events
+   themselves -- only their thumbs do -- or the upper input would swallow
+   every press aimed at the lower thumb; app.js handles presses on the bare
+   track. The track is inset by half a thumb on each side, because that is
+   the span a thumb's *centre* travels, so --lo/--hi (set by app.js as a
+   share of the scale) line the fill up with the thumbs exactly. */
+.range-dual {
+  --thumb: 16px;
+  position: relative;
+  height: 24px;
+  margin: 2px 0 0;
+}
+.range-dual-track {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--thumb) / 2);
+  right: calc(var(--thumb) / 2);
+  height: 4px;
+  transform: translateY(-50%);
+  background: var(--line);
+  border-radius: 2px;
+}
+.range-dual-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--lo, 0%);
+  right: calc(100% - var(--hi, 100%));
+  background: var(--accent);
+  border-radius: 2px;
+}
+.range-dual input[type="range"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: none;
+  pointer-events: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.range-dual input[type="range"]::-webkit-slider-runnable-track {
+  height: 100%;
+  background: none;
+  border: none;
+}
+.range-dual input[type="range"]::-moz-range-track {
+  background: none;
+  border: none;
+}
+/* WebKit aligns the thumb to the top of its (here full-height) track, so it
+   is centred by hand; Firefox centres it on its own. */
+.range-dual input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: auto;
+  width: var(--thumb);
+  height: var(--thumb);
+  margin-top: calc((24px - var(--thumb)) / 2);
+  background: var(--paper-raised);
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  cursor: grab;
+}
+.range-dual input[type="range"]::-moz-range-thumb {
+  pointer-events: auto;
+  box-sizing: border-box;
+  width: var(--thumb);
+  height: var(--thumb);
+  background: var(--paper-raised);
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  cursor: grab;
+}
+.range-dual input[type="range"]:active::-webkit-slider-thumb {
+  cursor: grabbing;
+}
+.range-dual input[type="range"]:active::-moz-range-thumb {
+  cursor: grabbing;
+}
+/* The input itself draws no focus ring (appearance: none, and it spans the
+   whole track), so the ring goes on the thumb that actually has focus. */
+.range-dual input[type="range"]:focus {
+  outline: none;
+}
+.range-dual input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--paper-raised), 0 0 0 5px var(--accent);
+}
+.range-dual input[type="range"]:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px var(--paper-raised), 0 0 0 5px var(--accent);
+}
+/* The typed bounds under the slider, one at each end so each sits under
+   the thumb it moves. They double as the scale's end labels: empty, their
+   placeholders read "0" and "bez limitu". */
+.range-dual-fields {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 4px;
+}
+.range-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+.range-field input {
+  /* Sized for the longer placeholder, "bez limitu" (10 characters) -- a
+     clipped "bez limit" reads as a typo rather than as the open bound. The
+     padding and border are added on top because of the global
+     `box-sizing: border-box`; a bare 11ch lost them out of the text area. */
+  width: calc(11ch + 14px);
+  padding: 3px 6px;
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  font-family: var(--font-data);
+  font-size: 12px;
+  text-align: right;
+}
+.range-field input::placeholder {
+  color: var(--ink-soft);
+  opacity: 0.8;
+}
+.range-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.range-field input[aria-invalid] {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px var(--danger);
+}
+.range-error {
+  margin-top: 4px;
+  color: var(--danger);
+}
+.options-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.options-row + .options-row {
+  margin-top: 6px;
+}
+.options-persist-hint {
+  margin: 0 0 12px;
+}
+
+/* A "Wszystkie" legend row whose layer the view options have hidden. Dimmed
+   rather than removed, so the legend keeps its shape and still says what the
+   swatch would mean -- the row's title names where to turn it back on. */
+.legend-row[data-hidden-by-options] {
+  opacity: 0.4;
+}
+
 /* ---- report modal (#report-modal) ----
    Shares .feedback-modal's box, backdrop and data-state colouring with
    #download-feedback; only the form inside it is new. Sized up a step from
@@ -945,7 +1210,10 @@ button {
   background: var(--paper);
 }
 
-@media (prefers-color-scheme: dark) {
+/* Keyed on data-theme like the dark token block, never on the media query --
+   otherwise an explicit light choice on a dark system would still get this
+   dark-mode red. */
+:root[data-theme="dark"] {
   /* --danger is deliberately not re-tuned in :root's dark block, and for the
      short inline warnings that use it (the masthead notice, the feedback
      modals' error text, two popup chips) that is fine. It is not fine on a
@@ -1213,60 +1481,34 @@ button {
     font-size: 12px;
     color: var(--ink-soft);
   }
-  /* max-height + the flex/overflow pair below cap the panel instead of
-     letting it grow upward off-content like the desktop version does: at
-     phone height, an uncapped expanded legend grows tall enough to run
-     under the masthead, since both are independently-positioned overlays
-     with no shared layout that would otherwise keep them apart. The 60vh
-     fallback is a rough guess for the instant before app.js's resize
-     listener computes the real figure (--legend-max-height, set from the
-     masthead's actual measured height -- a fixed vh guess undershot on a
-     narrow phone, where wrapped masthead text runs tall enough to eat past
-     any fraction that still leaves useful legend height on a *short*
-     phone) -- see updateLegendMaxHeight in app.js. The toggle button stays
-     outside the scroll region (only #legend-body scrolls) so it remains
-     reachable to re-collapse the panel however far the content is
-     scrolled. */
+  /* The cap itself is the base .panel-legend rule's; a phone only differs
+     in its fallback -- a rough 60vh for the instant before
+     updateLegendMaxHeight measures the real gap (a fixed vh guess undershot
+     on a narrow phone, where wrapped masthead text runs tall) -- and in its
+     width and bottom inset. */
   .panel-legend {
     width: calc(100vw - 32px);
     /* 16px (the desktop/other-panel inset) plus 8px: at phone width the
        AttributionControl's compact:false text bar (always-on, see app.js)
        runs the full width of the map and can sit tall enough to overlap a
-       plain 16px-inset panel bottom-left. Must move in lockstep with
-       updateLegendMaxHeight's own bottomOffset in app.js, which this same
-       number feeds into the max-height budget. */
+       plain 16px-inset panel bottom-left. updateLegendMaxHeight reads this
+       offset back from the computed style, so it needs no twin in app.js. */
     bottom: 24px;
     max-height: var(--legend-max-height, 60vh);
-    display: flex;
-    flex-direction: column;
-  }
-  /* flex: none pins the toggle to its natural size -- without it, a flex
-     item's default flex-shrink:1 lets the column squash it once content
-     forces the container against its max-height, same failure mode as
-     #legend-body's min-height:0 below guards against. */
-  .panel-legend #legend-toggle {
-    flex: none;
-  }
-  /* min-height: 0 overrides a flex item's default min-height:auto, which
-     would otherwise size #legend-body to its content and defeat the parent's
-     max-height instead of scrolling within it. flex: 1 1 auto lets it claim
-     whatever space #legend-toggle doesn't. */
-  .panel-legend #legend-body {
-    flex: 1 1 auto;
-    overflow-y: auto;
-    min-height: 0;
   }
   /* Neither is useful on a phone: /package assumes a JOSM desktop workflow,
      and the status table's six columns don't fit a phone-width screen.
      Hidden outright, unlike the legend -- which stays reachable, just
      folded by default at load (see the matchMedia check in app.js) -- since
      there's no useful folded state for either of these to fall back to. */
-  /* .masthead-actions joins these two for the same reason: "Edytuj w JOSM"
-     talks to a desktop JOSM over local remote control, which no phone
-     browser has anything to reach. */
+  /* #josm-edit-btn joins these two for the same reason: it talks to a
+     desktop JOSM over local remote control, which no phone browser has
+     anything to reach. Only the button, not the whole .masthead-actions
+     row -- "Opcje widoku" stays, since hiding small buildings or the
+     "Wszystkie" layers helps as much on a phone. */
   .panel-status,
   .panel-download,
-  .masthead-actions {
+  #josm-edit-btn {
     display: none;
   }
 }

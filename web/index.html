@@ -3,6 +3,26 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Resolves the theme before first paint, so a visitor whose theme differs
+       from the default never sees the page flash in the other one. Inline,
+       and ahead of the stylesheet, for exactly that reason -- app.js is a
+       module and runs after the first render. A choice stored by the toggle
+       wins; otherwise the system setting does. The key and the rule must
+       agree with THEME_STORAGE_KEY / storedTheme in app.js. -->
+  <script>
+    (function () {
+      var theme = null;
+      try {
+        theme = localStorage.getItem("osmpbudynkiv2.theme");
+      } catch (e) {
+        /* Storage blocked: fall back to the system setting. */
+      }
+      if (theme !== "light" && theme !== "dark") {
+        theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      }
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
   <title>OSM Polska budynki/adresy v2</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml" />
   <link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32" />
@@ -16,7 +36,24 @@
 
   <header class="masthead">
     <div>
-      <h1>osmpbudynkiv2</h1>
+      <div class="masthead-title-row">
+        <h1>osmpbudynkiv2</h1>
+        <!-- A toggle with a fixed name and aria-pressed, rather than a label
+             that flips between "jasny"/"ciemny": a screen reader then says
+             "Tryb ciemny, przełącznik, wciśnięty", which is unambiguous about
+             both the control and its state. The icon shows the theme a click
+             switches *to*, the usual convention. See the theme section in
+             app.js. -->
+        <button id="theme-toggle" type="button" class="theme-toggle" aria-pressed="false" aria-label="Tryb ciemny">
+          <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+          </svg>
+          <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <circle cx="12" cy="12" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/>
+            <path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
       <p>Aplikacja dla edytorów <a href="https://www.openstreetmap.org" target="_blank" rel="noopener noreferrer">OpenStreetMap (OSM)</a>.</p>
       <p>Rejestry publiczne porównywane są z OSM, a niedopasowane budynki i adresy można pobrac w celu dodania z użyciem edytora JOSM.</p>
       <hr>
@@ -26,9 +63,10 @@
       </p>
       <!-- Actions row. Deliberately below the warning rather than above it:
            the warning is a precondition for editing, so it has to be read
-           before the button that starts an edit. Hidden below 640px together
-           with .panel-download and .panel-status (see the media query in
-           style.css) -- all three assume a JOSM desktop workflow.
+           before the button that starts an edit. Below 640px only the JOSM
+           button is hidden, together with .panel-download and .panel-status
+           (see the media query in style.css) -- all three assume a JOSM
+           desktop workflow, while the view options are as useful on a phone.
            Text-only by choice: the JOSM wordmark would be a vendored
            third-party raster needing its own colour plate the way
            .sponsor-credit-logo does (it is fixed-colour art over a
@@ -41,6 +79,20 @@
           class="masthead-btn"
           title="Wczytuje w JOSM dane OSM dla widocznego obszaru. Wymaga uruchomionego JOSM ze zdalnym sterowaniem (Ustawienia → Zdalne sterowanie)."
         >Edytuj w JOSM</button>
+        <!-- Opens #display-options-modal. The dot and the visually-hidden
+             "(zmienione)" are shown together by applyDisplayOptionsIndicator
+             in app.js whenever any option differs from its default -- the
+             options persist across visits, so without a visible cue a
+             returning user would see buildings missing from the map with
+             nothing on screen saying why. -->
+        <button
+          id="display-options-btn"
+          type="button"
+          class="masthead-btn masthead-btn-secondary"
+          aria-haspopup="dialog"
+          aria-controls="display-options-modal"
+          title="Filtrowanie budynków według powierzchni i widoczność warstw „Wszystkie”."
+        >Opcje widoku<span id="display-options-custom" class="visually-hidden" hidden> (zmienione)</span><span id="display-options-dot" class="options-dot" aria-hidden="true" hidden></span></button>
       </div>
       <p id="josm-edit-hint" class="masthead-hint" role="status" aria-live="polite" hidden></p>
       <!-- Mobile-only twin of #sponsor-credit below -- hidden on desktop by
@@ -98,7 +150,7 @@
         <button type="button" class="source-btn" data-source="bdot10k" aria-pressed="true">BDOT10k</button>
         <button type="button" class="source-btn" data-source="egib" aria-pressed="false">EGiB</button>
       </div>
-      <div class="legend-row">
+      <div class="legend-row" data-all-layer="buildings">
         <span class="swatch swatch-all" data-swatch="buildings"></span>
         Wszystkie
       </div>
@@ -116,7 +168,7 @@
         <button type="button" class="source-btn" data-address-source="off" aria-pressed="false">Wyłącz</button>
         <button type="button" class="source-btn" data-address-source="prg" aria-pressed="true">PRG</button>
       </div>
-      <div class="legend-row">
+      <div class="legend-row" data-all-layer="addresses">
         <span class="swatch swatch-all" data-swatch="addresses"></span>
         Wszystkie
       </div>
@@ -166,12 +218,14 @@
       <div class="legend-group-header">
         <span class="legend-title">Niskie zoomy (5&ndash;11)</span>
       </div>
-      <div class="legend-subrow">
-        <span class="legend-subrow-label">Kolor</span>
-        <div class="metric-toggle" id="agg-color-toggle" role="group" aria-label="Co oznacza kolor">
-          <button type="button" class="metric-btn" data-color="ratio" aria-pressed="true">% braków</button>
-          <button type="button" class="metric-btn" data-color="count" aria-pressed="false">Liczba</button>
-        </div>
+      <!-- Same segmented control as the groups above. "Wyłącz" hides the
+           z5-11 grid only -- the z12-13 dots and the "Ostatnio
+           zaktualizowane" outline keep their own switches. See
+           applyAggMetric in app.js. -->
+      <div class="source-toggle" id="agg-color-toggle" role="group" aria-label="Siatka niskich zoomów: wyłączona albo co oznacza kolor">
+        <button type="button" class="source-btn" data-color="off" aria-pressed="false">Wyłącz</button>
+        <button type="button" class="source-btn" data-color="ratio" aria-pressed="true">% braków</button>
+        <button type="button" class="source-btn" data-color="count" aria-pressed="false">Liczba</button>
       </div>
       <div class="ratio-legend" id="ratio-legend">
         <div class="ratio-legend-scale">
@@ -322,6 +376,80 @@
              accepted -- see the report-modal-actions comment in app.js. -->
         <button id="report-close" type="button" class="feedback-modal-close" hidden>Zamknij</button>
       </div>
+    </div>
+  </dialog>
+
+  <!-- Standing display preferences, kept in localStorage (see the
+       display-options section in app.js). Every control applies on click --
+       there is no "save" step, so Zamknij and the backdrop only dismiss.
+       Same segmented-control vocabulary as the legend (role="group" +
+       .source-toggle + .source-btn + aria-pressed). -->
+  <dialog id="display-options-modal" class="feedback-modal display-options-modal" aria-labelledby="display-options-title">
+    <button id="display-options-close-x" type="button" class="modal-close-x" aria-label="Zamknij">&times;</button>
+    <h2 id="display-options-title">Opcje widoku</h2>
+
+    <!-- Two-thumb range: two native <input type="range"> stacked over one
+         drawn track, so each thumb keeps the browser's own keyboard and
+         screen-reader handling. Both inputs index the same step list
+         (AREA_STEPS in app.js, which also sets their min/max/value), so the
+         thumbs share one scale. The two text fields under it take any whole
+         number the steps cannot reach; an empty field is that end's open
+         bound, which the placeholders spell out. See the area-range comments
+         in app.js. -->
+    <div class="options-group">
+      <div class="options-group-header">
+        <h3 class="options-group-title" id="area-range-label">Powierzchnia budynków</h3>
+        <output id="area-range-value" for="area-min area-max" aria-live="off">Wszystkie</output>
+      </div>
+      <div id="area-range" class="range-dual" role="group" aria-labelledby="area-range-label">
+        <div class="range-dual-track" aria-hidden="true"><div class="range-dual-fill"></div></div>
+        <input id="area-min" type="range" min="0" max="1" step="1" value="0" aria-label="Najmniejsza powierzchnia" />
+        <input id="area-max" type="range" min="0" max="1" step="1" value="1" aria-label="Największa powierzchnia" />
+      </div>
+      <div class="range-dual-fields">
+        <label class="range-field">
+          <span aria-hidden="true">od</span>
+          <input id="area-min-text" type="text" inputmode="numeric" maxlength="7" autocomplete="off" spellcheck="false"
+                 placeholder="0" aria-label="Najmniejsza powierzchnia w m²" aria-describedby="area-range-error" />
+          <span aria-hidden="true">m²</span>
+        </label>
+        <label class="range-field">
+          <span aria-hidden="true">do</span>
+          <input id="area-max-text" type="text" inputmode="numeric" maxlength="7" autocomplete="off" spellcheck="false"
+                 placeholder="bez limitu" aria-label="Największa powierzchnia w m²" aria-describedby="area-range-error" />
+          <span aria-hidden="true">m²</span>
+        </label>
+      </div>
+      <p id="area-range-error" class="hint range-error" aria-live="polite" hidden></p>
+      <p class="hint">
+        Działa od zoomu 14, dla wszystkich i niedopasowanych budynków. Powierzchnia jest przybliżona.
+        Filtr zmienia tylko to, co widać na mapie &ndash; pobrana paczka zawiera wszystkie budynki z obszaru.
+      </p>
+    </div>
+
+    <div class="options-group">
+      <h3 class="options-group-title">Warstwy &bdquo;Wszystkie&rdquo;</h3>
+      <div class="options-row">
+        <span id="buildings-all-label">Wszystkie budynki</span>
+        <div class="source-toggle" role="group" aria-labelledby="buildings-all-label">
+          <button type="button" class="source-btn" data-show-buildings-all="true" aria-pressed="true">Pokaż</button>
+          <button type="button" class="source-btn" data-show-buildings-all="false" aria-pressed="false">Ukryj</button>
+        </div>
+      </div>
+      <div class="options-row">
+        <span id="addresses-all-label">Wszystkie adresy</span>
+        <div class="source-toggle" role="group" aria-labelledby="addresses-all-label">
+          <button type="button" class="source-btn" data-show-addresses-all="true" aria-pressed="true">Pokaż</button>
+          <button type="button" class="source-btn" data-show-addresses-all="false" aria-pressed="false">Ukryj</button>
+        </div>
+      </div>
+      <p class="hint">Niedopasowane obiekty są widoczne zawsze, gdy ich źródło jest włączone w legendzie.</p>
+    </div>
+
+    <p class="hint options-persist-hint">Ustawienia są zapamiętywane w tej przeglądarce.</p>
+    <div class="feedback-modal-actions">
+      <button id="display-options-reset" type="button" class="download-btn">Przywróć domyślne</button>
+      <button id="display-options-close" type="button" class="feedback-modal-close">Zamknij</button>
     </div>
   </dialog>
 

@@ -30,13 +30,8 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const addressUnmatchedOutlineColor = rootStyle
     .getPropertyValue("--address-unmatched-outline")
     .trim();
-  const paperRaisedColor = rootStyle.getPropertyValue("--paper-raised").trim();
-  const inkColor = rootStyle.getPropertyValue("--ink").trim();
-  // Sequential ramp for the z5-11 aggregate grid (low -> high density), used
-  // by the "Liczba" colour mode.
-  const rampColors = [1, 2, 3, 4, 5].map((i) => rootStyle.getPropertyValue(`--ramp-${i}`).trim());
   const ratioColors = [0, 1, 2, 3, 4].map((i) => rootStyle.getPropertyValue(`--ratio-${i}`).trim());
-  const ratioUnknownColor = rootStyle.getPropertyValue("--ratio-unknown").trim();
+  const gridOutlineColor = rootStyle.getPropertyValue("--grid-outline").trim();
   // "Draw an area to download" overlay -- see the draw layers below and the
   // token comment in style.css.
   const drawOutlineColor = rootStyle.getPropertyValue("--draw-outline").trim();
@@ -52,12 +47,33 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // interaction and only ever appears inside the teal polygon that produced
   // it, so a fifth colour here would read as another data series.
   const reportSelectHaloColor = "#ffffff";
-  // Recently-downloaded /package export areas, fed by GET /updates -- see the
-  // updates-fill/updates-outline layers and pollUpdates below.
-  const updatesColor = rootStyle.getPropertyValue("--updates").trim();
-  // Grid cells a government registry changed recently -- see the
-  // changes-outline layer and applyChangesVisibility below.
-  const changesColor = rootStyle.getPropertyValue("--changes").trim();
+
+  // The theme-dependent colours: the tokens style.css's dark block redefines.
+  // Everything read above stays `const` because that block deliberately
+  // leaves it alone (it paints onto the OSM raster, light in both themes).
+  // These are re-read on every theme switch and pushed back into the layers
+  // that use them -- see applyThemeToMap, whose layer list has to grow with
+  // any new use of one of these in a paint property. rootStyle is a live
+  // CSSStyleDeclaration, so a re-read after data-theme flips sees the new
+  // values.
+  let paperRaisedColor, inkColor, rampColors, ratioUnknownColor, updatesColor, changesColor;
+
+  function readThemeColors() {
+    const token = (name) => rootStyle.getPropertyValue(name).trim();
+    paperRaisedColor = token("--paper-raised");
+    inkColor = token("--ink");
+    // Sequential ramp for the z5-11 aggregate grid (low -> high density),
+    // used by the "Liczba" colour mode.
+    rampColors = [1, 2, 3, 4, 5].map((i) => token(`--ramp-${i}`));
+    ratioUnknownColor = token("--ratio-unknown");
+    // Recently-downloaded /package export areas, fed by GET /updates -- see
+    // the updates-fill/updates-outline layers and pollUpdates below.
+    updatesColor = token("--updates");
+    // Grid cells a government registry changed recently -- see the
+    // changes-outline layer and applyChangesVisibility below.
+    changesColor = token("--changes");
+  }
+  readThemeColors();
 
   // How far back "recently" reaches for the changes-outline overlay, as the
   // options the legend offers. Purely frontend numbers: the tile carries a
@@ -346,11 +362,11 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       minzoom: 5,
       maxzoom: 12,
       paint: {
-        // Bivariate by default (hue = ratio, opacity = count); the "Kolor"
+        // Bivariate by default (hue = ratio, opacity = count); the "Siatka"
         // toggle rewrites both together via applyAggMetric.
         "fill-color": ratioColorExpr("r_total"),
         "fill-opacity": countOpacityExpr("n_total"),
-        "fill-outline-color": paperRaisedColor,
+        "fill-outline-color": gridOutlineColor,
       },
     },
     {
@@ -764,6 +780,11 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     levels_above_ground: "Kondygnacje nadziemne",
     kondygnacje_podziemne: "Kondygnacje podziemne",
     rodzaj: "Rodzaj budynku",
+    // Computed by the server for the minimum-area filter (see the view
+    // options section below), on both building layers. Rendered with a
+    // leading "≈" by formatValue: it is a rounded, latitude-scaled planar
+    // area, not a surveyed figure.
+    approx_area_m2: "Powierzchnia",
 
     // buildings -- OSM tag preview, same convention as the addr:* group:
     // literal tag keys, shown unchanged. `building:levels` restates
@@ -902,6 +923,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   function formatValue(key, value) {
     if (value === null || value === undefined || value === "") return "—";
+    if (key === "approx_area_m2") return `≈ ${value} m²`;
     return String(value);
   }
 
@@ -1510,14 +1532,17 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const STATE_HASH_KEY = "layers";
   const VALID_BUILDING_SOURCES = ["off", "bdot10k", "egib"];
   const VALID_ADDRESS_SOURCES = ["off", "prg"];
-  const VALID_AGG_COLORS = ["ratio", "count"];
+  // "off" joined later; a link from before it simply never carries it.
+  const VALID_AGG_COLORS = ["off", "ratio", "count"];
   const VALID_CHANGES_WINDOWS = CHANGES_WINDOWS.map((w) => w.key);
 
-  // The changes window is the one setting that also survives a *new* visit,
-  // not just a shared link: it is a standing preference ("I watch registry
-  // updates") rather than a description of one view, and the alternative is
-  // re-picking it on every visit. Everything else in the hash stays
-  // session-scoped, so a bare visit still opens on the documented defaults.
+  // The changes window is the one *hash* setting that also survives a new
+  // visit, not just a shared link: it is a standing preference ("I watch
+  // registry updates") rather than a description of one view, and the
+  // alternative is re-picking it on every visit. Everything else in the hash
+  // stays session-scoped, so a bare visit still opens on the documented
+  // defaults. (The view options below persist too, but live only in
+  // localStorage, never in the hash -- see DISPLAY_OPTIONS_STORAGE_KEY.)
   //
   // localStorage can throw outright (Chrome with third-party/site data
   // blocked, Safari private mode), not merely return null, so every access
@@ -1661,20 +1686,163 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
   applyChangesWindowLabel();
 
+  // ---- view options (#display-options-modal) ----
+  //
+  // Standing per-viewer preferences, unlike the legend's toggles: which
+  // buildings are too small to be worth seeing, and whether the grey
+  // "Wszystkie" layers are clutter. So they live in localStorage alone and
+  // never in the `layers=` hash -- a shared link describes *what* to look at,
+  // and must not silently hide the recipient's small buildings or reference
+  // layers.
+  //
+  // They refine the legend rather than compete with it: a legend source set to
+  // "Wyłącz" hides everything of that kind whatever these say, and these only
+  // ever hide *more*. Hence the indicator on the button -- because they
+  // persist, a returning user would otherwise find buildings missing with
+  // nothing on screen saying why.
+  //
+  // The area range is a pair of bounds on the tile's approx_area_m2 (see
+  // approx_area_m2_sql in src/server/tiles.rs): MapLibre has no expression for
+  // a polygon's area, so the server carries it. It reaches only the four z14
+  // building layers -- the z12-13 dots and the z5-11 grid are aggregates with
+  // no per-building size -- and only the map: /package exports everything in
+  // the area, which the modal says in so many words.
+  //
+  // Bulk reporting follows the filter by construction: computeReportSelection
+  // uses queryRenderedFeatures, which skips filtered-out features, so a
+  // building hidden here can never be reported unseen.
+  const DISPLAY_OPTIONS_STORAGE_KEY = "osmpbudynkiv2.displayOptions";
+  // The area slider's scale, in m². Stepped rather than continuous because
+  // footprints span four orders of magnitude: on a linear 0..1000 track the
+  // whole shed-to-house range (5-150 m²) would be the first seventh of the
+  // slider. Each thumb position is one entry, and one extra position past the
+  // end means "no upper limit" (stored as null -- JSON has no Infinity).
+  // The two <input type="range"> in index.html take their min/max from this.
+  //
+  // The steps are the *slider's* vocabulary, not the state's: the text fields
+  // under it store any whole number (12 m², 2500 m²), and a thumb then shows
+  // the nearest step outward -- see minThumbIndex/maxThumbIndex.
+  const AREA_STEPS = [0, 5, 10, 15, 20, 30, 40, 50, 75, 100, 150, 200, 300, 500, 1000];
+  const AREA_NO_LIMIT_INDEX = AREA_STEPS.length;
+  const DEFAULT_DISPLAY_OPTIONS = Object.freeze({
+    minBuildingAreaM2: 0,
+    maxBuildingAreaM2: null,
+    showBuildingsAll: true,
+    showAddressesAll: true,
+  });
+
+  function areaAt(index) {
+    return index < AREA_STEPS.length ? AREA_STEPS[index] : null;
+  }
+
+  // Outward rounding, lower bound down and upper bound up, so the drawn fill
+  // always covers the whole range actually applied -- never a narrower one
+  // that would suggest buildings are shown when they are not. An upper bound
+  // past the last step sits on the "no limit" position; the readout and the
+  // text field still say the real number.
+  function minThumbIndex(min) {
+    let index = 0;
+    while (index + 1 < AREA_STEPS.length && AREA_STEPS[index + 1] <= min) index++;
+    return index;
+  }
+
+  function maxThumbIndex(max) {
+    if (max === null) return AREA_NO_LIMIT_INDEX;
+    const index = AREA_STEPS.findIndex((step) => step >= max);
+    return index === -1 ? AREA_NO_LIMIT_INDEX : index;
+  }
+
+  function displayOptionsAreDefault(options) {
+    return Object.keys(DEFAULT_DISPLAY_OPTIONS).every((k) => options[k] === DEFAULT_DISPLAY_OPTIONS[k]);
+  }
+
+  // Validated field by field, so one stale or hand-edited value falls back to
+  // its own default without discarding the rest. The two area bounds are one
+  // field for this purpose: both must be whole non-negative numbers (the upper
+  // one may be null) and in order, or both reset -- keeping one half of a
+  // broken pair could produce an empty range. Same "the store may throw" guard
+  // as readStoredChangesWindow.
+  function readStoredDisplayOptions() {
+    let stored = null;
+    try {
+      stored = JSON.parse(localStorage.getItem(DISPLAY_OPTIONS_STORAGE_KEY));
+    } catch {
+      /* Unavailable store or malformed JSON: defaults. */
+    }
+    const options = { ...DEFAULT_DISPLAY_OPTIONS };
+    if (stored && typeof stored === "object") {
+      // A max-less object is what the earlier min-only presets stored; it
+      // reads as "no upper limit", which is what it meant.
+      const min = stored.minBuildingAreaM2;
+      const max = stored.maxBuildingAreaM2 === undefined ? null : stored.maxBuildingAreaM2;
+      const isArea = (v) => Number.isInteger(v) && v >= 0;
+      if (isArea(min) && (max === null || (isArea(max) && min <= max))) {
+        options.minBuildingAreaM2 = min;
+        options.maxBuildingAreaM2 = max;
+      }
+      if (typeof stored.showBuildingsAll === "boolean") options.showBuildingsAll = stored.showBuildingsAll;
+      if (typeof stored.showAddressesAll === "boolean") options.showAddressesAll = stored.showAddressesAll;
+    }
+    return options;
+  }
+
+  // Defaults are stored as *nothing*, so a later change to a default reaches
+  // everyone who never picked anything, and "Przywróć domyślne" leaves no
+  // trace behind.
+  function storeDisplayOptions(options) {
+    try {
+      if (displayOptionsAreDefault(options)) {
+        localStorage.removeItem(DISPLAY_OPTIONS_STORAGE_KEY);
+      } else {
+        localStorage.setItem(DISPLAY_OPTIONS_STORAGE_KEY, JSON.stringify(options));
+      }
+    } catch {
+      /* Preference is not persisted; the session still works. */
+    }
+  }
+
+  let displayOptions = readStoredDisplayOptions();
+
+  // The map's layers exist only once the style has loaded; until then a
+  // change is recorded (state, storage, controls) and the load-time
+  // wireLegend applies it along with everything else.
+  let mapLayersReady = false;
+
+  // Both bounds inclusive, and a bound at its end of the scale is left out
+  // rather than written as `>= 0` / `<= Infinity`, so the default range adds
+  // no clause at all. A feature without approx_area_m2 (a tile cached from
+  // before the attribute existed) passes, so such a tile shows every building
+  // rather than none.
+  function areaFilterClause() {
+    const { minBuildingAreaM2: min, maxBuildingAreaM2: max } = displayOptions;
+    const bounds = [];
+    if (min > 0) bounds.push([">=", ["get", "approx_area_m2"], min]);
+    if (max !== null) bounds.push(["<=", ["get", "approx_area_m2"], max]);
+    if (!bounds.length) return null;
+    return ["any", ["!", ["has", "approx_area_m2"]], ["all", ...bounds]];
+  }
+
+  function buildingFilter(source) {
+    const area = areaFilterClause();
+    return area ? ["all", sourceFilter(source), area] : sourceFilter(source);
+  }
+
   function setLayerVisible(layerId, visible) {
     map.setLayoutProperty(layerId, "visibility", visible ? "visible" : "none");
   }
 
   function applyBuildingVisibility() {
     const visible = buildingSource !== "off";
+    const allVisible = visible && displayOptions.showBuildingsAll;
     if (visible) {
-      map.setFilter("buildings-all-fill", sourceFilter(buildingSource));
-      map.setFilter("buildings-all-outline", sourceFilter(buildingSource));
-      map.setFilter("buildings-unmatched-fill", sourceFilter(buildingSource));
-      map.setFilter("buildings-unmatched-outline", sourceFilter(buildingSource));
+      const filter = buildingFilter(buildingSource);
+      map.setFilter("buildings-all-fill", filter);
+      map.setFilter("buildings-all-outline", filter);
+      map.setFilter("buildings-unmatched-fill", filter);
+      map.setFilter("buildings-unmatched-outline", filter);
     }
-    setLayerVisible("buildings-all-fill", visible);
-    setLayerVisible("buildings-all-outline", visible);
+    setLayerVisible("buildings-all-fill", allVisible);
+    setLayerVisible("buildings-all-outline", allVisible);
     setLayerVisible("buildings-unmatched-fill", visible);
     setLayerVisible("buildings-unmatched-outline", visible);
   }
@@ -1683,10 +1851,366 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     // No filter needed: addresses/addresses_all source-layers are PRG-only
     // (see src/server/tiles.rs) -- "Wyłącz" is the only other state.
     const visible = addressSource !== "off";
-    setLayerVisible("addresses-all-circle", visible);
+    setLayerVisible("addresses-all-circle", visible && displayOptions.showAddressesAll);
     setLayerVisible("addresses-unmatched-circle", visible);
     setLayerVisible("addresses-unmatched-label", visible);
   }
+
+  const displayOptionsBtn = document.getElementById("display-options-btn");
+  const displayOptionsDot = document.getElementById("display-options-dot");
+  const displayOptionsCustomText = document.getElementById("display-options-custom");
+  const displayOptionsModal = document.getElementById("display-options-modal");
+  const displayOptionsReset = document.getElementById("display-options-reset");
+  const displayOptionsClose = document.getElementById("display-options-close");
+  const displayOptionsCloseX = document.getElementById("display-options-close-x");
+  const areaRange = document.getElementById("area-range");
+  const areaRangeTrack = areaRange.querySelector(".range-dual-track");
+  const areaMinInput = document.getElementById("area-min");
+  const areaMaxInput = document.getElementById("area-max");
+  const areaRangeValue = document.getElementById("area-range-value");
+  const areaMinText = document.getElementById("area-min-text");
+  const areaMaxText = document.getElementById("area-max-text");
+  const areaRangeError = document.getElementById("area-range-error");
+  for (const input of [areaMinInput, areaMaxInput]) {
+    input.min = "0";
+    input.max = String(AREA_NO_LIMIT_INDEX);
+  }
+  const buildingsAllButtons = displayOptionsModal.querySelectorAll("[data-show-buildings-all]");
+  const addressesAllButtons = displayOptionsModal.querySelectorAll("[data-show-addresses-all]");
+  const legendAllRows = {
+    buildings: document.querySelector('.legend-row[data-all-layer="buildings"]'),
+    addresses: document.querySelector('.legend-row[data-all-layer="addresses"]'),
+  };
+
+  function areaRangeText(min, max) {
+    if (min === 0 && max === null) return "Wszystkie";
+    if (max === null) return `od ${min} m²`;
+    if (min === 0) return `do ${max} m²`;
+    if (min === max) return `${min} m²`;
+    return `${min}–${max} m²`;
+  }
+
+  // An open bound shows as an empty field, which is what the placeholder
+  // ("0" / "bez limitu") is there to explain -- the same rule the fields read
+  // back with, so a round trip through them changes nothing.
+  function areaFieldText(value, openValue) {
+    return value === openValue ? "" : String(value);
+  }
+
+  // Whole square metres written with digits only, like approx_area_m2
+  // itself: the tile carries no fraction, so a decimal threshold could only
+  // ever select what a whole one does, while suggesting a precision the
+  // filter lacks. Anything else is an error rather than a correction.
+  // Silently stripping it was tried and turned "12,5" into 125, ten times
+  // what was meant. Surrounding whitespace is the one thing forgiven, since
+  // it cannot mean anything else.
+  function parseAreaField(text, openValue) {
+    const trimmed = text.trim();
+    if (trimmed === "") return { ok: true, value: openValue };
+    if (!/^\d+$/.test(trimmed)) return { ok: false };
+    return { ok: true, value: Number(trimmed) };
+  }
+
+  function setAreaFieldError(message, field) {
+    areaRangeError.textContent = message || "";
+    areaRangeError.hidden = !message;
+    areaMinText.toggleAttribute("aria-invalid", Boolean(message) && field === areaMinText);
+    areaMaxText.toggleAttribute("aria-invalid", Boolean(message) && field === areaMaxText);
+  }
+
+  // Everything on the page that *describes* the options, as opposed to the
+  // map layers they drive: the slider's thumbs, fill and readout, the
+  // modal's pressed states, the button's indicator (dot for sight,
+  // "(zmienione)" for screen readers), whether reset has anything to do, and
+  // the legend's two "Wszystkie" rows.
+  function syncDisplayOptionsControls() {
+    const { minBuildingAreaM2: min, maxBuildingAreaM2: max } = displayOptions;
+    const minIndex = minThumbIndex(min);
+    const maxIndex = maxThumbIndex(max);
+    // Written back even mid-drag: that is what snaps a thumb pushed into the
+    // other one back to its legal position.
+    areaMinInput.value = String(minIndex);
+    areaMaxInput.value = String(maxIndex);
+    // Never into the field being typed in: rewriting it would normalise the
+    // text under the caret ("12," -> "12") while the user is mid-number.
+    if (document.activeElement !== areaMinText) areaMinText.value = areaFieldText(min, 0);
+    if (document.activeElement !== areaMaxText) areaMaxText.value = areaFieldText(max, null);
+    // The input's own value is a step index, which would be read out as a
+    // meaningless "3"; aria-valuetext says what it stands for.
+    areaMinInput.setAttribute("aria-valuetext", min === 0 ? "0 m², bez dolnego limitu" : `od ${min} m²`);
+    areaMaxInput.setAttribute("aria-valuetext", max === null ? "bez górnego limitu" : `do ${max} m²`);
+    areaRange.style.setProperty("--lo", `${(minIndex / AREA_NO_LIMIT_INDEX) * 100}%`);
+    areaRange.style.setProperty("--hi", `${(maxIndex / AREA_NO_LIMIT_INDEX) * 100}%`);
+    areaRangeValue.textContent = areaRangeText(min, max);
+    for (const b of buildingsAllButtons) {
+      b.setAttribute("aria-pressed", String((b.dataset.showBuildingsAll === "true") === displayOptions.showBuildingsAll));
+    }
+    for (const b of addressesAllButtons) {
+      b.setAttribute("aria-pressed", String((b.dataset.showAddressesAll === "true") === displayOptions.showAddressesAll));
+    }
+    const custom = !displayOptionsAreDefault(displayOptions);
+    displayOptionsDot.hidden = !custom;
+    displayOptionsCustomText.hidden = !custom;
+    displayOptionsReset.disabled = !custom;
+    for (const [layer, shown] of [
+      ["buildings", displayOptions.showBuildingsAll],
+      ["addresses", displayOptions.showAddressesAll],
+    ]) {
+      const row = legendAllRows[layer];
+      if (!row) continue;
+      row.toggleAttribute("data-hidden-by-options", !shown);
+      if (shown) row.removeAttribute("title");
+      else row.title = "Ukryte w opcjach widoku";
+    }
+  }
+
+  // At most once per frame, reading whatever the options are by then: a
+  // slider drag fires `input` far faster than that, and setFilter is
+  // layout-affecting, so each call has MapLibre re-evaluate every loaded
+  // tile's features.
+  let applyDisplayOptionsFrame = 0;
+
+  function setDisplayOptions(next) {
+    displayOptions = next;
+    storeDisplayOptions(displayOptions);
+    syncDisplayOptionsControls();
+    if (!mapLayersReady || applyDisplayOptionsFrame) return;
+    applyDisplayOptionsFrame = requestAnimationFrame(() => {
+      applyDisplayOptionsFrame = 0;
+      applyBuildingVisibility();
+      applyAddressVisibility();
+    });
+  }
+
+  // A thumb sets only its own bound. Rebuilding both from the two thumb
+  // positions would snap the untouched one to a step: a typed 12 m² minimum,
+  // drawn at 10, would silently become 10 the moment the other thumb moved.
+  //
+  // The moved bound stops short of the other rather than pushing it along,
+  // so the bound the user is not touching never changes under them. A thumb
+  // cannot land *on* the other bound either: an empty range would hide every
+  // building, which nobody drags to on purpose. (A typed "od 50 do 50" is
+  // allowed -- that one is deliberate.)
+  function setAreaRangeFromInputs(moved) {
+    let { minBuildingAreaM2: min, maxBuildingAreaM2: max } = displayOptions;
+    if (moved === areaMinInput) {
+      min = AREA_STEPS[Math.min(Number(areaMinInput.value), AREA_STEPS.length - 1)];
+      if (max !== null && min >= max) {
+        const below = AREA_STEPS.filter((step) => step < max);
+        min = below.length ? below[below.length - 1] : 0;
+      }
+    } else {
+      max = areaAt(Number(areaMaxInput.value));
+      if (max !== null && max <= min) max = AREA_STEPS.find((step) => step > min) ?? null;
+    }
+    // A slider move is a fresh, valid state: whatever the fields were
+    // complaining about (or still about to apply) no longer describes
+    // anything.
+    cancelPendingAreaField();
+    setAreaFieldError(null);
+    setDisplayOptions({ ...displayOptions, minBuildingAreaM2: min, maxBuildingAreaM2: max });
+  }
+
+  // Applied once the user pauses typing (see AREA_FIELD_DEBOUNCE_MS), whenever
+  // both fields read as a valid range. While they do not, the map keeps the
+  // last valid range and
+  // the error says why; nothing is reverted on blur, because the fix is often
+  // in the *other* field ("od 300" while "do" still says 200) and snapping
+  // the first one back on the way there would undo the user's work. The
+  // dialog's close handler resyncs them.
+  // Not per keystroke: typing "300" would otherwise apply "3" and "30" on the
+  // way -- ranges nobody asked for, each a full setFilter -- and when "do"
+  // says 200 the map would be left on 30-200 once "300" turned invalid.
+  // Enter and leaving the field apply at once.
+  const AREA_FIELD_DEBOUNCE_MS = 300;
+  let areaFieldTimer = 0;
+
+  function cancelPendingAreaField() {
+    clearTimeout(areaFieldTimer);
+    areaFieldTimer = 0;
+  }
+
+  function flushPendingAreaField(field) {
+    if (!areaFieldTimer) return;
+    cancelPendingAreaField();
+    setAreaRangeFromFields(field);
+  }
+
+  function setAreaRangeFromFields(edited) {
+    const lo = parseAreaField(areaMinText.value, 0);
+    const hi = parseAreaField(areaMaxText.value, null);
+    if (!lo.ok || !hi.ok) {
+      setAreaFieldError(
+        "Wpisz liczbę całkowitą, same cyfry (np. 25), albo zostaw pole puste.",
+        !lo.ok ? areaMinText : areaMaxText,
+      );
+      return;
+    }
+    if (hi.value !== null && lo.value > hi.value) {
+      setAreaFieldError("Wartość „od” nie może być większa niż „do”.", edited);
+      return;
+    }
+    setAreaFieldError(null);
+    setDisplayOptions({ ...displayOptions, minBuildingAreaM2: lo.value, maxBuildingAreaM2: hi.value });
+  }
+
+  // Wired at startup rather than on map load, unlike the legend: the modal
+  // and its indicator are plain DOM, and a user who remembers hiding
+  // something should see the dot before the first tile arrives.
+  for (const input of [areaMinInput, areaMaxInput]) {
+    input.addEventListener("input", () => setAreaRangeFromInputs(input));
+  }
+  for (const field of [areaMinText, areaMaxText]) {
+    field.addEventListener("input", () => {
+      cancelPendingAreaField();
+      areaFieldTimer = setTimeout(() => {
+        areaFieldTimer = 0;
+        setAreaRangeFromFields(field);
+      }, AREA_FIELD_DEBOUNCE_MS);
+    });
+    field.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") flushPendingAreaField(field);
+    });
+    // Once the user leaves a field whose range applied, show it normalised
+    // ("007" -> "7"); one still in error is left as typed.
+    field.addEventListener("blur", () => {
+      flushPendingAreaField(field);
+      if (areaRangeError.hidden) syncDisplayOptionsControls();
+    });
+  }
+  // The inputs take pointer events on their thumbs only (see .range-dual in
+  // style.css) -- otherwise the upper input would swallow every click aimed
+  // at the lower thumb. So a click on the bare track lands here instead, and
+  // moves whichever thumb is nearer, the way a single native slider jumps to
+  // a clicked point.
+  areaRange.addEventListener("pointerdown", (e) => {
+    if (e.target === areaMinInput || e.target === areaMaxInput) return;
+    const rect = areaRangeTrack.getBoundingClientRect();
+    const fraction = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1);
+    const index = Math.round(fraction * AREA_NO_LIMIT_INDEX);
+    const minIndex = Number(areaMinInput.value);
+    const maxIndex = Number(areaMaxInput.value);
+    const input =
+      index <= minIndex || (index < maxIndex && index - minIndex <= maxIndex - index) ? areaMinInput : areaMaxInput;
+    input.value = String(index);
+    // Without preventDefault the press's own default mousedown runs after
+    // this and moves focus to the <dialog>, so keyboard nudging would no
+    // longer reach the thumb that just moved.
+    e.preventDefault();
+    input.focus();
+    setAreaRangeFromInputs(input);
+  });
+  for (const b of buildingsAllButtons) {
+    b.addEventListener("click", () =>
+      setDisplayOptions({ ...displayOptions, showBuildingsAll: b.dataset.showBuildingsAll === "true" }),
+    );
+  }
+  for (const b of addressesAllButtons) {
+    b.addEventListener("click", () =>
+      setDisplayOptions({ ...displayOptions, showAddressesAll: b.dataset.showAddressesAll === "true" }),
+    );
+  }
+  displayOptionsReset.addEventListener("click", () => {
+    cancelPendingAreaField();
+    setAreaFieldError(null);
+    setDisplayOptions({ ...DEFAULT_DISPLAY_OPTIONS });
+    // Reset disables itself (nothing left to reset), which would drop focus
+    // to <body> mid-dialog; hand it to the obvious next step instead.
+    displayOptionsClose.focus();
+  });
+  displayOptionsBtn.addEventListener("click", () => {
+    if (!displayOptionsModal.open) displayOptionsModal.showModal();
+  });
+  displayOptionsClose.addEventListener("click", () => displayOptionsModal.close());
+  displayOptionsCloseX.addEventListener("click", () => displayOptionsModal.close());
+  // Backdrop click, same as the other dialogs: the event targets the <dialog>
+  // itself only when it lands outside its content box.
+  displayOptionsModal.addEventListener("click", (e) => {
+    if (e.target === displayOptionsModal) displayOptionsModal.close();
+  });
+  // However the dialog closes (button, backdrop, Esc), text that never became
+  // a valid range is dropped: the next open shows what the map applies.
+  displayOptionsModal.addEventListener("close", () => {
+    cancelPendingAreaField();
+    setAreaFieldError(null);
+    syncDisplayOptionsControls();
+  });
+  syncDisplayOptionsControls();
+
+  // ---- light/dark theme (#theme-toggle) ----
+  //
+  // index.html's inline <head> script has already resolved the theme into
+  // <html data-theme> before first paint; this owns every change after that.
+  // A choice is stored only while it differs from the system setting, so
+  // picking the theme the system already asks for goes back to following the
+  // system -- no third "auto" state for the button to explain.
+  const THEME_STORAGE_KEY = "osmpbudynkiv2.theme"; // also read by index.html's <head> script
+  const themeToggle = document.getElementById("theme-toggle");
+  const systemDarkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+  function systemTheme() {
+    return systemDarkQuery.matches ? "dark" : "light";
+  }
+
+  // Same "the store may throw" guard as readStoredChangesWindow.
+  function storedTheme() {
+    try {
+      const theme = localStorage.getItem(THEME_STORAGE_KEY);
+      return theme === "light" || theme === "dark" ? theme : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function storeTheme(theme) {
+    try {
+      if (theme === systemTheme()) localStorage.removeItem(THEME_STORAGE_KEY);
+      else localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      /* Preference is not persisted; the session still works. */
+    }
+  }
+
+  function syncThemeToggle() {
+    const dark = document.documentElement.dataset.theme === "dark";
+    themeToggle.setAttribute("aria-pressed", String(dark));
+    themeToggle.title = dark ? "Przełącz na tryb jasny" : "Przełącz na tryb ciemny";
+  }
+
+  // Every paint property that took a theme-dependent colour (see
+  // readThemeColors) when the style was built. MapLibre never re-reads CSS,
+  // so a new use of one of those variables needs a line here -- a missed one
+  // keeps the previous theme's colour until a reload, and nothing errors.
+  // applyAggMetric rebuilds the grid's fill, which reads rampColors and
+  // ratioUnknownColor.
+  function applyThemeToMap() {
+    map.setPaintProperty("changes-outline", "line-color", changesColor);
+    map.setPaintProperty("updates-fill", "fill-color", updatesColor);
+    map.setPaintProperty("updates-outline", "line-color", updatesColor);
+    map.setPaintProperty("draw-vertices", "circle-color", paperRaisedColor);
+    map.setPaintProperty("addresses-unmatched-label", "text-color", inkColor);
+    map.setPaintProperty("addresses-unmatched-label", "text-halo-color", paperRaisedColor);
+    applyAggMetric();
+  }
+
+  function setTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    readThemeColors();
+    syncThemeToggle();
+    if (mapLayersReady) applyThemeToMap();
+  }
+
+  themeToggle.addEventListener("click", () => {
+    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    storeTheme(next);
+    setTheme(next);
+  });
+  // An OS switching theme (say, at sunset) is followed only while nothing is
+  // stored -- an explicit choice is exactly what must not move under the user.
+  systemDarkQuery.addEventListener("change", () => {
+    if (!storedTheme()) setTheme(systemTheme());
+  });
+  syncThemeToggle();
 
   function applyUpdatesVisibility() {
     setLayerVisible("updates-fill", updatesVisible);
@@ -1822,14 +2346,15 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // also offered circles and a heatmap was tried and removed. The grid no
   // longer has its own "Dane" picker either -- see the "combined grid Dane"
   // comment near combinedCountValueExpr above -- it now mirrors whichever
-  // registries the Budynki/Adresy toggles above have turned on. Only "Kolor"
-  // remains its own control, since it's orthogonal (how to draw the data, not
-  // which data). points-dots (z12-13) has no style/Dane hook of its own --
+  // registries the Budynki/Adresy toggles above have turned on. Only "Siatka"
+  // remains its own control, since it's orthogonal (whether and how to draw
+  // the data, not which data) -- its "Wyłącz" is the one way to hide the grid
+  // while keeping buildings/addresses on at z14. points-dots (z12-13) has no style/Dane hook of its own --
   // it's always dots colored by source -- but it does mirror the same active
   // Budynki/Adresy sources as the grid (applyAggMetric below sets its filter
   // too), so switching to e.g. BDOT10k hides EGiB's dots the same way it
   // hides EGiB's grid contribution.
-  const aggColorButtons = document.querySelectorAll("#agg-color-toggle .metric-btn");
+  const aggColorButtons = document.querySelectorAll("#agg-color-toggle .source-btn");
   const ratioLegend = document.getElementById("ratio-legend");
   const countLegend = document.getElementById("count-legend");
 
@@ -1847,21 +2372,27 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   function applyAggMetric() {
     const sources = activeAggSources();
-    const visible = sources.length > 0;
-    setLayerVisible("agg-grid-fill", visible);
+    const anySource = sources.length > 0;
+    // The grid's own "Wyłącz" hides the grid and nothing else. points-dots
+    // (z12-13) and changes-outline answer to the legend's source toggles
+    // alone: the picker is labelled for z5-11, and the recently-changed
+    // outline has its own switch, so tying either to it would hide something
+    // the user never turned off.
+    const gridVisible = anySource && aggColor !== "off";
+    setLayerVisible("agg-grid-fill", gridVisible);
     // points-dots carries all three sources unfiltered from the tile (see
     // POINTS_MVT_SQL in src/server/tiles.rs) -- restrict it to whichever
     // registries are actually toggled on, same set the grid uses.
-    setLayerVisible("points-dots", visible);
-    if (visible) {
+    setLayerVisible("points-dots", anySource);
+    if (anySource) {
       map.setFilter("points-dots", ["in", ["get", "source"], ["literal", sources]]);
     }
-    if (ratioLegend) ratioLegend.hidden = !visible || aggColor !== "ratio";
-    if (countLegend) countLegend.hidden = !visible || aggColor !== "count";
+    if (ratioLegend) ratioLegend.hidden = !gridVisible || aggColor !== "ratio";
+    if (countLegend) countLegend.hidden = !gridVisible || aggColor !== "count";
     // Before the early return: the overlay mirrors the same source set, so
     // it has to follow "Wyłącz" on both toggles down as well as back up.
     applyChangesVisibility();
-    if (!visible) return;
+    if (!gridVisible) return;
 
     const ratioMode = aggColor === "ratio";
     const countValue = combinedCountValueExpr(sources);
@@ -1909,12 +2440,14 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
 
   if (map.isStyleLoaded()) {
+    mapLayersReady = true;
     startChangesCutoffClock();
     wireLegend();
     wireAggLegend();
     pollUpdates();
   } else {
     map.once("load", () => {
+      mapLayersReady = true;
       startChangesCutoffClock();
       wireLegend();
       wireAggLegend();
@@ -1979,40 +2512,49 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   wirePanelToggle(legendToggle, legendBody);
   wirePanelToggle(document.getElementById("download-toggle"), document.getElementById("download-body"));
 
-  // On a phone-width screen the legend starts folded -- expanded is right on
-  // desktop, where there's vertical room to spare, but at phone height an
-  // expanded legend covers most of the map on first load. Breakpoint must
-  // match style.css's own `@media (max-width: 640px)`; only the initial
-  // state is width-driven, a manual toggle afterwards behaves like every
-  // other panel and just stays as the user left it.
-  if (window.matchMedia("(max-width: 640px)").matches) {
-    legendToggle.setAttribute("aria-expanded", "false");
-    legendBody.hidden = true;
-  }
 
-  // Keeps the mobile legend panel's cap (--legend-max-height, read by
-  // style.css's .panel-legend) pinned to the actual gap below the masthead
-  // instead of a guessed vh fraction -- the masthead's height is both
-  // viewport-width-dependent (its text wraps differently per phone) and
-  // content-driven, so no fixed fraction of viewport height stays safe
-  // across real phone sizes (measured: 60vh still let the expanded legend
-  // run under the masthead on a 320x568 screen). Math.max floors it well
-  // above zero so a pathologically short/landscape phone still leaves the
-  // toggle itself reachable rather than clipping the panel out entirely.
+  // Keeps the legend's height cap (--legend-max-height, read by style.css's
+  // .panel-legend) pinned to the actual gap between the masthead and the
+  // bottom edge, at every width. Measured rather than a vh fraction because
+  // the masthead's height is content- and width-dependent (its text wraps
+  // differently per screen; measured: 60vh still let the expanded legend run
+  // under the masthead on a 320x568 phone). Without the cap an expanded
+  // legend on a short window runs up under the masthead, and its own toggle
+  // ends up above the viewport where it cannot be folded back. The bottom
+  // inset is read from the computed style rather than restated, since the
+  // phone query moves it. Math.max floors the cap well above zero, so a
+  // pathologically short window still leaves the toggle itself reachable
+  // rather than clipping the panel out entirely.
   const mastheadEl = document.querySelector(".masthead");
   const legendPanel = document.querySelector(".panel-legend");
   function updateLegendMaxHeight() {
-    if (!window.matchMedia("(max-width: 640px)").matches) {
-      legendPanel.style.removeProperty("--legend-max-height");
-      return;
-    }
     const gapBelowMasthead = 8;
-    const bottomOffset = 24; // matches .panel-legend's own `bottom: 24px`
+    const bottomOffset = parseFloat(getComputedStyle(legendPanel).bottom) || 0;
     const available = window.innerHeight - mastheadEl.getBoundingClientRect().bottom - gapBelowMasthead - bottomOffset;
     legendPanel.style.setProperty("--legend-max-height", `${Math.max(available, 80)}px`);
   }
   updateLegendMaxHeight();
   window.addEventListener("resize", updateLegendMaxHeight);
+
+  // The legend starts folded when it would not fit expanded: on a phone-width
+  // screen always (at phone height an expanded legend covers most of the map
+  // on first load; breakpoint must match style.css's own
+  // `@media (max-width: 640px)`), and on a wider one when the window is too
+  // short to show it whole. "Too short" is "the capped legend would have to
+  // scroll", read off the real layout -- the cap above has just been applied
+  // and the body is still expanded -- rather than a guessed pixel threshold,
+  // since the legend's height and the masthead's both depend on content and
+  // font metrics.
+  //
+  // Only the initial state: a manual toggle afterwards behaves like every
+  // other panel and stays as the user left it, and a later resize never
+  // folds it out from under them -- the cap keeps an unfolded legend usable
+  // at any height.
+  const legendWouldScroll = legendBody.scrollHeight > legendBody.clientHeight + 1;
+  if (window.matchMedia("(max-width: 640px)").matches || legendWouldScroll) {
+    legendToggle.setAttribute("aria-expanded", "false");
+    legendBody.hidden = true;
+  }
 
   // /status carries timestamps in two shapes: the in-memory job registry
   // emits plain RFC3339 UTC ("...Z"), while job_run_log's ran_at and
@@ -2368,9 +2910,10 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   }
 
   // Last-used mode, remembered only for this page session (module-level, not
-  // localStorage -- the one persisted preference this frontend has is the
-  // changes window, see CHANGES_WINDOW_STORAGE_KEY, and a draw mode is a
-  // per-task choice rather than a standing one). Rectangle is the default
+  // localStorage -- what this frontend persists is standing preferences, the
+  // changes window and the view options (CHANGES_WINDOW_STORAGE_KEY,
+  // DISPLAY_OPTIONS_STORAGE_KEY), and a draw mode is a per-task choice rather
+  // than a standing one). Rectangle is the default
   // first mode since it needs no explanation.
   let drawMode = "rectangle";
 
