@@ -768,7 +768,9 @@ is deliberately kept (6,244 rows, overwhelmingly square sheds). Area comes from
 `geometry_always_xy = true`, which the server sets and a bare CLI session does
 not, so the same text is ~45% high in one of them with no error. The explicit
 `ST_IsEmpty` is load-bearing: `POLYGON EMPTY` passes `ST_IsValid` and has a
-NULL latitude, so the area alone reads NULL and keeps the row.
+NULL latitude, so the area alone reads NULL and keeps the row. The same
+expression feeds the tiles' `approx_area_m2` (`server::tiles::approx_area_m2_sql`),
+so "under 1 m²" means one thing at load and on the map.
 
 All three are row *filters* — they change which rows exist, never the content
 of a surviving row. The one real ordering constraint: all must run **before**

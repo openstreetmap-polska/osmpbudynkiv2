@@ -38,7 +38,9 @@ use crate::tile_math::{CHANGE_CELL_ZOOM, tile_to_bbox};
 /// attributes, completing the buildings tag preview.
 /// 3: bodies are stored gzipped with a content-hash `ETag`; z12..=z13 joined
 /// the persisted tiers.
-pub const TILE_FORMAT_VERSION: u32 = 3;
+/// 4: `buildings` and `buildings_all` gained `approx_area_m2`, which the
+/// frontend's minimum-area filter reads.
+pub const TILE_FORMAT_VERSION: u32 = 4;
 
 // ST_AsMVTGeom's bounds argument is BOX_2D, not GEOMETRY -- ST_MakeEnvelope
 // returns GEOMETRY, so it must be narrowed via ST_Extent() first or DuckDB's
@@ -397,6 +399,29 @@ fn addresses_sql(projection: &str, scope: TileScope) -> String {
     )
 }
 
+/// `approx_area_m2` for the two building layers: the footprint in whole
+/// square metres, from `dataset::area_m2_sql` -- the same expression
+/// `dataset::filter_undersized_geometry` drops rows by, so "under 1 m^2" means
+/// one thing at load and on the map. It exists for the frontend's
+/// minimum-area filter, which is a plain `>=` against this attribute: MapLibre
+/// has no expression for a polygon's area, so the number has to ride in the
+/// tile.
+///
+/// Whole metres rather than the raw `DOUBLE`, for tile size: `ST_AsMVT`
+/// interns each distinct attribute value once per layer, so a float that is
+/// unique per building would add one dictionary entry per feature, where
+/// integers repeat across a dense tile. The slider's thresholds are whole
+/// metres anyway. "Approximate" is in the name because it is a latitude-scaled
+/// planar area (within 0.05% of the ellipsoidal one, see `area_m2_sql`) and
+/// then rounded -- not a surveyed figure, and not to be exported as one.
+///
+/// Computed at render time rather than stored: it is ~0.13 us per feature
+/// (~1 ms on the densest `buildings_all` tile), and a stored column would
+/// need a re-import plus a `compare` to appear -- there is no migration path.
+fn approx_area_m2_sql(geom: &str) -> String {
+    format!("round({})::INTEGER", crate::dataset::area_m2_sql(geom))
+}
+
 /// Like `ADDRESSES_MVT_SQL`, built at first use rather than declared `const`,
 /// so the `source:building` values come from `package`'s own constants.
 ///
@@ -467,6 +492,7 @@ fn buildings_sql(projection: &str, scope: TileScope) -> String {
                -- key, so the frontend's report action can send a complete
                -- record key. NULL for egib, whose id_budynku is the whole key.
                u.PRZESTRZENNAZW,
+               u.approx_area_m2,
                u.funkcja_szczegolowa, u.funkcja_ogolna, u.levels_above_ground,
                u.KATEGORIAISTNIENIA, u.NAZWA, u.FSBUD, u.INFORMACJADODATKOWA,
                u.KODKST, u.ZRODLODANYCHGEOMETRYCZNYCH,
@@ -482,6 +508,7 @@ fn buildings_sql(projection: &str, scope: TileScope) -> String {
     {header}
     bdot10k_pkg AS MATERIALIZED (
         SELECT {tile_cols}b.rowid AS rid, b.LOKALNYID AS id, b.PRZESTRZENNAZW, b.geom,
+               {area} AS approx_area_m2,
                ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
                b.funkcja_szczegolowa, b.funkcja_ogolna, b.liczba_kondygnacji,
                b.KATEGORIAISTNIENIA, b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA,
@@ -503,6 +530,7 @@ fn buildings_sql(projection: &str, scope: TileScope) -> String {
     ),
     bdot10k_final AS (
         SELECT {final_tile_cols}pkg.geom, 'bdot10k' AS source, pkg.id, pkg.PRZESTRZENNAZW,
+               pkg.approx_area_m2,
                pkg.funkcja_szczegolowa, pkg.funkcja_ogolna,
                pkg.liczba_kondygnacji::INTEGER AS levels_above_ground,
                pkg.KATEGORIAISTNIENIA, pkg.NAZWA, pkg.FSBUD, pkg.INFORMACJADODATKOWA,
@@ -530,6 +558,7 @@ fn buildings_sql(projection: &str, scope: TileScope) -> String {
     ),
     egib_pkg AS MATERIALIZED (
         SELECT {tile_cols}b.rowid AS rid, b.id_budynku AS id, b.geom,
+               {area} AS approx_area_m2,
                ST_X(ST_Centroid(b.geom)) AS cx, ST_Y(ST_Centroid(b.geom)) AS cy,
                b.rodzaj_kod, b.kondygnacje_nadziemne, b.kondygnacje_podziemne, b.rodzaj
         FROM egib_unmatched b{pkg_join}
@@ -549,6 +578,7 @@ fn buildings_sql(projection: &str, scope: TileScope) -> String {
     ),
     egib_final AS (
         SELECT {final_tile_cols}pkg.geom, 'egib' AS source, pkg.id, NULL::VARCHAR AS PRZESTRZENNAZW,
+               pkg.approx_area_m2,
                NULL::VARCHAR AS funkcja_szczegolowa, NULL::VARCHAR AS funkcja_ogolna,
                pkg.kondygnacje_nadziemne AS levels_above_ground,
                NULL::VARCHAR AS KATEGORIAISTNIENIA, NULL::VARCHAR AS NAZWA,
@@ -577,6 +607,7 @@ fn buildings_sql(projection: &str, scope: TileScope) -> String {
         header = scope.header(),
         scan = scope.scan_envelope(0.0),
         scan_buf = scope.scan_envelope(ADJACENCY_READ_BUFFER_DEG),
+        area = approx_area_m2_sql("b.geom"),
         bdot10k_key = if batched {
             format!("'{BDOT10K_ADJACENCY_KEY}'")
         } else {
@@ -645,7 +676,8 @@ static ALL_BUILDINGS_MVT_SQL: LazyLock<String> =
 fn all_buildings_sql(projection: &str, scope: TileScope) -> String {
     let cols = format!(
         "ST_AsMVTGeom(raw.geom, {box}, 4096, 256, true) AS geom,
-               raw.id, raw.source, raw.PRZEWAZAJACAFUNKCJABUDYNKU, raw.FUNKCJAOGOLNABUDYNKU,
+               raw.id, raw.source, raw.approx_area_m2,
+               raw.PRZEWAZAJACAFUNKCJABUDYNKU, raw.FUNKCJAOGOLNABUDYNKU,
                raw.levels_above_ground, raw.KATEGORIAISTNIENIA, raw.NAZWA, raw.FSBUD,
                raw.INFORMACJADODATKOWA, raw.KODKST, raw.ZRODLODANYCHGEOMETRYCZNYCH,
                raw.kondygnacje_podziemne, raw.rodzaj, raw.reported",
@@ -654,6 +686,7 @@ fn all_buildings_sql(projection: &str, scope: TileScope) -> String {
     let raw = format!(
         "(
             SELECT b.geom, b.LOKALNYID AS id, 'bdot10k' AS source,
+                   {area} AS approx_area_m2,
                    b.PRZEWAZAJACAFUNKCJABUDYNKU, b.FUNKCJAOGOLNABUDYNKU,
                    b.LICZBAKONDYGNACJI::INTEGER AS levels_above_ground,
                    b.KATEGORIAISTNIENIA, b.NAZWA, b.FSBUD, b.INFORMACJADODATKOWA,
@@ -663,6 +696,7 @@ fn all_buildings_sql(projection: &str, scope: TileScope) -> String {
             FROM bdot10k_candidates b
             UNION ALL
             SELECT b.geom, b.id_budynku AS id, 'egib' AS source,
+                   {area} AS approx_area_m2,
                    NULL::VARCHAR AS PRZEWAZAJACAFUNKCJABUDYNKU, NULL::VARCHAR AS FUNKCJAOGOLNABUDYNKU,
                    b.kondygnacje_nadziemne AS levels_above_ground,
                    NULL::VARCHAR AS KATEGORIAISTNIENIA, NULL::VARCHAR AS NAZWA, NULL::VARCHAR AS FSBUD,
@@ -674,6 +708,7 @@ fn all_buildings_sql(projection: &str, scope: TileScope) -> String {
         ) raw",
         reported_bdot10k = reported_sql(&BDOT10K, "b"),
         reported_egib = reported_sql(&EGIB, "b"),
+        area = approx_area_m2_sql("b.geom"),
     );
     format!(
         "
@@ -2517,6 +2552,29 @@ mod tests {
     /// `with_building_levels`'s own rule rather than restated literals --
     /// the whole point of the preview is that it agrees with the export.
     fn building_tag_preview(state: &AppState) -> Vec<(String, String, Option<String>)> {
+        let mut out = query_unmatched_buildings(
+            state,
+            "t.id, t.\"source:building\", t.\"building:levels\"",
+            |row| {
+                (
+                    row.get::<_, String>(0).unwrap(),
+                    row.get::<_, String>(1).unwrap(),
+                    row.get::<_, Option<String>>(2).unwrap(),
+                )
+            },
+        );
+        out.sort();
+        out
+    }
+
+    /// Runs `buildings_sql` for tile 14/8000/4900 with `projection` over the
+    /// finished rows, binding exactly what `serve_tile` binds, and maps each
+    /// row through `read`.
+    fn query_unmatched_buildings<T>(
+        state: &AppState,
+        projection: &str,
+        read: impl Fn(&duckdb::Row) -> T,
+    ) -> Vec<T> {
         let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
         let (buf_min_lon, buf_min_lat, buf_max_lon, buf_max_lat) = (
             min_lon - ADJACENCY_READ_BUFFER_DEG,
@@ -2524,10 +2582,7 @@ mod tests {
             max_lon + ADJACENCY_READ_BUFFER_DEG,
             max_lat + ADJACENCY_READ_BUFFER_DEG,
         );
-        let sql = buildings_sql(
-            "t.id, t.\"source:building\", t.\"building:levels\"",
-            TileScope::Single,
-        );
+        let sql = buildings_sql(projection, TileScope::Single);
         let conn = state.pool.get().unwrap();
         let mut stmt = conn.prepare(&sql).unwrap();
         let mut rows = stmt
@@ -2558,14 +2613,113 @@ mod tests {
             .unwrap();
         let mut out = Vec::new();
         while let Some(row) = rows.next().unwrap() {
-            out.push((
-                row.get::<_, String>(0).unwrap(),
-                row.get::<_, String>(1).unwrap(),
-                row.get::<_, Option<String>>(2).unwrap(),
-            ));
+            out.push(read(row));
         }
-        out.sort();
         out
+    }
+
+    /// --- `approx_area_m2` on the two building layers ------------------------
+    ///
+    /// One ~0.0002 x 0.0001 degree rectangle per source, in both the unmatched
+    /// and the raw tables. The reference is EPSG:3035, which is equal-area and
+    /// so exact wherever it is defined -- not EPSG:2180, whose conformal scale
+    /// error reaches several percent this far (the fixture tile sits near 4E)
+    /// from its 19E central meridian. Tolerance covers `area_m2_sql`'s
+    /// measured 0.05% plus the rounding to whole metres.
+    ///
+    /// Per row through the projection seam, for the same reason as the
+    /// `reported` tests below: the key is in the layer dictionary whether or
+    /// not any feature carries a value.
+    fn seed_for_area() -> (String, String) {
+        let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+        let (lon, lat) = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0);
+        let wkt = format!(
+            "POLYGON(({lon} {lat}, {x} {lat}, {x} {y}, {lon} {y}, {lon} {lat}))",
+            x = lon + 0.0002,
+            y = lat + 0.0001
+        );
+        let seed = format!(
+            "INSERT INTO bdot10k_unmatched (LOKALNYID, geom, cell_x, cell_y, computed_at)
+             VALUES ('b1', ST_GeomFromText('{wkt}'), 8000, 4900, now());
+             INSERT INTO egib_unmatched (id_budynku, geom, cell_x, cell_y, computed_at)
+             VALUES ('e1', ST_GeomFromText('{wkt}'), 8000, 4900, now());
+             INSERT INTO bdot10k_buildings (PRZESTRZENNAZW, LOKALNYID, geom, centroid)
+             VALUES ('PL.PZGiK.BDOT10k.1234', 'b1', ST_GeomFromText('{wkt}'),
+                     ST_Centroid(ST_GeomFromText('{wkt}')));
+             INSERT INTO egib_buildings (id_budynku, geom, centroid)
+             VALUES ('e1', ST_GeomFromText('{wkt}'), ST_Centroid(ST_GeomFromText('{wkt}')));"
+        );
+        (seed, wkt)
+    }
+
+    fn equal_area_m2(state: &AppState, wkt: &str) -> f64 {
+        state
+            .pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ST_Area(ST_Transform(ST_GeomFromText(?::VARCHAR), 'EPSG:4326', 'EPSG:3035',
+                                             always_xy := true))",
+                [wkt],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn both_building_layers_carry_the_footprint_area_in_whole_square_metres() {
+        let (seed, wkt) = seed_for_area();
+        let state = make_state(&seed);
+        let expected = equal_area_m2(&state, &wkt);
+        assert!(
+            expected > 100.0,
+            "fixture must be a real-sized building, got {expected}"
+        );
+
+        let mut unmatched = query_unmatched_buildings(&state, "t.id, t.approx_area_m2", |row| {
+            (
+                row.get::<_, String>(0).unwrap(),
+                row.get::<_, Option<i64>>(1).unwrap(),
+            )
+        });
+        unmatched.sort();
+        let mut all = {
+            let (min_lon, min_lat, max_lon, max_lat) = tile_to_bbox(14, 8000, 4900);
+            let bbox = [min_lon, min_lat, max_lon, max_lat];
+            // bbox CTE, bdot10k_candidates, egib_candidates.
+            let flat: Vec<f64> = (0..3).flat_map(|_| bbox).collect();
+            let params: Vec<&dyn duckdb::ToSql> =
+                flat.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+            let conn = state.pool.get().unwrap();
+            let mut stmt = conn
+                .prepare(&all_buildings_sql(
+                    "t.id, t.approx_area_m2",
+                    TileScope::Single,
+                ))
+                .unwrap();
+            let mut rows = stmt.query(params.as_slice()).unwrap();
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().unwrap() {
+                out.push((
+                    row.get::<_, String>(0).unwrap(),
+                    row.get::<_, Option<i64>>(1).unwrap(),
+                ));
+            }
+            out
+        };
+        all.sort();
+
+        for (layer, rows) in [("buildings", &unmatched), ("buildings_all", &all)] {
+            let ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(ids, vec!["b1", "e1"], "{layer}: one feature per source");
+            for (id, area) in rows {
+                let area = area.unwrap_or_else(|| panic!("{layer}/{id}: approx_area_m2 is NULL"));
+                assert!(
+                    (area as f64 - expected).abs() <= expected * 0.001 + 0.5,
+                    "{layer}/{id}: approx_area_m2 {area}, equal-area reference {expected:.2}"
+                );
+            }
+        }
     }
 
     /// Seeds one bdot10k and one egib unmatched building in the tile, with
