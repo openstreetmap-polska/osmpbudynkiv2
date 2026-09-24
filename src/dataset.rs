@@ -1,7 +1,8 @@
 //! Per-source metadata ([`DatasetSpec`]) plus the shared load-time helpers
 //! used by both `import` and `update`'s staging load: [`non_null_key_sql`] /
 //! [`null_key_sql`] (record-identity filtering), [`deduplicate_by_key`],
-//! [`filter_invalid_geometry`] and [`filter_oversized_geometry`].
+//! [`filter_invalid_geometry`], [`filter_oversized_geometry`] and
+//! [`filter_undersized_geometry`].
 //!
 //! [`DatasetSpec::changed_predicate_sql`] is the single home for the
 //! comparison a refresh uses to decide whether a record is "modified" — see
@@ -490,16 +491,18 @@ pub fn null_key_sql(key_columns: &[&str]) -> String {
         .join(" OR ")
 }
 
-/// Rows a dataset loader dropped rather than staging, for one of five
+/// Rows a dataset loader dropped rather than staging, for one of six
 /// reasons: geometry that failed `ST_IsValid` (`ST_AsMVTGeom` cannot
 /// tolerate invalid geometry, see docs/invalid_geometry_tile_500s.md),
 /// geometry whose bbox spans at least one full z14 cell in either axis (see
 /// `filter_oversized_geometry` -- a corrupted merge of two unrelated
-/// features, not a real building), no coordinates to build a point from
-/// (PRG only, see `import::prg::materialize_into`), a NULL record key (see
+/// features, not a real building), a footprint under
+/// [`MIN_BUILDING_AREA_M2`] (see `filter_undersized_geometry`), no
+/// coordinates to build a point from (PRG only, see
+/// `import::prg::materialize_into`), a NULL record key (see
 /// [`non_null_key_sql`] -- a record with no identifier cannot be diffed or
 /// deduplicated), or a duplicate record key (see [`deduplicate_by_key`]).
-/// All five reasons drop rather than repair.
+/// All six reasons drop rather than repair.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadStats {
     pub skipped_invalid_geometry: i64,
@@ -511,6 +514,10 @@ pub struct LoadStats {
     /// Same cap and ordering caveat as `skipped_example_ids`, for the
     /// oversized-geometry reason.
     pub skipped_oversized_example_ids: Vec<String>,
+    pub skipped_undersized_geometry: i64,
+    /// Same cap and ordering caveat as `skipped_example_ids`, for the
+    /// undersized-geometry reason.
+    pub skipped_undersized_example_ids: Vec<String>,
     /// PRG rows with a NULL longitude or latitude, which `materialize_into`
     /// cannot turn into a point. Counted only among rows that *have* a key,
     /// so a row missing both lands under `skipped_null_key` alone and the
@@ -539,6 +546,15 @@ impl LoadStats {
     pub fn merge_oversized(mut self, oversized: LoadStats) -> Self {
         self.skipped_oversized_geometry = oversized.skipped_oversized_geometry;
         self.skipped_oversized_example_ids = oversized.skipped_oversized_example_ids;
+        self
+    }
+
+    /// Fold in the undersized-geometry counts from the third filter pass
+    /// (`filter_undersized_geometry`), exactly as `merge_oversized` does for
+    /// the second.
+    pub fn merge_undersized(mut self, undersized: LoadStats) -> Self {
+        self.skipped_undersized_geometry = undersized.skipped_undersized_geometry;
+        self.skipped_undersized_example_ids = undersized.skipped_undersized_example_ids;
         self
     }
 
@@ -719,9 +735,127 @@ pub fn filter_oversized_geometry(
     })
 }
 
+/// Smallest footprint, in square metres, that [`filter_undersized_geometry`]
+/// keeps. Nothing below it is a building: measured over the full source
+/// tables, the rows under 1 m^2 are either degenerate outlines -- BDOT10k
+/// carries `budynek jednorodzinny` records with a median area of 0.08 m^2,
+/// some two points traced out and back with a 7-19 m perimeter -- or EGIB's
+/// ~0.9 m^2 squares, which are cabinets and pillars rather than anything
+/// mapped as a building -- 92 BDOT10k and 707 EGIB rows. Real small
+/// structures start just above it: 1-2 m^2 holds another 364 BDOT10k and
+/// 5,880 EGIB rows, overwhelmingly square sheds and "gospodarczy"/"inny"
+/// outbuildings, which is why the line is not drawn at 2. How small a building is still *worth importing* is a separate,
+/// editorial question, answered per user on the map rather than here.
+pub const MIN_BUILDING_AREA_M2: f64 = 1.0;
+
+/// WGS84 semi-major axis and first eccentricity squared, for
+/// [`area_m2_sql`].
+const WGS84_A: f64 = 6_378_137.0;
+const WGS84_E2: f64 = 0.006_694_379_990_14;
+
+/// Area of `geom` (EPSG:4326, lon/lat) in square metres, as a SQL expression:
+/// the planar area in square degrees scaled by the WGS84 ellipsoid's local
+/// area element at the geometry's latitude, `M(phi) * N(phi) * cos(phi) *
+/// (pi/180)^2`, which folds to `a^2 (1 - e^2) (pi/180)^2 * cos(phi) / (1 -
+/// e^2 sin^2(phi))^2`.
+///
+/// Measured against `ST_Area_Spheroid` over every BDOT10k and EGIB row
+/// (33.9M): max deviation 0.043%, p99 0.0001%, largest absolute 7.4 m^2 on a
+/// ~100,000 m^2 building. Chosen over the two obvious alternatives, both of
+/// which are worse on more than speed:
+///
+/// - `ST_Area(ST_Transform(geom, 'EPSG:4326', 'EPSG:2180'))` is off by up to
+///   0.18% itself -- PUWG-92 is conformal, not equal-area, with scale 0.9993
+///   on its central meridian growing towards the borders -- and pays ~3 ms of
+///   PROJ setup per query.
+/// - `ST_Area_Spheroid(geom)` reads its input as lat/lon unless
+///   `geometry_always_xy = true`, which the server sets and a bare CLI
+///   session does not, so the same text is right in one place and ~45% high
+///   in the other, silently. It also costs ~20x this expression per row.
+///
+/// `phi` is the bbox's mid-latitude rather than the centroid's: it is never
+/// NULL for a non-empty geometry, whereas a near-degenerate outline's
+/// centroid can be, and a NULL area makes any predicate on it keep the row.
+/// An *empty* geometry still reads NULL here -- callers that must decide on
+/// every row test `ST_IsEmpty` alongside, as [`filter_undersized_geometry`]
+/// does.
+pub fn area_m2_sql(geom: &str) -> String {
+    let k = WGS84_A * WGS84_A * (1.0 - WGS84_E2) * (std::f64::consts::PI / 180.0).powi(2);
+    let lat = format!("radians((ST_YMin({geom}) + ST_YMax({geom})) / 2)");
+    format!(
+        "(ST_Area({geom}) * {k:?} * cos({lat}) / pow(1 - {WGS84_E2:?} * pow(sin({lat}), 2), 2))"
+    )
+}
+
+/// Delete rows whose footprint is under [`MIN_BUILDING_AREA_M2`] -- too small
+/// to be a real building -- or empty. Third sibling of
+/// `filter_invalid_geometry` and `filter_oversized_geometry` above, same
+/// shape and same funnel: every such row passes `ST_IsValid`, so neither of
+/// those catches it, and left in, it is proposed for import like any other
+/// unmatched building (580 of the 799 rows it drops nationally were).
+///
+/// **Area only, deliberately -- not thinness.** A dimensionless sliver test
+/// (Polsby-Popper `4*pi*A/P^2`) also flags long thin outlines, but most of
+/// those are *larger* than 10 m^2 (303 of 523 nationally) and some are
+/// outlines traced twice, whose real building may well be worth keeping. That
+/// is a judgement per row, not a bound; this filter only drops what cannot be
+/// a building at any shape.
+///
+/// **Empty is tested explicitly.** `POLYGON EMPTY` passes `ST_IsValid` and
+/// reads area 0 but a NULL latitude, so [`area_m2_sql`] returns NULL for it
+/// and `NULL < MIN` would keep the row. A NULL `geom` stays kept, as it does
+/// in both sibling filters.
+///
+/// Unlike `dataset::filter_oversized_geometry`, nothing downstream depends on
+/// this bound as an invariant: it only removes candidates, which is a safe
+/// false negative for a government row. Changing
+/// [`MIN_BUILDING_AREA_M2`] takes effect on the next refresh without a
+/// re-import -- the staged table simply gains or loses rows, and the diff
+/// reports them as added or removed.
+pub fn filter_undersized_geometry(
+    conn: &duckdb::Connection,
+    table: &str,
+    id_col: &str,
+) -> anyhow::Result<LoadStats> {
+    use anyhow::Context;
+
+    let predicate = format!(
+        "ST_IsEmpty(geom) OR {} < {MIN_BUILDING_AREA_M2:?}",
+        area_m2_sql("geom")
+    );
+
+    let mut skipped_undersized_example_ids = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {id_col} FROM {table} WHERE {predicate} LIMIT {MAX_EXAMPLE_IDS}"
+            ))
+            .with_context(|| format!("Failed to prepare undersized-geometry scan on {table}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .with_context(|| format!("Failed to scan undersized-geometry rows in {table}"))?;
+        for row in rows {
+            skipped_undersized_example_ids
+                .push(row.context("Failed to read undersized-geometry id")?);
+        }
+    }
+
+    let skipped_undersized_geometry = conn
+        .execute(&format!("DELETE FROM {table} WHERE {predicate}"), [])
+        .with_context(|| format!("Failed to delete undersized-geometry rows from {table}"))?
+        as i64;
+
+    Ok(LoadStats {
+        skipped_undersized_geometry,
+        skipped_undersized_example_ids,
+        ..Default::default()
+    })
+}
+
 /// Delete all but one row per duplicate key from a just-loaded table,
 /// capturing example ids before they're gone. Sibling to
-/// `filter_invalid_geometry` and `filter_oversized_geometry` above, matching
+/// `filter_invalid_geometry`, `filter_oversized_geometry` and
+/// `filter_undersized_geometry` above, matching
 /// their shape exactly: scan for up to `MAX_EXAMPLE_IDS` example ids,
 /// `DELETE`, return a `LoadStats`. Among duplicates sharing a key, the row
 /// `order_by` ranks first survives (`"WERSJA DESC"` for BDOT10k,
@@ -837,8 +971,8 @@ pub fn filter_oversized_geometry(
 /// `duckdb_init_commands` wholesale. A NULL version must never win over a
 /// dated one.
 ///
-/// **Must run after `filter_invalid_geometry` and
-/// `filter_oversized_geometry`.** A duplicate pair whose newest member has
+/// **Must run after `filter_invalid_geometry`, `filter_oversized_geometry`
+/// and `filter_undersized_geometry`.** A duplicate pair whose newest member has
 /// bad geometry must fall back to the older, valid member instead of being
 /// collapsed down to a row one of those filters then deletes -- losing the
 /// object entirely.
@@ -1396,6 +1530,137 @@ mod tests {
 
         assert_eq!(stats.skipped_oversized_geometry, 25);
         assert_eq!(stats.skipped_oversized_example_ids.len(), MAX_EXAMPLE_IDS);
+    }
+
+    /// `area_m2_sql` is a latitude-scaled planar area, so the two ways it can
+    /// go wrong are a units slip (square degrees, or a stray factor) and a
+    /// latitude term read from the wrong axis. Checked against EPSG:2180 --
+    /// accurate to 0.18% over Poland by measurement -- at both ends of the
+    /// country's latitude range and on both sides of its central meridian,
+    /// where a swapped axis would be off by tens of percent.
+    #[test]
+    fn area_m2_sql_agrees_with_puwg92_across_poland() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        for (lon, lat) in [
+            (14.25, 49.0),
+            (23.875, 49.0),
+            (14.25, 54.75),
+            (23.875, 54.75),
+        ] {
+            let wkt = format!(
+                "POLYGON(({lon} {lat}, {x} {lat}, {x} {y}, {lon} {y}, {lon} {lat}))",
+                x = lon + 0.0005,
+                y = lat + 0.0003
+            );
+            let (ours, puwg92): (f64, f64) = conn
+                .query_row(
+                    &format!(
+                        "SELECT {}, ST_Area(ST_Transform(g, 'EPSG:4326', 'EPSG:2180', always_xy := true))
+                         FROM (SELECT ST_GeomFromText(?::VARCHAR) AS g)",
+                        area_m2_sql("g")
+                    ),
+                    [&wkt],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert!(
+                (ours / puwg92 - 1.0).abs() < 0.0025,
+                "at ({lon}, {lat}): ours {ours} m^2, EPSG:2180 {puwg92} m^2"
+            );
+        }
+    }
+
+    /// The pair straddling the threshold is the load-bearing half: at 52N a
+    /// 0.00001-degree square is ~0.69 m x ~1.11 m = 0.76 m^2 and the
+    /// double-width one 1.53 m^2, so a units slip in `area_m2_sql` in
+    /// either direction flips one of them. `sliver` is the real defect in
+    /// miniature -- a 4-point `budynek jednorodzinny` outline ~7 m long and a
+    /// centimetre wide, which `ST_IsValid` accepts.
+    #[test]
+    fn filter_undersized_geometry_drops_sub_square_metre_rows_and_keeps_a_small_shed() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id VARCHAR, geom GEOMETRY);
+             INSERT INTO t VALUES
+                 ('tiny', ST_GeomFromText(
+                     'POLYGON((21.0 52.0, 21.00001 52.0, 21.00001 52.00001, 21.0 52.00001, 21.0 52.0))')),
+                 ('sliver', ST_GeomFromText(
+                     'POLYGON((21.0 52.0, 21.0001 52.0, 21.00005 52.0000001, 21.0 52.0))')),
+                 ('empty', ST_GeomFromText('POLYGON EMPTY')),
+                 ('shed', ST_GeomFromText(
+                     'POLYGON((21.0 52.0, 21.00002 52.0, 21.00002 52.00001, 21.0 52.00001, 21.0 52.0))')),
+                 ('house', ST_GeomFromText(
+                     'POLYGON((21.0 52.0, 21.0002 52.0, 21.0002 52.0001, 21.0 52.0001, 21.0 52.0))'));",
+        )
+        .unwrap();
+
+        let stats = filter_undersized_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(stats.skipped_undersized_geometry, 3);
+        let mut ids = stats.skipped_undersized_example_ids.clone();
+        ids.sort();
+        assert_eq!(ids, vec!["empty", "sliver", "tiny"]);
+        let remaining: Vec<String> = {
+            let mut s = conn.prepare("SELECT id FROM t ORDER BY id").unwrap();
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(remaining, vec!["house".to_string(), "shed".to_string()]);
+    }
+
+    /// A NULL `geom` is left alone, as `filter_invalid_geometry` and
+    /// `filter_oversized_geometry` leave it: this filter's job is footprints
+    /// too small to be a building, not rows with no footprint at all.
+    #[test]
+    fn filter_undersized_geometry_keeps_a_null_geometry() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id VARCHAR, geom GEOMETRY);
+             INSERT INTO t VALUES ('null', NULL);",
+        )
+        .unwrap();
+
+        let stats = filter_undersized_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(stats, LoadStats::default());
+    }
+
+    #[test]
+    fn filter_undersized_geometry_caps_example_ids_but_counts_all() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch("CREATE TABLE t (id VARCHAR, geom GEOMETRY);")
+            .unwrap();
+        for i in 0..25 {
+            conn.execute(
+                "INSERT INTO t VALUES (?, ST_GeomFromText(
+                     'POLYGON((21.0 52.0, 21.00001 52.0, 21.00001 52.00001, 21.0 52.00001, 21.0 52.0))'))",
+                duckdb::params![format!("tiny{i}")],
+            )
+            .unwrap();
+        }
+
+        let stats = filter_undersized_geometry(&conn, "t", "id").unwrap();
+
+        assert_eq!(stats.skipped_undersized_geometry, 25);
+        assert_eq!(stats.skipped_undersized_example_ids.len(), MAX_EXAMPLE_IDS);
     }
 
     #[test]

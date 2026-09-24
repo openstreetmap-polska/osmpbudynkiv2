@@ -758,12 +758,24 @@ cell in both axes, its reach from its own centroid's cell is `<= 1` **by
 construction** — which is what makes the 3x3 serving-version ring exact rather
 than approximate.
 
-Both filters are row *filters* — they change which rows exist, never the content
-of a surviving row. The one real ordering constraint: both must run **before**
+The third, `dataset::filter_undersized_geometry`, drops footprints under
+`MIN_BUILDING_AREA_M2` (1 m²) or empty: 92 BDOT10k and 707 EGIB rows, 580 of
+them then unmatched and proposed for import. It is **area only**, never a
+thinness test — most thin outlines are over 10 m² and may be real — and 1–2 m²
+is deliberately kept (6,244 rows, overwhelmingly square sheds). Area comes from
+`dataset::area_m2_sql`, a latitude-scaled planar area on the WGS84 ellipsoid,
+**not** `ST_Area_Spheroid`: that reads lon/lat only under
+`geometry_always_xy = true`, which the server sets and a bare CLI session does
+not, so the same text is ~45% high in one of them with no error. The explicit
+`ST_IsEmpty` is load-bearing: `POLYGON EMPTY` passes `ST_IsValid` and has a
+NULL latitude, so the area alone reads NULL and keeps the row.
+
+All three are row *filters* — they change which rows exist, never the content
+of a surviving row. The one real ordering constraint: all must run **before**
 `deduplicate_by_key`, so a duplicate pair whose newest member has bad geometry
 falls back to the older valid member instead of collapsing to a row a filter then
-deletes, losing the object entirely. `LoadStats::merge_oversized` folds both
-counts into the one `LoadStats` each loader returns, self-reported to
+deletes, losing the object entirely. `LoadStats::merge_oversized` and
+`merge_undersized` fold the counts into the one `LoadStats` each loader returns, self-reported to
 `job_run_log` under `import:<source>` / `update:<source>` and read back by
 `/status`. Note the reporting asymmetry: PRG's `update_prg` shares the same
 `refresh()` that self-reports, so `update:prg` appears (never with a geometry

@@ -300,10 +300,10 @@ pub fn refresh(
 }
 
 /// Human-readable message for the `job_run_log` row. Uses
-/// `dataset::format_skip_clause` for all five skip reasons -- see
+/// `dataset::format_skip_clause` for all six skip reasons -- see
 /// `dataset::LoadStats` for why a loader can drop rows for invalid
-/// geometry, oversized geometry, missing coordinates, a NULL record key, or a
-/// duplicate record key.
+/// geometry, oversized geometry, undersized geometry, missing coordinates, a
+/// NULL record key, or a duplicate record key.
 fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> String {
     let mut msg = format!(
         "added {} modified {} removed {}",
@@ -323,6 +323,14 @@ fn summarize_refresh(counts: &DiffCounts, stats: &crate::dataset::LoadStats) -> 
             "oversized-geometry",
             stats.skipped_oversized_geometry,
             &stats.skipped_oversized_example_ids,
+        ));
+    }
+    if stats.skipped_undersized_geometry > 0 {
+        msg.push_str("; ");
+        msg.push_str(&crate::dataset::format_skip_clause(
+            "undersized-geometry",
+            stats.skipped_undersized_geometry,
+            &stats.skipped_undersized_example_ids,
         ));
     }
     if stats.skipped_missing_coordinates > 0 {
@@ -637,6 +645,51 @@ mod tests {
             "got: {msg}"
         );
         assert!(msg.contains("glued"), "got: {msg}");
+    }
+
+    /// Same again for the third geometry filter: an update refresh
+    /// stages via `load_into`, which now also runs
+    /// `dataset::filter_undersized_geometry` on the staging table, so its
+    /// count and example ids must reach `update:<source>`'s job_run_log
+    /// message the same way the invalid-geometry ones do.
+    #[test]
+    fn refresh_records_undersized_geometry_skips_in_job_run_log() {
+        let conn = conn_with_live(LIVE_ROWS);
+        let loader_with_stats = |rows: &'static str, stats: crate::dataset::LoadStats| {
+            move |conn: &Connection, target: &str| -> Result<crate::dataset::LoadStats> {
+                let inner = format!("SELECT id, a, ST_Point(lon, lat) AS geom FROM ({rows})");
+                conn.execute_batch(&format!("CREATE TABLE {target} AS {inner};"))?;
+                Ok(stats)
+            }
+        };
+
+        refresh(
+            &conn,
+            &TEST_SPEC,
+            loader_with_stats(
+                NEW_ROWS,
+                crate::dataset::LoadStats {
+                    skipped_undersized_geometry: 1,
+                    skipped_undersized_example_ids: vec!["sliver".to_string()],
+                    ..Default::default()
+                },
+            ),
+            None,
+            &|| false,
+        )
+        .unwrap();
+
+        let log = crate::job_log::read_all(&conn).unwrap();
+        let entry = log
+            .get("update:test")
+            .expect("job_run_log entry must exist");
+        assert_eq!(entry.outcome, "Success");
+        let msg = entry.message.as_deref().unwrap();
+        assert!(
+            msg.contains("skipped 1 undersized-geometry rows"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("sliver"), "got: {msg}");
     }
 
     #[test]

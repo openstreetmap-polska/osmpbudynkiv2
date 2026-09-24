@@ -541,8 +541,10 @@ pub fn materialize_into(
     .with_context(|| format!("Failed to materialize {target_table}"))?;
 
     // Unlike BDOT10k/EGIB, PRG runs no geometry filters at all (there is no
-    // `filter_invalid_geometry`/`filter_oversized_geometry` call for PRG
-    // points), so their "must come after both geometry filters" ordering
+    // `filter_invalid_geometry`/`filter_oversized_geometry`/
+    // `filter_undersized_geometry` call for PRG points -- a point has no
+    // area, so the last would drop every row), so their "must come after the
+    // geometry filters" ordering
     // constraint on the dedup does not apply here. It still has to come
     // after the table is built, to match the other two loaders.
     //

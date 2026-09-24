@@ -11,7 +11,8 @@ use crate::utils::format_duration;
 
 /// Create `target_table` from a BDOT10k GeoParquet file, then delete any
 /// invalid-geometry rows (see `docs/invalid_geometry_tile_500s.md`), any
-/// oversized-geometry rows (see `dataset::filter_oversized_geometry`), drop
+/// oversized-geometry rows (see `dataset::filter_oversized_geometry`), any
+/// undersized-geometry rows (see `dataset::filter_undersized_geometry`), drop
 /// any row with a NULL record key (see `dataset::non_null_key_sql`), and
 /// finally collapse duplicate keys down to one row each (see
 /// `dataset::deduplicate_by_key`). Does NOT create an index -- callers that
@@ -101,7 +102,8 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
 
     let stats = crate::dataset::filter_invalid_geometry(conn, target_table, "LOKALNYID")?;
     let oversized = crate::dataset::filter_oversized_geometry(conn, target_table, "LOKALNYID")?;
-    // Must come after both geometry filters above: a duplicate pair whose
+    let undersized = crate::dataset::filter_undersized_geometry(conn, target_table, "LOKALNYID")?;
+    // Must come after all three geometry filters above: a duplicate pair whose
     // newest member has bad geometry must fall back to the older valid
     // member rather than being collapsed down to a row a geometry filter
     // then deletes, losing the object entirely. The NULL-key half of the
@@ -120,7 +122,10 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
         "LOKALNYID",
     )?;
     unique.skipped_null_key = null_key_rows;
-    Ok(stats.merge_oversized(oversized).merge_unique_key(unique))
+    Ok(stats
+        .merge_oversized(oversized)
+        .merge_undersized(undersized)
+        .merge_unique_key(unique))
 }
 
 pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str) -> Result<()> {
@@ -197,14 +202,15 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
     outcome.map(|_| ())
 }
 
-/// Human-readable message for the `job_run_log` row. Reports all four skip
+/// Human-readable message for the `job_run_log` row. Reports all five skip
 /// reasons `load_into` can produce -- invalid geometry, oversized geometry,
-/// NULL record key, and duplicate record key -- via the shared
+/// undersized geometry, NULL record key, and duplicate record key -- via the shared
 /// `dataset::format_skip_clause`, so a change to one clause's wording can't
 /// drift from the others'. Ordered in the order `load_into` applies the
 /// filters: the NULL-key `WHERE` runs first (inside the load SELECT), so it
-/// leads; invalid- and oversized-geometry run next in that order; dedup runs
-/// last, after both geometry filters (see `load_into`'s comment on why).
+/// leads; invalid-, oversized- and undersized-geometry run next in that
+/// order; dedup runs last, after all three geometry filters (see
+/// `load_into`'s comment on why).
 fn summarize(stats: &LoadStats) -> String {
     let mut parts = Vec::new();
     if stats.skipped_null_key > 0 {
@@ -226,6 +232,13 @@ fn summarize(stats: &LoadStats) -> String {
             "oversized-geometry",
             stats.skipped_oversized_geometry,
             &stats.skipped_oversized_example_ids,
+        ));
+    }
+    if stats.skipped_undersized_geometry > 0 {
+        parts.push(crate::dataset::format_skip_clause(
+            "undersized-geometry",
+            stats.skipped_undersized_geometry,
+            &stats.skipped_undersized_example_ids,
         ));
     }
     if stats.skipped_duplicate_key > 0 {
