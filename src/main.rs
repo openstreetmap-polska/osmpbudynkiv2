@@ -9,6 +9,7 @@ mod import;
 mod job_log;
 mod mappings;
 mod osm;
+mod process_memory;
 mod reports;
 mod server;
 mod shutdown;

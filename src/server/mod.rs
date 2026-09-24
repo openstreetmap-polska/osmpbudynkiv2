@@ -217,6 +217,12 @@ pub async fn run(
         timeout: std::time::Duration::from_secs(config.jobs.backup.timeout_seconds),
         run_on_start: config.jobs.backup.run_on_start,
     };
+    let health_log_cfg = jobs::JobConfigResolved {
+        enabled: config.jobs.health_log.enabled,
+        interval: std::time::Duration::from_secs(config.jobs.health_log.interval_seconds),
+        timeout: std::time::Duration::from_secs(config.jobs.health_log.timeout_seconds),
+        run_on_start: config.jobs.health_log.run_on_start,
+    };
     let job_list: Vec<(Arc<dyn jobs::Job>, jobs::JobConfigResolved)> = vec![
         (
             Arc::new(jobs::osm_update::OsmUpdateJob) as Arc<dyn jobs::Job>,
@@ -232,6 +238,11 @@ pub async fn run(
         (
             Arc::new(jobs::backup::BackupJob) as Arc<dyn jobs::Job>,
             backup_cfg,
+        ),
+        // Hourly journal line: DuckDB and process memory, OSM lag. Read-only.
+        (
+            Arc::new(jobs::health_log::HealthLogJob) as Arc<dyn jobs::Job>,
+            health_log_cfg,
         ),
         (
             Arc::new(jobs::dataset_update::DatasetUpdateJob::new(
@@ -609,6 +620,9 @@ mod tests {
             last_outcome: Some(JobOutcome::Success),
             next_run_at: Some("2026-05-28T12:01:03Z".to_string()),
             run_count: 7,
+            consecutive_failures: 0,
+            failing_since: None,
+            last_success_at: None,
             log_keys: Vec::new(),
         };
         let dir = tempfile::tempdir().unwrap();

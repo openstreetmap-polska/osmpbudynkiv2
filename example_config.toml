@@ -211,6 +211,20 @@ dir = "backups"
 # a quiet week would otherwise age out the only copy there is.
 keep_days = 30
 
+# One journal line per run with DuckDB's memory by tag, the process's own
+# memory (resident, swapped, peak) and the OSM replication lag -- the figures
+# /status shows live, kept as a time series. Read-only.
+#   journalctl -u osmpbudynkiv2 | grep ' health '
+[jobs.health_log]
+enabled = true
+interval_seconds = 3600
+timeout_seconds = 60
+run_on_start = true
+# WARN "OSM replication is behind" once the last applied diff is older than
+# this. The feed is minutely, so a healthy lag is 1-2 minutes. 0 disables it;
+# it is also skipped while osm_update is disabled.
+osm_lag_warn_seconds = 1800
+
 # Government dataset refreshes. Each downloads the current snapshot, diffs it
 # against the live table, and applies only the difference in a single
 # transaction, so HTTP readers are never disrupted.

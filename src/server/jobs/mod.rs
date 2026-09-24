@@ -9,6 +9,7 @@
 pub mod backup;
 pub mod building_types_update;
 pub mod dataset_update;
+pub mod health_log;
 pub mod match_reconcile;
 pub mod match_refresh;
 pub mod osm_update;
@@ -109,6 +110,20 @@ pub struct JobStatus {
     pub last_outcome: Option<JobOutcome>,
     pub next_run_at: Option<String>,
     pub run_count: u64,
+    /// Runs in a row that did not end in `Success` (errors and timeouts
+    /// alike), reset to 0 by the next success.
+    ///
+    /// Added 2026-09-24. `osm_update` failed every run for two days before
+    /// anyone noticed: each failure logs `job failed`, which reads the same
+    /// for one transient failure as for the 400th in a row. See
+    /// [`streak_log`] for the matching journal lines.
+    pub consecutive_failures: u64,
+    /// When the first failure of the current streak finished. `None` while
+    /// the last run succeeded.
+    pub failing_since: Option<String>,
+    /// When the most recent successful run finished. `None` before the first
+    /// one, and for a job that has never succeeded since the process started.
+    pub last_success_at: Option<String>,
     /// See `Job::log_keys`. Copied in at registration time since it's fixed
     /// per job, not per run.
     pub log_keys: Vec<&'static str>,
@@ -248,6 +263,9 @@ impl Scheduler {
                 last_outcome: None,
                 next_run_at,
                 run_count: 0,
+                consecutive_failures: 0,
+                failing_since: None,
+                last_success_at: None,
                 log_keys: job.log_keys().to_vec(),
             });
         }
@@ -317,6 +335,66 @@ impl Scheduler {
     }
 }
 
+/// A failure streak is announced once it reaches this many runs in a row.
+/// Below it a failure is plausibly transient, and the per-run `job failed`
+/// line says enough. For a daily job this is the third day.
+const FAILURE_STREAK_WARN_AT: u64 = 3;
+
+/// While a streak continues it is announced again at most this often, so a
+/// job failing every minute adds one line an hour rather than sixty.
+const FAILURE_STREAK_REMIND: Duration = Duration::from_secs(3600);
+
+#[derive(Debug, PartialEq, Eq)]
+enum StreakLog {
+    Quiet,
+    Failing,
+    Recovered,
+}
+
+/// What `supervise` logs about a failure streak once a run has finished.
+///
+/// `previous` and `streak` are the consecutive-failure counts before and
+/// after this run, so `streak == 0` means it succeeded.
+/// `since_last_warning` is how long ago the current streak was last
+/// announced, `None` if it has not been yet.
+fn streak_log(previous: u64, streak: u64, since_last_warning: Option<Duration>) -> StreakLog {
+    if streak == 0 {
+        // Only a streak that was announced gets a recovery line: an INFO
+        // answering a WARN nobody saw would be noise.
+        return if previous >= FAILURE_STREAK_WARN_AT {
+            StreakLog::Recovered
+        } else {
+            StreakLog::Quiet
+        };
+    }
+    if streak < FAILURE_STREAK_WARN_AT {
+        return StreakLog::Quiet;
+    }
+    match since_last_warning {
+        Some(elapsed) if elapsed < FAILURE_STREAK_REMIND => StreakLog::Quiet,
+        _ => StreakLog::Failing,
+    }
+}
+
+/// Logs DuckDB's per-tag memory right after a run that failed on the memory
+/// limit, from inside the run's blocking task.
+///
+/// The breakdown was only ever logged around the dataset refreshes, so when
+/// `osm_update` started failing on the limit on 2026-09-22, the journal held
+/// no picture of what filled it. `try_get`, not `get`: when the pool is the
+/// thing that is short, waiting out its timeout here would hold up the
+/// supervisor's next tick for a diagnostic.
+fn log_memory_if_out_of_memory(job: &'static str, pool: &DbPool, err: &anyhow::Error) {
+    if !crate::db_memory::is_out_of_memory(err) {
+        return;
+    }
+    let duckdb_memory = match pool.try_get() {
+        Some(conn) => crate::db_memory::summary_or_note(&conn),
+        None => "unavailable: no idle pool connection".to_string(),
+    };
+    warn!(job, %duckdb_memory, "DuckDB memory after an out-of-memory failure");
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn supervise(
     job: Arc<dyn Job>,
@@ -341,6 +419,12 @@ pub(crate) async fn supervise(
         tokio::time::interval_at(tokio::time::Instant::now() + cfg.interval, cfg.interval)
     };
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    // Failure-streak state, mirrored into the registry after every run.
+    let mut consecutive_failures: u64 = 0;
+    let mut failing_since: Option<SystemTime> = None;
+    let mut last_success_at: Option<SystemTime> = None;
+    let mut streak_warned_at: Option<Instant> = None;
 
     loop {
         // Register as a `Notify` waiter BEFORE checking `stop`, not after.
@@ -399,7 +483,13 @@ pub(crate) async fn supervise(
             cancel: cancel.clone(),
         };
         let job_clone = job.clone();
-        let mut handle = tokio::task::spawn_blocking(move || job_clone.run(&ctx));
+        let mut handle = tokio::task::spawn_blocking(move || {
+            let result = job_clone.run(&ctx);
+            if let Err(e) = &result {
+                log_memory_if_out_of_memory(name, &ctx.pool, e);
+            }
+            result
+        });
 
         let outcome = match tokio::time::timeout(cfg.timeout, &mut handle).await {
             Ok(Ok(Ok(()))) => JobOutcome::Success,
@@ -442,6 +532,53 @@ pub(crate) async fn supervise(
         let finished_sys = SystemTime::now();
         let elapsed_ms = started_inst.elapsed().as_millis() as u64;
         let next = finished_sys + cfg.interval;
+
+        let previous_failures = consecutive_failures;
+        if outcome == JobOutcome::Success {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures += 1;
+            failing_since.get_or_insert(finished_sys);
+        }
+        let failing_since_str = failing_since.map(format_rfc3339);
+        let last_success_str = last_success_at.map(format_rfc3339);
+        match streak_log(
+            previous_failures,
+            consecutive_failures,
+            streak_warned_at.map(|t| t.elapsed()),
+        ) {
+            StreakLog::Failing => {
+                let last_error = match &outcome {
+                    JobOutcome::Error(message) => message.as_str(),
+                    JobOutcome::TimedOut => "timed out",
+                    JobOutcome::Success => "",
+                };
+                warn!(
+                    job = name,
+                    consecutive_failures,
+                    failing_since = failing_since_str.as_deref().unwrap_or("?"),
+                    last_success_at = last_success_str.as_deref().unwrap_or("never since start"),
+                    last_error,
+                    "job keeps failing"
+                );
+                streak_warned_at = Some(Instant::now());
+            }
+            StreakLog::Recovered => {
+                tracing::info!(
+                    job = name,
+                    failed_runs = previous_failures,
+                    failing_since = failing_since_str.as_deref().unwrap_or("?"),
+                    "job recovered"
+                );
+            }
+            StreakLog::Quiet => {}
+        }
+        if consecutive_failures == 0 {
+            failing_since = None;
+            streak_warned_at = None;
+            last_success_at = Some(finished_sys);
+        }
+
         registry.update(name, |s| {
             s.state = JobState::Idle;
             s.last_finished_at = Some(format_rfc3339(finished_sys));
@@ -449,6 +586,9 @@ pub(crate) async fn supervise(
             s.last_outcome = Some(outcome);
             s.next_run_at = Some(format_rfc3339(next));
             s.run_count += 1;
+            s.consecutive_failures = consecutive_failures;
+            s.failing_since = failing_since.map(format_rfc3339);
+            s.last_success_at = last_success_at.map(format_rfc3339);
         });
     }
 }
@@ -546,6 +686,9 @@ mod tests {
                 last_outcome: None,
                 next_run_at: None,
                 run_count: 0,
+                consecutive_failures: 0,
+                failing_since: None,
+                last_success_at: None,
                 log_keys: Vec::new(),
             });
         }
@@ -634,6 +777,9 @@ mod tests {
             last_outcome: None,
             next_run_at: None,
             run_count: 0,
+            consecutive_failures: 0,
+            failing_since: None,
+            last_success_at: None,
             log_keys: Vec::new(),
         });
         Arc::new(r)
@@ -809,6 +955,103 @@ mod tests {
             Some(JobOutcome::Error(m)) => assert!(m.contains("boom"), "got: {m}"),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_streak_is_announced_at_the_threshold_then_hourly_then_on_recovery() {
+        let hour = FAILURE_STREAK_REMIND;
+        let minute = Duration::from_secs(60);
+
+        // Below the threshold: the per-run `job failed` line is enough.
+        assert_eq!(streak_log(0, 1, None), StreakLog::Quiet);
+        assert_eq!(
+            streak_log(FAILURE_STREAK_WARN_AT - 2, FAILURE_STREAK_WARN_AT - 1, None),
+            StreakLog::Quiet
+        );
+
+        // Reaching it announces, whatever the clock says.
+        let at = FAILURE_STREAK_WARN_AT;
+        assert_eq!(streak_log(at - 1, at, None), StreakLog::Failing);
+
+        // Continuing: quiet within the hour, announced again after it.
+        assert_eq!(streak_log(at, at + 1, Some(minute)), StreakLog::Quiet);
+        assert_eq!(streak_log(400, 401, Some(hour - minute)), StreakLog::Quiet);
+        assert_eq!(streak_log(400, 401, Some(hour)), StreakLog::Failing);
+
+        // Recovery answers only a streak that was announced.
+        assert_eq!(streak_log(at, 0, Some(minute)), StreakLog::Recovered);
+        assert_eq!(streak_log(at - 1, 0, None), StreakLog::Quiet);
+        assert_eq!(streak_log(0, 0, None), StreakLog::Quiet);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_tracks_the_failure_streak_and_resets_it_on_success() {
+        let (w, kv, cfg, _dir) = make_parts();
+        let job_cfg = JobConfigResolved {
+            enabled: true,
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_secs(5),
+            run_on_start: true,
+        };
+        let job = Arc::new(ScriptedJob {
+            name: "test_streak",
+            sleep_each: Duration::from_millis(5),
+            outcomes: vec![Err("boom".into()), Err("boom".into()), Ok(())],
+            call_count: Arc::new(AtomicUsize::new(0)),
+            current: Arc::new(AtomicUsize::new(0)),
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = make_registry_for("test_streak", &job_cfg);
+        let notify = Arc::new(Notify::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let handle = tokio::spawn(supervise(
+            job,
+            job_cfg,
+            registry.clone(),
+            notify.clone(),
+            stop.clone(),
+            cancel,
+            w,
+            kv,
+            cfg,
+        ));
+
+        let r = registry.clone();
+        assert!(
+            wait_until(
+                || {
+                    let s = &r.snapshot()[0];
+                    s.consecutive_failures == 2
+                        && s.failing_since.is_some()
+                        && s.last_success_at.is_none()
+                },
+                Duration::from_secs(2)
+            )
+            .await,
+            "two failures in a row, none succeeded yet: {:?}",
+            registry.snapshot()[0]
+        );
+        let r = registry.clone();
+        assert!(
+            wait_until(
+                || {
+                    let s = &r.snapshot()[0];
+                    s.consecutive_failures == 0
+                        && s.failing_since.is_none()
+                        && s.last_success_at.is_some()
+                },
+                Duration::from_secs(2)
+            )
+            .await,
+            "the third run succeeds and clears the streak: {:?}",
+            registry.snapshot()[0]
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        notify.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

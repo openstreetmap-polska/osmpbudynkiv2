@@ -89,7 +89,7 @@ impl DuckDbMemory {
     }
 }
 
-fn fmt_bytes(b: i64) -> String {
+pub(crate) fn fmt_bytes(b: i64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     let mib = b as f64 / MIB;
     if mib >= 1024.0 {
@@ -97,6 +97,18 @@ fn fmt_bytes(b: i64) -> String {
     } else {
         format!("{mib:.0}MiB")
     }
+}
+
+/// Whether an error chain is DuckDB refusing an allocation at `memory_limit`.
+///
+/// Two spellings reach us. Most statements fail with
+/// `Out of Memory Error: failed to pin block ...`, but the Appender reports the
+/// same condition as `Failed to append: could not allocate block of size ...
+/// (6.0 GiB/6.0 GiB used)` with no `Out of Memory` in it (seen on
+/// `update prg`, 2026-09-23).
+pub fn is_out_of_memory(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    message.contains("Out of Memory Error") || message.contains("could not allocate block")
 }
 
 /// Reads and summarizes, degrading to a note rather than failing: callers log
@@ -169,5 +181,33 @@ mod tests {
             m.summary(),
             "used=3.50GiB limit=3.7 GiB spilled=0MiB | ART_INDEX=3.00GiB BASE_TABLE=512MiB"
         );
+    }
+
+    #[test]
+    fn recognises_a_real_duckdb_out_of_memory_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        let err = conn
+            .execute_batch(
+                "SET memory_limit = '8MB';
+                 SET preserve_insertion_order = true;
+                 CREATE TABLE t AS SELECT range AS i, repeat('x', 200) AS s FROM range(2000000)
+                 ORDER BY s DESC, i;",
+            )
+            .expect_err("an 8MB limit cannot hold 400MB of rows");
+        let err = anyhow::Error::from(err).context("Failed to stage snapshot");
+        assert!(is_out_of_memory(&err), "{err:#}");
+    }
+
+    #[test]
+    fn recognises_the_appender_spelling_and_nothing_else() {
+        // Verbatim from the 2026-09-23 `update prg` failure.
+        let appender = anyhow::anyhow!(
+            "Failed to append: could not allocate block of size 256.0 KiB (6.0 GiB/6.0 GiB used)"
+        )
+        .context("Failed to append PRG batch to prg_addresses__staging_raw");
+        assert!(is_out_of_memory(&appender));
+
+        let conflict = anyhow::anyhow!("TransactionContext Error: Conflict on tuple deletion!");
+        assert!(!is_out_of_memory(&conflict));
     }
 }

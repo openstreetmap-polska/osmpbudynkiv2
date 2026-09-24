@@ -201,6 +201,42 @@ impl Default for RetentionPruneConfig {
     }
 }
 
+/// The `health_log` job: a periodic journal line with DuckDB's memory by tag,
+/// the process's own memory, and the OSM replication lag, plus a WARN when the
+/// lag passes `osm_lag_warn_seconds`.
+///
+/// Added 2026-09-24. Those figures were only readable live from `/status`, so
+/// after the fact the journal could not say when `ART_INDEX` had started
+/// climbing or how long OSM had been behind.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct HealthLogConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    /// See `JobConfig::run_on_start`.
+    pub run_on_start: bool,
+    /// Warn once the last applied OSM diff is older than this. The feed
+    /// publishes every minute, so a healthy lag stays around 1-2 minutes.
+    /// `0` disables the warning. Ignored while `osm_update` is disabled,
+    /// when a growing lag is expected.
+    pub osm_lag_warn_seconds: u64,
+}
+
+impl Default for HealthLogConfig {
+    fn default() -> Self {
+        Self {
+            // On: it only reads, and it is what the journal is missing
+            // without it.
+            enabled: true,
+            interval_seconds: 3600,
+            timeout_seconds: 60,
+            run_on_start: true,
+            osm_lag_warn_seconds: 1800,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct BackupConfig {
@@ -483,6 +519,7 @@ pub struct JobsConfig {
     pub osm_update: OsmUpdateConfig,
     pub retention_prune: RetentionPruneConfig,
     pub backup: BackupConfig,
+    pub health_log: HealthLogConfig,
     pub bdot10k_update: JobConfig,
     pub egib_update: JobConfig,
     pub prg_update: JobConfig,
@@ -508,6 +545,7 @@ impl Default for JobsConfig {
             osm_update: OsmUpdateConfig::default(),
             retention_prune: RetentionPruneConfig::default(),
             backup: BackupConfig::default(),
+            health_log: HealthLogConfig::default(),
             bdot10k_update: daily(3600),
             egib_update: daily(3600),
             // PRG streams ~16 GML files out of a ~1.7GB zip, so it needs longer.
@@ -893,6 +931,9 @@ file_path = "/data/TERC.zip"
         // fresh OSM edits behind it. See MatchReconcileConfig.
         assert!(!config.jobs.match_reconcile.enabled);
         assert_eq!(config.jobs.match_reconcile.interval_seconds, 86400);
+        assert!(config.jobs.health_log.enabled);
+        assert_eq!(config.jobs.health_log.interval_seconds, 3600);
+        assert_eq!(config.jobs.health_log.osm_lag_warn_seconds, 1800);
     }
 
     /// The reconcile job must still be configurable on, or the safety net is

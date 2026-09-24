@@ -744,8 +744,13 @@ fn apply_batch(
         .last()
         .map(|f| f.seq)
         .expect("apply_batch must not be called with an empty batch");
+    let first_seq = batch[0].seq;
+    // Every error out of here names the range, so a job that keeps failing
+    // shows in the journal whether it is retrying the same batch.
+    let range = || format!("applying OSM sequences {first_seq}..={last_seq}");
 
-    conn.execute_batch("BEGIN TRANSACTION")?;
+    conn.execute_batch("BEGIN TRANSACTION")
+        .with_context(range)?;
 
     let result = (|| -> Result<()> {
         // One collapsed change set for the whole batch, not one per
@@ -760,14 +765,17 @@ fn apply_batch(
             "DELETE FROM metadata WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp');
              INSERT INTO metadata VALUES ('osm_replication_sequence', '{last_seq}');
              INSERT INTO metadata VALUES ('osm_replication_timestamp', '{timestamp}');"
-        ))?;
+        ))
+        .context("stamping the replication sequence")?;
 
         Ok(())
     })();
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch("COMMIT")
+                .context("commit")
+                .with_context(range)?;
             Ok(())
         }
         Err(e) => {
@@ -780,12 +788,12 @@ fn apply_batch(
             if let Err(rb) = conn.execute_batch("ROLLBACK") {
                 warn!(
                     error = %rb,
-                    first_seq = batch[0].seq,
+                    first_seq,
                     last_seq,
                     "failed to roll back OSM batch; rows it deleted may stay locked until restart"
                 );
             }
-            Err(e)
+            Err(e.context(range()))
         }
     }
 }
@@ -847,7 +855,23 @@ fn apply_changes(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result
 /// output of `OsmChange::collapse`. The rebuilds look an object's tags up by
 /// id, so a second version of the same id would be ambiguous. That was the
 /// "first version wins" bug, when this was a `find` over an uncollapsed diff.
+///
+/// A failure names the phase it happened in. Without it the job's error was a
+/// bare `Out of Memory Error`, with nothing saying which of ~a dozen
+/// statement kinds hit the limit.
 fn apply_collapsed(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Result<()> {
+    let mut phase = "node changes";
+    apply_collapsed_phases(conn, kv, changes, &mut phase).with_context(|| phase)
+}
+
+/// [`apply_collapsed`]'s body. Sets `phase` at the start of each section so
+/// the wrapper can name it in the error.
+fn apply_collapsed_phases(
+    conn: &Connection,
+    kv: &RocksDB,
+    changes: &OsmChange,
+    phase: &mut &'static str,
+) -> Result<()> {
     let way_changes: HashMap<i64, &WayChange> = changes.ways.iter().map(|w| (w.id, w)).collect();
     let relation_changes: HashMap<i64, &RelationChange> =
         changes.relations.iter().map(|r| (r.id, r)).collect();
@@ -912,6 +936,7 @@ fn apply_collapsed(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Resu
     }
 
     // --- Apply way changes ---
+    *phase = "way changes";
     for way in &changes.ways {
         match way.action {
             ChangeAction::Delete => {
@@ -963,6 +988,7 @@ fn apply_collapsed(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Resu
     }
 
     // --- Apply relation changes ---
+    *phase = "relation changes";
     for rel in &changes.relations {
         match rel.action {
             ChangeAction::Delete => {
@@ -1027,21 +1053,27 @@ fn apply_collapsed(conn: &Connection, kv: &RocksDB, changes: &OsmChange) -> Resu
     }
 
     // --- Rebuild affected way geometries ---
+    *phase = "way geometry rebuild";
     for &way_id in &affected_way_ids {
-        rebuild_way_geometry(conn, kv, way_id, &way_changes, &mut dirty)?;
+        rebuild_way_geometry(conn, kv, way_id, &way_changes, &mut dirty)
+            .with_context(|| format!("way {way_id}"))?;
     }
 
     // Cascade way changes to relations
+    *phase = "way-to-relation cascade";
     for &way_id in &affected_way_ids {
         let rel_ids = kvstore::get_way_to_relations(kv, way_id)?;
         affected_relation_ids.extend(&rel_ids);
     }
 
     // --- Rebuild affected relation geometries ---
+    *phase = "relation geometry rebuild";
     for &relation_id in &affected_relation_ids {
-        rebuild_relation_geometry(conn, kv, relation_id, &relation_changes, &mut dirty)?;
+        rebuild_relation_geometry(conn, kv, relation_id, &relation_changes, &mut dirty)
+            .with_context(|| format!("relation {relation_id}"))?;
     }
 
+    *phase = "dirty-cell flush";
     dirty.flush(conn)?;
 
     Ok(())

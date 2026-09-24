@@ -119,38 +119,60 @@ fn match_staleness_or_default(state: &AppState) -> MatchStaleness {
     }
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, Debug)]
 pub struct OsmReplicationState {
     pub sequence_number: Option<i64>,
     pub timestamp: Option<String>,
+    /// Seconds from `timestamp` (the replication feed's time for the last
+    /// applied diff) to now: how far behind OSM the served data is. The feed
+    /// publishes every minute, so a healthy value stays around 60-120.
+    /// `null` when there is no stamp or it does not parse as a timestamp.
+    pub lag_seconds: Option<i64>,
 }
 
 /// Reads the OSM replication watermark last written by `update osm` /
 /// `import osm` (`metadata` keys `osm_replication_sequence` /
-/// `osm_replication_timestamp`, set in `update::osm::apply_sequence`). Falls
-/// back to an empty state for the same reason `match_staleness_or_default`
-/// does: this is a secondary diagnostic, not a reason for `/status` to fail.
+/// `osm_replication_timestamp`, set in `update::osm::apply_batch`), and how
+/// old it is. Shared by `/status` and the `health_log` job.
+pub fn read_osm_replication(conn: &Connection) -> Result<OsmReplicationState> {
+    let mut stmt = conn.prepare(
+        "SELECT key, value,
+                date_diff('second', TRY_CAST(value AS TIMESTAMPTZ), now())
+         FROM metadata
+         WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp')",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+        ))
+    })?;
+    let mut result = OsmReplicationState::default();
+    for row in rows {
+        let (key, value, age_seconds) = row?;
+        match key.as_str() {
+            "osm_replication_sequence" => result.sequence_number = value.parse().ok(),
+            "osm_replication_timestamp" => {
+                result.timestamp = Some(value);
+                result.lag_seconds = age_seconds;
+            }
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
+/// Falls back to an empty state for the same reason
+/// `match_staleness_or_default` does: this is a secondary diagnostic, not a
+/// reason for `/status` to fail.
 fn osm_replication_state_or_default(state: &AppState) -> OsmReplicationState {
     let outcome = (|| -> Result<OsmReplicationState> {
         let conn = state
             .pool
             .get()
             .context("Failed to acquire pool connection")?;
-        let mut stmt = conn.prepare(
-            "SELECT key, value FROM metadata
-             WHERE key IN ('osm_replication_sequence', 'osm_replication_timestamp')",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        let mut result = OsmReplicationState::default();
-        for row in rows {
-            let (key, value) = row?;
-            match key.as_str() {
-                "osm_replication_sequence" => result.sequence_number = value.parse().ok(),
-                "osm_replication_timestamp" => result.timestamp = Some(value),
-                _ => {}
-            }
-        }
-        Ok(result)
+        read_osm_replication(&conn)
     })();
     match outcome {
         Ok(s) => s,
@@ -258,6 +280,10 @@ pub struct StatusResponse {
     /// heap profiles cannot see DuckDB's allocator, and nothing outside can
     /// open the database. See `db_memory`. `null` if the read failed.
     pub duckdb_memory: Option<crate::db_memory::DuckDbMemory>,
+    /// The whole process as the kernel accounts it: resident, swapped out and
+    /// peak resident. Covers what `duckdb_memory` cannot see (RocksDB, GEOS,
+    /// the Rust heap). See `process_memory`. `null` off Linux.
+    pub process_memory: Option<crate::process_memory::ProcessMemory>,
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
@@ -300,6 +326,8 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         rocksdb,
         reports,
         duckdb_memory,
+        // A file read, not a DB read, so no `spawn_blocking` either.
+        process_memory: crate::process_memory::read(),
     })
 }
 
@@ -381,5 +409,42 @@ mod tests {
         let s = osm_replication_state_or_default(&state);
         assert_eq!(s.sequence_number, None);
         assert_eq!(s.timestamp, None);
+        assert_eq!(s.lag_seconds, None);
+    }
+
+    #[test]
+    fn lag_is_the_age_of_the_stamped_replication_timestamp() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Written in the replication feed's own `...Z` form, as the stamp is.
+        let stamp = crate::server::jobs::format_rfc3339(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 60),
+        );
+        conn.execute_batch(
+            "CREATE TABLE metadata (key VARCHAR, value VARCHAR);
+             INSERT INTO metadata VALUES ('osm_replication_sequence', '7298234');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata VALUES ('osm_replication_timestamp', ?)",
+            [&stamp],
+        )
+        .unwrap();
+        let s = read_osm_replication(&conn).unwrap();
+        let lag = s.lag_seconds.expect("a parseable stamp has a lag");
+        assert!(
+            (5390..=5410).contains(&lag),
+            "90 minutes behind, got {lag}s"
+        );
+
+        conn.execute_batch(
+            "UPDATE metadata SET value = 'not a time' WHERE key = 'osm_replication_timestamp'",
+        )
+        .unwrap();
+        let s = read_osm_replication(&conn).unwrap();
+        assert_eq!(s.timestamp.as_deref(), Some("not a time"));
+        assert_eq!(
+            s.lag_seconds, None,
+            "an unparseable stamp is no reading, not an error"
+        );
     }
 }
