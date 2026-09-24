@@ -771,7 +771,20 @@ fn apply_batch(
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            // A rollback that fails part-way (DuckDB pins each undo-buffer
+            // block, which can itself hit the memory limit) leaves the rows
+            // it had not reached marked as deleted by a transaction that no
+            // longer exists. Every later batch touching them then fails with
+            // `Conflict on tuple deletion!` until the process restarts, so
+            // this is the line that explains that error.
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                warn!(
+                    error = %rb,
+                    first_seq = batch[0].seq,
+                    last_seq,
+                    "failed to roll back OSM batch; rows it deleted may stay locked until restart"
+                );
+            }
             Err(e)
         }
     }

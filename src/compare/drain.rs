@@ -143,7 +143,9 @@ pub fn drain_batch(
             })
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::warn!(error = %rb, "match_refresh: failed to roll back failed batch");
+            }
             tracing::warn!(
                 error = %e,
                 cells = cells.len(),
@@ -227,15 +229,29 @@ fn replay_one_at_a_time(
         let res = drain_one_cell(conn, source, *cx, *cy, batch_start)
             .and_then(|()| enqueue_tiles_for_cells(conn, &[(*cx, *cy)]));
         match res {
-            Ok(()) => {
-                if conn.execute_batch("COMMIT").is_ok() {
-                    drained += 1;
-                } else {
+            Ok(()) => match conn.execute_batch("COMMIT") {
+                Ok(()) => drained += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        source = %source,
+                        cell_x = cx,
+                        cell_y = cy,
+                        error = %e,
+                        "match_refresh: cell commit failed"
+                    );
                     failed += 1;
                 }
-            }
+            },
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
+                if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                    tracing::warn!(
+                        source = %source,
+                        cell_x = cx,
+                        cell_y = cy,
+                        error = %rb,
+                        "match_refresh: failed to roll back failed cell"
+                    );
+                }
                 tracing::warn!(
                     source = %source,
                     cell_x = cx,
