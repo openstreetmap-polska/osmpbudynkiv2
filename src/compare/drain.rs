@@ -19,31 +19,39 @@ pub struct DrainStats {
 /// Drain up to `batch_size` distinct (source, cell) whose enqueued_at is at or
 /// before the batch start, oldest-enqueued first.
 ///
-/// # The batch is the transaction
+/// # A transaction per [`CELLS_PER_COMMIT`] cells, not per cell or per batch
 ///
-/// One `BEGIN`/`COMMIT` for the whole batch, not one per cell. At the default
-/// `batch_size` of 512 that is 511 fewer commits -- each a WAL append and
-/// flush -- for ~0.098s of actual work per cell, which is the wrong ratio on
-/// the slow production disk. Neither constraint that would block it holds: the
-/// only table shared with a concurrent dataset refresh is `match_dirty_cells`
-/// (`tile_dirty_cells` is append-vs-append), and append-vs-delete-of-different
-/// -rows is not a conflict for DuckDB's optimistic CC no matter how many cells
-/// the transaction spans -- see `compare::drain_refresh_concurrency`, which
-/// drives this function directly and is the standing evidence. 512 cells at
-/// ~0.098s is ~50s against a 300s job timeout.
+/// One `BEGIN`/`COMMIT` per group of cells, not one per cell. At the default
+/// `batch_size` of 512 that is 8 commits instead of 512 -- each a WAL append
+/// and flush -- for ~0.098s of actual work per cell, which is the wrong ratio
+/// on the slow production disk. Neither constraint that would block it holds:
+/// the only table shared with a concurrent dataset refresh is
+/// `match_dirty_cells` (`tile_dirty_cells` is append-vs-append), and
+/// append-vs-delete-of-different-rows is not a conflict for DuckDB's
+/// optimistic CC no matter how many cells the transaction spans -- see
+/// `compare::drain_refresh_concurrency`, which drives this function directly
+/// and is the standing evidence. 512 cells at ~0.098s is ~50s against a 300s
+/// job timeout.
+///
+/// It used to be one transaction for the whole batch. That held ~123-171 MiB
+/// of transaction-local memory until COMMIT on DuckDB 1.5.x (two INSERTs per
+/// cell, each holding ~18-29 KiB per column; see [`CELLS_PER_COMMIT`]).
 ///
 /// Two things the per-cell transaction used to buy are kept, more cheaply:
 ///
 /// - **Cancellation commits rather than rolling back.** Each cell's recompute
-///   is paired with its own queue delete, so the transaction is a grouping of
+///   is paired with its own queue delete, so a transaction is a grouping of
 ///   independently valid units and committing at any cell boundary is correct.
-///   `is_cancelled` is polled between cells; on a stop, what is finished is
-///   committed. That is strictly better than abandoning the in-flight cell.
-/// - **A poison cell is isolated by replay.** If the batch transaction fails,
-///   it rolls back and the same cells are re-run one at a time, so exactly the
-///   failing cell is warned about and left queued while the rest still drain.
-///   The cost is a second pass over one batch, paid only when something
-///   actually failed.
+///   That is also what makes committing every [`CELLS_PER_COMMIT`] cells
+///   correct. `is_cancelled` is polled between cells; on a stop, what is
+///   finished is committed. That is strictly better than abandoning the
+///   in-flight cell.
+/// - **A poison cell is isolated by replay.** If a group's transaction fails,
+///   it rolls back and that group's cells are re-run one at a time, so exactly
+///   the failing cell is warned about and left queued while the rest still
+///   drain. Groups already committed are not touched again, and the groups
+///   after it run normally. The cost is a second pass over one group, paid
+///   only when something actually failed.
 ///
 /// # The cutoff
 ///
@@ -118,28 +126,76 @@ pub fn drain_batch(
         v
     };
 
-    // The happy path: everything in one transaction.
+    let mut drained = 0u64;
+    let mut failed = 0u64;
+    for group in cells.chunks(CELLS_PER_COMMIT) {
+        let outcome = drain_group(conn, group, &batch_start, is_cancelled)?;
+        drained += outcome.drained;
+        failed += outcome.failed;
+        if outcome.cancelled {
+            break;
+        }
+    }
+    Ok(DrainStats {
+        cells: drained,
+        failed,
+        purged,
+    })
+}
+
+/// Cells per transaction in [`drain_batch`].
+///
+/// Each cell's recompute is two INSERT statements (`<source>_unmatched`, 9-15
+/// columns, and `cell_totals`, 4), and on DuckDB 1.5.x every INSERT inside a
+/// transaction holds ~18-29 KiB per column until COMMIT
+/// (`docs/duckdb_per_statement_insert_memory.md`). Measured on a copy of the
+/// national database with `a_full_batch_s_transaction_memory_on_real_data`:
+/// 512 cells in one transaction held 171 MiB (bdot10k), 123 MiB (egib) and
+/// 143 MiB (prg) of `IN_MEMORY_TABLE`; 64 cells hold an eighth of that. The
+/// statements' SQL is left per cell on purpose: it is shaped around RTREE
+/// plans (the `candidates` CTE and `MATERIALIZED` gotchas in CLAUDE.md), and
+/// a multi-cell rewrite would put those at risk to save memory that a commit
+/// every 64 cells already saves.
+const CELLS_PER_COMMIT: usize = 64;
+
+struct GroupOutcome {
+    drained: u64,
+    failed: u64,
+    cancelled: bool,
+}
+
+/// One group of [`drain_batch`]: one transaction, with the tile enqueue for
+/// exactly the cells it recomputed, so a committed recompute can never lose
+/// its tile enqueue. On failure, replays just this group one cell at a time.
+fn drain_group(
+    conn: &Connection,
+    group: &[(String, i32, i32)],
+    batch_start: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<GroupOutcome> {
     conn.execute_batch("BEGIN TRANSACTION")?;
-    let batch = (|| -> Result<Vec<(i32, i32)>> {
-        let mut done: Vec<(i32, i32)> = Vec::with_capacity(cells.len());
-        for (source, cx, cy) in &cells {
+    let mut cancelled = false;
+    let result = (|| -> Result<Vec<(i32, i32)>> {
+        let mut done: Vec<(i32, i32)> = Vec::with_capacity(group.len());
+        for (source, cx, cy) in group {
             if is_cancelled() {
+                cancelled = true;
                 break;
             }
-            drain_one_cell(conn, source, *cx, *cy, &batch_start)?;
+            drain_one_cell(conn, source, *cx, *cy, batch_start)?;
             done.push((*cx, *cy));
         }
         enqueue_tiles_for_cells(conn, &done)?;
         Ok(done)
     })();
 
-    match batch {
+    match result {
         Ok(done) => {
             conn.execute_batch("COMMIT")?;
-            Ok(DrainStats {
-                cells: done.len() as u64,
+            Ok(GroupOutcome {
+                drained: done.len() as u64,
                 failed: 0,
-                purged,
+                cancelled,
             })
         }
         Err(e) => {
@@ -148,16 +204,15 @@ pub fn drain_batch(
             }
             tracing::warn!(
                 error = %e,
-                cells = cells.len(),
+                cells = group.len(),
                 "match_refresh: batch failed, replaying it one cell at a time to isolate the cause"
             );
-            Ok(replay_one_at_a_time(
-                conn,
-                &cells,
-                &batch_start,
-                is_cancelled,
-                purged,
-            ))
+            let (drained, failed) = replay_one_at_a_time(conn, group, batch_start, is_cancelled);
+            Ok(GroupOutcome {
+                drained,
+                failed,
+                cancelled: is_cancelled(),
+            })
         }
     }
 }
@@ -207,7 +262,7 @@ fn enqueue_tiles_for_cells(conn: &Connection, cells: &[(i32, i32)]) -> Result<()
     .context("drain: enqueue dirty tiles")
 }
 
-/// The failure path: re-run a failed batch's cells one transaction at a time,
+/// The failure path: re-run a failed group's cells one transaction at a time,
 /// so exactly the cell that cannot be recomputed is left queued and warned
 /// about while every other cell still drains.
 fn replay_one_at_a_time(
@@ -215,8 +270,7 @@ fn replay_one_at_a_time(
     cells: &[(String, i32, i32)],
     batch_start: &str,
     is_cancelled: &dyn Fn() -> bool,
-    purged: u64,
-) -> DrainStats {
+) -> (u64, u64) {
     let mut drained = 0u64;
     let mut failed = 0u64;
     for (source, cx, cy) in cells {
@@ -263,11 +317,7 @@ fn replay_one_at_a_time(
             }
         }
     }
-    DrainStats {
-        cells: drained,
-        failed,
-        purged,
-    }
+    (drained, failed)
 }
 
 #[cfg(test)]
@@ -529,5 +579,103 @@ mod tests {
             tiles, 1,
             "the finished cell's tile enqueue must have committed with it"
         );
+    }
+
+    /// A batch spanning several transactions: a poison cell in the *second*
+    /// group is isolated by replaying that group alone. The first group was
+    /// already committed and must be neither replayed nor counted twice, which
+    /// would show as a second tile enqueue per cell; and the batch does not
+    /// stop at the failure.
+    #[test]
+    fn a_failing_cell_in_a_later_group_replays_only_that_group() {
+        let c = conn();
+        let healthy = CELLS_PER_COMMIT as i32 + 2;
+        c.execute_batch(&format!(
+            "INSERT INTO match_dirty_cells
+                 SELECT 'bdot10k', 14, 100 + i, 100, now() - INTERVAL 1 HOUR
+                 FROM range({healthy}) t(i);
+             INSERT INTO match_dirty_cells VALUES
+                 ('egib', 14, 200, 200, now() - INTERVAL 1 MINUTE);"
+        ))
+        .unwrap();
+
+        let s = drain_batch(&c, 1000, &|| false).unwrap();
+        assert_eq!((s.cells, s.failed), (healthy as u64, 1));
+        let left: Vec<String> = c
+            .prepare("SELECT source FROM match_dirty_cells")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<duckdb::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            left,
+            vec!["egib".to_string()],
+            "only the poison cell stays queued"
+        );
+        let tiles: i64 = c
+            .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tiles, healthy as i64, "one tile enqueue per drained cell");
+    }
+
+    /// Measures the transaction-local memory 512 cells (the default batch,
+    /// once one transaction) and [`CELLS_PER_COMMIT`] cells (one transaction
+    /// now) hold before COMMIT, on a copy of a real database: each cell is
+    /// two INSERT statements (`*_unmatched` and `cell_totals`), and on DuckDB
+    /// 1.5.x each INSERT inside a transaction holds ~18-29 KiB per column
+    /// until COMMIT (`docs/duckdb_per_statement_insert_memory.md`). Rolls
+    /// back, so the copy is left as it was.
+    ///
+    /// `OSMPB_MEMTEST_DB=/path/to/copy.duckdb cargo test --release --bin
+    /// osmpbudynkiv2 a_full_batch_s_transaction_memory -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs OSMPB_MEMTEST_DB pointing at a copy of a real database"]
+    fn a_full_batch_s_transaction_memory_on_real_data() {
+        let path = std::env::var("OSMPB_MEMTEST_DB").expect("OSMPB_MEMTEST_DB");
+        let init = [
+            "INSTALL spatial",
+            "LOAD spatial",
+            "INSTALL icu",
+            "LOAD icu",
+            "SET GLOBAL geometry_always_xy = true",
+            "SET GLOBAL memory_limit = '6GB'",
+        ]
+        .map(String::from);
+        let c = init_db(Path::new(&path), &init, None).unwrap();
+        crate::db_memory::use_parallel_insert_path(&c).unwrap();
+        for (source, n) in ["bdot10k", "egib", "prg"]
+            .into_iter()
+            .flat_map(|s| [(s, 512), (s, CELLS_PER_COMMIT as i64)])
+        {
+            let cells: Vec<(i32, i32)> = c
+                .prepare(
+                    "SELECT cell_x, cell_y FROM cell_totals WHERE source = ?
+                     ORDER BY hash(cell_x, cell_y) LIMIT ?",
+                )
+                .unwrap()
+                .query_map(duckdb::params![source, n], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<duckdb::Result<_>>()
+                .unwrap();
+            let batch_start: String = c
+                .query_row("SELECT now()::VARCHAR", [], |r| r.get(0))
+                .unwrap();
+            let started = std::time::Instant::now();
+            c.execute_batch("BEGIN TRANSACTION").unwrap();
+            for (x, y) in &cells {
+                drain_one_cell(&c, source, *x, *y, &batch_start).unwrap();
+            }
+            enqueue_tiles_for_cells(&c, &cells).unwrap();
+            let held = crate::db_memory::in_memory_table_bytes(&c).unwrap();
+            let elapsed = started.elapsed();
+            c.execute_batch("ROLLBACK").unwrap();
+            eprintln!(
+                "{source}: {} cells, IN_MEMORY_TABLE {} before COMMIT, {:.1?}",
+                cells.len(),
+                crate::db_memory::fmt_bytes(held),
+                elapsed
+            );
+        }
     }
 }

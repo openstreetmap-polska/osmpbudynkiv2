@@ -528,20 +528,25 @@ either side — or two different timestamps — either strands a cell dirty fore
 or deletes a queue row for a change the recompute never read.
 `jobs::tile_refresh` follows the same convention for `tile_dirty_cells`.
 
-**Gotcha — the batch *is* the transaction, and cancellation commits.** One
-`BEGIN`/`COMMIT` per `drain_batch`, not per cell: 512 commits per batch, each a
-WAL append and flush, is the wrong ratio against ~0.098 s of real work per cell.
-Three things make that safe, and none of them is obvious:
+**Gotcha — a drain batch commits every `CELLS_PER_COMMIT` (64) cells, and
+cancellation commits.** Not per cell: 512 commits per batch, each a WAL append
+and flush, is the wrong ratio against ~0.098 s of real work per cell. Not per
+batch either: that held 123–171 MiB of transaction memory until COMMIT (see the
+per-statement INSERT gotcha below). Three things make grouping safe, and none of
+them is obvious:
 
 1. **Cancellation commits rather than rolling back.** Each cell's recompute is
-   paired with its own queue delete, so the transaction is a *grouping of
-   independently valid units* and committing at any cell boundary is correct.
-   `is_cancelled` is still polled between cells. Rolling back instead would
-   redo that work every tick and on every shutdown.
-2. **A failed batch replays one cell at a time.** A poison cell would otherwise
+   paired with its own queue delete, so a transaction is a *grouping of
+   independently valid units* and committing at any cell boundary is correct —
+   which is also what makes the 64-cell commits correct. `is_cancelled` is
+   still polled between cells. Rolling back instead would redo that work every
+   tick and on every shutdown.
+2. **A failed group replays one cell at a time.** A poison cell would otherwise
    stall the queue forever, since nothing gets deleted. The replay isolates it,
-   warns, leaves it queued, and drains everything else — and costs a second
-   pass over one batch only when something actually failed.
+   warns, leaves it queued, and drains everything else. Only the failed group
+   replays: earlier groups are committed and must not be re-run
+   (`a_failing_cell_in_a_later_group_replays_only_that_group`). Each group's
+   tile enqueue runs in that group's transaction, for exactly its cells.
 3. **The conflict surface does not widen with transaction size.** The only
    table shared with a concurrent dataset refresh is `match_dirty_cells`
    (`tile_dirty_cells` is append-vs-append), and append-vs-delete-of-different-
