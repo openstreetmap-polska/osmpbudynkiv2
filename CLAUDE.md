@@ -871,6 +871,36 @@ the column reads NULL. The one `ALTER TABLE` in the codebase
 (`dataset::drop_ordering_column`) runs against a table the *same load's own*
 `CREATE TABLE AS SELECT` built moments earlier, never a pre-existing database.
 
+**Gotcha — on DuckDB 1.5.x every INSERT inside a transaction holds ~18–29 KiB
+per column until COMMIT, whatever its row count.** With `threads > 1` and
+`preserve_insertion_order = false` (production's settings) every INSERT takes
+the parallel path, which never frees its per-statement collection; it counts
+against `memory_limit`. One INSERT per row inside a transaction is what took a
+mass OSM revert to 2.8 GB and `Out of Memory Error`, twice. So **inside a
+transaction, write a set with one statement per table per chunk, never one per
+row**: a parameterized multi-row `VALUES` list (`db::values_sql`, every
+placeholder cast so an all-NULL column still types) and an interpolated integer
+`IN` list for ids (`db::id_list_sql`). `update::osm` (`REBUILD_CHUNK`),
+`reports::import_rows` and the drain's `CELLS_PER_COMMIT` follow this. Three
+traps:
+
+1. **A memory test is vacuous unless it sets `SET GLOBAL
+   preserve_insertion_order = false` and `threads > 1`** (the test default
+   hides the bug; `db_memory::use_parallel_insert_path`), and reads
+   `IN_MEMORY_TABLE` *before* COMMIT/ROLLBACK
+   (`db_memory::in_memory_table_bytes`).
+2. **`db_memory::tests::per_row_inserts_in_one_transaction_hold_memory_until_commit`
+   is a negative control that asserts the bug exists.** When a DuckDB upgrade
+   makes it fail, the fix (`575fd1b97b`, DuckDB 2.0) has arrived and the
+   regression tests next to it have become vacuous — nothing broke.
+3. **A 1,000-id `IN` list is planned as a MARK hash join**, so it reads every
+   projected column of the table, not only the matching rows: one lookup
+   caches ~817 MiB of `osm_buildings` blocks. That is evictable buffer pool,
+   not transaction memory, and still ~27× faster end to end than per-row
+   statements (1,598 s → 58 s on the real mass revert).
+
+Write-up and measurements: `docs/duckdb_per_statement_insert_memory.md`.
+
 **Gotcha — never hand DuckDB an Arrow batch through duckdb-rs's `arrow()`
 table function on a repeated path.** `arrow_recordbatch_to_query_params` (and
 its `_arraydata_`/`_ffi_` siblings) push every batch into a process-global store
