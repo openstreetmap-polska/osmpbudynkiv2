@@ -6,18 +6,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use duckdb::{Connection, OptionalExt};
+use duckdb::Connection;
+use duckdb::types::Value;
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::db::{id_list_sql, values_sql};
 use crate::download::{download_file_as_quiet, download_file_quiet};
 use crate::osm::geometry;
 use crate::osm::kvstore::RocksDB;
 use crate::osm::lifecycle;
 use crate::osm::replication::{
-    ChangeAction, OsmChange, RelationChange, WayChange, parse_osc, parse_state_txt,
+    ChangeAction, NodeChange, OsmChange, RelationChange, WayChange, parse_osc, parse_state_txt,
     sequence_state_path, sequence_to_path,
 };
 use crate::osm::{encoding, kvstore};
@@ -920,8 +922,17 @@ fn apply_collapsed_phases(
     let mut affected_relation_ids: HashSet<i64> = HashSet::new();
     let mut dirty = DirtyCells::new();
 
+    // Each phase below does its KV writes object by object and its SQL for
+    // the whole set afterwards, a chunk per statement (`REBUILD_CHUNK`). The
+    // split changes no result: none of a phase's SQL reads what the same
+    // phase writes to the KV store, and every phase's KV writes still finish
+    // before the next phase starts.
+
     // --- Apply node changes ---
+    let mut node_ids: Vec<i64> = Vec::with_capacity(changes.nodes.len());
+    let mut address_nodes: Vec<&NodeChange> = Vec::new();
     for node in &changes.nodes {
+        node_ids.push(node.id);
         match node.action {
             ChangeAction::Delete => {
                 let way_ids = kvstore::get_node_to_ways(kv, node.id)?;
@@ -930,11 +941,6 @@ fn apply_collapsed_phases(
                     kvstore::remove_node_to_ways(kv, node.id, wid)?;
                 }
                 kvstore::delete_node(kv, node.id)?;
-                dirty.note_existing(conn, Layer::Addresses, "osm_addresses", node.id, "node")?;
-                conn.execute(
-                    "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'node'",
-                    [node.id],
-                )?;
             }
             ChangeAction::Create | ChangeAction::Modify => {
                 // The `.osc` carries degrees as decimal text; the store keeps
@@ -948,29 +954,33 @@ fn apply_collapsed_phases(
                 )?;
                 let way_ids = kvstore::get_node_to_ways(kv, node.id)?;
                 affected_way_ids.extend(&way_ids);
-                dirty.note_existing(conn, Layer::Addresses, "osm_addresses", node.id, "node")?;
-                conn.execute(
-                    "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'node'",
-                    [node.id],
-                )?;
-                if let Some(hn) = tag_value(&node.tags, "addr:housenumber") {
-                    let street = tag_value(&node.tags, "addr:street");
-                    let city = tag_value(&node.tags, "addr:city")
-                        .or_else(|| tag_value(&node.tags, "addr:place"));
-                    let postcode = tag_value(&node.tags, "addr:postcode");
-                    conn.execute(
-                        "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
-                         VALUES (?, 'node', ?, ?, ?, ?, ST_Point(?, ?))",
-                        duckdb::params![node.id, hn, street, city, postcode, node.lon, node.lat],
-                    )?;
-                    dirty.note_point(Layer::Addresses, node.lon, node.lat);
+                if tag_value(&node.tags, "addr:housenumber").is_some() {
+                    address_nodes.push(node);
                 }
             }
+        }
+    }
+    // Every changed node loses the address row it had (a delete, a move, or
+    // a de-tag); only the ones still carrying a housenumber get one back.
+    for chunk in node_ids.chunks(REBUILD_CHUNK) {
+        (|| -> Result<()> {
+            dirty.note_existing(conn, Layer::Addresses, "osm_addresses", chunk, "node")?;
+            delete_rows(conn, "osm_addresses", "node", chunk)
+        })()
+        .with_context(|| chunk_label("node", chunk))?;
+    }
+    for chunk in address_nodes.chunks(REBUILD_CHUNK) {
+        insert_node_addresses(conn, chunk).with_context(|| {
+            chunk_label("node", &chunk.iter().map(|n| n.id).collect::<Vec<_>>())
+        })?;
+        for node in chunk {
+            dirty.note_point(Layer::Addresses, node.lon, node.lat);
         }
     }
 
     // --- Apply way changes ---
     *phase = "way changes";
+    let mut deleted_way_ids: Vec<i64> = Vec::new();
     for way in &changes.ways {
         match way.action {
             ChangeAction::Delete => {
@@ -982,27 +992,7 @@ fn apply_collapsed_phases(
                 let rel_ids = kvstore::get_way_to_relations(kv, way.id)?;
                 affected_relation_ids.extend(&rel_ids);
                 kvstore::delete_way(kv, way.id)?;
-                dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way.id, "way")?;
-                dirty.note_existing(conn, Layer::Addresses, "osm_addresses", way.id, "way")?;
-                dirty.note_existing(
-                    conn,
-                    Layer::Buildings,
-                    "osm_former_buildings",
-                    way.id,
-                    "way",
-                )?;
-                conn.execute(
-                    "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way'",
-                    [way.id],
-                )?;
-                conn.execute(
-                    "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'way'",
-                    [way.id],
-                )?;
-                conn.execute(
-                    "DELETE FROM osm_former_buildings WHERE osm_id = ? AND osm_type = 'way'",
-                    [way.id],
-                )?;
+                deleted_way_ids.push(way.id);
             }
             ChangeAction::Create | ChangeAction::Modify => {
                 if let Some(old_node_ids) = kvstore::get_way(kv, way.id)? {
@@ -1020,9 +1010,11 @@ fn apply_collapsed_phases(
             }
         }
     }
+    remove_served_rows(conn, &mut dirty, "way", &deleted_way_ids)?;
 
     // --- Apply relation changes ---
     *phase = "relation changes";
+    let mut deleted_relation_ids: Vec<i64> = Vec::new();
     for rel in &changes.relations {
         match rel.action {
             ChangeAction::Delete => {
@@ -1034,27 +1026,7 @@ fn apply_collapsed_phases(
                     }
                 }
                 kvstore::delete_relation(kv, rel.id)?;
-                dirty.note_existing(conn, Layer::Buildings, "osm_buildings", rel.id, "relation")?;
-                dirty.note_existing(conn, Layer::Addresses, "osm_addresses", rel.id, "relation")?;
-                dirty.note_existing(
-                    conn,
-                    Layer::Buildings,
-                    "osm_former_buildings",
-                    rel.id,
-                    "relation",
-                )?;
-                conn.execute(
-                    "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'relation'",
-                    [rel.id],
-                )?;
-                conn.execute(
-                    "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'relation'",
-                    [rel.id],
-                )?;
-                conn.execute(
-                    "DELETE FROM osm_former_buildings WHERE osm_id = ? AND osm_type = 'relation'",
-                    [rel.id],
-                )?;
+                deleted_relation_ids.push(rel.id);
             }
             ChangeAction::Create | ChangeAction::Modify => {
                 if let Some(old_members) = kvstore::get_relation(kv, rel.id)? {
@@ -1085,13 +1057,13 @@ fn apply_collapsed_phases(
             }
         }
     }
+    remove_served_rows(conn, &mut dirty, "relation", &deleted_relation_ids)?;
 
     // --- Rebuild affected way geometries ---
     *phase = "way geometry rebuild";
-    for &way_id in &affected_way_ids {
-        rebuild_way_geometry(conn, kv, way_id, &way_changes, &mut dirty)
-            .with_context(|| format!("way {way_id}"))?;
-    }
+    let mut way_ids: Vec<i64> = affected_way_ids.iter().copied().collect();
+    way_ids.sort_unstable();
+    rebuild_way_geometries(conn, kv, &way_ids, &way_changes, &mut dirty)?;
 
     // Cascade way changes to relations
     *phase = "way-to-relation cascade";
@@ -1102,14 +1074,116 @@ fn apply_collapsed_phases(
 
     // --- Rebuild affected relation geometries ---
     *phase = "relation geometry rebuild";
-    for &relation_id in &affected_relation_ids {
-        rebuild_relation_geometry(conn, kv, relation_id, &relation_changes, &mut dirty)
-            .with_context(|| format!("relation {relation_id}"))?;
-    }
+    let mut relation_ids: Vec<i64> = affected_relation_ids.iter().copied().collect();
+    relation_ids.sort_unstable();
+    rebuild_relation_geometries(conn, kv, &relation_ids, &relation_changes, &mut dirty)?;
 
     *phase = "dirty-cell flush";
     dirty.flush(conn)?;
 
+    Ok(())
+}
+
+/// Objects per statement in `update osm`'s writes: every DELETE, INSERT and
+/// `note_existing` query covers up to this many objects of one kind.
+///
+/// **The chunking is the memory fix, and the size is not.** On DuckDB 1.5.x
+/// each INSERT statement inside a transaction holds ~18-29 KiB *per column*
+/// until COMMIT (the parallel insert path taken under production's
+/// `preserve_insertion_order = false`; see
+/// `docs/duckdb_per_statement_insert_memory.md`). One statement per object
+/// is what took a mass revert of ~8,500 addressed building ways to 2.8 GB of
+/// `IN_MEMORY_TABLE` and an `Out of Memory Error`, twice. Any chunk size
+/// removes that; this one only bounds the statement text and its parameter
+/// count. It also cuts the time: the per-object DELETEs each scanned the
+/// whole unindexed table, 11 of 18 s in that measurement (0.10 s batched).
+const REBUILD_CHUNK: usize = 1000;
+
+fn text(value: Option<String>) -> Value {
+    value.map_or(Value::Null, Value::Text)
+}
+
+/// What a failed chunk says: its kind, first and last id, and size. The
+/// per-object SQL named the one object; a chunk's ids are sorted, so the
+/// range is where to look.
+fn chunk_label(kind: &str, ids: &[i64]) -> String {
+    match (ids.first(), ids.last()) {
+        (Some(first), Some(last)) => format!("{kind}s {first}..={last} ({} in chunk)", ids.len()),
+        _ => format!("{kind}s (empty chunk)"),
+    }
+}
+
+fn delete_rows(conn: &Connection, table: &str, osm_type: &str, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        &format!(
+            "DELETE FROM {table} WHERE osm_type = ? AND osm_id IN ({})",
+            id_list_sql(ids)
+        ),
+        [osm_type],
+    )
+    .with_context(|| format!("delete from {table}"))?;
+    Ok(())
+}
+
+/// Note the cells the objects' current rows occupy, then delete those rows,
+/// from all three OSM tables. Runs before any re-insert, so a de-tagged or
+/// deleted object still enqueues the cell it left.
+fn remove_served_rows(
+    conn: &Connection,
+    dirty: &mut DirtyCells,
+    osm_type: &str,
+    ids: &[i64],
+) -> Result<()> {
+    for chunk in ids.chunks(REBUILD_CHUNK) {
+        (|| -> Result<()> {
+            dirty.note_existing(conn, Layer::Buildings, "osm_buildings", chunk, osm_type)?;
+            dirty.note_existing(conn, Layer::Addresses, "osm_addresses", chunk, osm_type)?;
+            dirty.note_existing(
+                conn,
+                Layer::Buildings,
+                "osm_former_buildings",
+                chunk,
+                osm_type,
+            )?;
+            delete_rows(conn, "osm_buildings", osm_type, chunk)?;
+            delete_rows(conn, "osm_addresses", osm_type, chunk)?;
+            delete_rows(conn, "osm_former_buildings", osm_type, chunk)
+        })()
+        .with_context(|| chunk_label(osm_type, chunk))?;
+    }
+    Ok(())
+}
+
+fn insert_node_addresses(conn: &Connection, nodes: &[&NodeChange]) -> Result<()> {
+    let mut params: Vec<Value> = Vec::with_capacity(nodes.len() * 7);
+    for node in nodes {
+        params.extend([
+            Value::BigInt(node.id),
+            text(tag_value(&node.tags, "addr:housenumber")),
+            text(tag_value(&node.tags, "addr:street")),
+            text(
+                tag_value(&node.tags, "addr:city").or_else(|| tag_value(&node.tags, "addr:place")),
+            ),
+            text(tag_value(&node.tags, "addr:postcode")),
+            Value::Double(node.lon),
+            Value::Double(node.lat),
+        ]);
+    }
+    conn.execute(
+        &format!(
+            "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
+             SELECT s.id, 'node', s.housenumber, s.street, s.city, s.postcode, ST_Point(s.lon, s.lat)
+             FROM (VALUES {values}) s(id, housenumber, street, city, postcode, lon, lat)",
+            values = values_sql(
+                nodes.len(),
+                &["BIGINT", "VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR", "DOUBLE", "DOUBLE"]
+            ),
+        ),
+        duckdb::params_from_iter(params),
+    )?;
     Ok(())
 }
 
@@ -1137,11 +1211,11 @@ type StoredAddress = (
     Option<String>,
 );
 
-/// The tags of a way/relation that is being rebuilt only because a node or
-/// member way under it moved, so the changeset carries no tags for it: read
-/// back from the rows it already has, which must be done BEFORE the rebuild
-/// deletes them. `None` means it has no row at all, so there is nothing to
-/// rebuild.
+/// The tags of the ways/relations among `ids` that are being rebuilt only
+/// because a node or member way under them moved, so the changeset carries no
+/// tags for them: read back from the rows they already have, which must be
+/// done BEFORE the rebuild deletes them. An id missing from the result has no
+/// row at all, so there is nothing to rebuild.
 ///
 /// **Every value is the stored one, never a placeholder.** The rebuild deletes
 /// and re-inserts, so whatever this returns *is* the new row. This used to
@@ -1151,59 +1225,159 @@ type StoredAddress = (
 /// it was matching reappeared as unmatched (Niezapominajki 11, Pruszków, OSM
 /// way 1081685388). An existing database keeps the blanked rows until
 /// `import osm` is re-run; the tag values exist nowhere else in this system.
+///
+/// One query per table for the whole chunk. Should an object ever have two
+/// rows in a table, one of them wins arbitrarily, as it did when this was a
+/// `query_row` per object.
 fn stored_rebuild_tags(
     conn: &Connection,
-    osm_id: i64,
     osm_type: &str,
-) -> Result<Option<RebuildTags>> {
-    let building: Option<String> = conn
-        .query_row(
-            "SELECT COALESCE(building, 'yes') FROM osm_buildings WHERE osm_id = ? AND osm_type = ?",
-            duckdb::params![osm_id, osm_type],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let address: Option<StoredAddress> = conn
-        .query_row(
-            "SELECT housenumber, street, city, postcode FROM osm_addresses
-             WHERE osm_id = ? AND osm_type = ?",
-            duckdb::params![osm_id, osm_type],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    // Keep the stored key/value so the re-insert uses the SAME lifecycle key.
-    let former: Option<(String, String)> = conn
-        .query_row(
-            "SELECT lifecycle_key, lifecycle_value FROM osm_former_buildings
-             WHERE osm_id = ? AND osm_type = ?",
-            duckdb::params![osm_id, osm_type],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-
-    // Load-bearing: without `&& former.is_none()`, a former-building object
-    // whose geometry moved would return here before the delete/re-insert, so
-    // its row would keep stale pre-move geometry.
-    if building.is_none() && address.is_none() && former.is_none() {
-        return Ok(None);
+    ids: &[i64],
+) -> Result<HashMap<i64, RebuildTags>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
     }
-    // A stored address row always has a housenumber (every insert site
-    // requires one), so `Some` here is what re-inserts it.
-    let (housenumber, street, city, postcode) = match address {
-        Some((hn, street, city, postcode)) => {
-            (hn.or_else(|| Some(String::new())), street, city, postcode)
+    let list = id_list_sql(ids);
+
+    let mut buildings: HashMap<i64, String> = HashMap::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT osm_id, COALESCE(building, 'yes') FROM osm_buildings
+         WHERE osm_type = ? AND osm_id IN ({list})"
+    ))?;
+    for row in stmt.query_map([osm_type], |r| Ok((r.get(0)?, r.get(1)?)))? {
+        let (id, building) = row?;
+        buildings.entry(id).or_insert(building);
+    }
+
+    let mut addresses: HashMap<i64, StoredAddress> = HashMap::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT osm_id, housenumber, street, city, postcode FROM osm_addresses
+         WHERE osm_type = ? AND osm_id IN ({list})"
+    ))?;
+    for row in stmt.query_map([osm_type], |r| {
+        Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+    })? {
+        let (id, address) = row?;
+        addresses.entry(id).or_insert(address);
+    }
+
+    // Keep the stored key/value so the re-insert uses the SAME lifecycle key.
+    let mut formers: HashMap<i64, (String, String)> = HashMap::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT osm_id, lifecycle_key, lifecycle_value FROM osm_former_buildings
+         WHERE osm_type = ? AND osm_id IN ({list})"
+    ))?;
+    for row in stmt.query_map([osm_type], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))? {
+        let (id, former) = row?;
+        formers.entry(id).or_insert(former);
+    }
+
+    let mut tags = HashMap::new();
+    for &id in ids {
+        let building = buildings.remove(&id);
+        let address = addresses.remove(&id);
+        let former = formers.remove(&id);
+        // Load-bearing: without `&& former.is_none()`, a former-building
+        // object whose geometry moved would be skipped before the
+        // delete/re-insert, so its row would keep stale pre-move geometry.
+        if building.is_none() && address.is_none() && former.is_none() {
+            continue;
         }
-        None => (None, None, None, None),
-    };
-    Ok(Some((
-        building,
-        housenumber,
-        street,
-        city,
-        postcode,
-        former,
-    )))
+        // A stored address row always has a housenumber (every insert site
+        // requires one), so `Some` here is what re-inserts it.
+        let (housenumber, street, city, postcode) = match address {
+            Some((hn, street, city, postcode)) => {
+                (hn.or_else(|| Some(String::new())), street, city, postcode)
+            }
+            None => (None, None, None, None),
+        };
+        tags.insert(id, (building, housenumber, street, city, postcode, former));
+    }
+    Ok(tags)
 }
+
+/// The tags a rebuild re-inserts for an object the changeset carries.
+fn change_rebuild_tags(tags: &[(String, String)]) -> RebuildTags {
+    (
+        tag_value(tags, "building"),
+        tag_value(tags, "addr:housenumber"),
+        tag_value(tags, "addr:street"),
+        tag_value(tags, "addr:city").or_else(|| tag_value(tags, "addr:place")),
+        tag_value(tags, "addr:postcode"),
+        lifecycle::key_of(tags)
+            .map(|key| (key.to_string(), tag_value(tags, key).unwrap_or_default())),
+    )
+}
+
+/// The rows one chunk of rebuilt ways or relations re-inserts, by table.
+#[derive(Default)]
+struct RebuildRows {
+    buildings: Vec<(i64, String)>,
+    former: Vec<(i64, (String, String))>,
+    addresses: Vec<(i64, StoredAddress)>,
+}
+
+impl RebuildRows {
+    /// Whether `tags` asks for any row at all. When it does not, the object
+    /// was de-tagged: its old rows are deleted and nothing replaces them.
+    fn wants_any(tags: &RebuildTags) -> bool {
+        tags.0.is_some() || tags.1.is_some() || tags.5.is_some()
+    }
+
+    fn push(&mut self, id: i64, tags: RebuildTags) {
+        let (building, housenumber, street, city, postcode, former) = tags;
+        if let Some(building) = building {
+            self.buildings.push((id, building));
+        }
+        if let Some(former) = former {
+            self.former.push((id, former));
+        }
+        if housenumber.is_some() {
+            self.addresses
+                .push((id, (housenumber, street, city, postcode)));
+        }
+    }
+}
+
+fn ids_of<T>(rows: &[(i64, T)]) -> Vec<i64> {
+    rows.iter().map(|(id, _)| *id).collect()
+}
+
+fn building_params(rows: &[(i64, String)]) -> Vec<Value> {
+    rows.iter()
+        .flat_map(|(id, building)| [Value::BigInt(*id), Value::Text(building.clone())])
+        .collect()
+}
+
+fn former_params(rows: &[(i64, (String, String))]) -> Vec<Value> {
+    rows.iter()
+        .flat_map(|(id, (key, value))| {
+            [
+                Value::BigInt(*id),
+                Value::Text(key.clone()),
+                Value::Text(value.clone()),
+            ]
+        })
+        .collect()
+}
+
+fn address_params(rows: &[(i64, StoredAddress)]) -> Vec<Value> {
+    rows.iter()
+        .flat_map(|(id, (hn, street, city, postcode))| {
+            [
+                Value::BigInt(*id),
+                text(hn.clone()),
+                text(street.clone()),
+                text(city.clone()),
+                text(postcode.clone()),
+            ]
+        })
+        .collect()
+}
+
+const BUILDING_ROW: &[&str] = &["BIGINT", "VARCHAR"];
+const FORMER_ROW: &[&str] = &["BIGINT", "VARCHAR", "VARCHAR"];
+const ADDRESS_ROW: &[&str] = &["BIGINT", "VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR"];
 
 /// A way that cannot be turned into a geometry: absent from the store
 /// (`missing_nodes` is `None`), or present but referencing nodes that are not
@@ -1279,142 +1453,139 @@ fn describe_unresolved(unresolved: &[UnresolvedWay]) -> String {
     format!("{} (outside the extract?)", parts.join("; "))
 }
 
-fn rebuild_way_geometry(
+/// Rebuild the served rows of every way in `way_ids` (sorted), a chunk of
+/// `REBUILD_CHUNK` at a time: read the tags, note the cells and delete the
+/// rows for the whole chunk, then one INSERT per table. Every per-way
+/// decision is the one the per-way rebuild made; only the SQL is batched.
+fn rebuild_way_geometries(
     conn: &Connection,
     kv: &RocksDB,
-    way_id: i64,
+    way_ids: &[i64],
     way_changes: &HashMap<i64, &WayChange>,
     dirty: &mut DirtyCells,
 ) -> Result<()> {
-    if kvstore::get_way(kv, way_id)?.is_none() {
-        return Ok(());
-    }
-
-    // Determine tags: from the change if directly affected, else from the rows it
-    // already has (`stored_rebuild_tags`), read BEFORE the delete below.
-    let way_change = way_changes.get(&way_id);
-    let (building_tag, housenumber, street, city, postcode, former) = match way_change {
-        Some(wc) => (
-            tag_value(&wc.tags, "building"),
-            tag_value(&wc.tags, "addr:housenumber"),
-            tag_value(&wc.tags, "addr:street"),
-            tag_value(&wc.tags, "addr:city").or_else(|| tag_value(&wc.tags, "addr:place")),
-            tag_value(&wc.tags, "addr:postcode"),
-            lifecycle::key_of(&wc.tags).map(|key| {
-                (
-                    key.to_string(),
-                    tag_value(&wc.tags, key).unwrap_or_default(),
-                )
-            }),
-        ),
-        None => match stored_rebuild_tags(conn, way_id, "way")? {
-            Some(tags) => tags,
-            None => return Ok(()),
-        },
-    };
-
-    // No early return when all of building/address/former are absent: that is
-    // the de-tag case (a Modify stripped building/addr:housenumber/a lifecycle
-    // key off a way we serve), and it still has to delete the base row and
-    // note the cell it left -- otherwise the government object this way was
-    // matching (or vetoing) stays wrong until the next full compare. The
-    // re-inserts below are already guarded by their own is_some() checks, so
-    // falling through simply deletes and stops.
-    dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way_id, "way")?;
-    dirty.note_existing(conn, Layer::Addresses, "osm_addresses", way_id, "way")?;
-    dirty.note_existing(
-        conn,
-        Layer::Buildings,
-        "osm_former_buildings",
-        way_id,
-        "way",
-    )?;
-
-    conn.execute(
-        "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'way'",
-        [way_id],
-    )?;
-    conn.execute(
-        "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'way'",
-        [way_id],
-    )?;
-    conn.execute(
-        "DELETE FROM osm_former_buildings WHERE osm_id = ? AND osm_type = 'way'",
-        [way_id],
-    )?;
-
-    if building_tag.is_some() || former.is_some() || housenumber.is_some() {
-        let unresolved = unresolved_way_members(kv, &[way_id])?;
-        if !unresolved.is_empty() {
-            warn!(
-                "Ignoring way/{way_id}: {}",
-                describe_unresolved(&unresolved)
-            );
-            return Ok(());
+    // A way the store no longer has was deleted in this batch, and the way
+    // phase already removed its rows.
+    let mut present = Vec::with_capacity(way_ids.len());
+    for &way_id in way_ids {
+        if kvstore::get_way(kv, way_id)?.is_some() {
+            present.push(way_id);
         }
     }
+    for chunk in present.chunks(REBUILD_CHUNK) {
+        rebuild_way_chunk(conn, kv, chunk, way_changes, dirty)
+            .with_context(|| chunk_label("way", chunk))?;
+    }
+    Ok(())
+}
 
-    if building_tag.is_some() {
-        let building = building_tag.as_deref().unwrap_or("yes");
-        let building_sql = building.replace('\'', "''");
-        let ring = way_ring_polygon_sql(&way_id.to_string());
-        conn.execute_batch(&format!(
-            "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
-             SELECT {way_id}, 'way', '{building_sql}',
-                    {geom}
-             WHERE resolve_way_coords({way_id}) IS NOT NULL
-               AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords({way_id}))) >= 4
-               AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords({way_id})))
-               AND {guard}",
-            geom = geometry::repaired_geom_sql(&ring),
-            guard = geometry::has_polygon_sql(&ring),
-        ))?;
-        dirty.note_existing(conn, Layer::Buildings, "osm_buildings", way_id, "way")?;
+fn rebuild_way_chunk(
+    conn: &Connection,
+    kv: &RocksDB,
+    chunk: &[i64],
+    way_changes: &HashMap<i64, &WayChange>,
+    dirty: &mut DirtyCells,
+) -> Result<()> {
+    // Determine tags: from the change if directly affected, else from the rows
+    // each way already has (`stored_rebuild_tags`), read BEFORE the delete
+    // below. A way with neither is skipped: nothing to rebuild.
+    let inferred: Vec<i64> = chunk
+        .iter()
+        .copied()
+        .filter(|id| !way_changes.contains_key(id))
+        .collect();
+    let mut stored = stored_rebuild_tags(conn, "way", &inferred)?;
+    let targets: Vec<(i64, RebuildTags)> = chunk
+        .iter()
+        .filter_map(|&id| match way_changes.get(&id) {
+            Some(wc) => Some((id, change_rebuild_tags(&wc.tags))),
+            None => stored.remove(&id).map(|tags| (id, tags)),
+        })
+        .collect();
+
+    // No skip when all of building/address/former are absent: that is the
+    // de-tag case (a Modify stripped building/addr:housenumber/a lifecycle
+    // key off a way we serve), and it still has to delete the base row and
+    // note the cell it left -- otherwise the government object this way was
+    // matching (or vetoing) stays wrong until the next full compare.
+    // `RebuildRows::push` adds nothing for it, so it simply deletes and stops.
+    remove_served_rows(conn, dirty, "way", &ids_of(&targets))?;
+
+    let mut rows = RebuildRows::default();
+    for (way_id, tags) in targets {
+        if RebuildRows::wants_any(&tags) {
+            let unresolved = unresolved_way_members(kv, &[way_id])?;
+            if !unresolved.is_empty() {
+                warn!(
+                    "Ignoring way/{way_id}: {}",
+                    describe_unresolved(&unresolved)
+                );
+                continue;
+            }
+        }
+        rows.push(way_id, tags);
     }
 
-    if let Some((lifecycle_key, lifecycle_value)) = &former {
-        let ring = way_ring_polygon_sql("?");
+    let ring = way_ring_polygon_sql("s.id");
+    let closed_ring = "resolve_way_coords(s.id) IS NOT NULL
+               AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords(s.id))) >= 4
+               AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords(s.id)))";
+
+    if !rows.buildings.is_empty() {
         conn.execute(
             &format!(
-                "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
-                 SELECT ?, 'way', ?, ?,
+                "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
+                 SELECT s.id, 'way', s.building,
                         {geom}
-                 WHERE resolve_way_coords(?) IS NOT NULL
-                   AND ST_NPoints(ST_GeomFromWKB(resolve_way_coords(?))) >= 4
-                   AND ST_IsClosed(ST_GeomFromWKB(resolve_way_coords(?)))
+                 FROM (VALUES {values}) s(id, building)
+                 WHERE {closed_ring}
                    AND {guard}",
+                values = values_sql(rows.buildings.len(), BUILDING_ROW),
                 geom = geometry::repaired_geom_sql(&ring),
                 guard = geometry::has_polygon_sql(&ring),
             ),
-            duckdb::params![
-                way_id,
-                lifecycle_key,
-                lifecycle_value,
-                way_id,
-                way_id,
-                way_id,
-                way_id,
-                way_id
-            ],
-        )?;
-        dirty.note_existing(
-            conn,
-            Layer::Buildings,
-            "osm_former_buildings",
-            way_id,
-            "way",
-        )?;
+            duckdb::params_from_iter(building_params(&rows.buildings)),
+        )
+        .context("insert into osm_buildings")?;
+        let ids = ids_of(&rows.buildings);
+        dirty.note_existing(conn, Layer::Buildings, "osm_buildings", &ids, "way")?;
     }
 
-    if housenumber.is_some() {
+    if !rows.former.is_empty() {
         conn.execute(
-            "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
-             SELECT ?, 'way', ?, ?, ?, ?,
-                    ST_Centroid(ST_GeomFromWKB(resolve_way_coords(?)))
-             WHERE resolve_way_coords(?) IS NOT NULL",
-            duckdb::params![way_id, housenumber, street, city, postcode, way_id, way_id],
-        )?;
-        dirty.note_existing(conn, Layer::Addresses, "osm_addresses", way_id, "way")?;
+            &format!(
+                "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+                 SELECT s.id, 'way', s.lifecycle_key, s.lifecycle_value,
+                        {geom}
+                 FROM (VALUES {values}) s(id, lifecycle_key, lifecycle_value)
+                 WHERE {closed_ring}
+                   AND {guard}",
+                values = values_sql(rows.former.len(), FORMER_ROW),
+                geom = geometry::repaired_geom_sql(&ring),
+                guard = geometry::has_polygon_sql(&ring),
+            ),
+            duckdb::params_from_iter(former_params(&rows.former)),
+        )
+        .context("insert into osm_former_buildings")?;
+        let ids = ids_of(&rows.former);
+        dirty.note_existing(conn, Layer::Buildings, "osm_former_buildings", &ids, "way")?;
+    }
+
+    if !rows.addresses.is_empty() {
+        conn.execute(
+            &format!(
+                "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
+                 SELECT s.id, 'way', s.housenumber, s.street, s.city, s.postcode,
+                        ST_Centroid(ST_GeomFromWKB(resolve_way_coords(s.id)))
+                 FROM (VALUES {values}) s(id, housenumber, street, city, postcode)
+                 WHERE resolve_way_coords(s.id) IS NOT NULL",
+                values = values_sql(rows.addresses.len(), ADDRESS_ROW),
+            ),
+            duckdb::params_from_iter(address_params(&rows.addresses)),
+        )
+        .context("insert into osm_addresses")?;
+        let ids = ids_of(&rows.addresses);
+        dirty.note_existing(conn, Layer::Addresses, "osm_addresses", &ids, "way")?;
     }
 
     Ok(())
@@ -1422,8 +1593,8 @@ fn rebuild_way_geometry(
 
 /// The raw polygon a closed way's node coordinates describe, shared by
 /// `osm_buildings`' and `osm_former_buildings`' way inserts. `way_ref` is
-/// whatever the caller's statement uses to name the way -- an interpolated id
-/// for the `execute_batch` call site, a literal `?` for the parameterized one.
+/// whatever the caller's statement uses to name the way -- the `s.id` column
+/// of `rebuild_way_chunk`'s VALUES list.
 ///
 /// Deliberately *unrepaired*: the caller wraps it in
 /// `osm::geometry::repaired_geom_sql` for its select list and in
@@ -1457,230 +1628,256 @@ fn relation_polygon_sql() -> String {
 /// `osm_buildings` and `osm_former_buildings`' relation inserts both build
 /// this way. `osm_addresses`' relation insert does not: it wants a centroid,
 /// not a polygon, so it is deliberately left out of this shared home.
-/// `values_sql` is the `(way_id, role)` VALUES list built from the relation's
-/// way members. Callers append their own final `SELECT ... FROM outer_polys o
-/// LEFT JOIN inner_polys i ON true WHERE o.outer_geom IS NOT NULL`, since the
-/// non-geometry columns (and whether they come from a literal or a bind
-/// parameter) differ per caller.
-fn relation_multipolygon_geom_sql(values_sql: &str) -> String {
+/// `members_values_sql` is the `(relation_id, member_ord, way_id, role)`
+/// VALUES list from [`relation_members_values`], covering every relation the
+/// statement inserts; `outer_polys` and `inner_polys` hold one row per
+/// relation. Callers append their own final `SELECT ... FROM <their rows> r
+/// JOIN outer_polys o ON o.relation_id = r.id LEFT JOIN inner_polys i ON
+/// i.relation_id = r.id WHERE o.outer_geom IS NOT NULL`, since the
+/// non-geometry columns differ per caller.
+///
+/// The unions are ordered by `member_ord`, the member's position in the
+/// relation. That is the order the one-relation statement this replaced fed
+/// them in; grouping several relations into one hash aggregate would
+/// otherwise leave it to the plan.
+fn relation_multipolygon_geom_sql(members_values_sql: &str) -> String {
     format!(
-        "WITH way_members(way_id, member_role) AS (VALUES {values_sql}),
+        "WITH way_members(relation_id, member_ord, way_id, member_role) AS (VALUES {members_values_sql}),
          way_geoms AS (
-             SELECT way_id, member_role,
+             SELECT relation_id, member_ord, member_role,
                     ST_GeomFromWKB(resolve_way_coords(way_id)) AS line_geom
              FROM way_members
              WHERE resolve_way_coords(way_id) IS NOT NULL
          ),
          outer_polys AS (
-             SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS outer_geom
+             SELECT relation_id,
+                    ST_Union_Agg(ST_MakePolygon(line_geom) ORDER BY member_ord) AS outer_geom
              FROM way_geoms
              WHERE (member_role = 'outer' OR member_role = '')
                AND ST_NPoints(line_geom) >= 4
                AND ST_IsClosed(line_geom)
+             GROUP BY relation_id
          ),
          inner_polys AS (
-             SELECT ST_Union_Agg(ST_MakePolygon(line_geom)) AS inner_geom
+             SELECT relation_id,
+                    ST_Union_Agg(ST_MakePolygon(line_geom) ORDER BY member_ord) AS inner_geom
              FROM way_geoms
              WHERE member_role = 'inner'
                AND ST_NPoints(line_geom) >= 4
                AND ST_IsClosed(line_geom)
+             GROUP BY relation_id
          )"
     )
 }
 
-fn rebuild_relation_geometry(
+/// A relation's way members as `(way_id, role)`, in member order.
+type WayMembers = Vec<(i64, &'static str)>;
+
+/// A relation's members as the KV store keeps them: `(ref_id, member_type,
+/// role)`, encoded.
+type StoredMembers = Vec<(i64, u8, u8)>;
+
+/// The `(relation_id, member_ord, way_id, role)` VALUES list, and its
+/// parameters, for the way members of every relation in `relation_ids`.
+fn relation_members_values(
+    relation_ids: &[i64],
+    members: &HashMap<i64, WayMembers>,
+) -> (String, Vec<Value>) {
+    let mut params = Vec::new();
+    let mut rows = 0;
+    for relation_id in relation_ids {
+        for (ord, (way_id, role)) in members[relation_id].iter().enumerate() {
+            params.extend([
+                Value::BigInt(*relation_id),
+                Value::Int(ord as i32),
+                Value::BigInt(*way_id),
+                Value::Text((*role).to_string()),
+            ]);
+            rows += 1;
+        }
+    }
+    (
+        values_sql(rows, &["BIGINT", "INTEGER", "BIGINT", "VARCHAR"]),
+        params,
+    )
+}
+
+/// Rebuild the served rows of every relation in `relation_ids` (sorted), a
+/// chunk at a time. Same shape as [`rebuild_way_geometries`].
+fn rebuild_relation_geometries(
     conn: &Connection,
     kv: &RocksDB,
-    relation_id: i64,
+    relation_ids: &[i64],
     relation_changes: &HashMap<i64, &RelationChange>,
     dirty: &mut DirtyCells,
 ) -> Result<()> {
-    let members = match kvstore::get_relation(kv, relation_id)? {
-        Some(m) => m,
-        None => return Ok(()),
-    };
-
-    // Determine tags: from the change if directly affected, else from the rows it
-    // already has (`stored_rebuild_tags`), read BEFORE the delete below.
-    let rel_change = relation_changes.get(&relation_id);
-    let (building_tag, housenumber, street, city, postcode, former) = match rel_change {
-        Some(rc) => (
-            tag_value(&rc.tags, "building"),
-            tag_value(&rc.tags, "addr:housenumber"),
-            tag_value(&rc.tags, "addr:street"),
-            tag_value(&rc.tags, "addr:city").or_else(|| tag_value(&rc.tags, "addr:place")),
-            tag_value(&rc.tags, "addr:postcode"),
-            lifecycle::key_of(&rc.tags).map(|key| {
-                (
-                    key.to_string(),
-                    tag_value(&rc.tags, key).unwrap_or_default(),
-                )
-            }),
-        ),
-        None => match stored_rebuild_tags(conn, relation_id, "relation")? {
-            Some(tags) => tags,
-            None => return Ok(()),
-        },
-    };
-
-    // No early return when all of building/address/former are absent -- the
-    // de-tag case still has to delete and note the vacated cell. See
-    // rebuild_way_geometry.
-    dirty.note_existing(
-        conn,
-        Layer::Buildings,
-        "osm_buildings",
-        relation_id,
-        "relation",
-    )?;
-    dirty.note_existing(
-        conn,
-        Layer::Addresses,
-        "osm_addresses",
-        relation_id,
-        "relation",
-    )?;
-    dirty.note_existing(
-        conn,
-        Layer::Buildings,
-        "osm_former_buildings",
-        relation_id,
-        "relation",
-    )?;
-
-    conn.execute(
-        "DELETE FROM osm_buildings WHERE osm_id = ? AND osm_type = 'relation'",
-        [relation_id],
-    )?;
-    conn.execute(
-        "DELETE FROM osm_addresses WHERE osm_id = ? AND osm_type = 'relation'",
-        [relation_id],
-    )?;
-    conn.execute(
-        "DELETE FROM osm_former_buildings WHERE osm_id = ? AND osm_type = 'relation'",
-        [relation_id],
-    )?;
-
-    // Build a VALUES list of way members: (way_id, role)
-    let way_members: Vec<(i64, &str)> = members
-        .iter()
-        .filter(|(_, member_type, _)| *member_type == encoding::encode_member_type("way"))
-        .map(|(ref_id, _, role)| (*ref_id, encoding::decode_member_role(*role)))
-        .collect();
-
-    if way_members.is_empty() {
-        return Ok(());
-    }
-
-    if building_tag.is_some() || former.is_some() || housenumber.is_some() {
-        let way_ids: Vec<i64> = way_members.iter().map(|(wid, _)| *wid).collect();
-        let unresolved = unresolved_way_members(kv, &way_ids)?;
-        if !unresolved.is_empty() {
-            warn!(
-                "Ignoring relation/{relation_id}: {}",
-                describe_unresolved(&unresolved)
-            );
-            return Ok(());
+    // A relation the store no longer has was deleted in this batch, and the
+    // relation phase already removed its rows.
+    let mut present = Vec::with_capacity(relation_ids.len());
+    for &relation_id in relation_ids {
+        if let Some(members) = kvstore::get_relation(kv, relation_id)? {
+            present.push((relation_id, members));
         }
     }
+    for chunk in present.chunks(REBUILD_CHUNK) {
+        let ids: Vec<i64> = chunk.iter().map(|(id, _)| *id).collect();
+        rebuild_relation_chunk(conn, kv, chunk, relation_changes, dirty)
+            .with_context(|| chunk_label("relation", &ids))?;
+    }
+    Ok(())
+}
 
-    let values_sql: String = way_members
+fn rebuild_relation_chunk(
+    conn: &Connection,
+    kv: &RocksDB,
+    chunk: &[(i64, StoredMembers)],
+    relation_changes: &HashMap<i64, &RelationChange>,
+    dirty: &mut DirtyCells,
+) -> Result<()> {
+    // Determine tags: from the change if directly affected, else from the rows
+    // each relation already has (`stored_rebuild_tags`), read BEFORE the
+    // delete below.
+    let inferred: Vec<i64> = chunk
         .iter()
-        .map(|(wid, role)| format!("({wid}, '{role}')"))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .map(|(id, _)| *id)
+        .filter(|id| !relation_changes.contains_key(id))
+        .collect();
+    let mut stored = stored_rebuild_tags(conn, "relation", &inferred)?;
+    let targets: Vec<(i64, &StoredMembers, RebuildTags)> = chunk
+        .iter()
+        .filter_map(|(id, members)| {
+            let tags = match relation_changes.get(id) {
+                Some(rc) => change_rebuild_tags(&rc.tags),
+                None => stored.remove(id)?,
+            };
+            Some((*id, members, tags))
+        })
+        .collect();
 
-    if building_tag.is_some() {
-        let building = building_tag.as_deref().unwrap_or("yes");
-        let building_sql = building.replace('\'', "''");
-        conn.execute_batch(&format!(
-            "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
-             {cte}
-             SELECT
-                 {relation_id}, 'relation', '{building_sql}',
-                 {geom}
-             FROM outer_polys o
-             LEFT JOIN inner_polys i ON true
-             WHERE o.outer_geom IS NOT NULL
-               AND {guard}",
-            cte = relation_multipolygon_geom_sql(&values_sql),
-            geom = geometry::repaired_geom_sql(&relation_polygon_sql()),
-            guard = geometry::has_polygon_sql(&relation_polygon_sql()),
-        ))?;
-        dirty.note_existing(
-            conn,
-            Layer::Buildings,
-            "osm_buildings",
-            relation_id,
-            "relation",
-        )?;
+    // No skip when all of building/address/former are absent -- the de-tag
+    // case still has to delete and note the vacated cell. See
+    // rebuild_way_chunk.
+    let target_ids: Vec<i64> = targets.iter().map(|(id, _, _)| *id).collect();
+    remove_served_rows(conn, dirty, "relation", &target_ids)?;
+
+    let mut rows = RebuildRows::default();
+    let mut way_members: HashMap<i64, WayMembers> = HashMap::new();
+    for (relation_id, members, tags) in targets {
+        let ways: WayMembers = members
+            .iter()
+            .filter(|(_, member_type, _)| *member_type == encoding::encode_member_type("way"))
+            .map(|(ref_id, _, role)| (*ref_id, encoding::decode_member_role(*role)))
+            .collect();
+        if ways.is_empty() {
+            continue;
+        }
+        if RebuildRows::wants_any(&tags) {
+            let way_ids: Vec<i64> = ways.iter().map(|(wid, _)| *wid).collect();
+            let unresolved = unresolved_way_members(kv, &way_ids)?;
+            if !unresolved.is_empty() {
+                warn!(
+                    "Ignoring relation/{relation_id}: {}",
+                    describe_unresolved(&unresolved)
+                );
+                continue;
+            }
+        }
+        way_members.insert(relation_id, ways);
+        rows.push(relation_id, tags);
     }
 
-    if let Some((lifecycle_key, lifecycle_value)) = &former {
-        let sql = format!(
-            "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
-             {cte}
-             SELECT
-                 ?, 'relation', ?, ?,
-                 {geom}
-             FROM outer_polys o
-             LEFT JOIN inner_polys i ON true
-             WHERE o.outer_geom IS NOT NULL
-               AND {guard}",
-            cte = relation_multipolygon_geom_sql(&values_sql),
-            geom = geometry::repaired_geom_sql(&relation_polygon_sql()),
-            guard = geometry::has_polygon_sql(&relation_polygon_sql()),
-        );
+    if !rows.buildings.is_empty() {
+        let ids = ids_of(&rows.buildings);
+        let (members_sql, mut params) = relation_members_values(&ids, &way_members);
+        params.extend(building_params(&rows.buildings));
         conn.execute(
-            &sql,
-            duckdb::params![relation_id, lifecycle_key, lifecycle_value],
-        )?;
+            &format!(
+                "INSERT INTO osm_buildings (osm_id, osm_type, building, geom)
+                 {cte}
+                 SELECT
+                     r.id, 'relation', r.building,
+                     {geom}
+                 FROM (VALUES {values}) r(id, building)
+                 JOIN outer_polys o ON o.relation_id = r.id
+                 LEFT JOIN inner_polys i ON i.relation_id = r.id
+                 WHERE o.outer_geom IS NOT NULL
+                   AND {guard}",
+                cte = relation_multipolygon_geom_sql(&members_sql),
+                values = values_sql(rows.buildings.len(), BUILDING_ROW),
+                geom = geometry::repaired_geom_sql(&relation_polygon_sql()),
+                guard = geometry::has_polygon_sql(&relation_polygon_sql()),
+            ),
+            duckdb::params_from_iter(params),
+        )
+        .context("insert into osm_buildings")?;
+        dirty.note_existing(conn, Layer::Buildings, "osm_buildings", &ids, "relation")?;
+    }
+
+    if !rows.former.is_empty() {
+        let ids = ids_of(&rows.former);
+        let (members_sql, mut params) = relation_members_values(&ids, &way_members);
+        params.extend(former_params(&rows.former));
+        conn.execute(
+            &format!(
+                "INSERT INTO osm_former_buildings (osm_id, osm_type, lifecycle_key, lifecycle_value, geom)
+                 {cte}
+                 SELECT
+                     r.id, 'relation', r.lifecycle_key, r.lifecycle_value,
+                     {geom}
+                 FROM (VALUES {values}) r(id, lifecycle_key, lifecycle_value)
+                 JOIN outer_polys o ON o.relation_id = r.id
+                 LEFT JOIN inner_polys i ON i.relation_id = r.id
+                 WHERE o.outer_geom IS NOT NULL
+                   AND {guard}",
+                cte = relation_multipolygon_geom_sql(&members_sql),
+                values = values_sql(rows.former.len(), FORMER_ROW),
+                geom = geometry::repaired_geom_sql(&relation_polygon_sql()),
+                guard = geometry::has_polygon_sql(&relation_polygon_sql()),
+            ),
+            duckdb::params_from_iter(params),
+        )
+        .context("insert into osm_former_buildings")?;
         dirty.note_existing(
             conn,
             Layer::Buildings,
             "osm_former_buildings",
-            relation_id,
+            &ids,
             "relation",
         )?;
     }
 
-    if housenumber.is_some() {
-        let hn_sql = housenumber
-            .as_deref()
-            .map(|v| format!("'{}'", v.replace('\'', "''")))
-            .unwrap_or_else(|| "NULL".to_string());
-        let street_sql = street
-            .as_deref()
-            .map(|v| format!("'{}'", v.replace('\'', "''")))
-            .unwrap_or_else(|| "NULL".to_string());
-        let city_sql = city
-            .as_deref()
-            .map(|v| format!("'{}'", v.replace('\'', "''")))
-            .unwrap_or_else(|| "NULL".to_string());
-        let postcode_sql = postcode
-            .as_deref()
-            .map(|v| format!("'{}'", v.replace('\'', "''")))
-            .unwrap_or_else(|| "NULL".to_string());
-
-        conn.execute_batch(&format!(
-            "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
-             WITH way_members(way_id, member_role) AS (VALUES {values_sql}),
-             way_geoms AS (
-                 SELECT ST_GeomFromWKB(resolve_way_coords(way_id)) AS line_geom
-                 FROM way_members
-                 WHERE resolve_way_coords(way_id) IS NOT NULL
-             )
-             SELECT {relation_id}, 'relation', {hn_sql}, {street_sql}, {city_sql}, {postcode_sql},
-                    ST_Centroid(ST_Collect(list(line_geom)))
-             FROM way_geoms"
-        ))?;
-        dirty.note_existing(
-            conn,
-            Layer::Addresses,
-            "osm_addresses",
-            relation_id,
-            "relation",
-        )?;
+    if !rows.addresses.is_empty() {
+        let ids = ids_of(&rows.addresses);
+        let (members_sql, mut params) = relation_members_values(&ids, &way_members);
+        params.extend(address_params(&rows.addresses));
+        // `LEFT JOIN`, so a relation none of whose member ways resolves to a
+        // line still gets its row, with a NULL geometry -- what the
+        // one-relation statement's ungrouped aggregate produced.
+        conn.execute(
+            &format!(
+                "INSERT INTO osm_addresses (osm_id, osm_type, housenumber, street, city, postcode, geom)
+                 WITH way_members(relation_id, member_ord, way_id, member_role) AS (VALUES {members_sql}),
+                 way_geoms AS (
+                     SELECT relation_id, member_ord,
+                            ST_GeomFromWKB(resolve_way_coords(way_id)) AS line_geom
+                     FROM way_members
+                     WHERE resolve_way_coords(way_id) IS NOT NULL
+                 ),
+                 centroids AS (
+                     SELECT relation_id,
+                            ST_Centroid(ST_Collect(list(line_geom ORDER BY member_ord))) AS geom
+                     FROM way_geoms
+                     GROUP BY relation_id
+                 )
+                 SELECT r.id, 'relation', r.housenumber, r.street, r.city, r.postcode, c.geom
+                 FROM (VALUES {values}) r(id, housenumber, street, city, postcode)
+                 LEFT JOIN centroids c ON c.relation_id = r.id",
+                values = values_sql(rows.addresses.len(), ADDRESS_ROW),
+            ),
+            duckdb::params_from_iter(params),
+        )
+        .context("insert into osm_addresses")?;
+        dirty.note_existing(conn, Layer::Addresses, "osm_addresses", &ids, "relation")?;
     }
 
     Ok(())
@@ -5359,8 +5556,18 @@ mod tests {
         // sequences creating a brand-new building at a distinct location, so
         // apply_batch does real INSERT + match_dirty_cells work inside a
         // transaction long enough to genuinely overlap the drain thread.
+        //
+        // At least 10 batches, and then more until the drain has drained
+        // more than one batch's worth (16 cells), so the overlap does not
+        // depend on how fast `apply_batch` is. A fixed 10 used to suffice;
+        // since the rebuild writes a chunk per statement it finishes before
+        // the debug-build drain completes its second batch, and the
+        // `productive_batches >= 2` assertion below failed on timing alone.
+        // 200 batches keeps every synthetic building west of lon 30, clear
+        // of the government rows.
         let mut apply_errors: Vec<String> = Vec::new();
-        for batch_idx in 0..10u64 {
+        let mut batch_idx = 0u64;
+        while batch_idx < 10 || (drained.load(Ordering::SeqCst) <= 16 && batch_idx < 200) {
             let seqs: Vec<FetchedSequence> = (0..3u64)
                 .map(|i| {
                     let seq = batch_idx * 3 + i;
@@ -5370,6 +5577,7 @@ mod tests {
             if let Err(e) = apply_batch(&conn, &kv, &seqs, "2024-01-01T00:00:00Z") {
                 apply_errors.push(format!("apply_batch({batch_idx}) errored: {e:#}"));
             }
+            batch_idx += 1;
         }
 
         stop.store(true, Ordering::SeqCst);
@@ -6011,6 +6219,287 @@ mod tests {
              like it is deleting files the apply loop had not consumed yet"
         );
 
+        Ok(())
+    }
+
+    /// A mass edit of the shape that stalled production twice (2026-09-23,
+    /// 2026-09-26): hundreds of addressed building ways rebuilt in one batch,
+    /// half through the inferred arm (their nodes moved) and half re-tagged
+    /// directly, plus address nodes and a relation. Inside the open
+    /// transaction the rebuild must hold next to no `IN_MEMORY_TABLE`.
+    ///
+    /// One INSERT statement per row held ~18-29 KiB *per column* until COMMIT
+    /// on DuckDB 1.5.x's parallel insert path, so this batch held ~90 MiB
+    /// with the per-object SQL; the chunked statements hold a few MiB. See
+    /// `docs/duckdb_per_statement_insert_memory.md`, and
+    /// `db_memory::tests::per_row_inserts_in_one_transaction_hold_memory_until_commit`
+    /// -- the negative control that says whether this test still means
+    /// anything.
+    #[test]
+    fn a_mass_rebuild_holds_no_per_row_transaction_memory() -> Result<()> {
+        const WAYS: i64 = 300;
+        const NODES: i64 = 50;
+        let dir = tempfile::tempdir()?;
+        let kv = Arc::new(kvstore::open(&dir.path().join("kv"), 8, 4, 8)?);
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(&dir.path().join("db.duckdb"), &init, Some(kv.clone()))?;
+        crate::db_memory::use_parallel_insert_path(&conn)?;
+
+        let centre = |i: i64| (21.0 + 0.001 * i as f64, 52.0);
+        let mut seed = Vec::new();
+        for i in 0..WAYS {
+            let (lon, lat) = centre(i);
+            seed_square_way(&kv, 10_000 + i, 100_000 + 10 * i, lon, lat)?;
+            seed.push(format!(
+                "INSERT INTO osm_buildings VALUES ({id}, 'way', 'house', {env});
+                 INSERT INTO osm_addresses VALUES
+                     ({id}, 'way', '{i}', 'Ulica', 'Miasto', '00-001', ST_Point({lon}, {lat}));",
+                id = 10_000 + i,
+                env = square_envelope_sql(lon, lat),
+            ));
+        }
+        conn.execute_batch(&seed.join("\n"))?;
+
+        let mut changes = OsmChange::default();
+        for i in 0..WAYS / 2 {
+            let (lon, lat) = centre(i);
+            changes
+                .nodes
+                .extend(move_square_nodes(100_000 + 10 * i, lon + 0.0001, lat));
+        }
+        for i in WAYS / 2..WAYS {
+            changes.ways.push(WayChange {
+                action: ChangeAction::Modify,
+                version: 2,
+                id: 10_000 + i,
+                node_refs: square_refs(100_000 + 10 * i),
+                tags: vec![
+                    ("building".into(), "apartments".into()),
+                    ("addr:housenumber".into(), format!("{i}A")),
+                    ("addr:street".into(), "Nowa".into()),
+                ],
+            });
+        }
+        for i in 0..NODES {
+            changes.nodes.push(NodeChange {
+                action: ChangeAction::Create,
+                version: 1,
+                id: 900_000 + i,
+                lon: 21.0 + 0.001 * i as f64,
+                lat: 52.01,
+                tags: vec![("addr:housenumber".into(), i.to_string())],
+            });
+        }
+        changes.relations.push(RelationChange {
+            action: ChangeAction::Create,
+            version: 1,
+            id: 77,
+            members: vec![RelationMember {
+                member_type: "way".into(),
+                member_ref: 10_000,
+                role: "outer".into(),
+            }],
+            tags: vec![
+                ("type".into(), "multipolygon".into()),
+                ("building".into(), "yes".into()),
+                ("addr:housenumber".into(), "1".into()),
+            ],
+        });
+
+        conn.execute_batch("BEGIN TRANSACTION")?;
+        apply_changes(&conn, &kv, &changes)?;
+        let held = crate::db_memory::in_memory_table_bytes(&conn)?;
+        let rows: (i64, i64) = conn.query_row(
+            "SELECT (SELECT count(*) FROM osm_buildings), (SELECT count(*) FROM osm_addresses)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        conn.execute_batch("ROLLBACK")?;
+
+        assert_eq!(
+            rows,
+            (WAYS + 1, WAYS + NODES + 1),
+            "the batch itself applied"
+        );
+        assert!(
+            held < 16 * 1024 * 1024,
+            "the rebuild held {} of transaction-local memory -- per-row INSERTs are back?",
+            crate::db_memory::fmt_bytes(held)
+        );
+        Ok(())
+    }
+
+    /// Ways rebuilt a chunk per statement must come out the same on both
+    /// sides of a chunk boundary, through both tag arms: created directly
+    /// (tags from the change), then every node moved (tags read back by
+    /// `stored_rebuild_tags`). No way carries `addr:street`/`addr:city`/
+    /// `addr:postcode`, so those columns are NULL in every row of every chunk
+    /// -- the case the `?::VARCHAR` casts in `values_sql` exist for.
+    #[test]
+    fn ways_rebuilt_across_a_chunk_boundary_all_land_with_their_own_tags() -> Result<()> {
+        for n in [REBUILD_CHUNK - 1, REBUILD_CHUNK, REBUILD_CHUNK + 1] {
+            let (conn, kv, _dir) = setup_test_db_and_kv()?;
+            let n = n as i64;
+            let centre = |i: i64| {
+                (
+                    21.0 + 0.0005 * (i % 100) as f64,
+                    52.0 + 0.0005 * (i / 100) as f64,
+                )
+            };
+            let first_node = |i: i64| 1_000_000 + 10 * i;
+
+            let mut create = OsmChange::default();
+            for i in 0..n {
+                let (lon, lat) = centre(i);
+                create
+                    .nodes
+                    .extend(create_square_nodes(first_node(i), lon, lat));
+                create.ways.push(WayChange {
+                    action: ChangeAction::Create,
+                    version: 1,
+                    id: 50_000 + i,
+                    node_refs: square_refs(first_node(i)),
+                    tags: vec![
+                        ("building".into(), format!("b{i}")),
+                        ("addr:housenumber".into(), i.to_string()),
+                    ],
+                });
+            }
+            apply_changes(&conn, &kv, &create)?;
+
+            let mut moved = OsmChange::default();
+            for i in 0..n {
+                let (lon, lat) = centre(i);
+                moved
+                    .nodes
+                    .extend(move_square_nodes(first_node(i), lon + 0.0001, lat));
+            }
+            conn.execute_batch("DELETE FROM match_dirty_cells")?;
+            apply_changes(&conn, &kv, &moved)?;
+
+            let correct: i64 = count(
+                &conn,
+                &format!(
+                    "SELECT count(*) FROM osm_buildings b
+                     JOIN osm_addresses a USING (osm_id, osm_type)
+                     WHERE osm_type = 'way' AND osm_id >= 50000
+                       AND b.building = 'b' || (osm_id - 50000)
+                       AND a.housenumber = (osm_id - 50000)::VARCHAR
+                       AND a.street IS NULL AND a.city IS NULL AND a.postcode IS NULL
+                       AND abs(ST_XMin(b.geom) - (21.0 + 0.0005 * ((osm_id - 50000) % 100) - {h} + 0.0001)) < 1e-9
+                       AND ST_Contains(b.geom, a.geom)",
+                    h = SQUARE_HALF_DEG
+                ),
+            )?;
+            assert_eq!(
+                correct, n,
+                "every way rebuilt with its own tags at its moved position (n = {n})"
+            );
+            assert_eq!(
+                count(
+                    &conn,
+                    "SELECT count(*) FROM osm_buildings WHERE osm_id >= 50000"
+                )?,
+                n,
+                "exactly one row per way (n = {n})"
+            );
+            assert!(
+                !queued_cells(&conn, "bdot10k")?.is_empty()
+                    && !queued_cells(&conn, "prg")?.is_empty(),
+                "the moves enqueued cells (n = {n})"
+            );
+        }
+        Ok(())
+    }
+
+    /// Several relations rebuilt in one statement each get exactly their own
+    /// member ways: the batched relation SQL groups by relation id, where the
+    /// statement it replaced could only ever see one relation's members. Way
+    /// 71 is a member of both relations, so a grouping mix-up shows as a
+    /// footprint or centroid in the wrong place.
+    #[test]
+    fn relations_rebuilt_in_one_statement_each_get_only_their_own_members() -> Result<()> {
+        let (conn, kv, _dir) = setup_test_db_and_kv()?;
+        seed_square_way(&kv, 70, 7_000, 21.0, 52.0)?;
+        seed_square_way(&kv, 71, 7_100, 21.01, 52.0)?;
+        seed_square_way(&kv, 72, 7_200, 21.02, 52.0)?;
+        seed_square_way(&kv, 73, 7_300, 21.03, 52.0)?;
+        let relation = |id: i64, ways: &[i64], tags: &[(&str, &str)]| RelationChange {
+            action: ChangeAction::Create,
+            version: 1,
+            id,
+            members: ways
+                .iter()
+                .map(|&w| RelationMember {
+                    member_type: "way".into(),
+                    member_ref: w,
+                    role: "outer".into(),
+                })
+                .collect(),
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        apply_changes(
+            &conn,
+            &kv,
+            &OsmChange {
+                relations: vec![
+                    relation(
+                        801,
+                        &[70, 71],
+                        &[("building", "a"), ("addr:housenumber", "1")],
+                    ),
+                    relation(
+                        802,
+                        &[71, 72],
+                        &[("building", "b"), ("addr:housenumber", "2")],
+                    ),
+                    relation(803, &[73], &[("demolished:building", "yes")]),
+                ],
+                ..Default::default()
+            },
+        )?;
+
+        let square = (2.0 * SQUARE_HALF_DEG).powi(2);
+        let footprint = |id: i64, table: &str| -> Result<(f64, f64, f64)> {
+            Ok(conn.query_row(
+                &format!(
+                    "SELECT ST_Area(geom), ST_XMin(geom), ST_XMax(geom) FROM {table}
+                     WHERE osm_type = 'relation' AND osm_id = ?"
+                ),
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        };
+        let h = SQUARE_HALF_DEG;
+        for (id, west, east) in [(801, 21.0, 21.01), (802, 21.01, 21.02)] {
+            let (area, xmin, xmax) = footprint(id, "osm_buildings")?;
+            assert!(
+                (area - 2.0 * square).abs() < 1e-12,
+                "relation {id} area {area}"
+            );
+            assert!((xmin - (west - h)).abs() < 1e-9 && (xmax - (east + h)).abs() < 1e-9);
+            let x: f64 = conn.query_row(
+                "SELECT ST_X(geom) FROM osm_addresses WHERE osm_type = 'relation' AND osm_id = ?",
+                [id],
+                |r| r.get(0),
+            )?;
+            assert!(
+                (x - (west + east) / 2.0).abs() < 1e-9,
+                "relation {id} centroid at {x}"
+            );
+        }
+        let (area, xmin, _) = footprint(803, "osm_former_buildings")?;
+        assert!((area - square).abs() < 1e-12 && (xmin - (21.03 - h)).abs() < 1e-9);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM osm_buildings WHERE osm_type = 'relation'"
+            )?,
+            2
+        );
         Ok(())
     }
 }

@@ -116,9 +116,14 @@ impl DirtyCells {
         }
     }
 
-    /// Record every cell touched by the bbox of a row currently in `table`
-    /// for (osm_id, osm_type), buffered per [`layer_buffer_deg`]. A no-op
-    /// when the row is absent (nothing to leave from).
+    /// Record every cell touched by the bbox of each row currently in `table`
+    /// for `osm_type` and any of `osm_ids`, buffered per [`layer_buffer_deg`].
+    /// A no-op for an id with no row (nothing to leave from).
+    ///
+    /// One query for the whole slice: `update osm` passes a chunk of objects
+    /// at a time (`update::osm::REBUILD_CHUNK`), where it used to pass one
+    /// object per query. The per-row guard below still runs per stored row,
+    /// so a batch changes nothing about which cells are recorded.
     ///
     /// Uses `ST_XMin`/`ST_XMax`/`ST_YMin`/`ST_YMax` rather than a single
     /// representative point, so a building or address whose (buffered) bbox
@@ -133,9 +138,12 @@ impl DirtyCells {
         conn: &Connection,
         layer: Layer,
         table: &str,
-        osm_id: i64,
+        osm_ids: &[i64],
         osm_type: &str,
     ) -> Result<()> {
+        if osm_ids.is_empty() {
+            return Ok(());
+        }
         let buf = layer_buffer_deg(layer);
         let x_lo = cell_x_frac_sql(&format!("ST_XMin(geom) - {buf}"));
         let x_hi = cell_x_frac_sql(&format!("ST_XMax(geom) + {buf}"));
@@ -145,24 +153,26 @@ impl DirtyCells {
         let y_lo = cell_y_frac_sql(&format!("ST_YMax(geom) + {buf}"));
         let y_hi = cell_y_frac_sql(&format!("ST_YMin(geom) - {buf}"));
         let sql = format!(
-            "SELECT floor({x_lo})::INTEGER, floor({x_hi})::INTEGER,
+            "SELECT osm_id, floor({x_lo})::INTEGER, floor({x_hi})::INTEGER,
                     floor({y_lo})::INTEGER, floor({y_hi})::INTEGER
              FROM {table}
-             WHERE osm_id = ? AND osm_type = ? AND geom IS NOT NULL"
+             WHERE osm_type = ? AND osm_id IN ({ids}) AND geom IS NOT NULL",
+            ids = crate::db::id_list_sql(osm_ids),
         );
         let mut stmt = conn
             .prepare(&sql)
             .with_context(|| format!("note_existing prepare {table}"))?;
-        let rows = stmt.query_map(duckdb::params![osm_id, osm_type], |r| {
+        let rows = stmt.query_map(duckdb::params![osm_type], |r| {
             Ok((
-                r.get::<_, i32>(0)?,
+                r.get::<_, i64>(0)?,
                 r.get::<_, i32>(1)?,
                 r.get::<_, i32>(2)?,
                 r.get::<_, i32>(3)?,
+                r.get::<_, i32>(4)?,
             ))
         })?;
         for row in rows {
-            let (x_lo, x_hi, y_lo, y_hi) = row?;
+            let (osm_id, x_lo, x_hi, y_lo, y_hi) = row?;
             // Widths as i64 before multiplying: the corrupt case this guards
             // against reaches ~2.7M cells, and a row spanning the whole world
             // would overflow an i32 product.
@@ -303,7 +313,7 @@ mod tests {
         )
         .unwrap();
         let mut d = DirtyCells::default();
-        d.note_existing(&c, Layer::Buildings, "osm_buildings", 9, "way")
+        d.note_existing(&c, Layer::Buildings, "osm_buildings", &[9], "way")
             .unwrap();
         d.flush(&c).unwrap();
 
@@ -326,7 +336,7 @@ mod tests {
         )
         .unwrap();
         let mut d = DirtyCells::default();
-        d.note_existing(&c, Layer::Buildings, "osm_buildings", 10, "way")
+        d.note_existing(&c, Layer::Buildings, "osm_buildings", &[10], "way")
             .unwrap();
         d.flush(&c).unwrap();
 
@@ -351,7 +361,7 @@ mod tests {
         )
         .unwrap();
         let mut d = DirtyCells::default();
-        d.note_existing(&c, Layer::Buildings, "osm_buildings", 5, "way")
+        d.note_existing(&c, Layer::Buildings, "osm_buildings", &[5], "way")
             .unwrap();
         d.flush(&c).unwrap();
         let (bx, by) = lonlat_to_tile(21.0005, 52.0005, CHANGE_CELL_ZOOM);
@@ -394,7 +404,7 @@ mod tests {
         .unwrap();
 
         let mut d = DirtyCells::default();
-        d.note_existing(&c, Layer::Buildings, "osm_buildings", 7, "way")
+        d.note_existing(&c, Layer::Buildings, "osm_buildings", &[7], "way")
             .unwrap();
         d.flush(&c).unwrap();
 
@@ -445,7 +455,7 @@ mod tests {
         .unwrap();
 
         let mut d = DirtyCells::default();
-        d.note_existing(&c, Layer::Buildings, "osm_buildings", 8, "way")
+        d.note_existing(&c, Layer::Buildings, "osm_buildings", &[8], "way")
             .unwrap();
         d.flush(&c).unwrap();
 

@@ -395,6 +395,33 @@ fn create_serving_indexes(conn: &Connection) {
     }
 }
 
+/// `1, 2, 3` for an `IN (...)` list. The ids are integers, so interpolating
+/// them is safe, and it keeps a 1,000-id list out of the parameter count.
+pub(crate) fn id_list_sql(ids: &[i64]) -> String {
+    ids.iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `(?::BIGINT, ?::VARCHAR), (?::BIGINT, ?::VARCHAR)` for `rows` rows of the
+/// given column types: the placeholder text of a multi-row `VALUES` list,
+/// which is how a set of rows goes into one INSERT statement instead of one
+/// statement per row (`docs/duckdb_per_statement_insert_memory.md`). Every
+/// placeholder is cast, so a column that is NULL in every row of a chunk
+/// still has a type.
+pub(crate) fn values_sql(rows: usize, types: &[&str]) -> String {
+    let row = format!(
+        "({})",
+        types
+            .iter()
+            .map(|t| format!("?::{t}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    vec![row; rows].join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

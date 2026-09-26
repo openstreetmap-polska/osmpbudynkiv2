@@ -120,6 +120,38 @@ pub fn summary_or_note(conn: &Connection) -> String {
     }
 }
 
+/// Bytes DuckDB holds as `IN_MEMORY_TABLE`: transaction-local table data,
+/// among other things. Test support for the per-statement INSERT memory
+/// regression tests (`docs/duckdb_per_statement_insert_memory.md`).
+///
+/// **Read it inside the open transaction**, before COMMIT/ROLLBACK: the memory
+/// those tests look for is released at transaction end, so a reading taken
+/// afterwards shows nothing whatever the code did.
+#[cfg(test)]
+pub(crate) fn in_memory_table_bytes(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(sum(memory_usage_bytes), 0)::BIGINT
+         FROM duckdb_memory() WHERE tag = 'IN_MEMORY_TABLE'",
+        [],
+        |r| r.get(0),
+    )
+    .context("read IN_MEMORY_TABLE from duckdb_memory()")
+}
+
+/// Puts `conn`'s database on the insert path production runs on, which the
+/// test defaults hide. With DuckDB's default `preserve_insertion_order = true`
+/// no INSERT takes the parallel path, so the per-statement memory is never
+/// held and every memory regression test passes vacuously. Production's
+/// `duckdb_init_commands` set both of these.
+#[cfg(test)]
+pub(crate) fn use_parallel_insert_path(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "SET GLOBAL threads = 4;
+         SET GLOBAL preserve_insertion_order = false;",
+    )
+    .context("switch to the parallel insert path")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +241,60 @@ mod tests {
 
         let conflict = anyhow::anyhow!("TransactionContext Error: Conflict on tuple deletion!");
         assert!(!is_out_of_memory(&conflict));
+    }
+
+    /// **The negative control for every per-statement INSERT memory test**
+    /// (`update::osm`'s batched rebuilds and the others next to them). It
+    /// proves the harness can see the bug those tests guard against: 300
+    /// single-row INSERTs of 4 BIGINT columns inside one transaction hold
+    /// ~21 MiB of `IN_MEMORY_TABLE` until COMMIT on DuckDB 1.5.x (18 KiB per
+    /// column per statement; `docs/duckdb_per_statement_insert_memory.md`).
+    ///
+    /// **When this starts failing after a DuckDB upgrade, nothing broke**: the
+    /// upstream fix (`575fd1b97b`, on `main` for 2.0) has arrived, the
+    /// regression tests guarding the batched writes have become vacuous, and
+    /// they can be revisited. Until then, a regression test that passes while
+    /// this one also passes is a real result.
+    #[test]
+    fn per_row_inserts_in_one_transaction_hold_memory_until_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("t.duckdb")).unwrap();
+        use_parallel_insert_path(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, d BIGINT);
+             BEGIN TRANSACTION;",
+        )
+        .unwrap();
+        for i in 0..300_i64 {
+            conn.execute("INSERT INTO t SELECT ?, ?, ?, ?", [i, i, i, i])
+                .unwrap();
+        }
+        let held = in_memory_table_bytes(&conn).unwrap();
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            held > 15 * 1024 * 1024,
+            "expected the per-statement memory (~21 MiB) to be held, got {}; \
+             see this test's doc comment before changing anything",
+            fmt_bytes(held)
+        );
+    }
+
+    /// The same 300 rows as one statement, which is the shape every batched
+    /// write in this repository takes. Pins that the control above measures
+    /// the statement count and not the rows.
+    #[test]
+    fn one_multi_row_insert_holds_next_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("t.duckdb")).unwrap();
+        use_parallel_insert_path(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, d BIGINT);
+             BEGIN TRANSACTION;
+             INSERT INTO t SELECT range, range, range, range FROM range(300);",
+        )
+        .unwrap();
+        let held = in_memory_table_bytes(&conn).unwrap();
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert!(held < 2 * 1024 * 1024, "held {}", fmt_bytes(held));
     }
 }
