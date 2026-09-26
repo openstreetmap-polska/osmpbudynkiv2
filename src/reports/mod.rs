@@ -34,6 +34,7 @@
 
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;
+use duckdb::types::Value;
 
 use crate::compare::rule::REPORT_ACTIVE;
 use crate::dataset::{ALL_SPECS, DatasetSpec};
@@ -626,6 +627,11 @@ pub fn export_to_string(conn: &Connection) -> Result<String> {
     Ok(out)
 }
 
+/// Reports per INSERT statement in [`import_rows`]. Any chunk size removes
+/// the per-statement transaction memory; this only bounds the statement's
+/// text and parameter count.
+const IMPORT_CHUNK: usize = 1000;
+
 /// Re-insert reports from a `reports export` dump.
 ///
 /// Deliberately *not* an upsert and deliberately not id-preserving: ids are
@@ -633,68 +639,16 @@ pub fn export_to_string(conn: &Connection) -> Result<String> {
 /// already has reports cannot collide or silently overwrite. A round trip into
 /// an empty database is therefore faithful in content but not in id, which is
 /// the property that matters -- `record_key` is what identifies the object.
+///
+/// One transaction for the whole dump, and one INSERT per [`IMPORT_CHUNK`]
+/// reports.
 pub fn import_rows(conn: &Connection, rows: &[ReportRow]) -> Result<i64> {
     if rows.is_empty() {
         return Ok(0);
     }
     conn.execute_batch("BEGIN TRANSACTION")
         .context("Failed to begin report import")?;
-    let applied = (|| -> Result<i64> {
-        let mut next_id: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(report_id), 0) + 1 FROM object_reports",
-                [],
-                |r| r.get(0),
-            )
-            .context("Failed to allocate report_id")?;
-        let mut n = 0i64;
-        for row in rows {
-            conn.execute(
-                "INSERT INTO object_reports
-                     (report_id, source, record_key, signature,
-                      reported_at, cell_x, cell_y, status, resolved_at)
-                 VALUES (?, ?, CAST(? AS VARCHAR[]), ?, ?::TIMESTAMPTZ, ?, ?, ?,
-                         ?::TIMESTAMPTZ)",
-                duckdb::params![
-                    next_id,
-                    row.source,
-                    serde_json::to_string(&row.record_key)?,
-                    row.signature,
-                    row.reported_at,
-                    row.cell_x,
-                    row.cell_y,
-                    row.status,
-                    row.resolved_at,
-                ],
-            )
-            .context("Failed to insert an imported report")?;
-            next_id += 1;
-            n += 1;
-        }
-        // Every imported active report may suppress an object, so their cells
-        // have to be rebuilt -- same reasoning as `insert`.
-        conn.execute(
-            &format!(
-                "INSERT INTO match_dirty_cells
-                 SELECT DISTINCT source, {CHANGE_CELL_ZOOM}, cell_x, cell_y, now()
-                 FROM object_reports
-                 WHERE report_id >= ? AND status = '{STATUS_ACTIVE}'
-                   AND cell_x IS NOT NULL AND cell_y IS NOT NULL"
-            ),
-            duckdb::params![next_id - n],
-        )
-        .context("Failed to enqueue imported-report cells")?;
-        enqueue_tiles_for_reports(
-            conn,
-            &format!(
-                "report_id >= ? AND status = '{STATUS_ACTIVE}'
-                   AND cell_x IS NOT NULL AND cell_y IS NOT NULL"
-            ),
-            duckdb::params![next_id - n],
-        )?;
-        Ok(n)
-    })();
-    match applied {
+    match import_rows_in_txn(conn, rows) {
         Ok(n) => {
             conn.execute_batch("COMMIT")
                 .context("Failed to commit report import")?;
@@ -707,6 +661,90 @@ pub fn import_rows(conn: &Connection, rows: &[ReportRow]) -> Result<i64> {
             Err(e)
         }
     }
+}
+
+/// [`import_rows`]' body. Assumes an open transaction, which is what lets
+/// a test read the transaction-local memory before COMMIT.
+fn import_rows_in_txn(conn: &Connection, rows: &[ReportRow]) -> Result<i64> {
+    let mut next_id: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(report_id), 0) + 1 FROM object_reports",
+            [],
+            |r| r.get(0),
+        )
+        .context("Failed to allocate report_id")?;
+    let n = rows.len() as i64;
+    // One INSERT per chunk of rows, never one per row: on DuckDB 1.5.x
+    // each INSERT inside a transaction holds ~18-29 KiB per column until
+    // COMMIT, so a 9-column row per statement cost ~250 KiB a report
+    // (`docs/duckdb_per_statement_insert_memory.md`). Ids are still
+    // allocated in input order.
+    for chunk in rows.chunks(IMPORT_CHUNK) {
+        let mut params: Vec<Value> = Vec::with_capacity(chunk.len() * 9);
+        for row in chunk {
+            params.extend([
+                Value::BigInt(next_id),
+                Value::Text(row.source.clone()),
+                Value::Text(serde_json::to_string(&row.record_key)?),
+                row.signature.clone().map_or(Value::Null, Value::Text),
+                Value::Text(row.reported_at.clone()),
+                row.cell_x.map_or(Value::Null, Value::Int),
+                row.cell_y.map_or(Value::Null, Value::Int),
+                Value::Text(row.status.clone()),
+                row.resolved_at.clone().map_or(Value::Null, Value::Text),
+            ]);
+            next_id += 1;
+        }
+        conn.execute(
+            &format!(
+                "INSERT INTO object_reports
+                         (report_id, source, record_key, signature,
+                          reported_at, cell_x, cell_y, status, resolved_at)
+                     SELECT id, source, CAST(record_key AS VARCHAR[]), signature,
+                            reported_at, cell_x, cell_y, status, resolved_at
+                     FROM (VALUES {values}) s(id, source, record_key, signature,
+                            reported_at, cell_x, cell_y, status, resolved_at)",
+                values = crate::db::values_sql(
+                    chunk.len(),
+                    &[
+                        "BIGINT",
+                        "VARCHAR",
+                        "VARCHAR",
+                        "VARCHAR",
+                        "TIMESTAMPTZ",
+                        "INTEGER",
+                        "INTEGER",
+                        "VARCHAR",
+                        "TIMESTAMPTZ",
+                    ],
+                ),
+            ),
+            duckdb::params_from_iter(params),
+        )
+        .context("Failed to insert imported reports")?;
+    }
+    // Every imported active report may suppress an object, so their cells
+    // have to be rebuilt -- same reasoning as `insert`.
+    conn.execute(
+        &format!(
+            "INSERT INTO match_dirty_cells
+                 SELECT DISTINCT source, {CHANGE_CELL_ZOOM}, cell_x, cell_y, now()
+                 FROM object_reports
+                 WHERE report_id >= ? AND status = '{STATUS_ACTIVE}'
+                   AND cell_x IS NOT NULL AND cell_y IS NOT NULL"
+        ),
+        duckdb::params![next_id - n],
+    )
+    .context("Failed to enqueue imported-report cells")?;
+    enqueue_tiles_for_reports(
+        conn,
+        &format!(
+            "report_id >= ? AND status = '{STATUS_ACTIVE}'
+                   AND cell_x IS NOT NULL AND cell_y IS NOT NULL"
+        ),
+        duckdb::params![next_id - n],
+    )?;
+    Ok(n)
 }
 
 /// `reports <action>` dispatch.
@@ -1141,5 +1179,133 @@ mod tests {
 
         // A limit still narrows, so dropping the clause did not drop the option.
         assert_eq!(list(&c, None, None, None, Some(0)).unwrap().len(), 0);
+    }
+
+    fn dump_row(i: i64, status: &str, cell: Option<(i32, i32)>) -> ReportRow {
+        ReportRow {
+            report_id: 1_000 + i,
+            source: "bdot10k".into(),
+            record_key: vec!["PL.PZGiK.994.BDOT10k".into(), format!("id-{i}")],
+            signature: None,
+            reported_at: "2026-09-01 12:00:00+00".into(),
+            cell_x: cell.map(|c| c.0),
+            cell_y: cell.map(|c| c.1),
+            status: status.into(),
+            resolved_at: None,
+        }
+    }
+
+    /// `import_rows` is `reports import`'s whole write path and only had the
+    /// backup round trip covering it. Pins the content of each row --
+    /// including every optional field NULL, in a whole chunk of them --
+    /// the id reallocation in input order, and which rows enqueue cells:
+    /// active ones with a cell, never a revoked one or one without a cell.
+    #[test]
+    fn import_rows_writes_every_field_and_enqueues_only_active_located_reports() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO object_reports (report_id, source, record_key, status)
+             VALUES (41, 'prg', ['x'], 'active');",
+        )
+        .unwrap();
+        let mut rows = vec![
+            dump_row(0, STATUS_ACTIVE, Some((9000, 5000))),
+            dump_row(1, "revoked", Some((9001, 5000))),
+            dump_row(2, STATUS_ACTIVE, None),
+        ];
+        rows[1].signature = Some("abc".into());
+        rows[1].resolved_at = Some("2026-09-02 08:30:00+00".into());
+
+        assert_eq!(import_rows(&c, &rows).unwrap(), 3);
+
+        // (report_id, record_key, signature, cell_x, status, timestamps round-tripped)
+        type Imported = (i64, Vec<String>, Option<String>, Option<i32>, String, bool);
+        let got: Vec<Imported> = c
+            .prepare(
+                "SELECT report_id, record_key, signature, cell_x, status,
+                        resolved_at IS NOT NULL AND reported_at = '2026-09-01 12:00:00+00'
+                 FROM object_reports WHERE report_id > 41 ORDER BY report_id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                let key: duckdb::types::Value = r.get(1)?;
+                let key = match key {
+                    duckdb::types::Value::List(v) => v
+                        .into_iter()
+                        .map(|x| match x {
+                            duckdb::types::Value::Text(t) => t,
+                            other => panic!("{other:?}"),
+                        })
+                        .collect(),
+                    other => panic!("{other:?}"),
+                };
+                Ok((r.get(0)?, key, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })
+            .unwrap()
+            .collect::<duckdb::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    42,
+                    vec!["PL.PZGiK.994.BDOT10k".to_string(), "id-0".to_string()],
+                    None,
+                    Some(9000),
+                    STATUS_ACTIVE.to_string(),
+                    false
+                ),
+                (
+                    43,
+                    vec!["PL.PZGiK.994.BDOT10k".to_string(), "id-1".to_string()],
+                    Some("abc".to_string()),
+                    Some(9001),
+                    "revoked".to_string(),
+                    true
+                ),
+                (
+                    44,
+                    vec!["PL.PZGiK.994.BDOT10k".to_string(), "id-2".to_string()],
+                    None,
+                    None,
+                    STATUS_ACTIVE.to_string(),
+                    false
+                ),
+            ]
+        );
+        let queued: Vec<(String, i32, i32)> = c
+            .prepare("SELECT source, cell_x, cell_y FROM match_dirty_cells")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<duckdb::Result<_>>()
+            .unwrap();
+        assert_eq!(queued, vec![("bdot10k".to_string(), 9000, 5000)]);
+    }
+
+    /// A dump of a few hundred reports is one transaction. With one INSERT
+    /// per report it held ~250 KiB per report of transaction-local memory
+    /// until COMMIT (~70 MiB here); chunked, a few MiB. See
+    /// `db_memory::tests::per_row_inserts_in_one_transaction_hold_memory_until_commit`,
+    /// the negative control that says whether this test still means anything.
+    #[test]
+    fn importing_hundreds_of_reports_holds_no_per_row_transaction_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let c = init_db(&dir.path().join("db.duckdb"), &init, None).unwrap();
+        crate::db_memory::use_parallel_insert_path(&c).unwrap();
+        let rows: Vec<ReportRow> = (0..300)
+            .map(|i| dump_row(i, STATUS_ACTIVE, Some((9000 + i as i32, 5000))))
+            .collect();
+
+        c.execute_batch("BEGIN TRANSACTION").unwrap();
+        assert_eq!(import_rows_in_txn(&c, &rows).unwrap(), 300);
+        let held = crate::db_memory::in_memory_table_bytes(&c).unwrap();
+        c.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            held < 8 * 1024 * 1024,
+            "the import held {} of transaction-local memory -- one INSERT per report again?",
+            crate::db_memory::fmt_bytes(held)
+        );
     }
 }
