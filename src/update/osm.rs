@@ -18,7 +18,7 @@ use crate::osm::kvstore::RocksDB;
 use crate::osm::lifecycle;
 use crate::osm::replication::{
     ChangeAction, OsmChange, RelationChange, WayChange, parse_osc, parse_state_txt,
-    sequence_to_path,
+    sequence_state_path, sequence_to_path,
 };
 use crate::osm::{encoding, kvstore};
 use crate::update::dirty_cells::{DirtyCells, Layer};
@@ -224,7 +224,19 @@ pub fn update(
                 )?);
             }
 
-            apply_batch(conn, kv, &batch, &latest_timestamp)?;
+            // Stamp the time of the batch's *last* sequence, not the upstream
+            // head's. `/status`'s `lag_seconds` and `health_log`'s lag WARN
+            // read this stamp, and stamping the head made a two-day catch-up
+            // look current (2026-09-24). Fetched before `apply_batch` opens
+            // its transaction, like the diffs, and only when the batch stops
+            // short of the head: steady state is one sequence that *is* the
+            // head, so it costs no extra request.
+            let batch_timestamp = if batch_end == latest_seq {
+                latest_timestamp.clone()
+            } else {
+                fetch_sequence_timestamp(batch_end, replication_base_url, &download_dir)?
+            };
+            apply_batch(conn, kv, &batch, &batch_timestamp)?;
 
             let applied_count = batch.len() as u64;
             applied_so_far += applied_count;
@@ -614,6 +626,28 @@ fn fetch_latest_sequence(replication_base_url: &str, download_dir: &Path) -> Res
     let text = std::fs::read_to_string(&state_path).context("Failed to read state.txt")?;
     let _ = std::fs::remove_file(&state_path);
     parse_state_txt(&text)
+}
+
+/// Timestamp of one sequence, from the `state.txt` published next to its diff.
+///
+/// Saved under a name built from `seq`, not the URL's last segment, for the
+/// reason given in [`fetch_and_parse_sequence`]: `244.state.txt` repeats every
+/// 1000 sequences, and a stale copy would stamp another sequence's time.
+fn fetch_sequence_timestamp(
+    seq: u64,
+    replication_base_url: &str,
+    download_dir: &Path,
+) -> Result<String> {
+    let url = format!("{replication_base_url}/{}", sequence_state_path(seq));
+    let path = download_file_as_quiet(&url, download_dir, &format!("state-{seq}.txt"))?;
+    let text = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    let (state_seq, timestamp) =
+        parse_state_txt(&text.context("Failed to read sequence state.txt")?)?;
+    if state_seq != seq {
+        bail!("state.txt for sequence {seq} names sequence {state_seq}");
+    }
+    Ok(timestamp)
 }
 
 /// One downloaded, decompressed, and parsed replication sequence, ready to
@@ -5460,6 +5494,11 @@ mod tests {
     /// many connections arrive. Needed because a single `update()` run makes
     /// many requests -- `state.txt` once, plus one per sequence.
     ///
+    /// A per-sequence `NNN.state.txt` (fetched when a batch stops short of
+    /// the head, for its own timestamp) is answered with that sequence and
+    /// [`mock_sequence_timestamp`], and is deliberately NOT logged: it is not
+    /// a diff download, which is what every count below is about.
+    ///
     /// Returns the log of every sequence requested (`0` standing for
     /// `state.txt`) rather than a bare counter, because the interesting
     /// properties are per-sequence: *which* sequence was asked for twice
@@ -5492,6 +5531,25 @@ mod tests {
                         .strip_prefix("GET ")
                         .and_then(|r| r.split(' ').next())
                         .unwrap_or("");
+                    if let Some(stem) = path.strip_suffix(".state.txt") {
+                        let seq: u64 = stem
+                            .chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                            .parse()
+                            .unwrap_or(u64::MAX);
+                        let body = format!(
+                            "sequenceNumber={seq}\ntimestamp={}\n",
+                            mock_sequence_timestamp(seq).replace(':', "\\:")
+                        );
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(headers.as_bytes());
+                        let _ = stream.write_all(body.as_bytes());
+                        return;
+                    }
                     let is_state = path.ends_with("state.txt");
                     // `sequence_to_path` nests the zero-padded sequence
                     // across three directory levels, so the digits of the
@@ -5531,6 +5589,13 @@ mod tests {
         });
 
         (addr, requested)
+    }
+
+    /// The timestamp the mock server publishes for one sequence's own
+    /// `state.txt`: distinct per sequence, and never the head's
+    /// `2024-01-01T00:00:00Z`, so a test can tell which one was stamped.
+    fn mock_sequence_timestamp(seq: u64) -> String {
+        format!("2024-01-01T{:02}:{:02}:00Z", (seq / 60) % 24, seq % 60)
     }
 
     /// Every file sitting in `dir`, sorted. Used by the cleanup regressions
@@ -5621,6 +5686,15 @@ mod tests {
             "batch 1 (10 sequences) must have committed as one transaction before \
              cancellation, checked between batches, stopped the loop before batch 2"
         );
+        // The stamp carries batch 1's own time (sequence 1010), not the
+        // head's (1013): stamping the head is what made a two-day catch-up
+        // read as current in production.
+        let stamped: String = conn.query_row(
+            "SELECT value FROM metadata WHERE key = 'osm_replication_timestamp'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(stamped, mock_sequence_timestamp(1010));
 
         // The prefetcher and the apply loop must not each download the same
         // sequence: at most 1 (state.txt) + PENDING, with no slack. There

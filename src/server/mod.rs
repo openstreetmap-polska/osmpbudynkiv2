@@ -77,8 +77,96 @@ impl r2d2::ManageConnection for ClonedConnectionManager {
         conn.execute_batch("")
     }
 
-    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
-        false
+    /// Called on every return to the pool. See [`end_leftover_transaction`].
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        match end_leftover_transaction(conn) {
+            LeftoverTransaction::None => false,
+            LeftoverTransaction::RolledBack { found } => {
+                tracing::warn!(
+                    found = %found,
+                    "a pooled connection came back inside a transaction; rolled it back"
+                );
+                false
+            }
+            LeftoverTransaction::Unrecoverable {
+                found,
+                rollback_error,
+            } => {
+                tracing::warn!(
+                    found = %found,
+                    rollback_error = %rollback_error,
+                    "a pooled connection came back inside a transaction that would not roll back; discarding it"
+                );
+                true
+            }
+        }
+    }
+}
+
+/// What [`end_leftover_transaction`] found on a connection being returned.
+#[derive(Debug, PartialEq)]
+enum LeftoverTransaction {
+    None,
+    /// `found` is the error `BEGIN` gave, which says which state it was in:
+    /// open (`cannot start a transaction within a transaction`) or aborted
+    /// (`Current transaction is aborted`).
+    RolledBack {
+        found: String,
+    },
+    Unrecoverable {
+        found: String,
+        rollback_error: String,
+    },
+}
+
+/// Ends any transaction a connection is still inside when it goes back to the
+/// pool.
+///
+/// No checked-out connection is shared, so a transaction still open at return
+/// is always a leak: a `ROLLBACK` that itself failed. On 2026-09-25 one did
+/// (`failed to allocate data of size 2.0 KiB` under the memory limit), and the
+/// pool went on handing that connection out. The next users got `Current
+/// transaction is aborted (please ROLLBACK)` (one of them the EGIB refresh),
+/// and its uncommitted deletes kept `osm_update` failing with `Conflict on
+/// tuple deletion`, while its memory stayed held.
+///
+/// Measured against DuckDB 1.5.5 (the choice of probe rests on these):
+/// - `is_autocommit()` answers `true` inside a transaction (a duckdb-rs stub),
+///   and both an empty batch and `SELECT 1` succeed inside an open one, so
+///   none of them can see this.
+/// - `BEGIN TRANSACTION` fails in both an open and an aborted transaction,
+///   and costs ~54 us with its `ROLLBACK` on a clean connection. A bare
+///   `ROLLBACK` would do too, but fails on every *clean* connection, so
+///   telling that apart from a real failure would mean matching error text.
+/// - `ROLLBACK` ends an aborted transaction as well as an open one, and a
+///   connection that is dropped instead rolls back on close, releasing its
+///   rows to other connections.
+///
+/// Runs on return rather than on checkout so a leaked transaction's memory
+/// and row locks are released at once, not whenever the idle connection is
+/// next borrowed. A connection is repaired rather than discarded when the
+/// rollback works, which keeps its prepared-statement cache.
+fn end_leftover_transaction(conn: &Connection) -> LeftoverTransaction {
+    match conn.execute_batch("BEGIN TRANSACTION") {
+        Ok(()) => match conn.execute_batch("ROLLBACK") {
+            Ok(()) => LeftoverTransaction::None,
+            // Rolling back a transaction this function just began, with
+            // nothing in it, has no known way to fail. If it does, the
+            // connection is in a state nothing here understands.
+            Err(e) => LeftoverTransaction::Unrecoverable {
+                found: "none".to_string(),
+                rollback_error: e.to_string(),
+            },
+        },
+        Err(found) => match conn.execute_batch("ROLLBACK") {
+            Ok(()) => LeftoverTransaction::RolledBack {
+                found: found.to_string(),
+            },
+            Err(rollback_error) => LeftoverTransaction::Unrecoverable {
+                found: found.to_string(),
+                rollback_error: rollback_error.to_string(),
+            },
+        },
     }
 }
 
@@ -570,7 +658,99 @@ mod tests {
     use tower::ServiceExt;
 
     use super::jobs::{JobOutcome, JobRegistry, JobState, JobStatus};
-    use super::{AppState, build_pool, build_router};
+    use super::{
+        AppState, LeftoverTransaction, build_pool, build_router, end_leftover_transaction,
+    };
+
+    fn table_of_100() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t AS SELECT range AS id, 'x' AS s FROM range(100)")
+            .unwrap();
+        conn
+    }
+
+    /// Leaves `conn` inside an aborted transaction, the state a failed
+    /// `ROLLBACK` left behind in production. It has to be an *execution*
+    /// error: DuckDB does not abort a transaction over a binder error such as
+    /// a missing table, measured.
+    fn abort_a_transaction(conn: &Connection) {
+        conn.execute_batch("BEGIN TRANSACTION; DELETE FROM t WHERE id < 10;")
+            .unwrap();
+        assert!(
+            conn.execute_batch("SELECT CAST(s AS INTEGER) FROM t")
+                .is_err()
+        );
+        assert!(
+            conn.execute_batch("SELECT 1").is_err(),
+            "the transaction must now be aborted"
+        );
+    }
+
+    #[test]
+    fn a_leftover_transaction_is_found_and_rolled_back_in_either_state() {
+        let base = table_of_100();
+
+        let clean = base.try_clone().unwrap();
+        assert_eq!(end_leftover_transaction(&clean), LeftoverTransaction::None);
+
+        let open = base.try_clone().unwrap();
+        open.execute_batch("BEGIN TRANSACTION; DELETE FROM t WHERE id < 10;")
+            .unwrap();
+        match end_leftover_transaction(&open) {
+            LeftoverTransaction::RolledBack { found } => {
+                assert!(found.contains("within a transaction"), "{found}")
+            }
+            other => panic!("open transaction: {other:?}"),
+        }
+
+        let aborted = base.try_clone().unwrap();
+        abort_a_transaction(&aborted);
+        match end_leftover_transaction(&aborted) {
+            LeftoverTransaction::RolledBack { found } => {
+                assert!(found.contains("aborted"), "{found}")
+            }
+            other => panic!("aborted transaction: {other:?}"),
+        }
+
+        // Every connection is usable and outside any transaction afterwards,
+        // and neither leftover's deletes landed.
+        for c in [&clean, &open, &aborted] {
+            c.execute_batch("BEGIN TRANSACTION; ROLLBACK").unwrap();
+        }
+        let n: i64 = base
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 100);
+    }
+
+    /// End to end through the pool: a connection dropped mid-transaction must
+    /// not lend its rows' locks, or its aborted state, to the next borrower.
+    #[test]
+    fn a_connection_returned_mid_transaction_releases_its_rows() {
+        let pool = build_pool(table_of_100(), 2).unwrap();
+
+        let a = pool.get().unwrap();
+        a.execute_batch("BEGIN TRANSACTION; DELETE FROM t WHERE id < 10;")
+            .unwrap();
+        drop(a);
+        let b = pool.get().unwrap();
+        abort_a_transaction(&b);
+        drop(b);
+
+        // Both leftovers were rolled back on return: their rows can be
+        // deleted by anyone (a held delete would be `Conflict on tuple
+        // deletion`), and every connection starts a transaction cleanly.
+        let c = pool.get().unwrap();
+        let d = pool.get().unwrap();
+        for conn in [&c, &d] {
+            conn.execute_batch("BEGIN TRANSACTION; ROLLBACK").unwrap();
+        }
+        c.execute_batch("DELETE FROM t WHERE id = 5").unwrap();
+        let n: i64 = d
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 99, "only the one committed delete may have landed");
+    }
 
     /// `web_dir` is a parameter (not baked into a fixed default) so the
     /// static-fallback tests below can point it at a tempdir while

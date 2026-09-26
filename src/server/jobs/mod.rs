@@ -110,8 +110,9 @@ pub struct JobStatus {
     pub last_outcome: Option<JobOutcome>,
     pub next_run_at: Option<String>,
     pub run_count: u64,
-    /// Runs in a row that did not end in `Success` (errors and timeouts
-    /// alike), reset to 0 by the next success.
+    /// Runs in a row that ended in an error or a panic, reset to 0 by the
+    /// next run that did not. A timeout alone does not count: a run that
+    /// overran and then finished cleanly was slow, not failing.
     ///
     /// Added 2026-09-24. `osm_update` failed every run for two days before
     /// anyone noticed: each failure logs `job failed`, which reads the same
@@ -121,8 +122,9 @@ pub struct JobStatus {
     /// When the first failure of the current streak finished. `None` while
     /// the last run succeeded.
     pub failing_since: Option<String>,
-    /// When the most recent successful run finished. `None` before the first
-    /// one, and for a job that has never succeeded since the process started.
+    /// When the most recent run that ended without an error finished,
+    /// including one that overran its timeout. `None` until there is one
+    /// since the process started.
     pub last_success_at: Option<String>,
     /// See `Job::log_keys`. Copied in at registration time since it's fixed
     /// per job, not per run.
@@ -491,19 +493,22 @@ pub(crate) async fn supervise(
             result
         });
 
-        let outcome = match tokio::time::timeout(cfg.timeout, &mut handle).await {
-            Ok(Ok(Ok(()))) => JobOutcome::Success,
+        // `run_error` is the run's error if it ended in one, before or after
+        // the timeout; it, not `outcome`, drives the failure streak below.
+        let (outcome, run_error) = match tokio::time::timeout(cfg.timeout, &mut handle).await {
+            Ok(Ok(Ok(()))) => (JobOutcome::Success, None),
             // Logged here as well as recorded in the registry. Before this, a
             // failed run reached only `/status`. Three days of failed dataset
             // refreshes (2026-09-15..17) left no WARN or ERROR in the journal.
             Ok(Ok(Err(e))) => {
                 let message = format!("{e:#}");
                 tracing::error!(job = name, error = %message, "job failed");
-                JobOutcome::Error(message)
+                (JobOutcome::Error(message.clone()), Some(message))
             }
             Ok(Err(join_err)) => {
                 tracing::error!(job = name, error = %join_err, "job panicked");
-                JobOutcome::Error(format!("task panicked: {join_err}"))
+                let message = format!("task panicked: {join_err}");
+                (JobOutcome::Error(message.clone()), Some(message))
             }
             Err(_elapsed) => {
                 cancel.store(true, Ordering::SeqCst);
@@ -514,18 +519,22 @@ pub(crate) async fn supervise(
                 );
                 // MUST wait — abandoning the handle would let the next tick
                 // start a second writer and violate no-overlap.
-                match (&mut handle).await {
+                let run_error = match (&mut handle).await {
                     Ok(Ok(())) => {
                         tracing::info!(job = name, "job completed AFTER timeout was recorded");
+                        None
                     }
                     Ok(Err(e)) => {
-                        tracing::error!(job = name, error = %format!("{e:#}"), "job failed after timeout");
+                        let message = format!("{e:#}");
+                        tracing::error!(job = name, error = %message, "job failed after timeout");
+                        Some(message)
                     }
                     Err(e) => {
                         tracing::error!(job = name, error = %e, "job panicked after timeout");
+                        Some(format!("task panicked after timeout: {e}"))
                     }
-                }
-                JobOutcome::TimedOut
+                };
+                (JobOutcome::TimedOut, run_error)
             }
         };
 
@@ -533,8 +542,14 @@ pub(crate) async fn supervise(
         let elapsed_ms = started_inst.elapsed().as_millis() as u64;
         let next = finished_sys + cfg.interval;
 
+        // A run that timed out but then returned `Ok` is slow, not failing:
+        // `osm_update` does exactly that on every catch-up longer than its
+        // timeout, stopping cleanly between batches after committing
+        // progress, and counting it announced "job keeps failing" for a
+        // catch-up that was working (2026-09-26). `/status` still shows the
+        // `TimedOut` outcome.
         let previous_failures = consecutive_failures;
-        if outcome == JobOutcome::Success {
+        if run_error.is_none() {
             consecutive_failures = 0;
         } else {
             consecutive_failures += 1;
@@ -548,11 +563,7 @@ pub(crate) async fn supervise(
             streak_warned_at.map(|t| t.elapsed()),
         ) {
             StreakLog::Failing => {
-                let last_error = match &outcome {
-                    JobOutcome::Error(message) => message.as_str(),
-                    JobOutcome::TimedOut => "timed out",
-                    JobOutcome::Success => "",
-                };
+                let last_error = run_error.as_deref().unwrap_or("");
                 warn!(
                     job = name,
                     consecutive_failures,
@@ -982,6 +993,73 @@ mod tests {
         assert_eq!(streak_log(at, 0, Some(minute)), StreakLog::Recovered);
         assert_eq!(streak_log(at - 1, 0, None), StreakLog::Quiet);
         assert_eq!(streak_log(0, 0, None), StreakLog::Quiet);
+    }
+
+    /// Drives one job whose every run overruns `timeout` and then ends with
+    /// `result`, and returns the registry once two runs have finished.
+    async fn run_overrunning_job(result: std::result::Result<(), String>) -> JobStatus {
+        let (w, kv, cfg, _dir) = make_parts();
+        let job_cfg = JobConfigResolved {
+            enabled: true,
+            interval: Duration::from_millis(20),
+            timeout: Duration::from_millis(50),
+            run_on_start: true,
+        };
+        let job = Arc::new(ScriptedJob {
+            name: "test_overrun",
+            // Far past the timeout; ScriptedJob stops early once cancelled,
+            // like osm_update stopping between batches.
+            sleep_each: Duration::from_secs(5),
+            outcomes: vec![result],
+            call_count: Arc::new(AtomicUsize::new(0)),
+            current: Arc::new(AtomicUsize::new(0)),
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry = make_registry_for("test_overrun", &job_cfg);
+        let notify = Arc::new(Notify::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(supervise(
+            job,
+            job_cfg,
+            registry.clone(),
+            notify.clone(),
+            stop.clone(),
+            Arc::new(AtomicBool::new(false)),
+            w,
+            kv,
+            cfg,
+        ));
+        let r = registry.clone();
+        assert!(
+            wait_until(|| r.snapshot()[0].run_count >= 2, Duration::from_secs(5)).await,
+            "two overrunning runs should finish"
+        );
+        stop.store(true, Ordering::SeqCst);
+        notify.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        registry.snapshot()[0].clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_that_overruns_then_stops_cleanly_is_not_a_failure() {
+        let s = run_overrunning_job(Ok(())).await;
+        assert_eq!(s.last_outcome, Some(JobOutcome::TimedOut));
+        assert_eq!(s.consecutive_failures, 0, "{s:?}");
+        assert!(
+            s.failing_since.is_none() && s.last_success_at.is_some(),
+            "{s:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_that_overruns_then_errors_is_a_failure() {
+        let s = run_overrunning_job(Err("boom".into())).await;
+        assert_eq!(s.last_outcome, Some(JobOutcome::TimedOut));
+        assert!(s.consecutive_failures >= 2, "{s:?}");
+        assert!(
+            s.failing_since.is_some() && s.last_success_at.is_none(),
+            "{s:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -411,8 +411,20 @@ pub fn parse_state_txt(text: &str) -> Result<(u64, String)> {
 
 /// Construct the URL for an OsmChange file given a base URL and sequence number.
 pub fn sequence_to_path(seq: u64) -> String {
+    format!("{}.osc.gz", sequence_stem(seq))
+}
+
+/// Path of the `state.txt` published next to each sequence's diff
+/// (`007/298/244.state.txt`), which carries that sequence's own timestamp.
+pub fn sequence_state_path(seq: u64) -> String {
+    format!("{}.state.txt", sequence_stem(seq))
+}
+
+/// `007/298/244` for sequence 7298244: the one home for the zero-padded,
+/// three-level layout both paths above share.
+fn sequence_stem(seq: u64) -> String {
     let s = format!("{seq:09}");
-    format!("{}/{}/{}.osc.gz", &s[0..3], &s[3..6], &s[6..9])
+    format!("{}/{}/{}", &s[0..3], &s[3..6], &s[6..9])
 }
 
 #[cfg(test)]
@@ -751,5 +763,6 @@ timestamp=2025-03-10T12\\:00\\:00Z";
         assert_eq!(sequence_to_path(6543210), "006/543/210.osc.gz");
         assert_eq!(sequence_to_path(1), "000/000/001.osc.gz");
         assert_eq!(sequence_to_path(123456789), "123/456/789.osc.gz");
+        assert_eq!(sequence_state_path(7298244), "007/298/244.state.txt");
     }
 }
