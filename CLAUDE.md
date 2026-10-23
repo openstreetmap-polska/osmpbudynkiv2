@@ -1279,11 +1279,19 @@ background load proportional to what has actually been rendered.
 **Gotcha — the HTTP cache layer has one home too.** `src/server/http_cache.rs`
 builds every `Cache-Control` and `ETag` this server sends — nothing else should
 format one by hand. The API default, `Cache-Control: no-store`, is applied by a
-single **outermost** `SetResponseHeaderLayer::if_not_present` in `build_router`,
-and it must stay the *last* call in that chain: `Router::layer` only wraps routes
-that already exist when it is called, so applying it before `.fallback_service(...)`
-would leave the static frontend and axum's own 404/405/rejection responses
-unwrapped. `/package` (both verbs) is `no-store` for a **correctness** reason, not
+single `SetResponseHeaderLayer::if_not_present` in `build_router`, and it must
+stay after `.fallback_service(...)`: `Router::layer` only wraps routes that
+already exist when it is called, so applying it earlier would leave the static
+frontend and axum's own 404/405/rejection responses unwrapped. The one layer
+allowed after it is `CorsLayer::permissive()`, outermost for the same reason
+(every response class must carry `Access-Control-Allow-Origin: *`). Three
+consequences of that order: CORS preflights (`OPTIONS`, any path) are answered
+by the CORS layer itself and never reach a handler or the `no-store` layer, so
+they carry no `Cache-Control`; tower-http *appends* its `Vary` rather than
+replacing it, which is what keeps the tiles' mandatory `Vary: Accept-Encoding`
+intact; and CORS changes what a cross-origin page can *read*, not what it can
+*write* — `post_report` takes a bare `String` body, so a `text/plain` POST
+needed no preflight and reached it before the layer existed. `/package` (both verbs) is `no-store` for a **correctness** reason, not
 freshness: a cached response never reaches `package::log_export`, so
 `package_exports` would under-count and `/updates` would under-report. Tile 500s
 are deliberately left header-less so the outer default stamps them — an errored
