@@ -100,7 +100,44 @@ fn download_runtime() -> &'static Runtime {
 /// why a plain `Client`, not a `Mutex<Client>`, is the right shape here.
 fn download_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        build_download_client(DOWNLOAD_READ_TIMEOUT)
+            .expect("failed to build shared download client")
+    })
+}
+
+/// How long [`download_client`] waits for a TCP (and TLS) connection.
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long [`download_client`] waits for the *next* bytes of a response,
+/// from the response headers through every body chunk.
+///
+/// A bare `reqwest::Client::new()` has no timeout of any kind, so a server
+/// that accepts the request and then goes silent hangs the call until the
+/// job supervisor gives up. That happened on production on 2026-10-18: one
+/// `state.txt` fetch sat for 22 minutes, well past `osm_update`'s 600 s
+/// timeout, while `download.openstreetmap.fr` was misbehaving.
+///
+/// **A read timeout, never a total one (`ClientBuilder::timeout`).** It
+/// resets after every successful read, so it bounds a *stall*, not a
+/// transfer: a multi-GB government snapshot that keeps receiving bytes is
+/// never cut off, however long it takes. A total timeout would have to be
+/// set above the slowest snapshot download and would then do nothing for a
+/// stalled 100-byte `state.txt`.
+///
+/// 120 s is deliberately generous for a government server that is slow to
+/// start sending, and still short enough that a stalled minutely tick fails
+/// inside `osm_update`'s 600 s job timeout: [`MAX_RETRIES`] attempts of at
+/// most 120 s each plus 2 + 4 s of backoff is 366 s.
+const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The [`download_client`] configuration with the read timeout as a
+/// parameter, so tests can exercise it in milliseconds rather than minutes.
+fn build_download_client(read_timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(read_timeout)
+        .build()
 }
 
 /// Download a file from `url` to `dest_dir`, returning the path to the downloaded file.
@@ -802,5 +839,134 @@ mod tests {
             Vec::<String>::new(),
             "a failed download must clean up its own temp file"
         );
+    }
+
+    // --- Read timeout (`DOWNLOAD_READ_TIMEOUT`) ---
+    //
+    // Each of these builds the client through `build_download_client`, the
+    // same function `download_client` uses, with the timeout shortened to
+    // milliseconds. The servers hold their connection open rather than
+    // closing it: a closed connection fails on its own, timeout or not.
+
+    const TEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// An outer bound far above `TEST_READ_TIMEOUT`, so a regression fails
+    /// the test instead of hanging it the way production hung.
+    const TEST_HANG_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Accepts one connection, reads the request, writes `prefix` (possibly
+    /// nothing), then holds the connection open without sending anything
+    /// else.
+    async fn spawn_stalling_server(prefix: &'static [u8]) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.readable().await;
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            tokio::io::AsyncWriteExt::write_all(&mut stream, prefix)
+                .await
+                .unwrap();
+            tokio::time::sleep(TEST_HANG_BOUND * 2).await;
+            drop(stream);
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_fails_at_the_read_timeout() {
+        let addr = spawn_stalling_server(b"").await;
+        let client = build_download_client(TEST_READ_TIMEOUT).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("state.txt");
+
+        let result = tokio::time::timeout(
+            TEST_HANG_BOUND,
+            do_download(&client, &format!("http://{addr}/state.txt"), &dest, false),
+        )
+        .await
+        .expect("a server sending no response headers must not hang the download");
+
+        assert!(result.is_err(), "a stalled request must fail, not succeed");
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stalls_midway_fails_and_leaves_no_part_file() {
+        let addr = spawn_stalling_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nthe first few bytes",
+        )
+        .await;
+        let client = build_download_client(TEST_READ_TIMEOUT).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("snapshot.bin");
+
+        let result = tokio::time::timeout(
+            TEST_HANG_BOUND,
+            do_download(
+                &client,
+                &format!("http://{addr}/snapshot.bin"),
+                &dest,
+                false,
+            ),
+        )
+        .await
+        .expect("a body that stops arriving must not hang the download");
+
+        assert!(result.is_err(), "a stalled body must fail, not succeed");
+        assert!(!dest.exists());
+        assert_eq!(part_files_in(tmp.path()), Vec::<String>::new());
+    }
+
+    /// The property that makes this a read timeout and not a total one: a
+    /// transfer slower in total than the timeout, but never silent for as
+    /// long as it, succeeds. A multi-GB government snapshot depends on this.
+    #[tokio::test]
+    async fn a_slow_but_steady_body_outlasts_the_read_timeout() {
+        const CHUNKS: usize = 16;
+        const GAP: std::time::Duration = std::time::Duration::from_millis(60);
+        const CHUNK: &[u8] = b"0123456789abcdef";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.readable().await;
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                CHUNKS * CHUNK.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, headers.as_bytes())
+                .await
+                .unwrap();
+            for _ in 0..CHUNKS {
+                tokio::time::sleep(GAP).await;
+                tokio::io::AsyncWriteExt::write_all(&mut stream, CHUNK)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let client = build_download_client(TEST_READ_TIMEOUT).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("slow.bin");
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            TEST_HANG_BOUND,
+            do_download(&client, &format!("http://{addr}/slow.bin"), &dest, false),
+        )
+        .await
+        .unwrap()
+        .expect("a body that keeps arriving must not be cut off");
+
+        assert!(
+            started.elapsed() > TEST_READ_TIMEOUT,
+            "the transfer must take longer than the read timeout in total, or \
+             this test cannot tell a read timeout from a total one"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), CHUNK.repeat(CHUNKS));
     }
 }
