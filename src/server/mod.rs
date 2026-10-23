@@ -533,14 +533,14 @@ pub async fn run(
 /// `no-store` the true default for anything that didn't already set its own
 /// `Cache-Control` (tiles, `/updates`, and the static-asset middleware in
 /// `http_cache::static_router` all set theirs first, so `if_not_present`
-/// leaves them alone). It has to be the *last* call in this chain: applying
-/// it before `.fallback_service(...)` would only wrap the API routes that
-/// existed at that point, not the fallback added afterwards.
+/// leaves them alone). It has to come after `.fallback_service(...)`:
+/// applying it earlier would only wrap the API routes that existed at that
+/// point, not the fallback added afterwards.
 ///
-/// The `CorsLayer::permissive()` wrapped *around* it (the one layer applied
-/// after) re-wraps everything including this one, so cross-origin
-/// clients can read every response class the router emits; see the comment
-/// at that layer for why it exists.
+/// The one layer allowed after it is `CorsLayer::permissive()`, outermost for
+/// the same reason -- every response class must carry the CORS headers. It
+/// answers `OPTIONS` preflights itself, so those never reach the `no-store`
+/// layer and carry no `Cache-Control`.
 pub fn build_router(state: AppState) -> Router {
     let web_dir = state.config.web_dir.clone();
     let cache_headers = Arc::new(http_cache::CacheHeaders::from_config(&state.config.cache));
@@ -582,20 +582,17 @@ pub fn build_router(state: AppState) -> Router {
         // failing startup. Its own Cache-Control policy (fonts/vendor/known
         // entry files) lives in http_cache::static_router.
         .fallback_service(http_cache::static_router(&web_dir, cache_headers))
-        // API default: no-store. Must stay the last call -- see doc comment
-        // above.
+        // API default: no-store. Must stay after the fallback and inside the
+        // CORS layer -- see doc comment above.
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             http_cache::NO_STORE,
         ))
-        // The response is fully built at this point, so this outermost layer
-        // puts CORS headers on absolutely everything the router emits --
+        // Outermost: puts CORS headers on everything the router emits --
         // handler responses, axum's own 404s/extractor rejections, the static
         // fallback -- and answers `OPTIONS` preflights itself (axum routes
-        // would otherwise 405 them). Given the doc comment above promised
-        // `.layer(SetResponseHeaderLayer...)` had to be the last call, that is
-        // still true within the chain *below* this layer; permissive CORS is
-        // deliberately wrapped around it so no response class escapes it.
+        // would otherwise 405 them). Its `Vary` is appended, not replaced, so
+        // the tiles' `Vary: Accept-Encoding` survives.
         .layer(CorsLayer::permissive())
 }
 
