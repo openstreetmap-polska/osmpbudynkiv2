@@ -144,9 +144,9 @@ intended maximum, so
 z5–z11 tile, per the next point, not just this overlay. The window is otherwise
 free: it is a paint-time comparison against a raw `ts_*` the tile already
 carries, so switching presets costs no refetch and no restyle, and the picked
-preset rides in the `layers=` hash entry and `localStorage` (the only
-*hash* setting that persists; the view options below persist in
-`localStorage` alone). Two further consequences:
+preset rides in the `layers=` hash entry and `localStorage`, like every other
+legend choice (hash > `localStorage` > HTML default; the view options below
+persist in `localStorage` alone). Two further consequences:
 
 - **Per-tile cost is linear in `max_age_days` and independent of the tile.**
   The table has no index and no useful cell ordering (`insert_change_areas`

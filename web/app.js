@@ -624,7 +624,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const DEFAULT_BASEMAP = "osm";
   const BASEMAP_STORAGE_KEY = "osmpbudynkiv2.basemap";
 
-  // Same "the store may throw" guard as readStoredChangesWindow below.
+  // Same "the store may throw" guard as readStoredChoice below.
   function readStoredBasemap() {
     try {
       const stored = localStorage.getItem(BASEMAP_STORAGE_KEY);
@@ -1762,32 +1762,45 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const VALID_AGG_COLORS = ["off", "ratio", "count"];
   const VALID_CHANGES_WINDOWS = CHANGES_WINDOWS.map((w) => w.key);
 
-  // The changes window is the one *hash* setting that also survives a new
-  // visit, not just a shared link: it is a standing preference ("I watch
-  // registry updates") rather than a description of one view, and the
-  // alternative is re-picking it on every visit. Everything else in the hash
-  // stays session-scoped, so a bare visit still opens on the documented
-  // defaults. (The view options below persist too, but live only in
-  // localStorage, never in the hash -- see DISPLAY_OPTIONS_STORAGE_KEY.)
+  // Every legend choice also survives a new visit, not just a shared link:
+  // re-picking the registry, grid colouring and overlays on every visit is
+  // the alternative (issue #5). Precedence is hash > localStorage > the
+  // HTML's default everywhere: a link someone shared describes a specific
+  // view and has to win over the visitor's own standing preference, which in
+  // turn wins over the built-in default. "Ostatnio pobrane" has no hash field
+  // (see updatesVisible below), so for it the chain starts at localStorage.
+  // (The view options below persist too, but live only in localStorage,
+  // never in the hash -- see DISPLAY_OPTIONS_STORAGE_KEY.)
+  //
+  // The stored values are the same keys the hash carries, validated against
+  // the same lists on read, so a value from an older frontend that no longer
+  // exists falls through to the default rather than selecting nothing.
+  // CHANGES_WINDOW_STORAGE_KEY's name predates the rest and is kept, or every
+  // returning visitor would lose the one preference that already persisted.
   //
   // localStorage can throw outright (Chrome with third-party/site data
   // blocked, Safari private mode), not merely return null, so every access
   // is guarded -- an unavailable store must degrade to "no remembered
   // preference", never take the legend down with it.
+  const BUILDING_SOURCE_STORAGE_KEY = "osmpbudynkiv2.buildingSource";
+  const ADDRESS_SOURCE_STORAGE_KEY = "osmpbudynkiv2.addressSource";
+  const UPDATES_SOURCE_STORAGE_KEY = "osmpbudynkiv2.updatesSource";
+  const AGG_COLOR_STORAGE_KEY = "osmpbudynkiv2.aggColor";
   const CHANGES_WINDOW_STORAGE_KEY = "osmpbudynkiv2.changesWindow";
+  const VALID_UPDATES_SOURCES = ["off", "on"];
 
-  function readStoredChangesWindow() {
+  function readStoredChoice(storageKey, validValues) {
     try {
-      const stored = localStorage.getItem(CHANGES_WINDOW_STORAGE_KEY);
-      return VALID_CHANGES_WINDOWS.includes(stored) ? stored : null;
+      const stored = localStorage.getItem(storageKey);
+      return validValues.includes(stored) ? stored : null;
     } catch {
       return null;
     }
   }
 
-  function storeChangesWindow(value) {
+  function storeChoice(storageKey, value) {
     try {
-      localStorage.setItem(CHANGES_WINDOW_STORAGE_KEY, value);
+      localStorage.setItem(storageKey, value);
     } catch {
       /* Preference is not persisted; the session still works. */
     }
@@ -1893,7 +1906,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
       applyChangesVisibility();
     }
     if (remember) {
-      storeChangesWindow(changesWindow);
+      storeChoice(CHANGES_WINDOW_STORAGE_KEY, changesWindow);
       writeStateHash();
     }
   }
@@ -1920,12 +1933,18 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // category replaces the old pair of "all"/"unmatched" checkboxes -- picking
   // a registry shows both its all+unmatched layers together (previously the
   // default, and only tested, checkbox state anyway); "Wyłącz" hides both.
-  let buildingSource = restoredState.buildingSource || legendBuildingsGroup.dataset.buildingSource;
-  let addressSource = restoredState.addressSource || legendAddressesGroup.dataset.addressSource;
+  let buildingSource =
+    restoredState.buildingSource ||
+    readStoredChoice(BUILDING_SOURCE_STORAGE_KEY, VALID_BUILDING_SOURCES) ||
+    legendBuildingsGroup.dataset.buildingSource;
+  let addressSource =
+    restoredState.addressSource ||
+    readStoredChoice(ADDRESS_SOURCE_STORAGE_KEY, VALID_ADDRESS_SOURCES) ||
+    legendAddressesGroup.dataset.addressSource;
   legendBuildingsGroup.dataset.buildingSource = buildingSource;
   legendAddressesGroup.dataset.addressSource = addressSource;
-  // Buttons default to bdot10k/prg pressed in the HTML; if the hash restored
-  // a different value, the buttons must catch up so they don't lie about
+  // Buttons default to bdot10k/prg pressed in the HTML; if the hash or
+  // localStorage restored a different value, the buttons must catch up so they don't lie about
   // which state is actually active.
   for (const b of buildingSourceButtons) {
     b.setAttribute("aria-pressed", String(b.dataset.source === buildingSource));
@@ -1940,8 +1959,12 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // just visible or not. Deliberately still not carried in the URL hash, even
   // though the changes overlay below now is: this one is default-on and shows
   // whatever /updates last returned, so there is no state worth naming in a
-  // shared link -- the recipient sees the same thing either way.
-  let updatesVisible = legendUpdatesGroup.dataset.updatesSource !== "off";
+  // shared link -- the recipient sees the same thing either way. Turning it
+  // off *is* a standing preference, though, so it persists in localStorage.
+  let updatesVisible =
+    (readStoredChoice(UPDATES_SOURCE_STORAGE_KEY, VALID_UPDATES_SOURCES) ||
+      legendUpdatesGroup.dataset.updatesSource) !== "off";
+  legendUpdatesGroup.dataset.updatesSource = updatesVisible ? "on" : "off";
   for (const b of updatesSourceButtons) {
     b.setAttribute("aria-pressed", String(b.dataset.updatesSource === (updatesVisible ? "on" : "off")));
   }
@@ -1952,14 +1975,9 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // share of the country at once, but that *is* the signal an editor comes
   // here for, and an overlay nobody sees until they find the toggle mostly
   // does not get seen.
-  //
-  // Precedence is hash > localStorage > the HTML's default, matching the
-  // other three: a link someone shared describes a specific view and has to
-  // win over the visitor's own standing preference, which in turn wins over
-  // the built-in default.
   let changesWindow =
     restoredState.changesWindow ||
-    readStoredChangesWindow() ||
+    readStoredChoice(CHANGES_WINDOW_STORAGE_KEY, VALID_CHANGES_WINDOWS) ||
     legendChangesGroup.dataset.changesWindow ||
     DEFAULT_CHANGES_WINDOW;
   legendChangesGroup.dataset.changesWindow = changesWindow;
@@ -2043,7 +2061,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   // field for this purpose: both must be whole non-negative numbers (the upper
   // one may be null) and in order, or both reset -- keeping one half of a
   // broken pair could produce an empty range. Same "the store may throw" guard
-  // as readStoredChangesWindow.
+  // as readStoredChoice.
   function readStoredDisplayOptions() {
     let stored = null;
     try {
@@ -2434,7 +2452,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
     return systemDarkQuery.matches ? "dark" : "light";
   }
 
-  // Same "the store may throw" guard as readStoredChangesWindow.
+  // Same "the store may throw" guard as readStoredChoice.
   function storedTheme() {
     try {
       const theme = localStorage.getItem(THEME_STORAGE_KEY);
@@ -2563,6 +2581,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         // The grid (agg-grid-fill) mirrors this toggle too -- see
         // activeAggSources/applyAggMetric below.
         applyAggMetric();
+        storeChoice(BUILDING_SOURCE_STORAGE_KEY, buildingSource);
         writeStateHash();
       });
     }
@@ -2575,6 +2594,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
         }
         applyAddressVisibility();
         applyAggMetric();
+        storeChoice(ADDRESS_SOURCE_STORAGE_KEY, addressSource);
         writeStateHash();
       });
     }
@@ -2586,6 +2606,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           b.setAttribute("aria-pressed", String(b === btn));
         }
         applyUpdatesVisibility();
+        storeChoice(UPDATES_SOURCE_STORAGE_KEY, btn.dataset.updatesSource);
       });
     }
     for (const btn of changesWindowButtons) {
@@ -2627,7 +2648,8 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
   const ratioLegend = document.getElementById("ratio-legend");
   const countLegend = document.getElementById("count-legend");
 
-  let aggColor = restoredState.aggColor || "ratio";
+  let aggColor =
+    restoredState.aggColor || readStoredChoice(AGG_COLOR_STORAGE_KEY, VALID_AGG_COLORS) || "ratio";
   for (const b of aggColorButtons) {
     b.setAttribute("aria-pressed", String(b.dataset.color === aggColor));
   }
@@ -2689,6 +2711,7 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
           b.setAttribute("aria-pressed", String(b === btn));
         }
         applyAggMetric();
+        storeChoice(AGG_COLOR_STORAGE_KEY, aggColor);
         writeStateHash();
       });
     }
@@ -3241,8 +3264,8 @@ import * as maplibregl from "./vendor/maplibre-gl/maplibre-gl.mjs";
 
   // Last-used mode, remembered only for this page session (module-level, not
   // localStorage -- what this frontend persists is standing preferences, the
-  // changes window and the view options (CHANGES_WINDOW_STORAGE_KEY,
-  // DISPLAY_OPTIONS_STORAGE_KEY), and a draw mode is a per-task choice rather
+  // legend choices and the view options (the *_STORAGE_KEY constants), and
+  // a draw mode is a per-task choice rather
   // than a standing one). Rectangle is the default
   // first mode since it needs no explanation.
   let drawMode = "rectangle";
