@@ -20,6 +20,7 @@ use axum::{Router, http::StatusCode};
 use duckdb::Connection;
 use r2d2::Pool;
 use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::info;
 
@@ -535,6 +536,11 @@ pub async fn run(
 /// leaves them alone). It has to be the *last* call in this chain: applying
 /// it before `.fallback_service(...)` would only wrap the API routes that
 /// existed at that point, not the fallback added afterwards.
+///
+/// The `CorsLayer::permissive()` wrapped *around* it (the one layer applied
+/// after) re-wraps everything including this one, so cross-origin
+/// clients can read every response class the router emits; see the comment
+/// at that layer for why it exists.
 pub fn build_router(state: AppState) -> Router {
     let web_dir = state.config.web_dir.clone();
     let cache_headers = Arc::new(http_cache::CacheHeaders::from_config(&state.config.cache));
@@ -582,6 +588,15 @@ pub fn build_router(state: AppState) -> Router {
             header::CACHE_CONTROL,
             http_cache::NO_STORE,
         ))
+        // The response is fully built at this point, so this outermost layer
+        // puts CORS headers on absolutely everything the router emits --
+        // handler responses, axum's own 404s/extractor rejections, the static
+        // fallback -- and answers `OPTIONS` preflights itself (axum routes
+        // would otherwise 405 them). Given the doc comment above promised
+        // `.layer(SetResponseHeaderLayer...)` had to be the last call, that is
+        // still true within the chain *below* this layer; permissive CORS is
+        // deliberately wrapped around it so no response class escapes it.
+        .layer(CorsLayer::permissive())
 }
 
 const REQUIRED_TABLES: &[&str] = &[
@@ -1060,6 +1075,90 @@ mod tests {
             .unwrap();
         assert_eq!(method_not_allowed.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(method_not_allowed.headers()["cache-control"], "no-store");
+    }
+
+    /// Until v2 the deployment sent `Access-Control-Allow-Origin: *` on every
+    /// endpoint, letting third-party browser clients (a web app hosted on some
+    /// other origin) read the API. The rewrite dropped it, and every such
+    /// client broke: the browser discards a cross-origin response with no
+    /// CORS headers before the page's JavaScript ever sees it, even though the
+    /// server spent the bytes answering. The data itself is public and the
+    /// API carries no credentials, so permissive CORS re-admits exactly the
+    /// clients v1 had, and nothing more sensitive: same-origin clients are
+    /// unaffected either way.
+    ///
+    /// `CorsLayer::permissive` is wrapped around the whole router, so both
+    /// classes of response must carry the header: an ordinary handler
+    /// response, and the CORS preflight for a non-`GET/HEAD` verb, which
+    /// fetch's rules require before a cross-origin `POST` (here `/report`,
+    /// the one writable endpoint) may even be attempted. The preflight used
+    /// to die on axum's 405 with `Allow: POST` before any CORS layer could
+    /// explain itself.
+    #[tokio::test]
+    async fn cross_origin_reads_and_preflights_are_allowed_everywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(make_test_state(vec![], dir.path()));
+
+        // A plain cross-origin read of a handler response.
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header(header::ORIGIN, "https://example.org")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(get.headers()["access-control-allow-origin"], "*");
+
+        // Cross-origin reads are governed even on responses that would
+        // otherwise be errors, and it must reach the static fallback too.
+        for uri in ["/this/path/does/not/exist/anywhere", "/index.html"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::ORIGIN, "https://example.org")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+        }
+
+        // The preflight a browser runs before a cross-origin POST /report:
+        // must succeed (a 405 anywhere in it fails the request in the
+        // browser) and must itself announce the offered method.
+        let preflight = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/report")
+                    .header(header::ORIGIN, "https://example.org")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(preflight.headers()["access-control-allow-origin"], "*");
+        // `permissive` leaves the method set unconstrained, which tower-http
+        // may answer as a literal `*` (v0.6) or as an explicit list; both are
+        // an offer of POST, which is the only thing the preflight is for.
+        let methods = preflight.headers()["access-control-allow-methods"]
+            .to_str()
+            .unwrap()
+            .to_ascii_uppercase();
+        assert!(
+            methods == "*" || methods.split(',').any(|m| m.trim() == "POST"),
+            "preflight must offer POST, got {methods}"
+        );
     }
 
     // `/updates` and `/tiles` keeping their own `Cache-Control` through
