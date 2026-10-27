@@ -1268,13 +1268,19 @@ Four further points:
    Without it, every warmed tile keeps its old shape until something unrelated
    dirties its cell.
 
-`jobs::tile_refresh` drains the queue in **two passes per tick, and the split
-matters**: pass 1 deletes the affected keys and records which existed, pass 2
-re-renders only those. Deleting is microseconds per key while rendering is
-milliseconds, so a large invalidation clears in seconds but takes far longer to
-re-render — in one pass, tiles at the back of the queue would serve stale bytes
-for that whole time. Re-rendering only store-resident keys is also what keeps
-background load proportional to what has actually been rendered.
+`jobs::tile_refresh` **overwrites stale tiles in place and deletes a cell's
+queue row only after every resident tile it expands to is written** — never
+delete-first. It used to evict every resident key and the queue rows up front,
+then re-render. A tick cut short in between (a 300 s timeout in a dataset
+window is routine) left the rest evicted *and* unqueued, and since residency is
+the only way back into the job, they stayed cold until requested. Blocks render
+z12 → z13 → z14, so it was always the z14 tier that wore away. A cut-short tick
+now leaves its unfinished cells queued with their old tiles resident. A *failed*
+render is the one case that evicts and drains — retrying would let a poison block
+squat at the head of the oldest-first queue. Re-rendering only store-resident
+keys is what keeps background load proportional to what has actually been
+rendered. Guard:
+`a_tick_cut_short_before_z14_keeps_the_tile_and_its_cell_for_the_next_tick`.
 
 **Gotcha — the HTTP cache layer has one home too.** `src/server/http_cache.rs`
 builds every `Cache-Control` and `ETag` this server sends — nothing else should

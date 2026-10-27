@@ -338,11 +338,12 @@ impl Default for MatchRefreshConfig {
 }
 
 /// `jobs.tile_refresh` — drains `tile_dirty_cells` (see `server::tile_dirty`),
-/// deleting resident stale tiles from `server::tile_store::TileStore` and
-/// re-rendering only those. See `server::jobs::tile_refresh` for the two-pass
-/// design. Mirrors `MatchRefreshConfig`'s shape and defaults on purpose: the
-/// two queues share the same "drain what's dirty, oldest first, bounded per
-/// tick" pattern, just against a different table and a different store.
+/// re-rendering in place only the stale tiles already resident in
+/// `server::tile_store::TileStore`. See `server::jobs::tile_refresh` for why
+/// it never deletes first. Mirrors `MatchRefreshConfig`'s shape and defaults
+/// on purpose: the two queues share the same "drain what's dirty, oldest
+/// first, bounded per tick" pattern, just against a different table and a
+/// different store.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct TileRefreshConfig {

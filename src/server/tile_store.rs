@@ -14,8 +14,8 @@
 //! There is no version, no epoch and no per-cell freshness check on the read
 //! path: a hit is served as-is. What keeps it correct is that every site which
 //! changes what a tile renders *pushes* the affected cell into
-//! `tile_dirty_cells`, and `jobs::tile_refresh` deletes and re-renders from
-//! there. See `server::tile_dirty` for the expansion rule and CLAUDE.md for the
+//! `tile_dirty_cells`, and `jobs::tile_refresh` re-renders from there. See
+//! `server::tile_dirty` for the expansion rule and CLAUDE.md for the
 //! producer list -- a producer that forgets to enqueue leaves a permanently
 //! stale tile, and `tiles clear` is the only backstop.
 //!
