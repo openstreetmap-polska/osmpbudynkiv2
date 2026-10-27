@@ -104,6 +104,14 @@ binary, easy to deploy.
 - `kv compact` — rewrite the OSM RocksDB families into their compacted shape,
   the same step `import osm` ends with (requires exclusive access). For a store
   imported before that step existed; changes no data
+- `db copy <dest>` — rewrite the DuckDB database into a new file (requires
+  exclusive access; the operator swaps it in with the service stopped). The only
+  way to reach a newer storage version: `storage_compatibility_version` applies
+  when a file is *created*, never to an existing one, and `import` rebuilds
+  tables, not the file. Also drops accumulated free blocks. Deliberately not
+  `COPY FROM DATABASE`, which grows every RTREE row by row and scrambles row
+  order under `preserve_insertion_order = false` — reasons on `src/db_copy.rs`.
+  RocksDB is not copied
 - `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package`,
   `/updates`, `/stats` + `/stats/areas` + `/stats/units` (the `stats.html`
   page's data, queried per request, cached only by HTTP `max-age`), `POST /report`,

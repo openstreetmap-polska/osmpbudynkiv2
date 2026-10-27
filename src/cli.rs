@@ -86,6 +86,11 @@ pub enum Command {
         #[command(subcommand)]
         action: KvAction,
     },
+    /// Maintain the DuckDB database file itself
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
     /// Run HTTP service with background data updates
     Run,
 }
@@ -128,6 +133,25 @@ pub enum KvAction {
     /// exclusive access to the store — do not run this while a `run` server
     /// has it open.
     Compact,
+}
+
+#[derive(Subcommand)]
+pub enum DbAction {
+    /// Rewrite the database into a new file: at the newest storage version
+    /// (an existing file never upgrades on its own), without the free blocks
+    /// the original has accumulated, and without any damage that is not
+    /// visible to a query. Every table and index is copied; row order is
+    /// kept. The original is left untouched.
+    ///
+    /// To use the copy, stop the service and move it over the original. The
+    /// RocksDB store is not copied and stays paired with whichever file sits
+    /// at `db_path`. Needs free disk for the database's live size. Requires
+    /// exclusive access to the database — do not run this while a `run`
+    /// server has it open.
+    Copy {
+        /// Path of the new database file; must not exist
+        dest: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
