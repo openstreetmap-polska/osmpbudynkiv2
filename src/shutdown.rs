@@ -102,6 +102,53 @@ pub fn check_requested() -> anyhow::Result<()> {
 /// guard.
 pub const SHUTDOWN_BAIL_MESSAGE: &str = "Shutdown requested";
 
+static DATABASE_INVALIDATED: AtomicBool = AtomicBool::new(false);
+
+/// The text DuckDB puts in every error once a fatal or internal error has
+/// invalidated the database instance. Copied from production (2026-10-27):
+/// `FATAL Error: Failed: database has been invalidated because of a previous
+/// fatal error. The database must be restarted prior to being used again.`
+///
+/// The error that *causes* the invalidation (there, `INTERNAL Error:
+/// Attempted to dereference unique_ptr that is NULL!`) does not carry it; the
+/// next statement on any connection does, so matching on this costs at most
+/// one statement of lag.
+const DATABASE_INVALIDATED_MARKER: &str = "database has been invalidated";
+
+/// Whether `error` says DuckDB has invalidated the database. Pure, so tests
+/// can check it without touching the process-global flags.
+pub fn is_database_invalidated(error: &str) -> bool {
+    error.contains(DATABASE_INVALIDATED_MARKER)
+}
+
+/// The second reason the server stops, after a signal: an invalidated
+/// database never recovers in place, so the only way back is a new process.
+/// On 2026-10-27 production served 500s for 11.5 hours with every job failing
+/// on this error, because nothing restarted it.
+///
+/// If `error` matches, logs once and requests a graceful shutdown, and
+/// [`database_invalidated`] then makes `server::run` return an error, so the
+/// process exits non-zero and the unit's `Restart=on-failure` brings it back.
+/// Returns whether it matched.
+pub fn stop_if_database_invalidated(error: &str) -> bool {
+    if !is_database_invalidated(error) {
+        return false;
+    }
+    if !DATABASE_INVALIDATED.swap(true, Ordering::SeqCst) {
+        tracing::error!(
+            error,
+            "DuckDB has invalidated the database after a fatal error; \
+             shutting down so the service manager restarts the process"
+        );
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    }
+    true
+}
+
+pub fn database_invalidated() -> bool {
+    DATABASE_INVALIDATED.load(Ordering::SeqCst)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -181,5 +228,30 @@ mod tests {
             .expect("connection must accept a statement immediately after an interrupt");
         let one: i64 = conn.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
         assert_eq!(one, 1, "connection must still answer ordinary queries");
+    }
+
+    /// Verbatim from production's journal (2026-10-27), as the job failure
+    /// path formats it.
+    #[test]
+    fn the_production_invalidation_error_is_recognised() {
+        let message = "drain: read batch_start: FATAL Error: Failed: database has been \
+            invalidated because of a previous fatal error. The database must be restarted \
+            prior to being used again.\nOriginal error: \"Attempted to dereference unique_ptr \
+            that is NULL!\": Error code 1: Unknown error code";
+        assert!(super::is_database_invalidated(message));
+    }
+
+    /// Errors a healthy process sees routinely must not restart it.
+    #[test]
+    fn recoverable_errors_are_not_mistaken_for_an_invalidated_database() {
+        for message in [
+            "Out of Memory Error: failed to allocate data of size 2.0 KiB (6.0 GiB/6.0 GiB used)",
+            "TransactionContext Error: Current transaction is aborted (please ROLLBACK)",
+            "TransactionContext Error: Conflict on tuple deletion!",
+            "INTERRUPT Error: Interrupted!",
+            super::SHUTDOWN_BAIL_MESSAGE,
+        ] {
+            assert!(!super::is_database_invalidated(message), "{message}");
+        }
     }
 }

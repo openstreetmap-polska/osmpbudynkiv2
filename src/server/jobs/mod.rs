@@ -549,11 +549,12 @@ pub(crate) async fn supervise(
         // catch-up that was working (2026-09-26). `/status` still shows the
         // `TimedOut` outcome.
         let previous_failures = consecutive_failures;
-        if run_error.is_none() {
-            consecutive_failures = 0;
-        } else {
+        if let Some(message) = &run_error {
             consecutive_failures += 1;
             failing_since.get_or_insert(finished_sys);
+            crate::shutdown::stop_if_database_invalidated(message);
+        } else {
+            consecutive_failures = 0;
         }
         let failing_since_str = failing_since.map(format_rfc3339);
         let last_success_str = last_success_at.map(format_rfc3339);

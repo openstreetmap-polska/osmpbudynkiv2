@@ -4,6 +4,7 @@ use duckdb::Connection;
 use crate::compare::incremental::recompute_cell_in_txn;
 use crate::dataset::ALL_SPECS;
 use crate::server::tile_dirty;
+use crate::shutdown;
 
 pub struct DrainStats {
     pub cells: u64,
@@ -200,11 +201,25 @@ fn drain_group(
         }
         Err(e) => {
             if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                let rb = rb.to_string();
+                // Not a poison cell: every later statement fails the same way,
+                // so a replay isolates nothing. The cells never committed and
+                // are still queued; the error carries them so a crash can be
+                // reproduced, and the marker so the server restarts.
+                if shutdown::is_database_invalidated(&rb) {
+                    return Err(e.context(format!(
+                        "match_refresh: a batch of {} cells left DuckDB invalidated \
+                         (rollback: {rb}); cells: {}",
+                        group.len(),
+                        cell_list(group)
+                    )));
+                }
                 tracing::warn!(error = %rb, "match_refresh: failed to roll back failed batch");
             }
             tracing::warn!(
                 error = %e,
-                cells = group.len(),
+                cell_count = group.len(),
+                cells = %cell_list(group),
                 "match_refresh: batch failed, replaying it one cell at a time to isolate the cause"
             );
             let (drained, failed) = replay_one_at_a_time(conn, group, batch_start, is_cancelled);
@@ -215,6 +230,16 @@ fn drain_group(
             })
         }
     }
+}
+
+/// `source/cell_x/cell_y` per cell, space-separated: enough to re-queue and
+/// replay a failed group by hand.
+fn cell_list(group: &[(String, i32, i32)]) -> String {
+    group
+        .iter()
+        .map(|(source, cx, cy)| format!("{source}/{cx}/{cy}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Recompute one cell, delete its queue rows under the batch cutoff. Assumes

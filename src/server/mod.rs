@@ -95,6 +95,9 @@ impl r2d2::ManageConnection for ClonedConnectionManager {
                 found,
                 rollback_error,
             } => {
+                // The one check every borrower passes through, request
+                // handlers included, which never reach the job failure path.
+                shutdown::stop_if_database_invalidated(&rollback_error);
                 tracing::warn!(
                     found = %found,
                     rollback_error = %rollback_error,
@@ -505,6 +508,12 @@ pub async fn run(
         "server::run returning; process exit may now block on in-flight background jobs \
          until they finish (only applies if one is still running)"
     );
+
+    // Non-zero exit, so `Restart=on-failure` brings the process back; a clean
+    // `Ok` would leave it stopped. See `shutdown::stop_if_database_invalidated`.
+    if shutdown::database_invalidated() {
+        anyhow::bail!("stopped because DuckDB invalidated the database; restart to recover");
+    }
 
     serve_result.context("HTTP server error")?;
 
