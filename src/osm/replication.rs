@@ -150,7 +150,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let mut lat = 0.0f64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
-                            let val = std::str::from_utf8(&attr.value)?;
+                            let val = attr.decode_and_unescape_value(reader.decoder())?;
                             match key {
                                 "id" => id = val.parse()?,
                                 "version" => version = val.parse()?,
@@ -175,7 +175,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let mut version = 0u64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
-                            let val = std::str::from_utf8(&attr.value)?;
+                            let val = attr.decode_and_unescape_value(reader.decoder())?;
                             match key {
                                 "id" => id = val.parse()?,
                                 "version" => version = val.parse()?,
@@ -197,7 +197,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let mut version = 0u64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
-                            let val = std::str::from_utf8(&attr.value)?;
+                            let val = attr.decode_and_unescape_value(reader.decoder())?;
                             match key {
                                 "id" => id = val.parse()?,
                                 "version" => version = val.parse()?,
@@ -226,10 +226,10 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let mut v = String::new();
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
-                            let val = std::str::from_utf8(&attr.value)?;
+                            let val = attr.decode_and_unescape_value(reader.decoder())?;
                             match key {
-                                "k" => k = val.to_string(),
-                                "v" => v = val.to_string(),
+                                "k" => k = val.into_owned(),
+                                "v" => v = val.into_owned(),
                                 _ => {}
                             }
                         }
@@ -245,7 +245,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         if let Some(ref mut way) = current_way {
                             for attr in e.attributes().flatten() {
                                 let key = std::str::from_utf8(attr.key.as_ref())?;
-                                let val = std::str::from_utf8(&attr.value)?;
+                                let val = attr.decode_and_unescape_value(reader.decoder())?;
                                 if key == "ref" {
                                     way.node_refs.push(val.parse()?);
                                 }
@@ -259,11 +259,11 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                             let mut role = String::new();
                             for attr in e.attributes().flatten() {
                                 let key = std::str::from_utf8(attr.key.as_ref())?;
-                                let val = std::str::from_utf8(&attr.value)?;
+                                let val = attr.decode_and_unescape_value(reader.decoder())?;
                                 match key {
-                                    "type" => member_type = val.to_string(),
+                                    "type" => member_type = val.into_owned(),
                                     "ref" => member_ref = val.parse()?,
-                                    "role" => role = val.to_string(),
+                                    "role" => role = val.into_owned(),
                                     _ => {}
                                 }
                             }
@@ -284,7 +284,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let mut lat = 0.0f64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
-                            let val = std::str::from_utf8(&attr.value)?;
+                            let val = attr.decode_and_unescape_value(reader.decoder())?;
                             match key {
                                 "id" => id = val.parse()?,
                                 "version" => version = val.parse()?,
@@ -310,7 +310,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let mut version = 0u64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
-                            let val = std::str::from_utf8(&attr.value)?;
+                            let val = attr.decode_and_unescape_value(reader.decoder())?;
                             match key {
                                 "id" => id = val.parse()?,
                                 "version" => version = val.parse()?,
@@ -333,7 +333,7 @@ pub fn parse_osc(xml: &str) -> Result<OsmChange> {
                         let mut version = 0u64;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref())?;
-                            let val = std::str::from_utf8(&attr.value)?;
+                            let val = attr.decode_and_unescape_value(reader.decoder())?;
                             match key {
                                 "id" => id = val.parse()?,
                                 "version" => version = val.parse()?,
@@ -596,6 +596,48 @@ mod tests {
                 (1, vec![2], vec![("building".into(), "yes".into())]),
                 (1, vec![2, 3], vec![("building".into(), "house".into())]),
             ]
+        );
+        Ok(())
+    }
+
+    /// Attribute values are stored unescaped, as `import osm` stores them from
+    /// the PBF. Taking the raw bytes kept `&quot;` in an `addr:street`, which
+    /// then never equalled the PRG street name it should match.
+    #[test]
+    fn test_parse_osc_unescapes_attribute_values() -> Result<()> {
+        let change = parse_osc(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="1" version="2" lon="21.0" lat="52.0"><tag k="name" v="A &lt;&gt; B&#10;C"/></node>
+    <way id="2" version="3">
+      <nd ref="1"/>
+      <tag k="addr:street" v="Armii &quot;Krajowej&quot;"/>
+      <tag k="name" v="Kowalski &amp; Syn&apos;s"/>
+    </way>
+    <relation id="3" version="4">
+      <member type="way" ref="2" role="o&amp;uter"/>
+      <tag k="note&#x3A;pl" v="&#x105;"/>
+    </relation>
+  </modify>
+</osmChange>"#,
+        )?;
+
+        assert_eq!(
+            change.nodes[0].tags,
+            vec![("name".into(), "A <> B\nC".into())]
+        );
+        assert_eq!(
+            change.ways[0].tags,
+            vec![
+                ("addr:street".into(), "Armii \"Krajowej\"".into()),
+                ("name".into(), "Kowalski & Syn's".into()),
+            ]
+        );
+        assert_eq!(change.relations[0].members[0].role, "o&uter");
+        assert_eq!(
+            change.relations[0].tags,
+            vec![("note:pl".into(), "ą".into())]
         );
         Ok(())
     }
