@@ -17,14 +17,14 @@ duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.10505.0", feat
 r2d2 = "0.8"
 flate2 = "1"
 prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.8.0", default-features = false, features = ["download"] }
-quick-xml = "0.37"
+quick-xml = "0.38"
 reqwest = { version = "0.13", features = ["rustls", "stream"], default-features = false }
-indicatif = "0.17"
+indicatif = "0.18"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 tower-http = { version = "0.6", features = ["fs", "set-header", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
