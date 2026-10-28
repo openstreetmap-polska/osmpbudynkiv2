@@ -29,7 +29,7 @@ tower-http = { version = "0.6", features = ["fs", "set-header", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "6", default-features = false, features = ["deflate", "deflate64"] }
-rocksdb = { package = "rust-rocksdb", version = "0.52", default-features = false, features = ["zstd", "jemalloc"] }
+rocksdb = { package = "rust-rocksdb", version = "0.53", default-features = false, features = ["zstd", "jemalloc"] }
 osmpbf = "0.3.8"
 # Only ever pulled in by the `heap-profiling` feature. `rust-rocksdb`'s
 # `jemalloc` feature already depends on this exact crate, so naming it here does

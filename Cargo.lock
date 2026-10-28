@@ -2383,9 +2383,9 @@ dependencies = [
 
 [[package]]
 name = "rust-rocksdb"
-version = "0.52.0"
+version = "0.53.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b44b668dfc691c475a01f26181e326ca85cbe8b8ae89418b39aba64af0da59b"
+checksum = "38f59818211992b80ecd5d5195fc821b4917afd7ca771b8e0cc893c5909108e3"
 dependencies = [
  "libc",
  "parking_lot",

@@ -112,6 +112,8 @@ pub struct RocksDB {
 /// Measured against the real store: +1-2% on the `update osm` read path and
 /// +2-4% on tile-store gets (~0.15 us per get), negligible next to an HTTP
 /// response. Histograms or timers would cost more and nothing reads them.
+/// Those numbers are an upper bound: before `rust-rocksdb` 0.53 this variant
+/// selected the next level up, `ExceptTimers`, so they include histograms.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct KvStats {
     pub block_cache_data_hit: u64,
