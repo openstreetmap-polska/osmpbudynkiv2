@@ -311,8 +311,11 @@ fn report(
 }
 
 /// The storage version stamped in a database file's active header — the
-/// number `storage_compatibility_version` resolves to (7 for DuckDB 1.5.x).
-/// DuckDB exposes no SQL for it, which is why this reads the file.
+/// number `storage_compatibility_version` resolves to: 7 for `v1.5.0`
+/// (DuckDB 1.5.x's `latest`), 69 for DuckDB 2.0's `latest`, whose files also
+/// carry main-header format 999 where 1.5 wrote 68, and which DuckDB 1.5
+/// refuses to open. DuckDB exposes no SQL for it, which is why this reads the
+/// file.
 ///
 /// Layout (`single_file_block_manager.cpp`): a main header at offset 0 with
 /// the `DUCK` magic at byte 8 and the format number at byte 12, then two

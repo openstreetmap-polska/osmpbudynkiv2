@@ -274,8 +274,10 @@ coerces either, since `content_hash_sql` hashes a `DOUBLE` 1.0 differently from
 an `INTEGER` 1 where row-wise `IS DISTINCT FROM` called them equal. Unguarded,
 a loader that retyped a compared column would report every row in the source as
 modified — a national rewrite dirtying every z14 cell, with nothing naming the
-cause. Integer *widths* are safe (`TINYINT`/`INTEGER`/`BIGINT` of one value hash
-identically), so only a genuine type change trips it.
+cause. It compares the declared type strings exactly, so an integer *width*
+change trips it too, and must: `hash()` of a negative value differs between
+`INTEGER` and `BIGINT` (`TINYINT`/`SMALLINT`/`INTEGER` agree, and so do
+positive values; same on DuckDB 1.5.5 and 2.0).
 
 ### The match rule and its three vetoes
 
