@@ -25,10 +25,10 @@
 # KEEP IN SYNC WITH Cargo.toml
 # ----------------------------
 # This must match the DuckDB version behind the `duckdb`/`libduckdb-sys` tag
-# pinned in Cargo.toml (`tag = "v1.10505.0"` -> DuckDB v1.5.5). Nothing checks
+# pinned in Cargo.toml (`tag = "v1.20000.1"` -> DuckDB v2.0.0). Nothing checks
 # the two against each other, and a mismatch fails the same silent way: DuckDB
 # reports a version whose extension directory holds the wrong binaries.
 # `db::tests::duckdb_reports_a_real_version_so_extensions_resolve` asserts the
 # built library's actual version, so a drift here fails one named test instead of
 # several hundred unrelated-looking ones.
-set(OVERRIDE_GIT_DESCRIBE "v1.5.5" CACHE STRING "DuckDB version stamp" FORCE)
+set(OVERRIDE_GIT_DESCRIBE "v2.0.0" CACHE STRING "DuckDB version stamp" FORCE)

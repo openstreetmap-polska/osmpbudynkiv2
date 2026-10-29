@@ -375,9 +375,7 @@ mod tests {
     /// as the sibling test. See that test's doc comment for what was (and
     /// was not) verified about the `MATERIALIZED` keyword specifically; the
     /// same caveat applies here; `build_sql` keeps `MATERIALIZED` regardless,
-    /// matching the established `src/server/tiles.rs` pattern. Only the
-    /// substring "RTREE_IN" is asserted, for the same truncated-EXPLAIN-label
-    /// reason as `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`.
+    /// matching the established `src/server/tiles.rs` pattern.
     #[test]
     fn drain_candidate_cte_uses_the_centroid_rtree_index() {
         let c = conn();
@@ -402,7 +400,7 @@ mod tests {
             plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
         }
         assert!(
-            plan.contains("RTREE_IN"),
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
             "the cell-totals candidate CTE must use the centroid RTREE index, got plan: {plan}"
         );
     }

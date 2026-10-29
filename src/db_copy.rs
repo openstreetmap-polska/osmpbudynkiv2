@@ -428,9 +428,10 @@ mod tests {
             .query_map([], |r| r.get::<_, String>(1))?
             .collect::<duckdb::Result<Vec<_>>>()?
             .join("\n");
-        // Truncated operator label in wide plans; see
-        // `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`.
-        assert!(plan.contains("RTREE_IN"), "copied index not used:\n{plan}");
+        assert!(
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
+            "copied index not used:\n{plan}"
+        );
         Ok(())
     }
 

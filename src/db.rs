@@ -433,6 +433,15 @@ pub(crate) fn values_sql(rows: usize, types: &[&str]) -> String {
     vec![row; rows].join(", ")
 }
 
+/// How text `EXPLAIN` labels an RTREE index scan, for the tests that assert a
+/// query still reaches its index. DuckDB 2.0's renderer prints the full name
+/// in each box's header; 1.5 printed `RTREE_INDEX_SCAN` and truncated it in a
+/// wide plan, which is why those tests used to match the prefix `RTREE_IN`.
+/// `EXPLAIN (FORMAT JSON)` still says `RTREE_INDEX_SCAN` and also names the
+/// index, so prefer it where the index name matters.
+#[cfg(test)]
+pub(crate) const EXPLAIN_RTREE_SCAN: &str = "Rtree Index Scan";
+
 #[cfg(test)]
 mod tests {
     use super::*;

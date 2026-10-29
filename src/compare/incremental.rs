@@ -420,15 +420,12 @@ mod tests {
     ///
     /// osm_buildings / osm_former_buildings are left empty and unindexed --
     /// exactly what `db::create_schema` gives you before `import osm`'s
-    /// `create_spatial_indexes` ever runs -- so a false-positive "RTREE_IN"
+    /// `create_spatial_indexes` ever runs -- so a false-positive RTREE scan
     /// match from either anti-join side is structurally impossible: the only
     /// RTREE index anywhere in this fixture is the one built below on
-    /// `bdot10k_buildings.centroid`. Only the substring "RTREE_IN" is
-    /// asserted (DuckDB's EXPLAIN pretty-printer truncates operator labels in
-    /// a wide plan -- see `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`),
-    /// and the absence of "Sequential Scan" is deliberately NOT asserted: the
-    /// fixed plan still legitimately contains one, from the empty anti-join
-    /// tables.
+    /// `bdot10k_buildings.centroid`. The absence of a sequential scan is
+    /// deliberately NOT asserted: the fixed plan still legitimately contains
+    /// one, from the empty anti-join tables.
     #[test]
     fn drain_candidate_cte_uses_the_centroid_rtree_index() {
         let c = conn();
@@ -453,7 +450,7 @@ mod tests {
             plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
         }
         assert!(
-            plan.contains("RTREE_IN"),
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
             "the drained cell's candidate CTE must use the centroid RTREE index, got plan: {plan}"
         );
     }
@@ -469,7 +466,7 @@ mod tests {
     /// and the test would pass for the wrong reason.
     ///
     /// `osm_addresses` is left empty and unindexed (what `db::create_schema`
-    /// gives you before `import osm`), so a "RTREE_IN" match can only be
+    /// gives you before `import osm`), so an RTREE scan match can only be
     /// coming from `prg_addresses`.
     #[test]
     fn drain_prg_candidate_cte_uses_the_geom_rtree_index() {
@@ -493,7 +490,7 @@ mod tests {
             plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
         }
         assert!(
-            plan.contains("RTREE_IN"),
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
             "the drained cell's address CTE must use the geom RTREE index, got plan: {plan}"
         );
     }

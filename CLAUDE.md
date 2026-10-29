@@ -37,8 +37,8 @@ everything non-DuckDB. Four load-bearing points:
    drops DuckDB's jemalloc.** jemalloc lives in the `duckdb-sources` submodule,
    which the published crate `exclude`s, and the `bundled` amalgamation backend
    has no jemalloc sources at all. Only `bundled-cmake` has it, and it *requires*
-   a git checkout. The tag pins the exact version the registry dep used
-   (`v1.10505.0`) — the git source buys the build backend and nothing else.
+   a git checkout. The tag pins a published release (`v1.20000.1`) — the git
+   source buys the build backend and nothing else.
    `bundled-cmake` is marked experimental upstream.
 2. **The dev-dependency must name the same source as the normal dependency.**
    Two packages both declaring `links = "duckdb"` is a hard cargo error.
@@ -65,7 +65,7 @@ tests fail from this one cause.
    `-DCMAKE_C_COMPILER`/`CXX_COMPILER`. Fine natively, load-bearing for a
    cross-compile.
 2. **`cmake/duckdb_version.cmake` must move in lockstep with the `duckdb` tag in
-   `Cargo.toml`** (`v1.10505.0` ⇒ DuckDB `v1.5.5`). Nothing links them
+   `Cargo.toml`** (`v1.20000.1` ⇒ DuckDB `v2.0.0`). Nothing links them
    automatically. `db::tests::duckdb_reports_a_real_version_so_extensions_resolve`
    is the guard; it pins the *shape*, so a routine bump needs no test edit.
 3. **Editing the toolchain file does not rebuild DuckDB, and `cargo clean -p
@@ -998,9 +998,10 @@ optimizer can re-plan the filtered CTE into a plain `SEQ_SCAN` plus a separate
 four `*_pkg`/`*_nb` CTEs are all `MATERIALIZED` for this reason — removing the
 keyword reintroduces a full table scan while every functional test still passes.
 Only `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`, which asserts
-on `EXPLAIN` text, catches it; note that test searches for the substring
-`"RTREE_IN"` because wide plans truncate operator labels — don't "fix" it back to
-the full name.
+on `EXPLAIN` text, catches it. Every such test matches `db::EXPLAIN_RTREE_SCAN`,
+the one home for the text label: it changed with DuckDB 2.0 (`RTREE_INDEX_SCAN`
+→ `Rtree Index Scan`), and a renamed label turns these tests into failures
+that look like lost indexes.
 
 **Gotcha — the same index loss has a second, unrelated trigger: an expression
 equality filter on the indexed column alongside the `ST_Intersects`.** Both
