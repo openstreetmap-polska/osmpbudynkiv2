@@ -50,32 +50,27 @@ everything non-DuckDB. Four load-bearing points:
    runtime autoload dependency rather than changing behaviour.
    `DUCKDB_DISABLE_JEMALLOC=1` is the escape hatch for the DuckDB side only.
 
-**Gotcha — DuckDB's version comes from `git describe`, cargo's checkout has no
-tags, so it must be forced.** `describe` fails, DuckDB continues with the dummy
-version **`v0.0.1`** (a `message(WARNING)`, never an error), and since the
-version string *is* the extension repository path, `INSTALL spatial` 404s. That
-is in the default `duckdb_init_commands`, so *every* CLI command and hundreds of
-tests fail from this one cause.
+**Gotcha — DuckDB's version stamp is the extension repository path.** DuckDB
+derives its version from `git describe`, which fails in cargo's tagless checkout,
+and then continues as the dummy **`v0.0.1`** with only a `message(WARNING)`.
+Since the version string *is* the extension repository path, `INSTALL spatial`
+404s, and that is in the default `duckdb_init_commands`, so *every* CLI command
+and hundreds of tests fail from this one cause. Two things:
 
-1. **The fix is a CMake toolchain file** (`cmake/duckdb_version.cmake`, forcing
-   `OVERRIDE_GIT_DESCRIBE`), pointed at by `.cargo/config.toml`'s `[env]` with
-   `relative = true`. There is no other injection point: `libduckdb-sys` forwards
-   a fixed env list and rejects `DUCKDB_EXTENSION_CONFIGS`. Side effect: with a
-   toolchain file set, the `cmake` crate stops passing
-   `-DCMAKE_C_COMPILER`/`CXX_COMPILER`. Fine natively, load-bearing for a
-   cross-compile.
-2. **`cmake/duckdb_version.cmake` must move in lockstep with the `duckdb` tag in
-   `Cargo.toml`** (`v1.20000.1` ⇒ DuckDB `v2.0.0`). Nothing links them
-   automatically. `db::tests::duckdb_reports_a_real_version_so_extensions_resolve`
-   is the guard; it pins the *shape*, so a routine bump needs no test edit.
-3. **Editing the toolchain file does not rebuild DuckDB, and `cargo clean -p
-   libduckdb-sys` does not either** — the spec silently matches nothing for a git
-   source and exits 0. Delete by hand: `rm -rf target/*/build/libduckdb-sys-*
-   target/*/.fingerprint/libduckdb-sys-*`, then rebuild (≈12 min). Confirm by
-   grepping `OVERRIDE_GIT_DESCRIBE` out of the generated `CMakeCache.txt`.
-4. **`spatial` cannot be statically linked.** Only DuckDB's *in-tree* extensions
+1. **duckdb-rs `v1.20000.1`+ stamps it itself**: its bundled-cmake build script
+   passes `DUCKDB_EXPLICIT_VERSION`, derived from the crate version
+   (`1.20000.x` ⇒ `v2.0.0`, overridable with `DUCKDB_VERSION`), on every build.
+   Up to 1.10505 this project forced it with a CMake toolchain file
+   (`cmake/duckdb_version.cmake` via `.cargo/config.toml`), which had to move in
+   lockstep with the tag and did not trigger a rebuild when edited; both are
+   gone. `db::tests::duckdb_reports_a_real_version_so_extensions_resolve` is
+   still the guard, and pins the *shape*, so a routine bump needs no test edit.
+2. **`spatial` cannot be statically linked.** Only DuckDB's *in-tree* extensions
    can be; `spatial` is out-of-tree and `bundled-cmake` panics on the mechanism
-   that would pull it in. So a correct version stamp is non-negotiable.
+   that would pull it in. So a correct version stamp is non-negotiable. Since
+   DuckDB 2.0, installing at all also needs the `duckdb_loadable_extensions`
+   and `duckdb_httplib` libraries linked, which duckdb-rs `v1.20000.0` did not
+   do and `v1.20000.1` does.
 
 ## Architecture
 
@@ -544,8 +539,9 @@ or deletes a queue row for a change the recompute never read.
 **Gotcha — a drain batch commits every `CELLS_PER_COMMIT` (64) cells, and
 cancellation commits.** Not per cell: 512 commits per batch, each a WAL append
 and flush, is the wrong ratio against ~0.098 s of real work per cell. Not per
-batch either: that held 123–171 MiB of transaction memory until COMMIT (see the
-per-statement INSERT gotcha below). Three things make grouping safe, and none of
+batch either: on DuckDB 1.5 that held 123–171 MiB of transaction memory until
+COMMIT (the chunked-writes rule below), and on 2.0 it would still make one failed
+cell roll back and replay up to 512. Three things make grouping safe, and none of
 them is obvious:
 
 1. **Cancellation commits rather than rolling back.** Each cell's recompute is
@@ -931,48 +927,31 @@ the column reads NULL. The one `ALTER TABLE` in the codebase
 (`dataset::drop_ordering_column`) runs against a table the *same load's own*
 `CREATE TABLE AS SELECT` built moments earlier, never a pre-existing database.
 
-**Gotcha — on DuckDB 1.5.x every INSERT inside a transaction holds ~18–29 KiB
-per column until COMMIT, whatever its row count.** With `threads > 1` and
-`preserve_insertion_order = false` (production's settings) every INSERT takes
-the parallel path, which never frees its per-statement collection; it counts
-against `memory_limit`. One INSERT per row inside a transaction is what took a
-mass OSM revert to 2.8 GB and `Out of Memory Error`, twice. So **inside a
-transaction, write a set with one statement per table per chunk, never one per
-row**: a parameterized multi-row `VALUES` list (`db::values_sql`, every
-placeholder cast so an all-NULL column still types) and an interpolated integer
-`IN` list for ids (`db::id_list_sql`). `update::osm` (`REBUILD_CHUNK`),
-`reports::import_rows` and the drain's `CELLS_PER_COMMIT` follow this. Three
-traps:
+**Inside a transaction, write a set with one statement per table per chunk,
+never one per row**: a parameterized multi-row `VALUES` list (`db::values_sql`,
+every placeholder cast so an all-NULL column still types) and an interpolated
+integer `IN` list for ids (`db::id_list_sql`). `update::osm` (`REBUILD_CHUNK`),
+`reports::import_rows` and the drain's `CELLS_PER_COMMIT` follow this. On
+DuckDB 1.5 it was a memory rule: every INSERT inside a transaction held ~18–29
+KiB per column until COMMIT on the parallel insert path, which took a mass OSM
+revert to 2.8 GB and `Out of Memory Error`, twice. DuckDB 2.0 fixed that
+(`575fd1b97b`; 300 single-row INSERTs now hold 0 MiB, was ~21 MiB), and the
+tests that guarded it are gone. The rule stays for speed: the mass revert went
+1,598 s → 58 s, mostly per-object DELETEs each scanning an unindexed table. One
+cost to know: a 1,000-id `IN` list is planned as a MARK hash join that reads
+every projected column, so one lookup caches ~817 MiB of `osm_buildings`
+blocks (evictable buffer pool, not transaction memory). Write-up:
+`docs/duckdb_per_statement_insert_memory.md`.
 
-1. **A memory test is vacuous unless it sets `SET GLOBAL
-   preserve_insertion_order = false` and `threads > 1`** (the test default
-   hides the bug; `db_memory::use_parallel_insert_path`), and reads
-   `IN_MEMORY_TABLE` *before* COMMIT/ROLLBACK
-   (`db_memory::in_memory_table_bytes`).
-2. **`db_memory::tests::per_row_inserts_in_one_transaction_hold_memory_until_commit`
-   is a negative control that asserts the bug exists.** When a DuckDB upgrade
-   makes it fail, the fix (`575fd1b97b`, DuckDB 2.0) has arrived and the
-   regression tests next to it have become vacuous — nothing broke.
-3. **A 1,000-id `IN` list is planned as a MARK hash join**, so it reads every
-   projected column of the table, not only the matching rows: one lookup
-   caches ~817 MiB of `osm_buildings` blocks. That is evictable buffer pool,
-   not transaction memory, and still ~27× faster end to end than per-row
-   statements (1,598 s → 58 s on the real mass revert).
-
-Write-up and measurements: `docs/duckdb_per_statement_insert_memory.md`.
-
-**Gotcha — never hand DuckDB an Arrow batch through duckdb-rs's `arrow()`
-table function on a repeated path.** `arrow_recordbatch_to_query_params` (and
-its `_arraydata_`/`_ffi_` siblings) push every batch into a process-global store
-that is **never freed**. `import::prg::stream_gml_into` called it once per
-2,048-row batch, so the server kept every parsed PRG address alive: **~2.8 GiB
-per daily `update prg`**, from v0.1.2 until heap profiling found it. A CLI
-`import` leaks the same bytes but exits, so tests and imports never show it.
-Load batches with `Appender::append_record_batch` (`appender-arrow` feature)
-into a table from `import::prg::create_table_for_schema`. Its column types come
-from the same `to_duckdb_logical_type_for_field` the Appender types its chunks
-with, so they cannot drift apart. `ArrowVTab` is still registered in `db.rs`,
-unused. Write-up: `docs/prg_arrow_batch_leak.md`.
+**Arrow batches load through the `Appender`.** `import::prg::stream_gml_into`
+uses `Appender::append_record_batch` (`appender-arrow` feature) into a table
+from `import::prg::create_table_for_schema`, whose column types come from the
+same `to_duckdb_logical_type_for_field` the Appender types its chunks with, so
+they cannot drift apart. History: up to duckdb-rs 1.10505 the `arrow()` table
+function's `arrow_recordbatch_to_query_params` kept every batch in a global
+store forever, ~2.8 GiB per daily `update prg` (`docs/prg_arrow_batch_leak.md`).
+duckdb-rs 1.20000 replaced it with a registration freed on drop, and `db.rs`
+no longer registers `arrow()` at all.
 
 **Gotcha — the government loaders store only the columns anything reads.** They
 project an explicit column list, not `SELECT *`/`EXCLUDE`/`REPLACE` — a source
@@ -1039,18 +1018,6 @@ twice per drained cell. Both now wrap the source scan in a `candidates` CTE via 
    measurements and the two benchmarking traps that each produced a confident
    wrong answer (a pruned stand-in projection, and the debug binary's ~2.7×
    per-cell penalty) are on the constant in `compare::buildings`.
-
-**Gotcha — a correlated `NOT EXISTS` over a CTE that aggregates is a
-`DELIM_JOIN`, and at national scale that is a memory bill, not a style
-choice.** `compare::addresses::build_sql` removes the matched ids with an
-explicit `ANTI JOIN matched_ids`, because `matched_ids` is a `SELECT DISTINCT`
-and DuckDB does not flatten `NOT EXISTS (SELECT 1 FROM matched_ids ...)` over
-it: it materializes every `prg_addresses` row with all projected columns
-first. Identical rows either way; ~5 GB of working memory against ~2.5 GB,
-and the `NOT EXISTS` form fails outright at a 3 GB limit. On production that
-one statement took 1h 3m 53s while the building compares took minutes. Pinned by
-`addresses::tests::the_matched_ids_are_removed_by_a_plain_anti_join`, which
-carries its own negative control — no functional test can see the difference.
 
 **Gotcha — the `tiles` column family is the one that opts out of everything
 the others do.** It holds rendered z12–z14 `/tiles` bodies

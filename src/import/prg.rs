@@ -290,18 +290,19 @@ fn cleanup_if_downloaded(zip_path: &Path, should_delete: bool) {
 /// appending the rest. Drops any leftover `raw_table` from a previous run
 /// first.
 ///
-/// **Batches go through the `Appender`, never `SELECT * FROM arrow(?, ?)`.**
-/// `duckdb::vtab::arrow::arrow_recordbatch_to_query_params` pushes every batch
-/// into a process-global store that is never freed (its own doc comment says
-/// so: "Memory grows monotonically"), so calling it per batch retained the
-/// entire parsed PRG snapshot -- ~2.8 GiB of Arrow string buffers -- for the
-/// life of the server, once per daily `update prg`. Found by heap profiling in
-/// production; see `docs/prg_arrow_batch_leak.md`. A one-off `import prg`
-/// leaked the same bytes but exited, which is why nothing noticed.
+/// **Batches go through the `Appender`, not the `arrow()` table function.**
+/// Up to duckdb-rs 1.10505, `arrow_recordbatch_to_query_params` pushed every
+/// batch into a process-global store that was never freed, so calling it per
+/// batch retained the entire parsed PRG snapshot -- ~2.8 GiB of Arrow string
+/// buffers -- for the life of the server, once per daily `update prg` (found by
+/// heap profiling in production; `docs/prg_arrow_batch_leak.md`). duckdb-rs
+/// 1.20000 replaced it with `ArrowBatchRegistration`, which frees its batch on
+/// drop, so that hazard is gone. The Appender stays because it copies each
+/// batch into the table directly, with no registry and no SQL round trip.
 ///
 /// The table is created by [`create_table_for_schema`] rather than a
-/// `CREATE TABLE AS SELECT` over the first batch, because that CTAS needs the
-/// same leaking function.
+/// `CREATE TABLE AS SELECT` over the first batch, so it needs no table
+/// function either.
 ///
 /// `coordinate_order` goes straight to the parser (see
 /// [`resolve_coordinate_order`]). **An axis order is only ever corrected

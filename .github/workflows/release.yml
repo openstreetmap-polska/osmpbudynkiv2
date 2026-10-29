@@ -92,12 +92,10 @@ jobs:
     - name: Cache Rust build
       uses: Swatinem/rust-cache@v2
       with:
-        # Cargo.lock, the rustc version and the cargo config are folded into
-        # the computed key already. `cmake/duckdb_version.cmake` is not, and it
-        # decides the version DuckDB stamps into itself — a wrong stamp makes
-        # every `INSTALL <extension>` 404 (see CLAUDE.md). It is exactly the
-        # file that does not trigger a rebuild locally either, so without this
-        # a bumped DuckDB version would keep restoring the old build.
+        # Cargo.lock and the rustc version are folded into the computed key
+        # already, and since duckdb-rs 1.20000.1 the version DuckDB stamps into
+        # itself comes from libduckdb-sys's crate version in Cargo.lock, so a
+        # DuckDB bump changes the key by itself.
         #
         # `ImageOS` (`ubuntu22`/`ubuntu24`, set by the GitHub-hosted runner) is
         # folded in because rust-cache's own key uses `runner.os`, which is
@@ -106,7 +104,7 @@ jobs:
         # fingerprints still match, so they are linked rather than rebuilt --
         # silently undoing the `runs-on` pin above and reproducing the exact
         # glibc/libstdc++ failure it exists to prevent, after a green build.
-        key: ${{ env.ImageOS }}-${{ hashFiles('cmake/duckdb_version.cmake', '.cargo/config.toml') }}
+        key: ${{ env.ImageOS }}
         # A cold run that fails in our own crate still leaves half an hour of
         # compiled C++ behind. Keeping it turns the retry into a short job.
         cache-on-failure: true

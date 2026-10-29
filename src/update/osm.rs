@@ -1087,7 +1087,7 @@ fn apply_collapsed_phases(
 /// Objects per statement in `update osm`'s writes: every DELETE, INSERT and
 /// `note_existing` query covers up to this many objects of one kind.
 ///
-/// **The chunking is the memory fix, and the size is not.** On DuckDB 1.5.x
+/// **The chunking was the memory fix, and the size is not.** On DuckDB 1.5.x
 /// each INSERT statement inside a transaction holds ~18-29 KiB *per column*
 /// until COMMIT (the parallel insert path taken under production's
 /// `preserve_insertion_order = false`; see
@@ -1095,8 +1095,9 @@ fn apply_collapsed_phases(
 /// is what took a mass revert of ~8,500 addressed building ways to 2.8 GB of
 /// `IN_MEMORY_TABLE` and an `Out of Memory Error`, twice. Any chunk size
 /// removes that; this one only bounds the statement text and its parameter
-/// count. It also cuts the time: the per-object DELETEs each scanned the
-/// whole unindexed table, 11 of 18 s in that measurement (0.10 s batched).
+/// count. DuckDB 2.0 no longer holds per-statement memory, so what keeps the
+/// chunking is the time: the per-object DELETEs each scanned the whole
+/// unindexed table, 11 of 18 s in that measurement (0.10 s batched).
 const REBUILD_CHUNK: usize = 1000;
 
 fn text(value: Option<String>) -> Value {
@@ -6225,25 +6226,19 @@ mod tests {
     /// A mass edit of the shape that stalled production twice (2026-09-23,
     /// 2026-09-26): hundreds of addressed building ways rebuilt in one batch,
     /// half through the inferred arm (their nodes moved) and half re-tagged
-    /// directly, plus address nodes and a relation. Inside the open
-    /// transaction the rebuild must hold next to no `IN_MEMORY_TABLE`.
-    ///
-    /// One INSERT statement per row held ~18-29 KiB *per column* until COMMIT
-    /// on DuckDB 1.5.x's parallel insert path, so this batch held ~90 MiB
-    /// with the per-object SQL; the chunked statements hold a few MiB. See
-    /// `docs/duckdb_per_statement_insert_memory.md`, and
-    /// `db_memory::tests::per_row_inserts_in_one_transaction_hold_memory_until_commit`
-    /// -- the negative control that says whether this test still means
-    /// anything.
+    /// directly, plus address nodes and a relation, all through the chunked
+    /// statements. On DuckDB 1.5 this test also bounded the transaction's
+    /// memory, which one INSERT per row held until COMMIT
+    /// (`docs/duckdb_per_statement_insert_memory.md`); DuckDB 2.0 fixed that,
+    /// so what is left to pin is that the whole batch applies.
     #[test]
-    fn a_mass_rebuild_holds_no_per_row_transaction_memory() -> Result<()> {
+    fn a_mass_rebuild_applies_every_change() -> Result<()> {
         const WAYS: i64 = 300;
         const NODES: i64 = 50;
         let dir = tempfile::tempdir()?;
         let kv = Arc::new(kvstore::open(&dir.path().join("kv"), 8, 4, 8)?);
         let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
         let conn = init_db(&dir.path().join("db.duckdb"), &init, Some(kv.clone()))?;
-        crate::db_memory::use_parallel_insert_path(&conn)?;
 
         let centre = |i: i64| (21.0 + 0.001 * i as f64, 52.0);
         let mut seed = Vec::new();
@@ -6306,26 +6301,13 @@ mod tests {
             ],
         });
 
-        conn.execute_batch("BEGIN TRANSACTION")?;
         apply_changes(&conn, &kv, &changes)?;
-        let held = crate::db_memory::in_memory_table_bytes(&conn)?;
         let rows: (i64, i64) = conn.query_row(
             "SELECT (SELECT count(*) FROM osm_buildings), (SELECT count(*) FROM osm_addresses)",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        conn.execute_batch("ROLLBACK")?;
-
-        assert_eq!(
-            rows,
-            (WAYS + 1, WAYS + NODES + 1),
-            "the batch itself applied"
-        );
-        assert!(
-            held < 16 * 1024 * 1024,
-            "the rebuild held {} of transaction-local memory -- per-row INSERTs are back?",
-            crate::db_memory::fmt_bytes(held)
-        );
+        assert_eq!(rows, (WAYS + 1, WAYS + NODES + 1), "the batch applied");
         Ok(())
     }
 

@@ -48,7 +48,7 @@ Pierwsza kompilacja będzie trwać dość długo ze względu na konieczność sk
 
 ### Notatki o wersji DuckDB oraz o użyciu alokatora Jemalloc (przydatne przy aktualizacjach dependencji):
 
-Proces budowania czyta plik `.cargo/config.toml`, który wskazuje CMake na `cmake/duckdb_version.cmake`, żeby ustawić wersję DuckDB. Kompilowanie spoza katalogu głównego repozytorium albo z już ustawioną zmienną środowiskową `CMAKE_TOOLCHAIN_FILE` pomija ten krok i daje w efekcie DuckDB, który raportuje wersję `v0.0.1` i nie potrafi zainstalować potrzebnego rozszerzenia `spatial`. Przy podnoszeniu przypiętego tagu `duckdb` trzeba zaktualizować `cmake/duckdb_version.cmake`, tak by pasował, i wymusić ponowną kompilację DuckDB poleceniem `rm -rf target/*/build/libduckdb-sys-* target/*/.fingerprint/libduckdb-sys-*` (`cargo clean -p libduckdb-sys` nie zadziała dla paczki pobranej z gita).
+Wersję DuckDB, od której zależy ścieżka repozytorium rozszerzeń (a więc instalacja `spatial`), ustawia skrypt budowania `libduckdb-sys` na podstawie wersji paczki (`1.20000.x` ⇒ `v2.0.0`); można ją nadpisać zmienną `DUCKDB_VERSION`. Przy podnoszeniu przypiętego tagu `duckdb` nic więcej nie trzeba zmieniać.
 
 Oba silniki bazodanowe są budowane z jemalloc: DuckDB używa własnej, dołączonej kopii z prefiksem `duckdb_je_`, natomiast RocksDB pociąga za sobą `tikv-jemalloc-sys`, który dodatkowo podmienia `malloc` w całym procesie. Ustawienie `DUCKDB_DISABLE_JEMALLOC=1` powoduje zbudowanie DuckDB ze standardowym alokatorem. Na platformach, gdzie któraś z tych kompilacji nie obsługuje jemalloc (macOS, musl, 32-bit, BSD), odpowiednia flaga po cichu nic nie robi i używany jest standardowy alokator.
 

@@ -13,12 +13,13 @@ ctrlc = { version = "3", features = ["termination"] }
 # (`third_party/jemalloc`), which the published crate excludes, and the `bundled`
 # amalgamation backend has no jemalloc sources at all. `bundled-cmake` builds via
 # CMake with `ENABLE_JEMALLOC=ON` by default. See CLAUDE.md's jemalloc gotcha.
-# The tag must move with `cmake/duckdb_version.cmake`.
+# The crate version also sets the version DuckDB stamps into itself, which is
+# its extension repository path (CLAUDE.md, version-stamp gotcha).
 #
 # `default-features = false` drops `vcpkg`, `pkg-config` and `download-lib`
 # (which puts `ureq` into the build script). All three only serve a linked,
 # non-bundled build; `duckdb` enables the `capi-v1` bindings itself.
-duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.20000.1", default-features = false, features = ["bundled-cmake", "vtab", "vtab-arrow", "appender-arrow", "vscalar", "r2d2"] }
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.20000.1", default-features = false, features = ["bundled-cmake", "appender-arrow", "vscalar", "r2d2"] }
 r2d2 = "0.8"
 flate2 = "1"
 # `import::prg` passes prg_convert's arrow `RecordBatch` into duckdb's Appender

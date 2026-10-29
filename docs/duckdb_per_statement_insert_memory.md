@@ -1,8 +1,15 @@
 # Every INSERT inside a transaction holds memory until COMMIT (DuckDB 1.5.x)
 
-Measured 2026-09-26 against DuckDB 1.5.5 (the version `Cargo.toml` pins).
-Fixed on our side by writing sets in chunked statements; fixed upstream on
-DuckDB `main` for 2.0.
+Measured 2026-09-26 against DuckDB 1.5.5 (the version `Cargo.toml` pinned then).
+Fixed on our side by writing sets in chunked statements; fixed upstream in
+DuckDB 2.0.
+
+**Status (2026-10-29): confirmed fixed on DuckDB 2.0.0.** The negative control
+(300 single-row INSERTs of 4 BIGINT columns in one transaction) holds 0 MiB of
+`IN_MEMORY_TABLE`, where 1.5.5 held ~21 MiB. The memory regression tests listed
+below, their harness (`use_parallel_insert_path`, `in_memory_table_bytes`) and
+the control itself were removed with the upgrade, because on 2.0 they pass
+whatever the code does. The chunked statements stay: they are also much faster.
 
 ## Symptom
 

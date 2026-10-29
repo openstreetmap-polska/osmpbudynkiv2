@@ -3,6 +3,11 @@
 Found 2026-09-13 by heap profiling production (v0.2.1 + `heap-profiling`).
 Closes the leak in `docs/memory_growth_investigation.md`.
 
+**Status (2026-10-29): fixed upstream as well.** duckdb-rs 1.20000 removed
+`arrow_recordbatch_to_query_params` and its never-freed store; its replacement,
+`ArrowBatchRegistration`, frees the batch on drop. This project still loads
+through the `Appender`, and no longer registers the `arrow()` table function.
+
 ## Symptom
 
 Server memory rose by roughly 2.6–2.9 GiB once a day and never came back,
