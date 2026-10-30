@@ -255,11 +255,11 @@ fn drain_one_cell(
     batch_start: &str,
 ) -> Result<()> {
     recompute_cell_in_txn(conn, source, cell_x, cell_y)?;
-    conn.execute(
+    conn.prepare_cached(
         "DELETE FROM match_dirty_cells
          WHERE source = ? AND cell_x = ? AND cell_y = ? AND enqueued_at <= ?::TIMESTAMPTZ",
-        duckdb::params![source, cell_x, cell_y, batch_start],
-    )?;
+    )?
+    .execute(duckdb::params![source, cell_x, cell_y, batch_start])?;
     Ok(())
 }
 

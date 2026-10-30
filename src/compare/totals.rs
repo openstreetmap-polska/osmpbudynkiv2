@@ -42,7 +42,7 @@
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;
 
-use crate::compare::rule::{BDOT10K_EKSPLOATOWANY_FILTER, envelope_sql};
+use crate::compare::rule::{Area, BDOT10K_EKSPLOATOWANY_FILTER};
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
 struct TotalsSpec {
@@ -128,27 +128,45 @@ pub fn rebuild_all_in_txn(conn: &Connection, source: &str) -> Result<()> {
 /// `filter`, when set) is applied twice -- once building `candidates`, once
 /// in the outer `WHERE` -- deliberately and idempotently, same as the
 /// sibling seam.
-fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<String> {
+///
+/// Like the sibling, the text depends only on `source` and the cell travels
+/// in the returned parameters (envelope `$1..$4`, cell `$5, $6`), so
+/// `recompute_cell_in_txn` plans it once per connection rather than per cell.
+fn build_sql(
+    source: &str,
+    cell_x: i32,
+    cell_y: i32,
+) -> Result<(String, Vec<duckdb::types::Value>)> {
+    use duckdb::types::Value;
     let s = spec(source)?;
     let (x1, y1, x2, y2) = tile_to_bbox(CHANGE_CELL_ZOOM, cell_x as u32, cell_y as u32);
     let cx = cell_x_sql(s.point);
     let cy = cell_y_sql(s.point);
     let extra = s.filter.map(|f| format!("AND {f} ")).unwrap_or_default();
-    let envelope = envelope_sql((x1, y1, x2, y2));
+    let envelope = Area::Params(1).envelope_sql();
+    let params = vec![
+        Value::Double(x1),
+        Value::Double(y1),
+        Value::Double(x2),
+        Value::Double(y2),
+        Value::Int(cell_x),
+        Value::Int(cell_y),
+    ];
 
-    Ok(format!(
+    let sql = format!(
         "WITH candidates AS MATERIALIZED (
              SELECT * FROM {table} b
              WHERE ST_Intersects({point}, {envelope}) {extra}
          )
-         SELECT '{source}', {cell_x}, {cell_y}, count(*)::INTEGER
+         SELECT '{source}', $5, $6, count(*)::INTEGER
          FROM candidates b
          WHERE ST_Intersects({point}, {envelope})
-           {extra}AND {cx} = {cell_x} AND {cy} = {cell_y}
+           {extra}AND {cx} = $5 AND {cy} = $6
          HAVING count(*) > 0",
         table = s.table,
         point = s.point,
-    ))
+    );
+    Ok((sql, params))
 }
 
 /// Rebuild one z14 cell's total for one source. Assumes an open transaction —
@@ -165,18 +183,17 @@ pub fn recompute_cell_in_txn(
     cell_x: i32,
     cell_y: i32,
 ) -> Result<()> {
-    let inner = build_sql(source, cell_x, cell_y)?;
+    let (inner, params) = build_sql(source, cell_x, cell_y)?;
 
-    conn.execute(
-        "DELETE FROM cell_totals WHERE source = ? AND cell_x = ? AND cell_y = ?",
-        duckdb::params![source, cell_x, cell_y],
-    )
-    .with_context(|| {
-        format!("cell_totals: failed to clear cell ({cell_x},{cell_y}) for {source}")
-    })?;
-    conn.execute_batch(&format!(
-        "INSERT INTO cell_totals (source, cell_x, cell_y, total) {inner};"
+    conn.prepare_cached("DELETE FROM cell_totals WHERE source = ? AND cell_x = ? AND cell_y = ?")
+        .and_then(|mut stmt| stmt.execute(duckdb::params![source, cell_x, cell_y]))
+        .with_context(|| {
+            format!("cell_totals: failed to clear cell ({cell_x},{cell_y}) for {source}")
+        })?;
+    conn.prepare_cached(&format!(
+        "INSERT INTO cell_totals (source, cell_x, cell_y, total) {inner}"
     ))
+    .and_then(|mut stmt| stmt.execute(duckdb::params_from_iter(&params)))
     .with_context(|| {
         format!("cell_totals: failed to recompute cell ({cell_x},{cell_y}) for {source}")
     })?;
@@ -391,10 +408,10 @@ mod tests {
         .unwrap();
 
         let (cx, cy) = lonlat_to_tile(20.5005, 52.00002, CHANGE_CELL_ZOOM);
-        let sql = build_sql("bdot10k", cx as i32, cy as i32).unwrap();
+        let (sql, params) = build_sql("bdot10k", cx as i32, cy as i32).unwrap();
 
         let mut stmt = c.prepare(&format!("EXPLAIN {sql}")).unwrap();
-        let mut rows = stmt.query([]).unwrap();
+        let mut rows = stmt.query(duckdb::params_from_iter(&params)).unwrap();
         let mut plan = String::new();
         while let Some(row) = rows.next().unwrap() {
             plan.push_str(&row.get::<_, String>(1).unwrap_or_default());

@@ -120,6 +120,38 @@ pub fn envelope_sql(area: Bounds) -> String {
     format!("ST_MakeEnvelope({x1}, {y1}, {x2}, {y2})")
 }
 
+/// The area a rule reads or writes: literal bounds, or the four numbered
+/// parameters `$n..$n+3` in [`envelope_sql`]'s argument order.
+///
+/// `Params` exists for the per-cell drain, which runs the same statement for
+/// every cell: with the cell bound rather than spelled into the text, one
+/// cached prepared statement serves them all instead of each cell being
+/// parsed and planned again (a 3,457-cell drain: 80.7-86.7 s -> 72.0 s on
+/// DuckDB 2.0, identical output). A bound
+/// parameter still counts as constant for the RTREE index scan, as on the
+/// tile path (`server::tiles`).
+#[derive(Clone, Copy, Debug)]
+pub enum Area {
+    Bounds(Bounds),
+    Params(usize),
+}
+
+impl From<Bounds> for Area {
+    fn from(b: Bounds) -> Self {
+        Area::Bounds(b)
+    }
+}
+
+impl Area {
+    /// The `ST_MakeEnvelope` call for this area; [`envelope_sql`] for bounds.
+    pub fn envelope_sql(self) -> String {
+        match self {
+            Area::Bounds(b) => envelope_sql(b),
+            Area::Params(n) => format!("ST_MakeEnvelope(${n}, ${}, ${}, ${})", n + 1, n + 2, n + 3),
+        }
+    }
+}
+
 /// BDOT10k-only pre-filter for `unmatched_buildings_sql`'s `extra_filter`:
 /// only rows still standing count as a government building to compare at
 /// all — excludes `w budowie` (under construction), `nieczynny` (inactive)
@@ -272,10 +304,10 @@ pub fn unmatched_buildings_sql(
     spec: &DatasetSpec,
     source_table: &str,
     select_list: &str,
-    area: Bounds,
+    area: impl Into<Area>,
     extra_filter: Option<&str>,
 ) -> String {
-    let envelope = envelope_sql(area);
+    let envelope = area.into().envelope_sql();
     let extra = extra_filter
         .map(|f| format!("AND {f}\n           "))
         .unwrap_or_default();
@@ -477,11 +509,11 @@ pub fn unmatched_addresses_in_cell_sql(
     spec: &DatasetSpec,
     source_table: &str,
     select_list: &str,
-    write: Bounds,
-    read: Bounds,
+    write: impl Into<Area>,
+    read: impl Into<Area>,
 ) -> String {
-    let write_envelope = envelope_sql(write);
-    let read_envelope = envelope_sql(read);
+    let write_envelope = write.into().envelope_sql();
+    let read_envelope = read.into().envelope_sql();
     let dist = MATCH_DISTANCE_METERS;
     let name_dist = NAME_MATCH_DISTANCE_METERS;
     let resolved_street = normalized_name_sql(&resolved_street_expr_sql("c"));
