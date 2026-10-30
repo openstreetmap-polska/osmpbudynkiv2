@@ -3784,6 +3784,11 @@ mod tests {
             "INSTALL icu".to_string(),
             "LOAD icu".to_string(),
             "SET geometry_always_xy = true".to_string(),
+            // Production's setting, and on DuckDB 2.0 not a detail: with the
+            // default `true`, the batched queries' `MATERIALIZED` CTEs run on
+            // one thread, and a Warsaw z14 block measured ~2x slower than on
+            // 1.5.5 where production runs it faster than 1.5.5.
+            "SET preserve_insertion_order = false".to_string(),
         ];
         Some(crate::db::init_db(path, &init, None).unwrap())
     }
