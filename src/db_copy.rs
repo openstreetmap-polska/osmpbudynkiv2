@@ -28,6 +28,13 @@
 //! transaction with order preserved, then replays the indexes over the full
 //! tables.
 //!
+//! Re-measured on DuckDB 2.0.0 against a fresh national database (9.2 GB):
+//! this copy took 54 s and wrote 8.64 GB; `COPY FROM DATABASE` took 121 s,
+//! peaked 1.1 GB higher and wrote 10.07 GB, the difference being the
+//! row-by-row RTREEs. Under `preserve_insertion_order = false` it also still
+//! moved 8.5M-17.9M rows per big table. Setting it to `true` fixes the order
+//! but not the indexes.
+//!
 //! The copy is written to `<dest>.partial` and renamed into place only after
 //! every table's row count and the index set have been checked, so a file at
 //! `<dest>` is always complete. Not `<dest>.tmp`: that is DuckDB's default
