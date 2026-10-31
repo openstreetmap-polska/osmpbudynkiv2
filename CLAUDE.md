@@ -1528,11 +1528,15 @@ global flag as well.
    `BEGIN` while adding a rollback path to reason about.
 4. **A flag polled between statements cannot touch a statement already running**,
    which is most of the wall time. `shutdown::register_interrupt_handle` closes
-   that gap by failing the in-flight DuckDB statement. **Scope is the CLI's single
-   connection only** — `try_clone` opens a brand-new connection with its own
-   handle, so the server relies on graceful shutdown and per-job cancel flags
-   instead. `interrupting_a_running_statement_does_not_poison_the_connection` pins
-   both that the interrupt lands and that the connection still works afterwards,
+   that gap by failing the in-flight DuckDB statement. `try_clone` opens a
+   brand-new connection with its own handle, so each owner registers its own:
+   `main.rs` the CLI's connection, `server::ClonedConnectionManager` every pooled
+   connection. Without the pool's registration a SIGTERM waited out each job's
+   statement until systemd killed the process, skipping the checkpoint a clean
+   close performs. Clones made outside the pool (`tiles warm`'s workers) are not
+   registered and finish their statement.
+   `interrupting_a_running_statement_does_not_poison_the_connection` pins both
+   that the interrupt lands and that the connection still works afterwards,
    which is what makes `in_transaction`'s `ROLLBACK`-after-error work on the way
    out.
 
