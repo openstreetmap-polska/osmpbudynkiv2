@@ -38,7 +38,7 @@ everything non-DuckDB. Four load-bearing points:
    which the published crate `exclude`s, and the `bundled` amalgamation backend
    has no jemalloc sources at all. Only `bundled-cmake` has it, and it *requires*
    a git checkout. The tag pins the exact version the registry dep used
-   (`v1.10505.0`) — the git source buys the build backend and nothing else.
+   (`v1.10506.1`) — the git source buys the build backend and nothing else.
    `bundled-cmake` is marked experimental upstream.
 2. **The dev-dependency must name the same source as the normal dependency.**
    Two packages both declaring `links = "duckdb"` is a hard cargo error.
@@ -65,7 +65,7 @@ tests fail from this one cause.
    `-DCMAKE_C_COMPILER`/`CXX_COMPILER`. Fine natively, load-bearing for a
    cross-compile.
 2. **`cmake/duckdb_version.cmake` must move in lockstep with the `duckdb` tag in
-   `Cargo.toml`** (`v1.10505.0` ⇒ DuckDB `v1.5.5`). Nothing links them
+   `Cargo.toml`** (`v1.10506.1` ⇒ DuckDB `v1.5.6`). Nothing links them
    automatically. `db::tests::duckdb_reports_a_real_version_so_extensions_resolve`
    is the guard; it pins the *shape*, so a routine bump needs no test edit.
 3. **Editing the toolchain file does not rebuild DuckDB, and `cargo clean -p
