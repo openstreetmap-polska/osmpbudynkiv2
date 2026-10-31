@@ -95,7 +95,7 @@ fn rewritten_zip(dir: &Path, name: &str, rewrite: impl Fn(&str) -> String) -> Pa
     let mut rewrote = 0;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).unwrap();
-        let entry_name = entry.name().to_string();
+        let entry_name = entry.name().unwrap().to_string();
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
         if entry_name.to_ascii_lowercase().ends_with(".gml") {

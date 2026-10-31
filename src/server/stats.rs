@@ -324,16 +324,13 @@ fn scope_sql(scoped: bool) -> &'static str {
 /// The only interpolated text comes from the enums above, never from the
 /// request; `LIMIT`/`OFFSET` are parameters.
 ///
-/// **`ST_Extent_Agg` is safe here only because every string in the result
-/// is a group key, never the output of another aggregate.** On DuckDB 1.5.5 +
-/// spatial it corrupts the strings of a `histogram()` over VARCHAR computed
-/// alongside it -- nondeterministically, with no error (an earlier version of
-/// this query lost ~10,250 of 52,560 settlement names that way). Group-key
-/// strings are unaffected, which `long_names_survive_the_ranking_query_at_scale`
-/// pins. That test would *not* notice a text-valued aggregate added here
-/// later; adding one means switching the extent to `min`/`max` of
-/// `ST_X`/`ST_Y`, which is ~30% slower at gmina level and ~10% at settlement
-/// level.
+/// On DuckDB 1.5.5 + spatial, `ST_Extent_Agg` corrupted the strings of a
+/// `histogram()` over VARCHAR computed alongside it, nondeterministically and
+/// with no error (an earlier version of this query lost ~10,250 of 52,560
+/// settlement names that way), so this query kept every string a group key.
+/// DuckDB 2.0's spatial (`a3dbcd1781`) fixed it: the minimal repro corrupts
+/// 679-2,089 of 5,000 names on 1.5.5 and none in five runs on 2.0.
+/// `long_names_survive_the_ranking_query_at_scale` still pins the group keys.
 ///
 /// With `scoped`, both sides are narrowed to one unit first, and the query
 /// takes its code twice ahead of `LIMIT`/`OFFSET`.

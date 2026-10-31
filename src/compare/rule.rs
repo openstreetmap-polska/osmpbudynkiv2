@@ -120,6 +120,38 @@ pub fn envelope_sql(area: Bounds) -> String {
     format!("ST_MakeEnvelope({x1}, {y1}, {x2}, {y2})")
 }
 
+/// The area a rule reads or writes: literal bounds, or the four numbered
+/// parameters `$n..$n+3` in [`envelope_sql`]'s argument order.
+///
+/// `Params` exists for the per-cell drain, which runs the same statement for
+/// every cell: with the cell bound rather than spelled into the text, one
+/// cached prepared statement serves them all instead of each cell being
+/// parsed and planned again (a 3,457-cell drain: 80.7-86.7 s -> 72.0 s on
+/// DuckDB 2.0, identical output). A bound
+/// parameter still counts as constant for the RTREE index scan, as on the
+/// tile path (`server::tiles`).
+#[derive(Clone, Copy, Debug)]
+pub enum Area {
+    Bounds(Bounds),
+    Params(usize),
+}
+
+impl From<Bounds> for Area {
+    fn from(b: Bounds) -> Self {
+        Area::Bounds(b)
+    }
+}
+
+impl Area {
+    /// The `ST_MakeEnvelope` call for this area; [`envelope_sql`] for bounds.
+    pub fn envelope_sql(self) -> String {
+        match self {
+            Area::Bounds(b) => envelope_sql(b),
+            Area::Params(n) => format!("ST_MakeEnvelope(${n}, ${}, ${}, ${})", n + 1, n + 2, n + 3),
+        }
+    }
+}
+
 /// BDOT10k-only pre-filter for `unmatched_buildings_sql`'s `extra_filter`:
 /// only rows still standing count as a government building to compare at
 /// all — excludes `w budowie` (under construction), `nieczynny` (inactive)
@@ -272,10 +304,10 @@ pub fn unmatched_buildings_sql(
     spec: &DatasetSpec,
     source_table: &str,
     select_list: &str,
-    area: Bounds,
+    area: impl Into<Area>,
     extra_filter: Option<&str>,
 ) -> String {
-    let envelope = envelope_sql(area);
+    let envelope = area.into().envelope_sql();
     let extra = extra_filter
         .map(|f| format!("AND {f}\n           "))
         .unwrap_or_default();
@@ -477,11 +509,11 @@ pub fn unmatched_addresses_in_cell_sql(
     spec: &DatasetSpec,
     source_table: &str,
     select_list: &str,
-    write: Bounds,
-    read: Bounds,
+    write: impl Into<Area>,
+    read: impl Into<Area>,
 ) -> String {
-    let write_envelope = envelope_sql(write);
-    let read_envelope = envelope_sql(read);
+    let write_envelope = write.into().envelope_sql();
+    let read_envelope = read.into().envelope_sql();
     let dist = MATCH_DISTANCE_METERS;
     let name_dist = NAME_MATCH_DISTANCE_METERS;
     let resolved_street = normalized_name_sql(&resolved_street_expr_sql("c"));
@@ -715,10 +747,11 @@ mod tests {
     /// enough that `RTREE_INDEX_SCAN` rendered as `RTREE_INDE...` and this
     /// assertion failed while the index was still very much in use (verified
     /// against the JSON plan, which showed `RTREE_INDEX_SCAN` on `bsrc` via
-    /// `bsrc_centroid_idx`). Elsewhere in this codebase that hazard is worked
-    /// around by asserting the substring `"RTREE_IN"`; JSON is the better
-    /// answer, because it also lets the *index name* be pinned, so the test
-    /// cannot pass on some unrelated table's R-tree scan.
+    /// `bsrc_centroid_idx`). DuckDB 2.0's text renderer no longer truncates
+    /// (see `db::EXPLAIN_RTREE_SCAN`), but JSON is still the better answer:
+    /// it also lets the *index name* be pinned, so the test cannot pass on
+    /// some unrelated table's R-tree scan, and its operator name survived the
+    /// 1.5 -> 2.0 upgrade where the text label did not.
     #[test]
     fn unmatched_buildings_predicate_uses_the_centroid_rtree_index() {
         let c = conn();
@@ -822,11 +855,8 @@ mod tests {
         while let Some(row) = rows.next().unwrap() {
             plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
         }
-        // Substring "RTREE_IN" rather than the full operator name: DuckDB's
-        // EXPLAIN truncates labels to fit box width in wide plans (same
-        // reason as server::tiles and compare::totals).
         assert!(
-            plan.contains("RTREE_IN"),
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
             "the candidates CTE must still reach the centroid RTREE index, got plan: {plan}"
         );
     }
@@ -1407,7 +1437,7 @@ mod tests {
     /// the source table its geometry index — that is the difference between a
     /// z14 cell recompute taking ~0.07 s and taking a full-table scan.
     /// `osm_addresses` is left unindexed here, so a plan mentioning
-    /// `RTREE_IN` can only be coming from `asrc`.
+    /// an RTREE scan can only be coming from `asrc`.
     #[test]
     fn unmatched_addresses_predicate_uses_the_geom_rtree_index() {
         let c = conn();
@@ -1434,10 +1464,8 @@ mod tests {
         while let Some(row) = rows.next().unwrap() {
             plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
         }
-        // Substring "RTREE_IN" rather than the full operator name: DuckDB's
-        // EXPLAIN truncates operator labels to fit box width in a wide plan.
         assert!(
-            plan.contains("RTREE_IN"),
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
             "the candidates CTE must still reach the geom RTREE index, got plan: {plan}"
         );
     }

@@ -150,9 +150,11 @@ pub fn drain_batch(
 /// columns, and `cell_totals`, 4), and on DuckDB 1.5.x every INSERT inside a
 /// transaction holds ~18-29 KiB per column until COMMIT
 /// (`docs/duckdb_per_statement_insert_memory.md`). Measured on a copy of the
-/// national database with `a_full_batch_s_transaction_memory_on_real_data`:
-/// 512 cells in one transaction held 171 MiB (bdot10k), 123 MiB (egib) and
-/// 143 MiB (prg) of `IN_MEMORY_TABLE`; 64 cells hold an eighth of that. The
+/// national database on 1.5.x: 512 cells in one transaction held 171 MiB
+/// (bdot10k), 123 MiB (egib) and 143 MiB (prg) of `IN_MEMORY_TABLE`; 64 cells
+/// hold an eighth of that. DuckDB 2.0 no longer holds that memory, so the
+/// bound now matters for a different reason: a failed group replays cell by
+/// cell, and 64 caps the work one failure rolls back and redoes. The
 /// statements' SQL is left per cell on purpose: it is shaped around RTREE
 /// plans (the `candidates` CTE and `MATERIALIZED` gotchas in CLAUDE.md), and
 /// a multi-cell rewrite would put those at risk to save memory that a commit
@@ -253,11 +255,11 @@ fn drain_one_cell(
     batch_start: &str,
 ) -> Result<()> {
     recompute_cell_in_txn(conn, source, cell_x, cell_y)?;
-    conn.execute(
+    conn.prepare_cached(
         "DELETE FROM match_dirty_cells
          WHERE source = ? AND cell_x = ? AND cell_y = ? AND enqueued_at <= ?::TIMESTAMPTZ",
-        duckdb::params![source, cell_x, cell_y, batch_start],
-    )?;
+    )?
+    .execute(duckdb::params![source, cell_x, cell_y, batch_start])?;
     Ok(())
 }
 
@@ -642,65 +644,5 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tile_dirty_cells", [], |r| r.get(0))
             .unwrap();
         assert_eq!(tiles, healthy as i64, "one tile enqueue per drained cell");
-    }
-
-    /// Measures the transaction-local memory 512 cells (the default batch,
-    /// once one transaction) and [`CELLS_PER_COMMIT`] cells (one transaction
-    /// now) hold before COMMIT, on a copy of a real database: each cell is
-    /// two INSERT statements (`*_unmatched` and `cell_totals`), and on DuckDB
-    /// 1.5.x each INSERT inside a transaction holds ~18-29 KiB per column
-    /// until COMMIT (`docs/duckdb_per_statement_insert_memory.md`). Rolls
-    /// back, so the copy is left as it was.
-    ///
-    /// `OSMPB_MEMTEST_DB=/path/to/copy.duckdb cargo test --release --bin
-    /// osmpbudynkiv2 a_full_batch_s_transaction_memory -- --ignored --nocapture`
-    #[test]
-    #[ignore = "needs OSMPB_MEMTEST_DB pointing at a copy of a real database"]
-    fn a_full_batch_s_transaction_memory_on_real_data() {
-        let path = std::env::var("OSMPB_MEMTEST_DB").expect("OSMPB_MEMTEST_DB");
-        let init = [
-            "INSTALL spatial",
-            "LOAD spatial",
-            "INSTALL icu",
-            "LOAD icu",
-            "SET GLOBAL geometry_always_xy = true",
-            "SET GLOBAL memory_limit = '6GB'",
-        ]
-        .map(String::from);
-        let c = init_db(Path::new(&path), &init, None).unwrap();
-        crate::db_memory::use_parallel_insert_path(&c).unwrap();
-        for (source, n) in ["bdot10k", "egib", "prg"]
-            .into_iter()
-            .flat_map(|s| [(s, 512), (s, CELLS_PER_COMMIT as i64)])
-        {
-            let cells: Vec<(i32, i32)> = c
-                .prepare(
-                    "SELECT cell_x, cell_y FROM cell_totals WHERE source = ?
-                     ORDER BY hash(cell_x, cell_y) LIMIT ?",
-                )
-                .unwrap()
-                .query_map(duckdb::params![source, n], |r| Ok((r.get(0)?, r.get(1)?)))
-                .unwrap()
-                .collect::<duckdb::Result<_>>()
-                .unwrap();
-            let batch_start: String = c
-                .query_row("SELECT now()::VARCHAR", [], |r| r.get(0))
-                .unwrap();
-            let started = std::time::Instant::now();
-            c.execute_batch("BEGIN TRANSACTION").unwrap();
-            for (x, y) in &cells {
-                drain_one_cell(&c, source, *x, *y, &batch_start).unwrap();
-            }
-            enqueue_tiles_for_cells(&c, &cells).unwrap();
-            let held = crate::db_memory::in_memory_table_bytes(&c).unwrap();
-            let elapsed = started.elapsed();
-            c.execute_batch("ROLLBACK").unwrap();
-            eprintln!(
-                "{source}: {} cells, IN_MEMORY_TABLE {} before COMMIT, {:.1?}",
-                cells.len(),
-                crate::db_memory::fmt_bytes(held),
-                elapsed
-            );
-        }
     }
 }

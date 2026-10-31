@@ -32,10 +32,15 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
     // it is removed right after via `dataset::drop_ordering_column`, see
     // that function's doc comment ("the ordering-column problem" in
     // `docs/superpowers/plans/2026-08-14-column-trimming.md`).
+    //
+    // `always_xy := true` is passed per call, not read from the session: the
+    // files are easting-first, DuckDB 2.0 refuses `ST_Transform` while
+    // `geometry_always_xy` is unset, and on 1.5 an unset setting meant `false`,
+    // which reads the input northing-first.
     let inner = format!(
         "SELECT id_budynku, rodzaj, kondygnacje_nadziemne, kondygnacje_podziemne, \
                 czas_pozyskania, \
-                ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326') AS geom \
+                ST_Transform(geometry, 'EPSG:2180', 'EPSG:4326', always_xy := true) AS geom \
          FROM '{parquet_path}' WHERE {non_null}"
     );
     let select = crate::dataset::EGIB.with_centroid_select(&inner);

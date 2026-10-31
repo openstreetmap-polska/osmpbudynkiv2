@@ -54,11 +54,22 @@ pub fn load_into(conn: &Connection, target_table: &str, parquet_path: &str) -> R
     // BDOT10k's churn figures over -- keep it in sync with that plan's
     // "keep 14" list (12 raw columns here plus `geom` and, via
     // `with_centroid_select` below, `centroid`).
+    //
+    // `always_xy := true` is passed per call, not read from the session: the
+    // files are easting-first, DuckDB 2.0 refuses `ST_Transform` while
+    // `geometry_always_xy` is unset, and on 1.5 an unset setting meant `false`,
+    // which reads the input northing-first.
+    //
+    // `WERSJA` is cast because the exports store it in nanoseconds: DuckDB 1.5
+    // read that as `TIMESTAMPTZ` (microseconds), 2.0 reads `TIMESTAMPTZ_NS`,
+    // which `check_column_shapes_match` would reject against a live table
+    // built by 1.5. Lossless on real data: no value in 16,351,817 rows has a
+    // sub-microsecond part (2026-08-15 snapshot).
     let inner = format!(
-        "SELECT PRZESTRZENNAZW, LOKALNYID, WERSJA, KATEGORIAISTNIENIA, \
+        "SELECT PRZESTRZENNAZW, LOKALNYID, WERSJA::TIMESTAMPTZ AS WERSJA, KATEGORIAISTNIENIA, \
                 PRZEWAZAJACAFUNKCJABUDYNKU, FUNKCJAOGOLNABUDYNKU, LICZBAKONDYGNACJI, \
                 NAZWA, FSBUD, INFORMACJADODATKOWA, KODKST, ZRODLODANYCHGEOMETRYCZNYCH, \
-                ST_Transform(ST_GeomFromWKB(GEOM), 'EPSG:2180', 'EPSG:4326') AS geom \
+                ST_Transform(ST_GeomFromWKB(GEOM), 'EPSG:2180', 'EPSG:4326', always_xy := true) AS geom \
          FROM '{parquet_path}' WHERE {non_null}"
     );
     let select = crate::dataset::BDOT10K.with_centroid_select(&inner);

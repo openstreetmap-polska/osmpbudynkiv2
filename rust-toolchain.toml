@@ -19,8 +19,8 @@
 # -------
 # Edit `channel`, then run `cargo clippy --all-targets`, `cargo fmt -- --check`
 # and `cargo test`. rustup fetches the new toolchain on the next cargo
-# invocation. Unlike `cmake/duckdb_version.cmake`, this version is mirrored
-# nowhere else and has no lockstep partner to keep in sync.
+# invocation. This version is mirrored nowhere else and has no lockstep
+# partner to keep in sync.
 #
 # This file only takes effect under rustup; a distro-packaged cargo ignores it.
 [toolchain]

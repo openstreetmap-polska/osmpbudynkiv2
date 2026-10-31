@@ -627,9 +627,9 @@ pub fn export_to_string(conn: &Connection) -> Result<String> {
     Ok(out)
 }
 
-/// Reports per INSERT statement in [`import_rows`]. Any chunk size removes
-/// the per-statement transaction memory; this only bounds the statement's
-/// text and parameter count.
+/// Reports per INSERT statement in [`import_rows`]. On DuckDB 1.5 any chunk
+/// size removed the per-statement transaction memory (2.0 holds none); this
+/// only bounds the statement's text and parameter count.
 const IMPORT_CHUNK: usize = 1000;
 
 /// Re-insert reports from a `reports export` dump.
@@ -1281,31 +1281,5 @@ mod tests {
             .collect::<duckdb::Result<_>>()
             .unwrap();
         assert_eq!(queued, vec![("bdot10k".to_string(), 9000, 5000)]);
-    }
-
-    /// A dump of a few hundred reports is one transaction. With one INSERT
-    /// per report it held ~250 KiB per report of transaction-local memory
-    /// until COMMIT (~70 MiB here); chunked, a few MiB. See
-    /// `db_memory::tests::per_row_inserts_in_one_transaction_hold_memory_until_commit`,
-    /// the negative control that says whether this test still means anything.
-    #[test]
-    fn importing_hundreds_of_reports_holds_no_per_row_transaction_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
-        let c = init_db(&dir.path().join("db.duckdb"), &init, None).unwrap();
-        crate::db_memory::use_parallel_insert_path(&c).unwrap();
-        let rows: Vec<ReportRow> = (0..300)
-            .map(|i| dump_row(i, STATUS_ACTIVE, Some((9000 + i as i32, 5000))))
-            .collect();
-
-        c.execute_batch("BEGIN TRANSACTION").unwrap();
-        assert_eq!(import_rows_in_txn(&c, &rows).unwrap(), 300);
-        let held = crate::db_memory::in_memory_table_bytes(&c).unwrap();
-        c.execute_batch("ROLLBACK").unwrap();
-        assert!(
-            held < 8 * 1024 * 1024,
-            "the import held {} of transaction-local memory -- one INSERT per report again?",
-            crate::db_memory::fmt_bytes(held)
-        );
     }
 }

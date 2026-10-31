@@ -1742,14 +1742,9 @@ mod tests {
             .map(|v| v as &dyn duckdb::ToSql)
             .collect();
 
-        // "RTREE_IN" rather than the full "RTREE_INDEX_SCAN": DuckDB's EXPLAIN
-        // pretty-printer truncates operator labels to fit the box width, and
-        // a plan with many sibling branches (BUILDINGS_MVT_SQL's four scans)
-        // renders as "RTREE_IN..." -- verified by printing the plan and
-        // comparing against the untruncated single-scan ADDRESSES_MVT_SQL case.
         let addr_plan = plan_of(ADDRESSES_MVT_SQL.as_str(), &addr_params_dyn);
         assert!(
-            addr_plan.contains("RTREE_IN"),
+            addr_plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
             "addresses MVT query must use the RTREE index, got plan:\n{addr_plan}"
         );
 
@@ -1768,7 +1763,7 @@ mod tests {
         bldg_params.push(&EGIB_ADJACENCY_KEY);
 
         let bldg_plan = plan_of(BUILDINGS_MVT_SQL.as_str(), &bldg_params);
-        let bldg_scans = bldg_plan.matches("RTREE_IN").count();
+        let bldg_scans = bldg_plan.matches(crate::db::EXPLAIN_RTREE_SCAN).count();
         assert_eq!(
             bldg_scans, 4,
             "buildings MVT query must use all four RTREE indexes \
@@ -1778,7 +1773,7 @@ mod tests {
 
         let all_addr_plan = plan_of(ALL_ADDRESSES_MVT_SQL.as_str(), &addr_params_dyn);
         assert!(
-            all_addr_plan.contains("RTREE_IN"),
+            all_addr_plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
             "all-addresses MVT query must use the RTREE index, got plan:\n{all_addr_plan}"
         );
 
@@ -1796,7 +1791,7 @@ mod tests {
         // still shows an index scan -- which a single `.contains()` would
         // happily pass.
         let all_bldg_plan = plan_of(ALL_BUILDINGS_MVT_SQL.as_str(), &all_bldg_params_dyn);
-        let all_bldg_scans = all_bldg_plan.matches("RTREE_IN").count();
+        let all_bldg_scans = all_bldg_plan.matches(crate::db::EXPLAIN_RTREE_SCAN).count();
         assert_eq!(
             all_bldg_scans, 2,
             "all-buildings MVT query must use both RTREE indexes \
@@ -3789,6 +3784,11 @@ mod tests {
             "INSTALL icu".to_string(),
             "LOAD icu".to_string(),
             "SET geometry_always_xy = true".to_string(),
+            // Production's setting, and on DuckDB 2.0 not a detail: with the
+            // default `true`, the batched queries' `MATERIALIZED` CTEs run on
+            // one thread, and a Warsaw z14 block measured ~2x slower than
+            // 1.5.5. With `false`, the two versions measure the same.
+            "SET preserve_insertion_order = false".to_string(),
         ];
         Some(crate::db::init_db(path, &init, None).unwrap())
     }

@@ -1,35 +1,47 @@
 [package]
 name = "osmpbudynkiv2"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
-# Git dependency, pinned to the tag matching the crates.io version we used before,
-# purely to get `bundled-cmake`: DuckDB's jemalloc lives in `duckdb-sources`
+# Git dependency, pinned to a release tag (v1.20000.1 = DuckDB v2.0.0), purely to
+# get `bundled-cmake`: DuckDB's jemalloc lives in `duckdb-sources`
 # (`third_party/jemalloc`), which the published crate excludes, and the `bundled`
 # amalgamation backend has no jemalloc sources at all. `bundled-cmake` builds via
 # CMake with `ENABLE_JEMALLOC=ON` by default. See CLAUDE.md's jemalloc gotcha.
-duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.10506.1", features = ["bundled-cmake", "vtab", "vtab-arrow", "appender-arrow", "vscalar", "r2d2"] }
+# The crate version also sets the version DuckDB stamps into itself, which is
+# its extension repository path (CLAUDE.md, version-stamp gotcha).
+#
+# `default-features = false` drops `vcpkg`, `pkg-config` and `download-lib`
+# (which puts `ureq` into the build script). All three only serve a linked,
+# non-bundled build; `duckdb` enables the `capi-v1` bindings itself.
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.20000.1", default-features = false, features = ["bundled-cmake", "appender-arrow", "vscalar", "r2d2"] }
 r2d2 = "0.8"
 flate2 = "1"
-prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.8.0", default-features = false, features = ["download"] }
-quick-xml = "0.37"
-reqwest = { version = "0.12", features = ["rustls-tls", "stream"], default-features = false }
-indicatif = "0.17"
+# `import::prg` passes prg_convert's arrow `RecordBatch` into duckdb's Appender
+# and its own zip `ZipArchive` into prg_convert, so prg_convert must share both
+# the arrow major (duckdb's) and the zip major with this crate.
+prg_convert = { git = "https://github.com/ttomasz/prg_convert", tag = "v0.9.0", default-features = false, features = ["download"] }
+quick-xml = "0.38"
+reqwest = { version = "0.13", features = ["rustls", "stream"], default-features = false }
+indicatif = "0.18"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-toml = "0.8"
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 tower-http = { version = "0.6", features = ["fs", "set-header", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zip = "6"
-rocksdb = { package = "rust-rocksdb", version = "0.52", default-features = false, features = ["zstd", "jemalloc"] }
+# Read-only: `deflate-flate2-zlib-rs` decompresses without `deflate`'s zopfli
+# (compression only). It is also what puts flate2, and so `osmpbf`, on zlib-rs
+# (CLAUDE.md, `import osm` point 3).
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64"] }
+rocksdb = { package = "rust-rocksdb", version = "0.53", default-features = false, features = ["zstd", "jemalloc"] }
 osmpbf = "0.3.8"
 # Only ever pulled in by the `heap-profiling` feature. `rust-rocksdb`'s
 # `jemalloc` feature already depends on this exact crate, so naming it here does
@@ -50,7 +62,7 @@ assert_cmd = "2"
 # Must name the same source as the normal dependency above: a registry `duckdb`
 # alongside a git one would be two packages both declaring `links = "duckdb"`,
 # which cargo rejects outright.
-duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.10506.1", features = ["bundled-cmake"] }
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.20000.1", default-features = false, features = ["bundled-cmake"] }
 predicates = "3"
 tempfile = "3"
 tower = "0.5"

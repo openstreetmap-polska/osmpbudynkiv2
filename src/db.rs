@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use duckdb::vtab::arrow::ArrowVTab;
 use duckdb::{Config, Connection};
 
 use crate::osm::kvstore::RocksDB;
@@ -20,9 +19,6 @@ pub fn init_db(
             .unwrap(),
     )
     .with_context(|| format!("Failed to open database at {path:?}"))?;
-
-    conn.register_table_function::<ArrowVTab>("arrow")
-        .context("Failed to register arrow vtab")?;
 
     if let Some(kv) = kv {
         udf::register_udfs(&conn, kv)?;
@@ -433,6 +429,15 @@ pub(crate) fn values_sql(rows: usize, types: &[&str]) -> String {
     vec![row; rows].join(", ")
 }
 
+/// How text `EXPLAIN` labels an RTREE index scan, for the tests that assert a
+/// query still reaches its index. DuckDB 2.0's renderer prints the full name
+/// in each box's header; 1.5 printed `RTREE_INDEX_SCAN` and truncated it in a
+/// wide plan, which is why those tests used to match the prefix `RTREE_IN`.
+/// `EXPLAIN (FORMAT JSON)` still says `RTREE_INDEX_SCAN` and also names the
+/// index, so prefer it where the index name matters.
+#[cfg(test)]
+pub(crate) const EXPLAIN_RTREE_SCAN: &str = "Rtree Index Scan";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,8 +446,8 @@ mod tests {
     ///
     /// DuckDB derives its version from `git describe` inside `duckdb-sources`,
     /// which cargo checks out without tags — so it falls back to the dummy
-    /// `v0.0.1` unless `cmake/duckdb_version.cmake` forces `OVERRIDE_GIT_DESCRIBE`
-    /// (wired up by `.cargo/config.toml`). That version string *is* the extension
+    /// `v0.0.1` unless the build passes `DUCKDB_EXPLICIT_VERSION`, which
+    /// libduckdb-sys 1.20000.1+ derives from its own crate version. That version string *is* the extension
     /// repository path, so a wrong one makes every `INSTALL <extension>` 404 and
     /// hides locally installed extensions. Without this test that surfaces as
     /// several hundred unrelated-looking failures across the whole suite; with
@@ -462,10 +467,9 @@ mod tests {
         assert_ne!(
             version, "v0.0.1",
             "DuckDB built with its dummy version: `git describe` failed in duckdb-sources \
-             and OVERRIDE_GIT_DESCRIBE was not applied. Extension installs will 404. \
-             Check that .cargo/config.toml's CMAKE_TOOLCHAIN_FILE reaches the build \
-             (it is not covered by rerun-if-env-changed — `cargo clean -p libduckdb-sys` \
-             after changing it)."
+             and no DUCKDB_EXPLICIT_VERSION reached the CMake build. Extension installs \
+             will 404. libduckdb-sys 1.20000.1+ passes it itself; check the build \
+             script's `bundled-cmake DuckDB version` warning."
         );
         let major_minor_patch = version.trim_start_matches('v');
         assert_eq!(

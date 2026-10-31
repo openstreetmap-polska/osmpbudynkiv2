@@ -5,16 +5,33 @@ use duckdb::Connection;
 
 use crate::compare::columns::classification_columns;
 use crate::compare::rule::{
-    BDOT10K_EKSPLOATOWANY_FILTER, OSM_MATCH_BUFFER_DEG, buffer, envelope_sql,
+    Area, BDOT10K_EKSPLOATOWANY_FILTER, OSM_MATCH_BUFFER_DEG, buffer,
     unmatched_addresses_in_cell_sql, unmatched_buildings_sql,
 };
 use crate::dataset::{BDOT10K, EGIB, PRG};
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
-/// Builds the `(dest_table, insert_cols, inner_select)` triple
-/// `recompute_cell_in_txn` inserts from. Extracted into its own function so a
-/// regression test can `EXPLAIN` the actual generated SQL, not a
-/// hand-reconstructed copy of it.
+/// What `recompute_cell_in_txn` inserts from: `INSERT INTO {dest}
+/// ({insert_cols}) {inner}`, run with `params`.
+struct CellSql {
+    dest: &'static str,
+    insert_cols: String,
+    inner: String,
+    params: Vec<duckdb::types::Value>,
+}
+
+/// Builds the [`CellSql`] `recompute_cell_in_txn` runs. Extracted into its
+/// own function so a regression test can `EXPLAIN` the actual generated SQL,
+/// not a hand-reconstructed copy of it.
+///
+/// **The text depends only on `source`; the cell travels in `params`.** That
+/// is what lets the caller use `prepare_cached`: one plan per source for the
+/// whole drain, instead of every cell being parsed and planned from scratch
+/// (~13% of a drain on DuckDB 2.0, see [`Area`]). Spelling
+/// any per-cell value back into the text silently brings that cost back.
+/// Layout: the write envelope is `$1..$4`; the buildings' cell guard is
+/// `$5, $6`; prg adds the read envelope as `$5..$8` and its guard is
+/// `$9, $10`.
 ///
 /// The source-table scan is wrapped in a `MATERIALIZED` candidate CTE before
 /// `unmatched_buildings_sql`/`unmatched_addresses_in_cell_sql` and the
@@ -39,8 +56,11 @@ use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 /// text stay untouched (see `CLAUDE.md`'s "match rule has one home" gotcha)
 /// rather than needing a signature change to skip the now-redundant outer
 /// check.
-fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, String, String)> {
+fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<CellSql> {
+    use duckdb::types::Value;
     let write = tile_to_bbox(CHANGE_CELL_ZOOM, cell_x as u32, cell_y as u32);
+    let envelope_params = |b: crate::compare::rule::Bounds| [b.0, b.1, b.2, b.3].map(Value::Double);
+    let cell_params = [Value::Int(cell_x), Value::Int(cell_y)];
     match source {
         "bdot10k" | "egib" => {
             let (spec, id, dest, extra_filter) = if source == "bdot10k" {
@@ -66,7 +86,7 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, St
                      SELECT * FROM {src} b
                      WHERE ST_Intersects(b.centroid, {}){extra}
                  )\n",
-                envelope_sql(write)
+                Area::Params(1).envelope_sql()
             );
             // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
             // closed on all four cell edges, so a centroid exactly on a
@@ -76,14 +96,18 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, St
             // this cell, so a boundary row is written by exactly the cell
             // that owns it.
             let inner = format!(
-                "{candidates}{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
-                unmatched_buildings_sql(spec, "candidates", &select, write, extra_filter)
+                "{candidates}{} AND {cx} = $5 AND {cy} = $6",
+                unmatched_buildings_sql(spec, "candidates", &select, Area::Params(1), extra_filter)
             );
-            Ok((
+            Ok(CellSql {
                 dest,
-                format!("{id}, geom, cell_x, cell_y, computed_at, {}", cc.dest_names),
+                insert_cols: format!("{id}, geom, cell_x, cell_y, computed_at, {}", cc.dest_names),
                 inner,
-            ))
+                params: envelope_params(write)
+                    .into_iter()
+                    .chain(cell_params)
+                    .collect(),
+            })
         }
         "prg" => {
             let read = buffer(write, OSM_MATCH_BUFFER_DEG);
@@ -111,17 +135,29 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<(&'static str, St
             // (docs/per_cell_recompute_cell_guard_scan.md), and the CTE
             // boundary is what defuses that.
             let inner = format!(
-                "{} AND {cx} = {cell_x} AND {cy} = {cell_y}",
-                unmatched_addresses_in_cell_sql(&PRG, "prg_addresses", &select, write, read)
+                "{} AND {cx} = $9 AND {cy} = $10",
+                unmatched_addresses_in_cell_sql(
+                    &PRG,
+                    "prg_addresses",
+                    &select,
+                    Area::Params(1),
+                    Area::Params(5)
+                )
             );
-            Ok((
-                "prg_unmatched",
-                "geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy, \
+            Ok(CellSql {
+                dest: "prg_unmatched",
+                insert_cols:
+                    "geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy, \
                  teryt_miejscowosc, wazny_od_lub_data_nadania, teryt_gmina, gmina, \
                  cell_x, cell_y, computed_at"
-                    .to_string(),
+                        .to_string(),
                 inner,
-            ))
+                params: envelope_params(write)
+                    .into_iter()
+                    .chain(envelope_params(read))
+                    .chain(cell_params)
+                    .collect(),
+            })
         }
         other => bail!("recompute_cell: unknown source {other}"),
     }
@@ -138,13 +174,20 @@ pub fn recompute_cell_in_txn(
     cell_x: i32,
     cell_y: i32,
 ) -> Result<()> {
-    let (dest, insert_cols, inner) = build_sql(source, cell_x, cell_y)?;
+    let cell = build_sql(source, cell_x, cell_y)?;
+    let dest = cell.dest;
 
-    conn.execute(
-        &format!("DELETE FROM {dest} WHERE cell_x = ? AND cell_y = ?"),
-        duckdb::params![cell_x, cell_y],
-    )?;
-    conn.execute_batch(&format!("INSERT INTO {dest} ({insert_cols}) {inner};"))?;
+    // `prepare_cached` for all of them: every text here is constant per source
+    // (see `build_sql`), so a drain plans each once per connection.
+    conn.prepare_cached(&format!(
+        "DELETE FROM {dest} WHERE cell_x = ? AND cell_y = ?"
+    ))?
+    .execute(duckdb::params![cell_x, cell_y])?;
+    conn.prepare_cached(&format!(
+        "INSERT INTO {dest} ({}) {}",
+        cell.insert_cols, cell.inner
+    ))?
+    .execute(duckdb::params_from_iter(&cell.params))?;
     // The cell's denominator, recomputed in the caller's transaction alongside
     // the numerator above so the two can never be read from different passes.
     // Cheap: it re-reads the same envelope through the same RTREE index the
@@ -420,15 +463,12 @@ mod tests {
     ///
     /// osm_buildings / osm_former_buildings are left empty and unindexed --
     /// exactly what `db::create_schema` gives you before `import osm`'s
-    /// `create_spatial_indexes` ever runs -- so a false-positive "RTREE_IN"
+    /// `create_spatial_indexes` ever runs -- so a false-positive RTREE scan
     /// match from either anti-join side is structurally impossible: the only
     /// RTREE index anywhere in this fixture is the one built below on
-    /// `bdot10k_buildings.centroid`. Only the substring "RTREE_IN" is
-    /// asserted (DuckDB's EXPLAIN pretty-printer truncates operator labels in
-    /// a wide plan -- see `server::tiles::tests::mvt_bbox_filter_uses_the_rtree_index`),
-    /// and the absence of "Sequential Scan" is deliberately NOT asserted: the
-    /// fixed plan still legitimately contains one, from the empty anti-join
-    /// tables.
+    /// `bdot10k_buildings.centroid`. The absence of a sequential scan is
+    /// deliberately NOT asserted: the fixed plan still legitimately contains
+    /// one, from the empty anti-join tables.
     #[test]
     fn drain_candidate_cte_uses_the_centroid_rtree_index() {
         let c = conn();
@@ -444,16 +484,16 @@ mod tests {
         .unwrap();
 
         let (cx, cy) = lonlat_to_tile(20.5005, 52.00002, CHANGE_CELL_ZOOM);
-        let (_, _, inner) = build_sql("bdot10k", cx as i32, cy as i32).unwrap();
+        let cell = build_sql("bdot10k", cx as i32, cy as i32).unwrap();
 
-        let mut stmt = c.prepare(&format!("EXPLAIN {inner}")).unwrap();
-        let mut rows = stmt.query([]).unwrap();
+        let mut stmt = c.prepare(&format!("EXPLAIN {}", cell.inner)).unwrap();
+        let mut rows = stmt.query(duckdb::params_from_iter(&cell.params)).unwrap();
         let mut plan = String::new();
         while let Some(row) = rows.next().unwrap() {
             plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
         }
         assert!(
-            plan.contains("RTREE_IN"),
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
             "the drained cell's candidate CTE must use the centroid RTREE index, got plan: {plan}"
         );
     }
@@ -469,7 +509,7 @@ mod tests {
     /// and the test would pass for the wrong reason.
     ///
     /// `osm_addresses` is left empty and unindexed (what `db::create_schema`
-    /// gives you before `import osm`), so a "RTREE_IN" match can only be
+    /// gives you before `import osm`), so an RTREE scan match can only be
     /// coming from `prg_addresses`.
     #[test]
     fn drain_prg_candidate_cte_uses_the_geom_rtree_index() {
@@ -484,16 +524,16 @@ mod tests {
         .unwrap();
 
         let (cx, cy) = lonlat_to_tile(20.5005, 52.0, CHANGE_CELL_ZOOM);
-        let (_, _, inner) = build_sql("prg", cx as i32, cy as i32).unwrap();
+        let cell = build_sql("prg", cx as i32, cy as i32).unwrap();
 
-        let mut stmt = c.prepare(&format!("EXPLAIN {inner}")).unwrap();
-        let mut rows = stmt.query([]).unwrap();
+        let mut stmt = c.prepare(&format!("EXPLAIN {}", cell.inner)).unwrap();
+        let mut rows = stmt.query(duckdb::params_from_iter(&cell.params)).unwrap();
         let mut plan = String::new();
         while let Some(row) = rows.next().unwrap() {
             plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
         }
         assert!(
-            plan.contains("RTREE_IN"),
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
             "the drained cell's address CTE must use the geom RTREE index, got plan: {plan}"
         );
     }

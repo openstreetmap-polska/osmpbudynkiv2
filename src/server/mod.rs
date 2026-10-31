@@ -199,10 +199,12 @@ pub type DbPool = Pool<ClonedConnectionManager>;
 ///
 /// `tiles::query_mvt_layer` relies on this: it caches on the SQL text, and a
 /// server connection cycles through eleven constant texts (the four z14 layers
-/// plus one `agg_cells_sql` per zoom z5..z11). duckdb-rs defaults to 16, which
-/// clears that but leaves no room, and an LRU that starts thrashing costs the
-/// ~8 ms/tile of planning back **silently** -- no error, just a slower server.
-/// Raised so a future query does not quietly reintroduce the cost.
+/// plus one `agg_cells_sql` per zoom z5..z11). The `match_refresh` drain adds
+/// eleven more (`compare::incremental::recompute_cell_in_txn`: three per
+/// source, plus the totals and queue deletes), for 22. duckdb-rs defaults to
+/// 16, and an LRU that starts thrashing costs the planning back **silently**
+/// -- ~8 ms per tile, a few ms per drained cell -- no error, just a slower
+/// server. Keep this above the sum when adding a cached query.
 const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 32;
 
 pub fn build_pool(base_conn: Connection, pool_size: u32) -> Result<DbPool> {

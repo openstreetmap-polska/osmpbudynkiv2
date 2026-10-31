@@ -616,7 +616,7 @@ mod tests {
     /// shared tag resolution re-plan the source read into a full sequential
     /// scan (measured on the national BDOT10k table: 1.3 s vs 18 ms per
     /// request). Only `EXPLAIN` can see it -- every functional test passes
-    /// either way. `RTREE_IN`, not the full name: wide plans truncate labels.
+    /// either way.
     #[test]
     fn the_nearest_building_search_uses_the_rtree_index() {
         let state = seeded_state();
@@ -648,7 +648,7 @@ mod tests {
             // neighbours -- and both must be index scans. (The mapping
             // table's own sequential scan is expected; it is tiny.)
             assert_eq!(
-                plan.matches("RTREE_IN").count(),
+                plan.matches(crate::db::EXPLAIN_RTREE_SCAN).count(),
                 2,
                 "{table}: a source read lost its RTREE index:\n{plan}"
             );

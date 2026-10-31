@@ -64,7 +64,9 @@ Guard: `tile_store::tests::may_exist_rejects_absent_tiles_once_they_are_on_disk`
 workload, two interleaved pairs each: `update osm` reads +1–2%, tile gets
 +2–4% (~0.15 µs per get). Everything in this file was measured with these
 counters; without them the block cache and the filter are unobservable in
-production. `/status` carries `rocksdb.*` — see `kvstore::KvStats`.
+production. Those overheads were measured on `rust-rocksdb` 0.52, whose
+`ExceptHistogramOrTimers` actually selected `ExceptTimers` (histograms on);
+0.53 fixed the mapping, so they are an upper bound. `/status` carries `rocksdb.*` — see `kvstore::KvStats`.
 
 Two things to know. The counters live on the `Options` object, not the
 database, so `RocksDB` owns its `Options` for the same reason it owns its

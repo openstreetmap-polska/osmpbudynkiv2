@@ -3,6 +3,7 @@ mod compare;
 mod config;
 mod dataset;
 mod db;
+mod db_copy;
 mod db_memory;
 mod download;
 mod import;
@@ -156,6 +157,13 @@ fn main() -> Result<()> {
             // nothing a tile renders can change.
             osm::kvstore::compact_osm_families(&kv)?;
             info!("RocksDB compaction complete");
+        }
+        Command::Db {
+            action: cli::DbAction::Copy { dest },
+        } => {
+            // No `clear_tile_store`: the copy holds the same rows, so nothing
+            // a tile renders changes.
+            db_copy::copy_database(&conn, Path::new(&config.db_path), &dest)?;
         }
         Command::Run => {
             let rt = tokio::runtime::Runtime::new()?;
