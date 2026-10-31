@@ -157,9 +157,10 @@ fn warm(
             // Each worker gets its own connection: `try_clone` opens a new one
             // rather than sharing, which is what lets these run concurrently
             // at all. Note the cancellation limit that comes with it --
-            // `shutdown::register_interrupt_handle` covers only the CLI's
-            // original connection, so a Ctrl+C lets each worker finish its
-            // in-flight tile (seconds) before the poll below stops it.
+            // these clones are not registered with
+            // `shutdown::register_interrupt_handle`, so a Ctrl+C lets each
+            // worker finish its in-flight tile (seconds) before the poll below
+            // stops it.
             let worker_conn = conn.try_clone().context("tiles warm: clone connection")?;
             let blocks = blocks.clone();
             let next = next.clone();

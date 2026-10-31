@@ -60,7 +60,7 @@ and hundreds of tests fail from this one cause. Two things:
 1. **duckdb-rs `v1.20000.1`+ stamps it itself**: its bundled-cmake build script
    passes `DUCKDB_EXPLICIT_VERSION`, derived from the crate version
    (`1.20000.x` ⇒ `v2.0.0`, overridable with `DUCKDB_VERSION`), on every build.
-   Up to 1.10505 this project forced it with a CMake toolchain file
+   Up to 1.10506 this project forced it with a CMake toolchain file
    (`cmake/duckdb_version.cmake` via `.cargo/config.toml`), which had to move in
    lockstep with the tag and did not trigger a rebuild when edited; both are
    gone. `db::tests::duckdb_reports_a_real_version_so_extensions_resolve` is
@@ -1506,11 +1506,15 @@ global flag as well.
    `BEGIN` while adding a rollback path to reason about.
 4. **A flag polled between statements cannot touch a statement already running**,
    which is most of the wall time. `shutdown::register_interrupt_handle` closes
-   that gap by failing the in-flight DuckDB statement. **Scope is the CLI's single
-   connection only** — `try_clone` opens a brand-new connection with its own
-   handle, so the server relies on graceful shutdown and per-job cancel flags
-   instead. `interrupting_a_running_statement_does_not_poison_the_connection` pins
-   both that the interrupt lands and that the connection still works afterwards,
+   that gap by failing the in-flight DuckDB statement. `try_clone` opens a
+   brand-new connection with its own handle, so each owner registers its own:
+   `main.rs` the CLI's connection, `server::ClonedConnectionManager` every pooled
+   connection. Without the pool's registration a SIGTERM waited out each job's
+   statement until systemd killed the process, skipping the checkpoint a clean
+   close performs. Clones made outside the pool (`tiles warm`'s workers) are not
+   registered and finish their statement.
+   `interrupting_a_running_statement_does_not_poison_the_connection` pins both
+   that the interrupt lands and that the connection still works afterwards,
    which is what makes `in_transaction`'s `ROLLBACK`-after-error work on the way
    out.
 

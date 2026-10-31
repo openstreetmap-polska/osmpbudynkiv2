@@ -536,6 +536,42 @@ mod tests {
         Ok(())
     }
 
+    /// duckdb-spatial#861's reproduction: one row appended to an
+    /// RTREE-indexed table, then a close that skips the checkpoint, as any
+    /// crash or kill does. Up to DuckDB v1.5.5 the reopened database failed
+    /// the DELETE below with `INTERNAL Error: Operation requires a flat
+    /// vector`, and in the server that left every later query on the table
+    /// spinning (docs/duckdb_checkpoint_failure.md, 2026-10-31). Fixed by
+    /// duckdb-spatial#862, first shipped with v1.5.6.
+    #[test]
+    fn rtree_indexes_survive_an_unclean_shutdown() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("unclean.duckdb");
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        {
+            let conn = init_db(&path, &init_commands, None)?;
+            conn.execute_batch(
+                "CREATE INDEX osm_addresses_geom_idx ON osm_addresses USING RTREE (geom);
+                 PRAGMA disable_checkpoint_on_shutdown;
+                 INSERT INTO osm_addresses (osm_id, osm_type, geom)
+                     VALUES (1, 'node', ST_Point(21, 52));",
+            )?;
+        }
+        let wal = std::fs::metadata(dir.path().join("unclean.duckdb.wal"))?;
+        assert!(wal.len() > 0, "the close must leave the insert in the WAL");
+
+        let conn = init_db(&path, &init_commands, None)?;
+        conn.execute_batch("DELETE FROM osm_addresses WHERE osm_type = 'node' AND osm_id IN (2)")?;
+        let hits: i64 = conn.query_row(
+            "SELECT count(*) FROM osm_addresses
+             WHERE ST_Intersects(geom, ST_MakeEnvelope(20, 51, 22, 53))",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(hits, 1, "the replayed row must be found through the index");
+        Ok(())
+    }
+
     #[test]
     fn test_package_exports_column_types_round_trip() -> Result<()> {
         let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];

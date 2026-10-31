@@ -11,6 +11,10 @@ the recovery is not, and one of the causes was a change made the same day.
 > for the mechanism, why the patched-extension fix is unavailable on v1.5.5,
 > and the CLI version-skew hazard. The July **recovery procedure is still the
 > right one** and is unchanged.
+>
+> **On 2026-10-31 it recurred as a silent livelock**, and DuckDB v1.5.6 fixes
+> the cause. See
+> [Update 2026-10-31](#update-2026-10-31-a-silent-livelock-fixed-by-v156).
 
 ---
 
@@ -223,3 +227,47 @@ tells you about extension behaviour is about that other stack, not production's.
 Run `reports export`. `object_reports` is the only table in this database that
 cannot be reconstructed from an external source — everything else is an
 `import full` away. See CLAUDE.md.
+
+---
+
+# Update 2026-10-31: a silent livelock, fixed by v1.5.6
+
+## Symptom
+
+No error at all. About 90 minutes after each start every pool connection was
+busy, and `/status`, `tile_refresh` and the API logged `failed to acquire pool
+connection`. `match_refresh` and `osm_update` hit their timeouts and never
+drained, OSM replication fell nine hours behind, and a `SIGTERM` waited out
+`TimeoutStopSec` before systemd killed the process. That kill left a WAL, so
+the next start was broken the same way.
+
+## Mechanism
+
+The #861 replay error is thrown inside DuckDB's `TableIndexList::Bind`
+(`src/storage/table_index_list.cpp`, unchanged on `main`). It marks an index
+`BINDING`, releases its lock, binds, and marks it `BOUND` only on success. The
+exception skips that, so the entry stays `BINDING` for the life of the process,
+and every other thread that needs the index busy-spins in "another thread is
+binding the index", including the failing statement's own sibling tasks, which
+its executor then waits for in `CancelTasks`. Stack samples showed three
+threads in `Bind` under `PhysicalDelete::GetLocalSinkState` (an `osm_update`
+`DELETE`) and the `match_refresh` statement in `CancelTasks`. The spin checks
+no interrupt flag, so nothing in the process could end it.
+
+The trigger was the 2026-10-30 restart after `database has been invalidated`:
+an invalidated database cannot checkpoint, so that exit, like any crash or
+kill, left a WAL of OSM appends.
+
+## Recovery and fix
+
+The July table copy restored it, run with the v1.5.5 CLI (all 22 tables, 11
+RTREE indexes, about 4 minutes; 20.9 GB became 13.8 GB). The broken original
+is kept beside it as `osmpbudynkiv2.duckdb.broken-backup-20261031` with its
+`.wal`.
+
+duckdb-spatial#862 was merged into the `v1.5-variegata` branch, and the
+spatial build pinned by DuckDB v1.5.6 contains it, so the patched-extension
+section above no longer applies: the project now builds against v1.5.6.
+`db::tests::rtree_indexes_survive_an_unclean_shutdown` is #861's reproduction,
+which fails on v1.5.5. The server's pooled connections are also interrupted on
+`SIGTERM` now, so an ordinary stop checkpoints instead of being killed.

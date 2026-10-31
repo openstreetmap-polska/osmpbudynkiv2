@@ -66,6 +66,13 @@ impl r2d2::ManageConnection for ClonedConnectionManager {
     /// later request failing to acquire one. `try_clone` reads the base
     /// connection without mutating it, so a panic elsewhere leaves nothing
     /// half-written for it to observe.
+    ///
+    /// Every connection made here is registered with
+    /// [`crate::shutdown::register_interrupt_handle`]. A clone has its own
+    /// interrupt handle, so the base connection's registration does not reach
+    /// it. Without this, a SIGTERM waited for each job's in-flight statement
+    /// until systemd's stop timeout killed the process, skipping the
+    /// checkpoint a clean close performs.
     fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
         let conn = self
             .base
@@ -73,6 +80,7 @@ impl r2d2::ManageConnection for ClonedConnectionManager {
             .unwrap_or_else(|e| e.into_inner())
             .try_clone()?;
         conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+        crate::shutdown::register_interrupt_handle(conn.interrupt_handle());
         Ok(conn)
     }
 
@@ -780,6 +788,16 @@ mod tests {
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 99, "only the one committed delete may have landed");
+    }
+
+    /// A pooled connection is a clone with its own interrupt handle, so only
+    /// registering it lets the first shutdown signal abort a job's in-flight
+    /// statement instead of waiting it out.
+    #[test]
+    fn pooled_connections_are_interrupted_on_shutdown() {
+        let pool = build_pool(table_of_100(), 2).unwrap();
+        let conn = pool.get().unwrap();
+        assert!(crate::shutdown::is_registered(&conn.interrupt_handle()));
     }
 
     /// `web_dir` is a parameter (not baked into a fixed default) so the

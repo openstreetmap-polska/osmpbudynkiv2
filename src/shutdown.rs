@@ -12,6 +12,8 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Registering a connection's interrupt handle here closes that gap: the
 /// ctrlc handler below calls `.interrupt()` on everything registered, which
 /// makes DuckDB fail the in-flight statement instead of waiting for it.
+/// The CLI registers its one connection in `main.rs`; the server's pool
+/// registers each connection it makes (`server::ClonedConnectionManager`).
 ///
 /// `Mutex::new`/`Vec::new` are both `const`, so this needs no `OnceLock` or
 /// lazy-init dance.
@@ -28,6 +30,16 @@ pub fn register_interrupt_handle(handle: Arc<InterruptHandle>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(handle);
+}
+
+/// Whether `handle` is one the first shutdown signal will interrupt.
+#[cfg(test)]
+pub fn is_registered(handle: &Arc<InterruptHandle>) -> bool {
+    INTERRUPT_HANDLES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|registered| Arc::ptr_eq(registered, handle))
 }
 
 /// Register a handler for SIGINT and SIGTERM.
@@ -184,8 +196,8 @@ mod tests {
         // `InnerConnection::try_clone`, duckdb-1.10505.0). So this test must
         // run the long statement on `conn` itself, moved into the worker
         // thread, and hand it back afterwards rather than cloning it -- which
-        // is also exactly why Gap 1's `main.rs` registration only covers the
-        // CLI's single connection, not the server's cloned pool.
+        // is also why `main.rs`'s registration covers only the CLI's own
+        // connection, and the server's pool registers each clone it makes.
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let query_thread = std::thread::spawn(move || {
