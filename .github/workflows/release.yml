@@ -80,17 +80,25 @@ jobs:
     # The Rust version is not restated here on purpose: rustup reads
     # rust-toolchain.toml, so the pin keeps the single home it has in the repo
     # instead of gaining a second copy that can drift.
-    - name: Show toolchain
+    - name: Prepare toolchain
+      shell: bash
       run: |
         rustc --version
         cargo --version
+        # rust-cache hashes every installed toolchain, including unused ones.
+        active=$(rustup show active-toolchain | cut -d ' ' -f1)
+        while read -r toolchain _; do
+          if [ "$toolchain" != "$active" ]; then
+            rustup toolchain uninstall "$toolchain"
+          fi
+        done < <(rustup toolchain list --quiet)
 
     # Caches ~/.cargo plus the dependency half of target/. The DuckDB CMake
     # tree alone is ~600 MB uncompressed (RocksDB adds ~77 MB), which is both
     # the reason this job needs a cache and the reason to keep an eye on the
     # repo's 10 GB Actions cache budget.
     - name: Cache Rust build
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         # Cargo.lock and the rustc version are folded into the computed key
         # already, and since duckdb-rs 1.20000.1 the version DuckDB stamps into
@@ -104,7 +112,7 @@ jobs:
         # fingerprints still match, so they are linked rather than rebuilt --
         # silently undoing the `runs-on` pin above and reproducing the exact
         # glibc/libstdc++ failure it exists to prevent, after a green build.
-        key: ${{ env.ImageOS }}
+        env-vars: ImageOS
         # A cold run that fails in our own crate still leaves half an hour of
         # compiled C++ behind. Keeping it turns the retry into a short job.
         cache-on-failure: true
