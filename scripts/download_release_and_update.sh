@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Update a deployed osmpbudynkiv2 server to the newest GitHub release.
 #
-# Run on the server, as root:
+# Run as the deployment owner (usually root for a system service):
 #   sudo bash scripts/download_release_and_update.sh
 #   sudo bash scripts/download_release_and_update.sh --no-start
 #
@@ -15,7 +15,7 @@ set -euo pipefail
 
 REPO=${REPO:-openstreetmap-polska/osmpbudynkiv2}
 APP_DIR=${APP_DIR:-/opt/osmpbudynkiv2}
-OWNER=${OWNER:-osmpbudynkiv2:osmpbudynkiv2}
+OWNER=${OWNER:-$(id -u):$(id -g)}
 SERVICE=${SERVICE:-osmpbudynkiv2}
 
 # --no-start updates the files but leaves the service down. Needed whenever the
@@ -31,8 +31,6 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-
-[ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
 # `releases/latest` skips prereleases. This takes the first .tar.gz asset,
 # which is unambiguous while the release workflow publishes exactly one.
@@ -58,12 +56,14 @@ src=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)
 # DuckDB has no multi-writer support, so never swap under a running server.
 # Restarted only if it was running: leaves a deliberately-stopped service
 # (mid-import, say) stopped.
-active=0; systemctl is-active --quiet "$SERVICE" && active=1 || true
-[ "$active" -eq 1 ] && systemctl stop "$SERVICE" || true
+active=0
+if systemctl is-active --quiet "$SERVICE"; then
+  active=1
+  systemctl stop "$SERVICE"
+fi
 
-# `install`, not `cp`: sets owner and mode in one step (tar extracted as root),
-# and unlinks the destination first, so it works even against a binary that is
-# still executing, where cp fails with ETXTBSY.
+# `install` unlinks the destination first, so it works even against a binary
+# that is still executing, where cp fails with ETXTBSY.
 install -o "${OWNER%%:*}" -g "${OWNER##*:}" -m 755 "$src/osmpbudynkiv2" "$APP_DIR/osmpbudynkiv2"
 
 # Self-update. Safe for the same reason `install` is used above: bash reads a

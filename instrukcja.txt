@@ -37,7 +37,9 @@ Flaga `--no-start` zostawia usługę zatrzymaną. Przydaje się przy pierwszym w
 sudo bash download_release_and_update.sh --no-start
 ```
 
-Domyślne ścieżki i nazwy (`/opt/osmpbudynkiv2`, użytkownik `osmpbudynkiv2`, usługa `osmpbudynkiv2`) można nadpisać zmiennymi środowiskowymi `APP_DIR`, `OWNER`, `SERVICE` i `REPO` — pamiętając o `sudo -E`, które przekazuje je do skryptu.
+Domyślnie pliki wydania należą do użytkownika uruchamiającego skrypt. W przypadku usługi systemowej katalog aplikacji i jego pliki powinny należeć do administratora, a baza danych i rozszerzenia DuckDB znajdować się w osobnym katalogu zapisywalnym przez użytkownika usługi.
+
+Domyślny katalog aplikacji, właściciela plików, nazwę usługi i repozytorium można nadpisać zmiennymi środowiskowymi `APP_DIR`, `OWNER`, `SERVICE` i `REPO` — pamiętając o `sudo -E`, które przekazuje je do skryptu.
 
 ---
 
