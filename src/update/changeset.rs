@@ -169,7 +169,7 @@ mod tests {
         table: "live",
         key_columns: &["id"],
         compared_columns: &["a"],
-        compare_geometry: true,
+        compare_geometry: crate::dataset::GeometryCompare::Exact,
         geom_kind: GeomKind::Point,
     };
 

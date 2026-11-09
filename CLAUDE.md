@@ -172,28 +172,40 @@ and comparing a *named list* of columns — never a whole-row hash, which cannot
 tell a record changing from its *serialization* changing (a routine BDOT10k
 re-export rewrote all 16,344,762 rows). Both halves live on `DatasetSpec`
 (`src/dataset.rs`): `key_columns` for identity, `compared_columns` +
-`compare_geometry` for change. The three configurations look inconsistent from
-outside; each is deliberate. Measurements:
-`docs/superpowers/plans/2026-08-14-key-based-diff.md`.
+`compare_geometry` (`GeometryCompare::None` / `Exact` / `Tolerance { metres }`)
+for change. The three configurations look inconsistent from outside; each is
+deliberate. Measurements:
+`docs/superpowers/plans/2026-08-14-key-based-diff.md`,
+`docs/egib_geometry_tolerance.md`.
 
 **Gotcha — "modified" has one *definition* and three *expressions*, and the one
 the diff runs is not the one that defines it.** All three are generated from the
 same `compared_columns` + `compare_geometry`, which is what keeps each source's
 measured column choices inherited everywhere for free:
 
-| expression | who runs it | stability |
-|---|---|---|
-| `changed_predicate_sql` | **nobody** — the definition, exercised only by tests | — |
-| `content_hash_sql` | `update::diff::compute` | transient, per query |
-| `content_signature_sql` | `reports::reconcile_source` | **stored in `object_reports`; must never change** |
+| expression | who runs it | vs. the definition, `None`/`Exact` | `Tolerance` (EGIB) | stability |
+|---|---|---|---|---|
+| `changed_predicate_sql` | **tests only** — the definition | — | — | — |
+| `content_hash_sql` | `update::diff::compute` | differs ⇔ modified | modified ⇒ differs (a prefilter) | transient, per query |
+| `content_signature_sql` | `reports::reconcile_source` | differs ⇔ modified | byte-exact, unchanged | **stored in `object_reports`; must never change** |
 
 1. **`changed_predicate_sql` has no production caller and must not be deleted
    as dead code** (it carries `#[cfg_attr(not(test), allow(dead_code))]` saying
-   so). It is what the other two are correct *against*:
+   so; only its geometry half, `geometry_changed_sql`, runs, in the tolerance
+   diff's stage 2). It is what the other two are correct *against*:
    `dataset::tests::signature_changes_exactly_when_the_diff_says_modified`
    asserts row by row that both differ exactly when it does. Delete it and the
    remaining two are pinned only to each other, free to drift together in
-   silence.
+   silence. **For `Tolerance` the equivalences become implications**, each
+   pinned row by row: the hash never hides a flagged row
+   (`the_tolerance_prefilter_never_hides_a_row_the_definition_flags`), the
+   two-stage diff equals the definition
+   (`diff::tests::the_two_stage_diff_equals_the_definition`), and the
+   signature stays byte-exact because the apply rewrites only modified rows —
+   not modified ⇒ live bytes untouched ⇒ signature untouched
+   (`a_tolerance_refresh_moves_the_signature_only_of_rows_it_rewrites`), so no
+   migration. PRG's and BDOT10k's SQL is pinned byte-identical to before
+   (`exact_and_ignored_geometry_sql_is_unchanged`, in `dataset` and `diff`).
 2. **The diff hashes each side *before* the join** — `(key, hash)` subqueries
    joined on the key, never `JOIN ... WHERE changed_predicate`, which would drag
    every compared column (EGIB's 17.6M polygons included) through the hash join
@@ -203,6 +215,11 @@ measured column choices inherited everywhere for free:
    already project keys alone. Pinned structurally by
    `diff::tests::the_modified_diff_hashes_each_side_before_joining`, because the
    answer is identical either way and no functional test can see the difference.
+   **`Tolerance` keeps that shape for stage 1**, writing the differing keys to
+   `diff_modified_candidates` with an attrs-changed flag (`content_hash_sql` is a
+   struct of two digests for exactly this); stage 2 joins geometry back **only
+   for the geometry-only candidates**. Materializing that key set is fine;
+   materializing either full side is the trap above.
 3. **This is still not a whole-row hash**, the thing the paragraph above
    forbids. It hashes exactly the curated `compared_columns`, so BDOT10k's
    geometry churn stays excluded —
@@ -220,7 +237,7 @@ measured column choices inherited everywhere for free:
    DuckDB's internal hash with no such promise, which costs nothing inside one
    query and would be a trap if the two shared an expression.
 
-- **BDOT10k — `compare_geometry: false`.** BDOT10k periodically re-serializes
+- **BDOT10k — `GeometryCompare::None`.** BDOT10k periodically re-serializes
   every geometry wholesale (0.94%, 4.5%, then **100%** of rows across measured
   snapshot pairs). Re-serialized bytes are indistinguishable from real movement.
   Accepted cost: a geometry-only edit with no `WERSJA` bump and no attribute
@@ -241,8 +258,22 @@ measured column choices inherited everywhere for free:
 - **EGIB — `czas_pozyskania` (99.7% churn per export) and `pozostale_atrybuty`
   (32.8%, carries a per-export `gml_id`) are excluded**, and geometry is *not*
   optional: 617,207 records have all three compared attributes NULL, so geometry
-  is their only signal. Compare it as `ST_AsWKB(...)`, never bare `GEOMETRY` —
-  24.18s vs 2.50s on the real 17.5M-row table for the identical answer.
+  is their only signal. **It is compared with a 2 cm tolerance
+  (`EGIB_GEOMETRY_TOLERANCE_M`), not byte for byte**: GUGiK re-serializes whole
+  powiats at a different coordinate precision between exports, which read as
+  ~3.1M of 17.6M rows modified a day and 5.5–6.5 h applies. Modified ⇔ structure
+  changed (type, parts, rings, vertices per ring) or some vertex moved ≥ 2 cm,
+  paired in `ST_Points` order and measured by latitude-scaled degree deltas
+  (never `ST_Distance_Sphere`/`_Spheroid` — `geometry_always_xy`, as for area).
+  Four things: **(1)** not rounding — that flags any vertex near a grid line
+  however small the move (7 decimals still flags ~10% of the noise); **(2)** the
+  prefilter snaps to 1e-7° and is sound only while the tolerance ≥ the cell
+  diagonal (≤ 1.33 cm in Poland) — `the_tolerance_covers_the_prefilter_grid_diagonal`
+  computes it; **(3)** served geometry stays raw: an unmodified row keeps the
+  previous export's bytes, within 2 cm of the latest; **(4)** `import egib`
+  rebuilds from raw bytes, so it still expires reports on noise — accepted for
+  a manual rebuild. Any byte comparison is `ST_AsWKB(...)`, never bare
+  `GEOMETRY` (24.18s vs 2.50s for the identical answer).
 
 **Gotcha — the key diff needs a non-null, unique key, and nothing at diff time
 can check that.** `update::diff::compute` joins with plain equality. A NULL key
@@ -403,7 +434,9 @@ be proposed at all. An `active` report vetoes its object out of
    gmina bulk-republish expires nothing; BDOT10k includes `WERSJA` but not
    geometry, so a bump does expire — precisely the "new version ⇒ importable
    again" behaviour). `dataset::tests::signature_changes_exactly_when_the_diff_says_modified`
-   pins them together. It hashes the *curated* compared set for
+   pins them together. EGIB's tolerance needed no signature change: it is
+   compared against the *live* row, which a sub-tolerance re-serialization
+   never rewrites. It hashes the *curated* compared set for
    `O(active reports)` rows, never `O(source table)` — do not widen it.
 6. **`reconcile_source` has four call sites and the `import` one is not
    redundant**: `update::dataset::refresh` (inside the apply transaction), every

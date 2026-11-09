@@ -8,7 +8,8 @@
 //! comparison a refresh uses to decide whether a record is "modified" — see
 //! its doc comment and `docs/superpowers/plans/2026-08-14-key-based-diff.md`
 //! for the measurements behind each source's `compared_columns` /
-//! `compare_geometry` choice.
+//! `compare_geometry` choice, and `docs/egib_geometry_tolerance.md` for
+//! [`GeometryCompare::Tolerance`].
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeomKind {
@@ -16,6 +17,28 @@ pub enum GeomKind {
     Point,
     /// Geometry is an area; use its centroid as the representative point.
     Polygon,
+}
+
+/// How a source's geometry takes part in deciding "modified". Per source,
+/// like `compared_columns`, and for the same reason: each choice is a
+/// measured answer to how that source's exports churn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GeometryCompare {
+    /// Not compared at all (BDOT10k, which re-serializes every geometry
+    /// wholesale; see the comment on [`BDOT10K`]).
+    None,
+    /// Byte for byte, as `ST_AsWKB` (PRG).
+    Exact,
+    /// Modified iff the geometry's *structure* changed -- type, part count,
+    /// ring count per part, vertex count per ring -- or some vertex moved at
+    /// least `metres`, vertices paired in `ST_Dump(ST_Points(g))` order (EGIB;
+    /// see [`EGIB_GEOMETRY_TOLERANCE_M`]).
+    ///
+    /// **Polygonal sources only**: the structure digest reads rings, and
+    /// `ST_ExteriorRing` of anything else is NULL, so a line's vertex count
+    /// would go unchecked. `tests::tolerance_is_only_used_on_polygon_sources`
+    /// pins it.
+    Tolerance { metres: f64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -29,8 +52,8 @@ pub struct DatasetSpec {
     pub key_columns: &'static [&'static str],
     /// Columns compared to decide "modified". Never volatile export metadata.
     pub compared_columns: &'static [&'static str],
-    /// Whether geometry participates in the comparison.
-    pub compare_geometry: bool,
+    /// Whether, and how, geometry participates in the comparison.
+    pub compare_geometry: GeometryCompare,
     pub geom_kind: GeomKind,
 }
 
@@ -100,9 +123,19 @@ impl DatasetSpec {
     /// for the measurements behind each source's `compared_columns` /
     /// `compare_geometry` choice. Shape: a row-wise
     /// `(a.c1, a.c2, ...) IS DISTINCT FROM (b.c1, b.c2, ...)` over
-    /// `compared_columns`, plus `OR ST_AsWKB(a.geom) IS DISTINCT FROM
-    /// ST_AsWKB(b.geom)` when `compare_geometry` is set. The whole result is
+    /// `compared_columns`, plus `OR` the geometry half,
+    /// [`geometry_changed_sql`](Self::geometry_changed_sql), unless
+    /// `compare_geometry` is [`GeometryCompare::None`]. The whole result is
     /// parenthesized so a caller can safely append ` AND ...` to it.
+    ///
+    /// **What "implement" means depends on the geometry mode.** For `None` and
+    /// `Exact`, `content_hash_sql` differs *exactly* when this does. For
+    /// `Tolerance` it cannot -- a hash cannot express "moved less than 2 cm"
+    /// -- so it is only a *necessary* condition, a prefilter: it never hides a
+    /// row this predicate flags, and `update::diff` verifies what it lets
+    /// through with the geometry half of this predicate. Both properties are
+    /// pinned row by row (`tests::the_tolerance_prefilter_never_hides_a_row_the_definition_flags`,
+    /// `update::diff::tests::the_two_stage_diff_equals_the_definition`).
     ///
     /// Row-wise `IS DISTINCT FROM` is used specifically because it is
     /// NULL-safe in DuckDB (`(NULL, 1) IS DISTINCT FROM (NULL, 1)` is false,
@@ -137,13 +170,7 @@ impl DatasetSpec {
             Some(format!("({lhs}) IS DISTINCT FROM ({rhs})"))
         };
 
-        let geom = if self.compare_geometry {
-            Some(format!(
-                "ST_AsWKB({a}.geom) IS DISTINCT FROM ST_AsWKB({b}.geom)"
-            ))
-        } else {
-            None
-        };
+        let geom = self.geometry_changed_sql(&format!("{a}.geom"), &format!("{b}.geom"));
 
         match (attrs, geom) {
             (Some(attrs), Some(geom)) => format!("({attrs} OR {geom})"),
@@ -151,6 +178,25 @@ impl DatasetSpec {
             (None, Some(geom)) => format!("({geom})"),
             // Nothing is compared, so nothing can ever be modified.
             (None, None) => "(FALSE)".to_string(),
+        }
+    }
+
+    /// The geometry half of [`changed_predicate_sql`](Self::changed_predicate_sql):
+    /// true when geometry `a` differs from geometry `b` in a way this source
+    /// cares about, `None` when it does not compare geometry at all.
+    ///
+    /// Its own builder because it has two callers that must agree: the
+    /// predicate above, and stage 2 of `update::diff::compute` for a
+    /// [`GeometryCompare::Tolerance`] source, which verifies the prefilter's
+    /// geometry-only candidates with exactly this text.
+    ///
+    /// Never NULL for `Tolerance`: NULL vs NULL is unchanged and NULL vs a
+    /// geometry is changed, the same answer `IS DISTINCT FROM` gives `Exact`.
+    pub fn geometry_changed_sql(&self, a: &str, b: &str) -> Option<String> {
+        match self.compare_geometry {
+            GeometryCompare::None => None,
+            GeometryCompare::Exact => Some(format!("ST_AsWKB({a}) IS DISTINCT FROM ST_AsWKB({b})")),
+            GeometryCompare::Tolerance { metres } => Some(geometry_moved_sql(a, b, metres)),
         }
     }
 
@@ -215,6 +261,19 @@ impl DatasetSpec {
     /// `GEOMETRY`, matching `changed_predicate_sql`'s reason for `ST_AsWKB`:
     /// native geometry comparison measured 24.18s against 2.50s on the real
     /// 17.5M-row EGIB table.
+    ///
+    /// **A [`GeometryCompare::Tolerance`] source is digested byte-exactly too,
+    /// deliberately, and must stay so.** Changing this text would expire every
+    /// stored report on upgrade, and it does not need to change:
+    /// `reports::reconcile_source` compares the stored signature against the
+    /// *live* row, and the apply rewrites only rows the diff calls modified.
+    /// A sub-tolerance re-serialization is not modified, so the live bytes --
+    /// and this signature -- stay exactly as they were. The equivalence with
+    /// the diff therefore becomes one-directional for such a source ("not
+    /// modified" implies "signature unchanged", never the converse), which
+    /// `tests::a_tolerance_refresh_moves_the_signature_only_of_rows_it_rewrites`
+    /// pins. The one path that still expires reports on noise is `import
+    /// egib`, a manual full rebuild from the raw bytes -- accepted.
     pub fn content_signature_sql(&self, alias: &str) -> String {
         // chr(30) = record separator, chr(31) = unit separator. Both are
         // control characters that cannot occur in these sources' text columns
@@ -229,7 +288,7 @@ impl DatasetSpec {
             .map(|c| format!("COALESCE({alias}.{c}::VARCHAR, {NULL_SENTINEL})"))
             .collect();
 
-        if self.compare_geometry {
+        if self.compare_geometry != GeometryCompare::None {
             parts.push(format!(
                 "COALESCE(hex(ST_AsWKB({alias}.geom)), {NULL_SENTINEL})"
             ));
@@ -309,6 +368,23 @@ impl DatasetSpec {
     /// NULL-skipping opens. Callers still compare with `IS DISTINCT FROM`,
     /// which is correct whether or not the hash itself is ever NULL.
     ///
+    /// **For a [`GeometryCompare::Tolerance`] source this is a prefilter, not
+    /// an equivalent**, and it is a struct of two digests rather than one:
+    /// `attrs` hashes the compared columns exactly as above, `geom` hashes a
+    /// structural digest (type, per-part ring vertex counts) plus every vertex
+    /// snapped to a 1e-7 degree grid ([`TOLERANCE_GRID_PER_DEGREE`]). A vertex
+    /// that moved at least one grid-cell diagonal must land in another cell,
+    /// so as long as the tolerance is at least that diagonal, a row the
+    /// definition flags always differs here
+    /// (`tests::the_tolerance_covers_the_prefilter_grid_diagonal` computes the
+    /// bound). The converse fails on purpose: a 1 mm shift across a grid line
+    /// differs too, which is why `update::diff` verifies the geometry-only
+    /// candidates, and why the two digests are kept apart -- a row whose
+    /// `attrs` differ is modified with no geometry check at all. Its prototype
+    /// measured 12.4 s per side on the real 17.6M-row table, against 2.4 s for
+    /// `ST_AsWKB`; the whole EGIB diff went from 6.5 s to 22.1 s. On a churn
+    /// day it lets through ~10% of the noise.
+    ///
     /// One behaviour difference from `changed_predicate_sql` worth knowing:
     /// row-wise `IS DISTINCT FROM` coerces across numeric types, so a live
     /// `INTEGER` 1 and a staged `DOUBLE` 1.0 compare equal, while their hashes
@@ -324,8 +400,18 @@ impl DatasetSpec {
             .map(|c| format!("{alias}.{c}"))
             .collect();
 
-        if self.compare_geometry {
-            parts.push(format!("ST_AsWKB({alias}.geom)"));
+        match self.compare_geometry {
+            GeometryCompare::None => {}
+            GeometryCompare::Exact => parts.push(format!("ST_AsWKB({alias}.geom)")),
+            GeometryCompare::Tolerance { .. } => {
+                let attrs = if parts.is_empty() {
+                    "hash(NULL)".to_string()
+                } else {
+                    format!("hash({})", parts.join(", "))
+                };
+                let geom = geometry_grid_digest_sql(&format!("{alias}.geom"));
+                return format!("{{'{HASH_ATTRS_FIELD}': {attrs}, '{HASH_GEOM_FIELD}': {geom}}}");
+            }
         }
 
         // Nothing is compared, so nothing can ever change -- mirroring
@@ -339,6 +425,138 @@ impl DatasetSpec {
 
         format!("hash({})", parts.join(", "))
     }
+}
+
+/// Field names of the struct [`DatasetSpec::content_hash_sql`] returns for a
+/// [`GeometryCompare::Tolerance`] source: the compared attributes' hash, and
+/// the geometry's grid digest. `update::diff` reads `attrs` to tell a
+/// geometry-only candidate apart.
+pub const HASH_ATTRS_FIELD: &str = "attrs";
+pub const HASH_GEOM_FIELD: &str = "geom";
+
+/// The smallest vertex shift, in metres, that makes an EGIB geometry
+/// "modified" ([`GeometryCompare::Tolerance`]).
+///
+/// **Why EGIB needs one at all.** GUGiK re-serializes whole powiats at a
+/// different coordinate precision from one export to the next -- rounded to
+/// 6 decimals or to the millimetre in one, unrounded or re-reprojected (~1e-7 m
+/// apart) in the next. Compared byte for byte, that reported ~3.1M of 17.6M
+/// rows modified every day (3,096,259 on 2026-11-07, 3,089,180 on 2026-11-08),
+/// each apply taking 5.5-6.5 h before the match and tile backlog it left. Our
+/// own pipeline is deterministic: the same file loaded twice diffs 0/0/0.
+///
+/// **Why a tolerance and not rounding.** Measured on 30,000 rows of the
+/// churning powiats whose bytes changed between the 2026-08-15 and 2026-11-09
+/// exports, geometry transformed exactly as `import::egib` does (rows flagged
+/// modified under each comparison):
+///
+/// | largest vertex shift | rows | exact WKB | 7 dec | 6 dec | 1 cm grid, EPSG:2180 | tolerance 1 cm | tolerance 5 cm |
+/// |---|---|---|---|---|---|---|---|
+/// | < 1 mm | 28,148 | 28,148 | 2,193 | 259 | 3,075 | 0 | 0 |
+/// | 1 mm - 1 cm | 1,045 | 1,045 | 765 | 196 | 725 | 0 | 0 |
+/// | 1 - 5 cm | 0 | | | | | | |
+/// | 5 - 15 cm | 2 | 2 | 2 | 2 | 2 | 2 | 2 |
+/// | >= 15 cm | 762 | 762 | 762 | 762 | 762 | 762 | 762 |
+/// | vertex count changed | 43 | 43 | 43 | 43 | 43 | 43 | 43 |
+///
+/// Rounding flags any vertex that happens to sit either side of a grid line,
+/// however small the move; a coarser grid only lowers the odds, and 6
+/// decimals (~7x11 cm) would catch real moves under ~11 cm only by chance.
+/// A tolerance on the actual shift separates the two populations cleanly.
+///
+/// **Why 2 cm.** Noise tops out under 1 cm and nothing at all sits between
+/// 1 and 5 cm, so anywhere in that gap is equivalent on this data; 2 cm keeps
+/// the most room for real edits while staying above the prefilter grid's
+/// cell diagonal (<= ~1.33 cm at Polish latitudes), which soundness requires
+/// -- `tests::the_tolerance_covers_the_prefilter_grid_diagonal` computes it.
+///
+/// **Served geometry stays raw.** Nothing is snapped or rounded on the way
+/// in. An unmodified row simply keeps the previous export's geometry, which is
+/// within this distance of the latest one at every vertex. Write-up:
+/// `docs/egib_geometry_tolerance.md`.
+pub const EGIB_GEOMETRY_TOLERANCE_M: f64 = 0.02;
+
+/// Reciprocal of the grid, in decimal degrees, that the tolerance prefilter
+/// snaps vertices to (1e-7 degrees: 0.64-0.73 cm of longitude and ~1.11 cm of
+/// latitude across Poland). Stored as the multiplier because that is what the
+/// SQL multiplies by.
+pub const TOLERANCE_GRID_PER_DEGREE: f64 = 1e7;
+
+/// The structural half of a [`GeometryCompare::Tolerance`] comparison, as
+/// two SQL expressions over `g`: the geometry type, and per `ST_Dump` part
+/// the vertex count of the exterior ring followed by each interior ring's.
+fn geometry_structure_sql(g: &str) -> [String; 2] {
+    [
+        format!("ST_GeometryType({g})"),
+        format!(
+            "list_transform(ST_Dump({g}), lambda __d: list_prepend(\
+             ST_NPoints(ST_ExteriorRing(__d.geom)), \
+             list_transform(range(1, ST_NumInteriorRings(__d.geom) + 1), \
+             lambda __i: ST_NPoints(ST_InteriorRingN(__d.geom, __i)))))"
+        ),
+    ]
+}
+
+/// The tolerance prefilter's geometry digest: structure plus every vertex
+/// snapped to the [`TOLERANCE_GRID_PER_DEGREE`] grid, in `ST_Points` order.
+fn geometry_grid_digest_sql(g: &str) -> String {
+    let [ty, rings] = geometry_structure_sql(g);
+    let k = TOLERANCE_GRID_PER_DEGREE;
+    format!(
+        "hash({ty}, {rings}, list_transform(ST_Dump(ST_Points({g})), lambda __p: \
+         [round(ST_X(__p.geom) * {k:?})::BIGINT, round(ST_Y(__p.geom) * {k:?})::BIGINT]))"
+    )
+}
+
+/// The latitude-independent factors of WGS84's metres per degree: of
+/// longitude, `a cos(phi) / sqrt(w) * pi/180`, and of latitude,
+/// `a (1 - e^2) / w^1.5 * pi/180`, with `w = 1 - e^2 sin^2(phi)`. One home for
+/// [`vertex_shift_m_sql`] and the soundness test.
+const METRES_PER_DEG_LON_NUMERATOR: f64 = WGS84_A * std::f64::consts::PI / 180.0;
+const METRES_PER_DEG_LAT_NUMERATOR: f64 = WGS84_A * (1.0 - WGS84_E2) * std::f64::consts::PI / 180.0;
+
+/// Distance in metres between two `[lon, lat]` list expressions `p` and `q`,
+/// from their degree deltas scaled by the WGS84 parallel and meridian radii at
+/// their mid-latitude -- the way [`area_m2_sql`] scales area. Against
+/// EPSG:2180 on the sample in [`EGIB_GEOMETRY_TOLERANCE_M`] it agreed within
+/// 3 um for shifts under 1 cm and within ~0.1 mm for shifts of 5-15 cm.
+///
+/// **Not `ST_Distance_Sphere` / `ST_Distance_Spheroid`**: like
+/// `ST_Area_Spheroid`, their axis order follows `geometry_always_xy`, which
+/// the server sets and a bare CLI session does not, so the same text would
+/// measure something else in each.
+fn vertex_shift_m_sql(p: &str, q: &str) -> String {
+    let lat = format!("radians(({p}[2] + {q}[2]) / 2)");
+    let w = format!("(1 - {WGS84_E2:?} * pow(sin({lat}), 2))");
+    format!(
+        "sqrt(pow(({p}[1] - {q}[1]) * {METRES_PER_DEG_LON_NUMERATOR:?} * cos({lat}) / sqrt({w}), 2) \
+         + pow(({p}[2] - {q}[2]) * {METRES_PER_DEG_LAT_NUMERATOR:?} / pow({w}, 1.5), 2))"
+    )
+}
+
+/// The [`GeometryCompare::Tolerance`] definition of "geometry changed": the
+/// structure differs, or some vertex moved at least `metres`. NULL-safe and
+/// never NULL itself. Polygonal geometry only (see the variant's doc).
+///
+/// Equal structure implies equal vertex counts, so `list_zip` pairs every
+/// vertex; on unequal structure the zip pads with NULLs, which `list_max`
+/// ignores, and the structure arm has already answered.
+fn geometry_moved_sql(a: &str, b: &str, metres: f64) -> String {
+    let [ta, ra] = geometry_structure_sql(a);
+    let [tb, rb] = geometry_structure_sql(b);
+    let points = |g: &str| {
+        format!(
+            "list_transform(ST_Dump(ST_Points({g})), lambda __p: [ST_X(__p.geom), ST_Y(__p.geom)])"
+        )
+    };
+    let (pa, pb) = (points(a), points(b));
+    let shift = vertex_shift_m_sql("__z[1]", "__z[2]");
+    format!(
+        "(CASE WHEN {a} IS NULL OR {b} IS NULL THEN ({a} IS NULL) <> ({b} IS NULL) \
+         ELSE ({ta}, {ra}) IS DISTINCT FROM ({tb}, {rb}) \
+         OR COALESCE(list_max(list_transform(list_zip({pa}, {pb}), lambda __z: {shift})) \
+         >= {metres:?}, FALSE) END)"
+    )
 }
 
 /// Look a source up by the name it is known by everywhere else -- CLI
@@ -398,7 +616,7 @@ pub const BDOT10K: DatasetSpec = DatasetSpec {
         "KODKST",
         "ZRODLODANYCHGEOMETRYCZNYCH",
     ],
-    compare_geometry: false,
+    compare_geometry: GeometryCompare::None,
     geom_kind: GeomKind::Polygon,
 };
 
@@ -411,8 +629,14 @@ pub const EGIB: DatasetSpec = DatasetSpec {
     // noise. Geometry is NOT optional here, unlike BDOT10k: 617,207 records
     // have all three of these attributes NULL, so geometry is their only
     // signal of change. See docs/superpowers/plans/2026-08-14-key-based-diff.md.
+    //
+    // Compared with a tolerance, not byte for byte: GUGiK re-serializes whole
+    // powiats at a different coordinate precision between exports (~3.1M rows
+    // a day read as modified). See EGIB_GEOMETRY_TOLERANCE_M.
     compared_columns: &["rodzaj", "kondygnacje_nadziemne", "kondygnacje_podziemne"],
-    compare_geometry: true,
+    compare_geometry: GeometryCompare::Tolerance {
+        metres: EGIB_GEOMETRY_TOLERANCE_M,
+    },
     geom_kind: GeomKind::Polygon,
 };
 
@@ -436,7 +660,7 @@ pub const PRG: DatasetSpec = DatasetSpec {
         "kod_pocztowy",
         "teryt_miejscowosc",
     ],
-    compare_geometry: true,
+    compare_geometry: GeometryCompare::Exact,
     geom_kind: GeomKind::Point,
 };
 
@@ -945,7 +1169,7 @@ pub fn filter_undersized_geometry(
 /// | PRG (8.6M, points, compares geom) | 197 MiB | **439 MiB** | 439 MiB |
 ///
 /// BDOT10k is the case that makes the point: +61 MiB here against +3,148 MiB
-/// for a whole-row tiebreak, because its `compare_geometry: false` keeps
+/// for a whole-row tiebreak, because its `GeometryCompare::None` keeps
 /// `geom` out of the expression entirely. It needs nothing more anyway,
 /// having just 2 duplicate groups, both with distinct `WERSJA`. PRG lands at
 /// the same cost as the whole row, since its row is little more than the
@@ -1068,6 +1292,166 @@ pub fn drop_ordering_column(
         .with_context(|| format!("Failed to drop ordering column {column} from {table}"))
 }
 
+/// Polygon fixture for [`GeometryCompare::Tolerance`], shared by this
+/// module's tests and `update::diff`'s, so "the prefilter is sound" and "the
+/// two-stage diff equals the definition" are checked over the same rows.
+///
+/// Every coordinate is an exact binary fraction, per the fixture gotcha in
+/// CLAUDE.md: whether a shift straddles a 1e-7 degree grid line is the whole
+/// point of several rows, and an ordinary decimal could land on either side.
+/// The moved vertex starts at `(21 + 2^-12, 52)`, i.e. 0.406 of a grid cell
+/// into its longitude cell and exactly on a latitude line.
+#[cfg(test)]
+pub(crate) mod tolerance_fixture {
+    pub struct Case {
+        pub id: &'static str,
+        pub live: (&'static str, Option<String>),
+        pub staged: (&'static str, Option<String>),
+        /// What the definition must say.
+        pub modified: bool,
+    }
+
+    const X0: f64 = 21.0;
+    const Y0: f64 = 52.0;
+    /// 2^-12 degrees, ~17 x 27 m.
+    const S: f64 = 1.0 / 4096.0;
+
+    fn ring(v2: (f64, f64), extra: &[(f64, f64)]) -> String {
+        let mut pts = vec![(X0, Y0), v2];
+        pts.extend_from_slice(extra);
+        pts.extend([(X0 + S, Y0 + S), (X0, Y0 + S), (X0, Y0)]);
+        let pts: Vec<String> = pts.iter().map(|(x, y)| format!("{x:?} {y:?}")).collect();
+        format!("({})", pts.join(", "))
+    }
+
+    fn square_moved(dx: f64, dy: f64) -> Option<String> {
+        Some(format!("POLYGON({})", ring((X0 + S + dx, Y0 + dy), &[])))
+    }
+
+    fn square() -> Option<String> {
+        square_moved(0.0, 0.0)
+    }
+
+    pub fn cases() -> Vec<Case> {
+        let two = |e: i32| 2f64.powi(e);
+        let case = |id, live, staged, modified| Case {
+            id,
+            live: ("v", live),
+            staged: ("v", staged),
+            modified,
+        };
+        vec![
+            case("same", square(), square(), false),
+            // 2^-25 deg of longitude (~2 mm) from 0.406 to 0.704 of a cell:
+            // crosses a grid line, so the prefilter lets it through and
+            // verification must drop it.
+            case(
+                "sub_crossing_grid",
+                square(),
+                square_moved(two(-25), 0.0),
+                false,
+            ),
+            // 2^-27 deg (~0.5 mm), 0.406 -> 0.480 of a cell: same cell.
+            case(
+                "sub_same_cell",
+                square(),
+                square_moved(two(-27), 0.0),
+                false,
+            ),
+            // 2^-23 deg of latitude, ~1.33 cm: crosses a line, under 2 cm.
+            case(
+                "under_tolerance",
+                square(),
+                square_moved(0.0, two(-23)),
+                false,
+            ),
+            // 2^-22 deg of latitude, ~2.65 cm.
+            case(
+                "over_tolerance",
+                square(),
+                square_moved(0.0, two(-22)),
+                true,
+            ),
+            case(
+                "vertex_added",
+                square(),
+                Some(format!(
+                    "POLYGON({})",
+                    ring((X0 + S, Y0), &[(X0 + S, Y0 + S / 2.0)])
+                )),
+                true,
+            ),
+            case(
+                "ring_added",
+                square(),
+                Some(format!(
+                    "POLYGON({}, ({a:?} {a2:?}, {b:?} {a2:?}, {b:?} {b2:?}, {a:?} {a2:?}))",
+                    ring((X0 + S, Y0), &[]),
+                    a = X0 + S / 4.0,
+                    b = X0 + S / 2.0,
+                    a2 = Y0 + S / 4.0,
+                    b2 = Y0 + S / 2.0,
+                )),
+                true,
+            ),
+            case(
+                "to_multipolygon",
+                square(),
+                Some(format!("MULTIPOLYGON(({}))", ring((X0 + S, Y0), &[]))),
+                true,
+            ),
+            Case {
+                id: "attr_and_sub_tolerance",
+                live: ("v", square()),
+                staged: ("w", square_moved(two(-25), 0.0)),
+                modified: true,
+            },
+            Case {
+                id: "attr_only",
+                live: ("v", square()),
+                staged: ("w", square()),
+                modified: true,
+            },
+            case("null_both", None, None, false),
+            case("to_null", square(), None, true),
+            case("from_null", None, square(), true),
+        ]
+    }
+
+    fn values(side: impl Fn(&Case) -> &(&'static str, Option<String>), with_nulls: bool) -> String {
+        cases()
+            .iter()
+            .filter(|c| with_nulls || (c.live.1.is_some() && c.staged.1.is_some()))
+            .map(|c| {
+                let (a, g) = side(c);
+                let g = g
+                    .as_ref()
+                    .map_or("NULL".to_string(), |w| format!("ST_GeomFromText('{w}')"));
+                format!("('{}', '{a}', {g})", c.id)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// `CREATE TABLE {live}` and `{staged}` as `(id, a, geom)`, plus a stored
+    /// `centroid` so a `Polygon` spec can run a full refresh against them.
+    /// `with_nulls = false` leaves out the NULL-geometry rows, which have no
+    /// cell to enqueue.
+    pub fn create_sql(live: &str, staged: &str, with_nulls: bool) -> String {
+        let table = |name: &str, rows: String| {
+            format!(
+                "CREATE TABLE {name} AS SELECT *, ST_Centroid(geom) AS centroid FROM \
+                 (SELECT id, a, geom::GEOMETRY AS geom FROM (VALUES {rows}) t(id, a, geom));"
+            )
+        };
+        format!(
+            "{}\n{}",
+            table(live, values(|c| &c.live, with_nulls)),
+            table(staged, values(|c| &c.staged, with_nulls))
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,10 +1513,13 @@ mod tests {
         )
         .unwrap();
 
-        // Both polarities of `compare_geometry`, since BDOT10k excludes
-        // geometry while EGIB and PRG include it -- the signature has to track
-        // that choice, not make its own.
-        for compare_geometry in [true, false] {
+        // Both exact modes of `compare_geometry`, since BDOT10k excludes
+        // geometry while PRG compares it byte for byte -- the signature has to
+        // track that choice, not make its own. `Tolerance` is held to the
+        // weaker, one-directional form of this property instead, by
+        // `the_tolerance_prefilter_never_hides_a_row_the_definition_flags` and
+        // `a_tolerance_refresh_moves_the_signature_only_of_rows_it_rewrites`.
+        for compare_geometry in [GeometryCompare::Exact, GeometryCompare::None] {
             let spec = DatasetSpec {
                 name: "test",
                 table: "l",
@@ -1161,12 +1548,12 @@ mod tests {
             for (id, diff_says_changed, signature_differs, hash_differs) in rows {
                 assert_eq!(
                     diff_says_changed, signature_differs,
-                    "compare_geometry={compare_geometry}, row '{id}': the diff and the \
+                    "compare_geometry={compare_geometry:?}, row '{id}': the diff and the \
                      signature disagree about whether this record changed"
                 );
                 assert_eq!(
                     diff_says_changed, hash_differs,
-                    "compare_geometry={compare_geometry}, row '{id}': the diff and the \
+                    "compare_geometry={compare_geometry:?}, row '{id}': the diff and the \
                      content hash disagree about whether this record changed"
                 );
             }
@@ -1191,7 +1578,7 @@ mod tests {
             table: "t",
             key_columns: &["id"],
             compared_columns: &["a", "b"],
-            compare_geometry: false,
+            compare_geometry: GeometryCompare::None,
             geom_kind: GeomKind::Point,
         };
         conn.execute_batch(
@@ -1269,7 +1656,7 @@ mod tests {
             table: "t",
             key_columns: &["id"],
             compared_columns: &["a"],
-            compare_geometry: false,
+            compare_geometry: GeometryCompare::None,
             geom_kind: GeomKind::Polygon,
         };
 
@@ -1945,7 +2332,7 @@ mod tests {
             table: "t",
             key_columns: &["id"],
             compared_columns: &["rodzaj"],
-            compare_geometry: false,
+            compare_geometry: GeometryCompare::None,
             geom_kind: GeomKind::Point,
         };
         assert_eq!(
@@ -1961,7 +2348,7 @@ mod tests {
             table: "t",
             key_columns: &["id"],
             compared_columns: &["rodzaj", "kondygnacje_nadziemne", "kondygnacje_podziemne"],
-            compare_geometry: true,
+            compare_geometry: GeometryCompare::Exact,
             geom_kind: GeomKind::Polygon,
         };
         assert_eq!(
@@ -1974,10 +2361,10 @@ mod tests {
 
     /// Silent-regression territory: BDOT10k's geometry churn (100% in the
     /// 2026-08-10 export) means comparing geometry would rewrite every
-    /// z14 cell in Poland on that kind of refresh. `compare_geometry: false`
-    /// is what prevents that, so pin that the predicate text never mentions
-    /// `geom` -- a future reader "fixing" `compare_geometry` back to `true`
-    /// on the const should fail this test.
+    /// z14 cell in Poland on that kind of refresh. `GeometryCompare::None` is
+    /// what prevents that, so pin that the predicate text never mentions
+    /// `geom` -- a future reader "fixing" `compare_geometry` to `Exact` or
+    /// `Tolerance` on the const should fail this test.
     ///
     /// `content_hash_sql` is checked alongside it, and is in fact the half
     /// that bites: it is what `update::diff` actually evaluates, so pinning
@@ -1996,32 +2383,39 @@ mod tests {
     }
 
     /// The mirror of the BDOT10k test above, and it was missing: nothing
-    /// pinned the EGIB spec at all, so flipping `compare_geometry` to `false`
-    /// there -- a plausible "make it consistent with BDOT10k" edit -- passed
-    /// the whole suite. It is not a symmetric choice. 617,207 EGIB records
-    /// have all three compared attributes NULL, so geometry is their ONLY
-    /// signal that anything changed; without it those records freeze at
-    /// whatever they were first imported as, silently and forever.
+    /// pinned the EGIB spec at all, so dropping its geometry comparison --
+    /// a plausible "make it consistent with BDOT10k" edit -- passed the whole
+    /// suite. It is not a symmetric choice. 617,207 EGIB records have all
+    /// three compared attributes NULL, so geometry is their ONLY signal that
+    /// anything changed; without it those records freeze at whatever they
+    /// were first imported as, silently and forever.
+    ///
+    /// It is compared with a tolerance, not byte for byte (see
+    /// [`EGIB_GEOMETRY_TOLERANCE_M`]): an `Exact` EGIB reads GUGiK's
+    /// precision re-serializations as ~3.1M modified rows a day.
     ///
     /// The export-noise columns are pinned in the same place, since they are
     /// the other half of the same measured decision: `czas_pozyskania` churns
     /// on 99.7% of rows per export and `pozostale_atrybuty` on 32.8% (it
     /// carries a per-export `gml_id`), so admitting either reports a national
     /// rewrite as a national modification.
-    ///
-    /// Geometry must be spelled `ST_AsWKB(...)`, never a bare `GEOMETRY`
-    /// comparison: 24.18s against 2.50s on the real 17.5M-row table for the
-    /// identical answer.
     #[test]
-    fn egib_predicate_compares_geometry_as_wkb_and_omits_the_export_noise_columns() {
+    fn egib_compares_geometry_with_a_tolerance_and_omits_the_export_noise_columns() {
+        assert_eq!(
+            EGIB.compare_geometry,
+            GeometryCompare::Tolerance {
+                metres: EGIB_GEOMETRY_TOLERANCE_M
+            }
+        );
         for sql in [
             EGIB.changed_predicate_sql("s", "l"),
             EGIB.content_hash_sql("t"),
+            EGIB.content_signature_sql("t"),
         ] {
             assert!(
-                sql.contains("ST_AsWKB"),
+                sql.contains("geom"),
                 "EGIB must compare geometry -- 617,207 records have no other \
-                 signal of change -- and must do it as WKB, got: {sql}"
+                 signal of change -- got: {sql}"
             );
             assert!(
                 !sql.contains("czas_pozyskania"),
@@ -2034,6 +2428,351 @@ mod tests {
         }
     }
 
+    /// Every `Tolerance` spec must be polygonal: the structure digest counts
+    /// ring vertices, and `ST_ExteriorRing` of a point or a line is NULL, so
+    /// a line gaining a vertex would go unseen by the structural arm.
+    #[test]
+    fn tolerance_is_only_used_on_polygon_sources() {
+        for spec in ALL_SPECS {
+            if let GeometryCompare::Tolerance { .. } = spec.compare_geometry {
+                assert_eq!(spec.geom_kind, GeomKind::Polygon, "{}", spec.name);
+            }
+        }
+    }
+
+    /// WGS84 metres per degree of (longitude, latitude) at `lat_deg`, from
+    /// the same constants [`vertex_shift_m_sql`] uses.
+    fn metres_per_degree(lat_deg: f64) -> (f64, f64) {
+        let phi = lat_deg.to_radians();
+        let w = 1.0 - WGS84_E2 * phi.sin().powi(2);
+        (
+            METRES_PER_DEG_LON_NUMERATOR * phi.cos() / w.sqrt(),
+            METRES_PER_DEG_LAT_NUMERATOR / w.powf(1.5),
+        )
+    }
+
+    /// The prefilter's soundness rests on one inequality: a vertex that moved
+    /// at least `T` must have moved at least one grid cell along some axis,
+    /// so its snapped coordinates differ. That holds iff `T` is at least the
+    /// cell's diagonal, which depends on latitude -- so compute the worst
+    /// case over Poland's extent from the constants rather than trust the
+    /// "<= 1.33 cm" in the prose. Silent if violated: a real edit between the
+    /// diagonal and `T` would sometimes never reach verification.
+    ///
+    /// The margin covers float error in `round(x * 1e7)`, which is ~1e-8 of a
+    /// cell at these magnitudes; 0.1% is generous. The SQL half ties
+    /// `vertex_shift_m_sql` to the Rust scale factors, so the two cannot
+    /// drift apart and leave this test checking a formula nothing runs.
+    #[test]
+    fn the_tolerance_covers_the_prefilter_grid_diagonal() {
+        use crate::import::prg_axis::POLAND_EXTENT;
+
+        let grid = 1.0 / TOLERANCE_GRID_PER_DEGREE;
+        let diagonal = |lat: f64| {
+            let (kx, ky) = metres_per_degree(lat);
+            ((grid * kx).powi(2) + (grid * ky).powi(2)).sqrt()
+        };
+        let steps = 1000;
+        let (worst_lat, worst) = (0..=steps)
+            .map(|i| {
+                let lat = POLAND_EXTENT.lat_min
+                    + (POLAND_EXTENT.lat_max - POLAND_EXTENT.lat_min) * i as f64 / steps as f64;
+                (lat, diagonal(lat))
+            })
+            .fold((0.0, 0.0), |acc, x| if x.1 > acc.1 { x } else { acc });
+        assert!(
+            (0.0132..0.0134).contains(&worst),
+            "sanity: the worst diagonal over Poland is ~1.33 cm, got {worst} m at {worst_lat}"
+        );
+
+        let tolerances: Vec<(&str, f64)> = ALL_SPECS
+            .iter()
+            .filter_map(|s| match s.compare_geometry {
+                GeometryCompare::Tolerance { metres } => Some((s.name, metres)),
+                _ => None,
+            })
+            .collect();
+        assert!(!tolerances.is_empty(), "EGIB at least uses a tolerance");
+        for (name, metres) in tolerances {
+            assert!(
+                metres >= worst * 1.001,
+                "{name}: tolerance {metres} m is under the prefilter grid's cell \
+                 diagonal ({worst} m at {worst_lat} N), so a real move could stay \
+                 inside one cell on both axes and never reach verification"
+            );
+        }
+
+        use crate::db::init_db;
+        use std::path::Path;
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        let lat = POLAND_EXTENT.lat_min;
+        let sql_diagonal: f64 = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM (SELECT [21.0, {lat:?}] AS p, [21.0 + {grid:?}, {lat:?} + {grid:?}] AS q)",
+                    vertex_shift_m_sql("p", "q")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (sql_diagonal - diagonal(lat)).abs() < 1e-9,
+            "vertex_shift_m_sql measures {sql_diagonal} m for one cell diagonal, \
+             the Rust bound {} m",
+            diagonal(lat)
+        );
+    }
+
+    /// The metric is the definition's ruler, so check it against a known
+    /// distance as well as against itself: at 52N a degree of latitude is
+    /// 111,267 m on the WGS84 meridian and a degree of longitude 68,678 m, so
+    /// 1e-5 degrees is 1.1127 m and 0.6868 m. (Independently, the sample in
+    /// `EGIB_GEOMETRY_TOLERANCE_M` agreed with EPSG:2180 distances within 3 um
+    /// under 1 cm and ~0.1 mm at 5-15 cm.)
+    #[test]
+    fn vertex_shift_measures_known_distances() {
+        use crate::db::init_db;
+        use std::path::Path;
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        let measure = |q: &str| -> f64 {
+            conn.query_row(
+                &format!(
+                    "SELECT {} FROM (SELECT [21.0, 52.0] AS p, {q} AS q)",
+                    vertex_shift_m_sql("p", "q")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let dlat = measure("[21.0, 52.00001]");
+        let dlon = measure("[21.00001, 52.0]");
+        assert!((dlat - 1.1127).abs() < 1e-4, "{dlat}");
+        assert!((dlon - 0.6868).abs() < 1e-4, "{dlon}");
+    }
+
+    /// The fixture ids for which `predicate` (over aliases `s` and `l`) holds.
+    fn tolerance_fixture_ids_where(conn: &duckdb::Connection, predicate: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT l.id FROM l JOIN s USING (id) WHERE {predicate} ORDER BY l.id"
+            ))
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn tolerance_spec() -> DatasetSpec {
+        DatasetSpec {
+            name: "test",
+            table: "l",
+            key_columns: &["id"],
+            compared_columns: &["a"],
+            compare_geometry: GeometryCompare::Tolerance {
+                metres: EGIB_GEOMETRY_TOLERANCE_M,
+            },
+            geom_kind: GeomKind::Polygon,
+        }
+    }
+
+    /// The two properties that replace exact equivalence for a `Tolerance`
+    /// spec, row by row over the shared fixture: the definition says what
+    /// each row is meant to be (pinned against the fixture's own
+    /// expectation), and `content_hash_sql` differs for every row it flags --
+    /// the prefilter never hides one. The converse is deliberately not
+    /// asserted, and the fixture includes rows where it fails
+    /// (`sub_crossing_grid`, `under_tolerance`): those are what stage 2 of
+    /// the diff exists for. That some row exercises that gap is asserted too,
+    /// or the fixture could quietly stop testing verification at all.
+    #[test]
+    fn the_tolerance_prefilter_never_hides_a_row_the_definition_flags() {
+        use crate::db::init_db;
+        use std::path::Path;
+
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(&tolerance_fixture::create_sql("l", "s", true))
+            .unwrap();
+        let spec = tolerance_spec();
+
+        let defined = tolerance_fixture_ids_where(&conn, &spec.changed_predicate_sql("s", "l"));
+        let mut expected: Vec<String> = tolerance_fixture::cases()
+            .into_iter()
+            .filter(|c| c.modified)
+            .map(|c| c.id.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            defined, expected,
+            "the definition must classify the fixture as designed"
+        );
+
+        let prefiltered = tolerance_fixture_ids_where(
+            &conn,
+            &format!(
+                "{} IS DISTINCT FROM {}",
+                spec.content_hash_sql("s"),
+                spec.content_hash_sql("l")
+            ),
+        );
+        for id in &defined {
+            assert!(
+                prefiltered.contains(id),
+                "row '{id}': the definition flags it but the prefilter hides it"
+            );
+        }
+        for id in ["sub_crossing_grid", "under_tolerance"] {
+            assert!(
+                prefiltered.contains(&id.to_string()) && !defined.contains(&id.to_string()),
+                "row '{id}' must pass the prefilter and fail the definition"
+            );
+        }
+        assert!(
+            !prefiltered.contains(&"sub_same_cell".to_string()),
+            "a shift inside one grid cell must not even be a candidate"
+        );
+    }
+
+    /// The signature half of the one-directional property, run through a
+    /// real refresh because it is a statement about the *apply*: a row the
+    /// diff does not call modified is never rewritten, so its live bytes --
+    /// and therefore its persisted signature -- stay exactly as they were,
+    /// even though the staged bytes differ. A modified row is rewritten with
+    /// the *staged* raw geometry (never a snapped one), so its signature
+    /// becomes the staged row's.
+    #[test]
+    fn a_tolerance_refresh_moves_the_signature_only_of_rows_it_rewrites() {
+        use crate::db::init_db;
+        use std::collections::BTreeMap;
+        use std::path::Path;
+
+        let init = vec![
+            "INSTALL spatial".to_string(),
+            "LOAD spatial".to_string(),
+            "INSTALL icu".to_string(),
+            "LOAD icu".to_string(),
+        ];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(&tolerance_fixture::create_sql("l", "staged_source", false))
+            .unwrap();
+        let spec = tolerance_spec();
+
+        let snapshot = |table: &str| -> BTreeMap<String, (String, String)> {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT t.id, {}, hex(ST_AsWKB(t.geom)) FROM {table} t",
+                    spec.content_signature_sql("t")
+                ))
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = snapshot("l");
+        let staged = snapshot("staged_source");
+
+        let counts = crate::update::dataset::refresh(
+            &conn,
+            &spec,
+            |conn, target| {
+                conn.execute_batch(&format!(
+                    "CREATE TABLE {target} AS SELECT * FROM staged_source"
+                ))?;
+                Ok(LoadStats::default())
+            },
+            None,
+            &|| false,
+        )
+        .unwrap();
+        let after = snapshot("l");
+
+        let modified: Vec<&str> = tolerance_fixture::cases()
+            .into_iter()
+            .filter(|c| c.live.1.is_some() && c.staged.1.is_some())
+            .filter(|c| c.modified)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(counts.modified, modified.len() as i64);
+        assert_eq!((counts.added, counts.removed), (0, 0));
+
+        for (id, now) in &after {
+            if modified.contains(&id.as_str()) {
+                assert_eq!(
+                    now, &staged[id],
+                    "row '{id}': modified, so the staged raw row is written"
+                );
+            } else {
+                assert_eq!(
+                    now, &before[id],
+                    "row '{id}': not modified, so the live bytes and signature are untouched"
+                );
+            }
+        }
+        for id in ["sub_crossing_grid", "under_tolerance", "sub_same_cell"] {
+            assert_ne!(
+                before[id].1, staged[id].1,
+                "fixture: '{id}' must differ in bytes, or it proves nothing"
+            );
+        }
+    }
+
+    /// PRG and BDOT10k must generate exactly the SQL they generated before
+    /// `GeometryCompare` existed: the change was for EGIB, and a drive-by
+    /// edit to a shared builder would silently re-tune two measured
+    /// configurations. Captured from the pre-change builders. EGIB's
+    /// *signature* is pinned too, for a stronger reason -- it is persisted in
+    /// `object_reports`, so a different text would expire every EGIB report
+    /// on upgrade. `update::diff` pins the diff batch the same way.
+    #[test]
+    fn exact_and_ignored_geometry_sql_is_unchanged() {
+        let pinned: [(&str, String, &str); 7] = [
+            (
+                "bdot10k predicate",
+                BDOT10K.changed_predicate_sql("s", "l"),
+                r#"((s.WERSJA, s.KATEGORIAISTNIENIA, s.PRZEWAZAJACAFUNKCJABUDYNKU, s.FUNKCJAOGOLNABUDYNKU, s.LICZBAKONDYGNACJI, s.NAZWA, s.FSBUD, s.INFORMACJADODATKOWA, s.KODKST, s.ZRODLODANYCHGEOMETRYCZNYCH) IS DISTINCT FROM (l.WERSJA, l.KATEGORIAISTNIENIA, l.PRZEWAZAJACAFUNKCJABUDYNKU, l.FUNKCJAOGOLNABUDYNKU, l.LICZBAKONDYGNACJI, l.NAZWA, l.FSBUD, l.INFORMACJADODATKOWA, l.KODKST, l.ZRODLODANYCHGEOMETRYCZNYCH))"#,
+            ),
+            (
+                "bdot10k hash",
+                BDOT10K.content_hash_sql("t"),
+                r#"hash(t.WERSJA, t.KATEGORIAISTNIENIA, t.PRZEWAZAJACAFUNKCJABUDYNKU, t.FUNKCJAOGOLNABUDYNKU, t.LICZBAKONDYGNACJI, t.NAZWA, t.FSBUD, t.INFORMACJADODATKOWA, t.KODKST, t.ZRODLODANYCHGEOMETRYCZNYCH)"#,
+            ),
+            (
+                "bdot10k signature",
+                BDOT10K.content_signature_sql("t"),
+                r#"md5(concat(COALESCE(t.WERSJA::VARCHAR, chr(30)), chr(31), COALESCE(t.KATEGORIAISTNIENIA::VARCHAR, chr(30)), chr(31), COALESCE(t.PRZEWAZAJACAFUNKCJABUDYNKU::VARCHAR, chr(30)), chr(31), COALESCE(t.FUNKCJAOGOLNABUDYNKU::VARCHAR, chr(30)), chr(31), COALESCE(t.LICZBAKONDYGNACJI::VARCHAR, chr(30)), chr(31), COALESCE(t.NAZWA::VARCHAR, chr(30)), chr(31), COALESCE(t.FSBUD::VARCHAR, chr(30)), chr(31), COALESCE(t.INFORMACJADODATKOWA::VARCHAR, chr(30)), chr(31), COALESCE(t.KODKST::VARCHAR, chr(30)), chr(31), COALESCE(t.ZRODLODANYCHGEOMETRYCZNYCH::VARCHAR, chr(30))))"#,
+            ),
+            (
+                "prg predicate",
+                PRG.changed_predicate_sql("s", "l"),
+                r#"((s.numer_porzadkowy, s.ulica, s.miejscowosc, s.kod_pocztowy, s.teryt_miejscowosc) IS DISTINCT FROM (l.numer_porzadkowy, l.ulica, l.miejscowosc, l.kod_pocztowy, l.teryt_miejscowosc) OR ST_AsWKB(s.geom) IS DISTINCT FROM ST_AsWKB(l.geom))"#,
+            ),
+            (
+                "prg hash",
+                PRG.content_hash_sql("t"),
+                r#"hash(t.numer_porzadkowy, t.ulica, t.miejscowosc, t.kod_pocztowy, t.teryt_miejscowosc, ST_AsWKB(t.geom))"#,
+            ),
+            (
+                "prg signature",
+                PRG.content_signature_sql("t"),
+                r#"md5(concat(COALESCE(t.numer_porzadkowy::VARCHAR, chr(30)), chr(31), COALESCE(t.ulica::VARCHAR, chr(30)), chr(31), COALESCE(t.miejscowosc::VARCHAR, chr(30)), chr(31), COALESCE(t.kod_pocztowy::VARCHAR, chr(30)), chr(31), COALESCE(t.teryt_miejscowosc::VARCHAR, chr(30)), chr(31), COALESCE(hex(ST_AsWKB(t.geom)), chr(30))))"#,
+            ),
+            (
+                "egib signature",
+                EGIB.content_signature_sql("t"),
+                r#"md5(concat(COALESCE(t.rodzaj::VARCHAR, chr(30)), chr(31), COALESCE(t.kondygnacje_nadziemne::VARCHAR, chr(30)), chr(31), COALESCE(t.kondygnacje_podziemne::VARCHAR, chr(30)), chr(31), COALESCE(hex(ST_AsWKB(t.geom)), chr(30))))"#,
+            ),
+        ];
+        for (what, actual, expected) in pinned {
+            assert_eq!(actual, expected, "{what} changed");
+        }
+    }
+
     #[test]
     fn content_hash_sql_single_column_no_geometry() {
         let spec = DatasetSpec {
@@ -2041,7 +2780,7 @@ mod tests {
             table: "t",
             key_columns: &["id"],
             compared_columns: &["rodzaj"],
-            compare_geometry: false,
+            compare_geometry: GeometryCompare::None,
             geom_kind: GeomKind::Point,
         };
         assert_eq!(spec.content_hash_sql("s"), "hash(s.rodzaj)");
@@ -2054,7 +2793,7 @@ mod tests {
             table: "t",
             key_columns: &["id"],
             compared_columns: &["rodzaj", "kondygnacje_nadziemne", "kondygnacje_podziemne"],
-            compare_geometry: true,
+            compare_geometry: GeometryCompare::Exact,
             geom_kind: GeomKind::Polygon,
         };
         assert_eq!(
@@ -2081,7 +2820,7 @@ mod tests {
             table: "t",
             key_columns: &["id"],
             compared_columns: &[],
-            compare_geometry: false,
+            compare_geometry: GeometryCompare::None,
             geom_kind: GeomKind::Point,
         };
 
@@ -2143,7 +2882,7 @@ mod tests {
             table: "t",
             key_columns: &["id"],
             compared_columns: &["a", "b"],
-            compare_geometry: false,
+            compare_geometry: GeometryCompare::None,
             geom_kind: GeomKind::Point,
         };
 
@@ -2178,8 +2917,8 @@ mod tests {
     /// Geometry participation must be driven by `compare_geometry`,
     /// exercised through real SQL rather than just string-inspecting the
     /// predicate: two rows with equal attributes and different geometry
-    /// compare as changed when `compare_geometry: true`, and unchanged when
-    /// `compare_geometry: false`.
+    /// compare as changed under `GeometryCompare::Exact`, and unchanged under
+    /// `GeometryCompare::None`.
     #[test]
     fn changed_predicate_sql_geometry_participation_follows_compare_geometry() {
         use crate::db::init_db;
@@ -2203,11 +2942,11 @@ mod tests {
             table: "t",
             key_columns: &["id"],
             compared_columns: &["a"],
-            compare_geometry: true,
+            compare_geometry: GeometryCompare::Exact,
             geom_kind: GeomKind::Polygon,
         };
         let without_geom = DatasetSpec {
-            compare_geometry: false,
+            compare_geometry: GeometryCompare::None,
             ..with_geom
         };
 
@@ -2223,7 +2962,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             changed_with, 1,
-            "geometry-only change must count as modified when compare_geometry is true"
+            "geometry-only change must count as modified under GeometryCompare::Exact"
         );
 
         let changed_without: i64 = conn
@@ -2238,7 +2977,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             changed_without, 0,
-            "geometry-only change must be invisible when compare_geometry is false"
+            "geometry-only change must be invisible under GeometryCompare::None"
         );
     }
 }

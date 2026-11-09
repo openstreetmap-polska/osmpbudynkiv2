@@ -39,8 +39,10 @@ impl Drop for ScratchGuard<'_> {
              DROP TABLE IF EXISTS diff_added;
              DROP TABLE IF EXISTS diff_removed;
              DROP TABLE IF EXISTS diff_modified;
+             DROP TABLE IF EXISTS {};
              DROP TABLE IF EXISTS {};",
             self.staging,
+            crate::update::diff::MODIFIED_CANDIDATES_TABLE,
             crate::update::changeset::CHANGED_CELLS_TABLE
         );
         if let Err(e) = self.conn.execute_batch(&sql) {
@@ -497,7 +499,7 @@ mod tests {
         table: "live",
         key_columns: &["id"],
         compared_columns: &["a"],
-        compare_geometry: true,
+        compare_geometry: crate::dataset::GeometryCompare::Exact,
         geom_kind: GeomKind::Point,
     };
 
@@ -886,8 +888,28 @@ mod tests {
         let conn = conn_with_live(LIVE_ROWS);
         refresh(&conn, &TEST_SPEC, loader(NEW_ROWS), None, &|| false).unwrap();
 
-        for t in ["diff_added", "diff_removed", "diff_modified"] {
+        let tables = [
+            "diff_added",
+            "diff_removed",
+            "diff_modified",
+            crate::update::diff::MODIFIED_CANDIDATES_TABLE,
+        ];
+        for t in tables {
             assert!(!table_exists(&conn, t), "{t} left behind after success");
+        }
+
+        // A tolerance diff drops its candidates table itself on success, so
+        // only the guard covers a refresh that fails after creating it. Plant
+        // one and fail the refresh.
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE {} (id VARCHAR)",
+            crate::update::diff::MODIFIED_CANDIDATES_TABLE
+        ))
+        .unwrap();
+        let empty = "SELECT * FROM (VALUES ('x','y',1.0,1.0)) t(id,a,lon,lat) WHERE false";
+        let _ = refresh(&conn, &TEST_SPEC, loader(empty), None, &|| false);
+        for t in tables {
+            assert!(!table_exists(&conn, t), "{t} left behind after failure");
         }
     }
 

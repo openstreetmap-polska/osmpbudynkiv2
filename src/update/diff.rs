@@ -1,7 +1,14 @@
 use anyhow::{Context, Result};
 use duckdb::Connection;
+use tracing::info;
 
-use crate::dataset::DatasetSpec;
+use crate::dataset::{DatasetSpec, GeometryCompare, HASH_ATTRS_FIELD};
+
+/// Stage 1's output for a [`GeometryCompare::Tolerance`] source: every key
+/// whose prefilter digest differs, with whether its attributes did. Dropped by
+/// [`compute`] once `diff_modified` is built, and by the refresh's scratch
+/// guard on the error path.
+pub const MODIFIED_CANDIDATES_TABLE: &str = "diff_modified_candidates";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffCounts {
@@ -52,6 +59,24 @@ pub struct DiffCounts {
 ///    `hash` never returns NULL today, which makes the two equivalent, but the
 ///    `(FALSE)`-equivalent arm of `content_hash_sql` and any future NULL-valued
 ///    digest both depend on the NULL-safe form.
+///
+/// **A [`GeometryCompare::Tolerance`] source runs it in two stages**, because
+/// its `content_hash_sql` is only a prefilter (see that method):
+///
+/// 1. **Prefilter** -- the shape above, unchanged, writing the keys whose
+///    digest differs to [`MODIFIED_CANDIDATES_TABLE`] along with whether
+///    their `attrs` digest did. Still `(key, hash)` on each side; still no
+///    geometry under the join.
+/// 2. **Verification** -- rows whose attributes changed are modified with no
+///    geometry check. Only the rest, the geometry-only candidates, are joined
+///    back to both tables and kept iff `DatasetSpec::geometry_changed_sql`
+///    holds. On the 2026-08-15 → 11-09 exports that was 333,340 rows (10% of
+///    the 2.1M noise rows, plus the 121,097 real moves); materializing that
+///    *key set* is cheap,
+///    unlike materializing either full side (point 1 above).
+///
+/// `tests::the_two_stage_diff_equals_the_definition` pins the result to
+/// `changed_predicate_sql` row by row.
 pub fn compute(conn: &Connection, spec: &DatasetSpec) -> Result<DiffCounts> {
     conn.execute_batch(&build_sql(spec))
         .with_context(|| format!("Failed to compute diff for {}", spec.name))?;
@@ -62,6 +87,30 @@ pub fn compute(conn: &Connection, spec: &DatasetSpec) -> Result<DiffCounts> {
         })
         .with_context(|| format!("Failed to count {table}"))
     };
+
+    if let GeometryCompare::Tolerance { metres } = spec.compare_geometry {
+        let (candidates, geometry_only): (i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE NOT __attrs_changed)
+                     FROM {MODIFIED_CANDIDATES_TABLE}"
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .with_context(|| format!("Failed to count {MODIFIED_CANDIDATES_TABLE}"))?;
+        let modified = count("diff_modified")?;
+        info!(
+            source = spec.name,
+            prefilter_candidates = candidates,
+            geometry_only_candidates = geometry_only,
+            confirmed_geometry_only = modified - (candidates - geometry_only),
+            tolerance_m = metres,
+            "geometry tolerance verification"
+        );
+        conn.execute_batch(&format!("DROP TABLE {MODIFIED_CANDIDATES_TABLE}"))
+            .with_context(|| format!("Failed to drop {MODIFIED_CANDIDATES_TABLE}"))?;
+    }
 
     Ok(DiffCounts {
         added: count("diff_added")?,
@@ -83,6 +132,43 @@ fn build_sql(spec: &DatasetSpec) -> String {
     let staging = spec.staging_table();
     let keys = spec.key_columns.join(", ");
     let content_hash = spec.content_hash_sql("t");
+
+    // A separate template rather than a branch inside the one below, so the
+    // SQL every other source runs stays byte-identical to what it was before
+    // tolerance existed (`tests::exact_and_ignored_geometry_sql_is_unchanged`).
+    if let GeometryCompare::Tolerance { .. } = spec.compare_geometry {
+        let geom_changed = spec
+            .geometry_changed_sql("s.geom", "l.geom")
+            .expect("a tolerance spec compares geometry");
+        let candidates = MODIFIED_CANDIDATES_TABLE;
+        let attrs = HASH_ATTRS_FIELD;
+        return format!(
+            "DROP TABLE IF EXISTS diff_added;
+         DROP TABLE IF EXISTS diff_removed;
+         DROP TABLE IF EXISTS diff_modified;
+         DROP TABLE IF EXISTS {candidates};
+
+         CREATE TEMP TABLE diff_added AS
+             SELECT {keys} FROM {staging} ANTI JOIN {live} USING ({keys});
+         CREATE TEMP TABLE diff_removed AS
+             SELECT {keys} FROM {live} ANTI JOIN {staging} USING ({keys});
+         CREATE TEMP TABLE {candidates} AS
+             SELECT {keys}, s.__sig.{attrs} IS DISTINCT FROM l.__sig.{attrs} AS __attrs_changed FROM
+                 (SELECT {keys}, {content_hash} AS __sig FROM {staging} t) s
+                 JOIN
+                 (SELECT {keys}, {content_hash} AS __sig FROM {live} t) l
+                 USING ({keys})
+             WHERE s.__sig IS DISTINCT FROM l.__sig;
+         CREATE TEMP TABLE diff_modified AS
+             SELECT {keys} FROM {candidates} WHERE __attrs_changed
+             UNION ALL
+             SELECT {keys} FROM
+                 (SELECT {keys} FROM {candidates} WHERE NOT __attrs_changed) c
+                 JOIN {staging} s USING ({keys})
+                 JOIN {live} l USING ({keys})
+             WHERE {geom_changed};"
+        );
+    }
 
     format!(
         "DROP TABLE IF EXISTS diff_added;
@@ -106,7 +192,7 @@ fn build_sql(spec: &DatasetSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::{DatasetSpec, GeomKind};
+    use crate::dataset::{DatasetSpec, GeomKind, GeometryCompare};
     use crate::db::init_db;
     use std::path::Path;
 
@@ -115,7 +201,7 @@ mod tests {
         table: "live",
         key_columns: &["id"],
         compared_columns: &["a"],
-        compare_geometry: true,
+        compare_geometry: GeometryCompare::Exact,
         geom_kind: GeomKind::Point,
     };
 
@@ -167,33 +253,151 @@ mod tests {
     /// source scans must appear wrapped in a `__sig` projection, and neither
     /// compared column may appear bare at the top level where it would have to
     /// travel through the join as payload. Geometry is the sharpest case, so it
-    /// gets its own assertion via EGIB.
+    /// gets its own assertion -- via PRG (`Exact`, one stage) and EGIB
+    /// (`Tolerance`, where stage 1 writes the candidate table).
+    ///
+    /// For EGIB the property also has a second half: stage 2 may join
+    /// geometry, but only for the geometry-only *candidates*, never the full
+    /// tables against each other.
     #[test]
     fn the_modified_diff_hashes_each_side_before_joining() {
-        let sql = build_sql(&crate::dataset::EGIB);
-        let modified = sql
-            .split("CREATE TEMP TABLE diff_modified AS")
-            .nth(1)
-            .expect("build_sql must still create diff_modified");
+        let stage_one = |sql: &str, table: &str| -> String {
+            sql.split(&format!("CREATE TEMP TABLE {table} AS"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("build_sql must still create {table}"))
+                .split("CREATE TEMP TABLE")
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let prg = build_sql(&crate::dataset::PRG);
+        let egib = build_sql(&crate::dataset::EGIB);
+        for prefilter in [
+            stage_one(&prg, "diff_modified"),
+            stage_one(&egib, MODIFIED_CANDIDATES_TABLE),
+        ] {
+            assert_eq!(
+                prefilter.matches("AS __sig FROM").count(),
+                2,
+                "both staging and live must be projected to (key, hash) before the \
+                 join, not joined and then filtered: {prefilter}"
+            );
+            assert!(
+                !prefilter.contains("l.geom") && !prefilter.contains("s.geom"),
+                "geometry must only be reachable inside the hashed subqueries — a \
+                 `geom` under the join aliases means it is hash-join payload again, \
+                 which is the 17.6M-polygon cost this shape exists to avoid: \
+                 {prefilter}"
+            );
+            assert!(
+                prefilter.contains("s.__sig IS DISTINCT FROM l.__sig"),
+                "the comparison must be the NULL-safe form over the two digests: \
+                 {prefilter}"
+            );
+        }
 
+        let verification = stage_one(&egib, "diff_modified");
+        assert!(
+            verification.contains(&format!(
+                "(SELECT id_budynku FROM {MODIFIED_CANDIDATES_TABLE} WHERE NOT __attrs_changed) c"
+            )),
+            "stage 2 must drive its geometry join from the geometry-only \
+             candidates: {verification}"
+        );
         assert_eq!(
-            modified.matches("AS __sig FROM").count(),
+            verification.matches("JOIN").count(),
             2,
-            "both staging and live must be projected to (key, hash) before the \
-             join, not joined and then filtered: {modified}"
+            "stage 2 joins the candidates to staging and live, nothing else: {verification}"
         );
+    }
+
+    fn tolerance_spec() -> DatasetSpec {
+        DatasetSpec {
+            name: "test",
+            table: "live",
+            key_columns: &["id"],
+            compared_columns: &["a"],
+            compare_geometry: GeometryCompare::Tolerance {
+                metres: crate::dataset::EGIB_GEOMETRY_TOLERANCE_M,
+            },
+            geom_kind: GeomKind::Polygon,
+        }
+    }
+
+    /// The two-stage diff and `changed_predicate_sql` must agree row by row --
+    /// the property `dataset::tests::signature_changes_exactly_when_the_diff_
+    /// says_modified` gives the one-stage sources. The fixture includes rows
+    /// the prefilter lets through and verification must drop, rows it
+    /// verifies, rows modified on attributes alone, and NULL geometry in
+    /// every position.
+    #[test]
+    fn the_two_stage_diff_equals_the_definition() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(&crate::dataset::tolerance_fixture::create_sql(
+            "live",
+            "live__staging",
+            true,
+        ))
+        .unwrap();
+        let spec = tolerance_spec();
+
+        let counts = compute(&conn, &spec).unwrap();
+        let defined: Vec<String> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT l.id FROM live__staging s JOIN live l USING (id) WHERE {} ORDER BY l.id",
+                    spec.changed_predicate_sql("s", "l")
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(!defined.is_empty());
+        assert_eq!(ids(&conn, "diff_modified"), defined);
+        assert_eq!(counts.modified, defined.len() as i64);
+        assert_eq!((counts.added, counts.removed), (0, 0));
         assert!(
-            !modified.contains("l.geom") && !modified.contains("s.geom"),
-            "geometry must only be reachable inside the hashed subqueries — a \
-             `geom` under the join aliases means it is hash-join payload again, \
-             which is the 17.6M-polygon cost this shape exists to avoid: \
-             {modified}"
+            !table_exists(&conn, MODIFIED_CANDIDATES_TABLE),
+            "the candidate table is scratch and must not outlive compute"
         );
-        assert!(
-            modified.contains("s.__sig IS DISTINCT FROM l.__sig"),
-            "the comparison must be the NULL-safe form over the two digests: \
-             {modified}"
+    }
+
+    /// Our own pipeline is deterministic, so the same file staged twice must
+    /// diff 0/0/0 under the tolerance form too -- not merely "nothing over
+    /// the tolerance", but nothing reaching verification at all.
+    #[test]
+    fn tolerance_identical_snapshots_produce_no_changes() {
+        let init = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        let conn = init_db(Path::new(":memory:"), &init, None).unwrap();
+        conn.execute_batch(&crate::dataset::tolerance_fixture::create_sql(
+            "live", "other", true,
+        ))
+        .unwrap();
+        conn.execute_batch("CREATE TABLE live__staging AS SELECT * FROM live")
+            .unwrap();
+
+        let counts = compute(&conn, &tolerance_spec()).unwrap();
+        assert_eq!(
+            counts,
+            DiffCounts {
+                added: 0,
+                modified: 0,
+                removed: 0
+            }
         );
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = ?",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
     }
 
     #[test]
@@ -277,7 +481,7 @@ mod tests {
             table: "live",
             key_columns: &["id"],
             compared_columns: &["a"],
-            compare_geometry: false,
+            compare_geometry: GeometryCompare::None,
             geom_kind: GeomKind::Point,
         };
 
@@ -321,7 +525,7 @@ mod tests {
             table: "live",
             key_columns: &["k1", "k2"],
             compared_columns: &["val"],
-            compare_geometry: false,
+            compare_geometry: GeometryCompare::None,
             geom_kind: GeomKind::Point,
         };
 
@@ -348,6 +552,49 @@ mod tests {
             modified,
             vec![("ns1".to_string(), "b".to_string())],
             "only the (ns1, b) record changed — (ns1, a) must not be misclassified"
+        );
+    }
+
+    /// PRG's and BDOT10k's diff batch must be byte-identical to what ran
+    /// before `GeometryCompare::Tolerance` existed (captured from the
+    /// pre-change `build_sql`): the two-stage form is EGIB's alone.
+    #[test]
+    fn exact_and_ignored_geometry_sql_is_unchanged() {
+        assert_eq!(
+            build_sql(&crate::dataset::BDOT10K),
+            r#"DROP TABLE IF EXISTS diff_added;
+         DROP TABLE IF EXISTS diff_removed;
+         DROP TABLE IF EXISTS diff_modified;
+
+         CREATE TEMP TABLE diff_added AS
+             SELECT PRZESTRZENNAZW, LOKALNYID FROM bdot10k_buildings__staging ANTI JOIN bdot10k_buildings USING (PRZESTRZENNAZW, LOKALNYID);
+         CREATE TEMP TABLE diff_removed AS
+             SELECT PRZESTRZENNAZW, LOKALNYID FROM bdot10k_buildings ANTI JOIN bdot10k_buildings__staging USING (PRZESTRZENNAZW, LOKALNYID);
+         CREATE TEMP TABLE diff_modified AS
+             SELECT PRZESTRZENNAZW, LOKALNYID FROM
+                 (SELECT PRZESTRZENNAZW, LOKALNYID, hash(t.WERSJA, t.KATEGORIAISTNIENIA, t.PRZEWAZAJACAFUNKCJABUDYNKU, t.FUNKCJAOGOLNABUDYNKU, t.LICZBAKONDYGNACJI, t.NAZWA, t.FSBUD, t.INFORMACJADODATKOWA, t.KODKST, t.ZRODLODANYCHGEOMETRYCZNYCH) AS __sig FROM bdot10k_buildings__staging t) s
+                 JOIN
+                 (SELECT PRZESTRZENNAZW, LOKALNYID, hash(t.WERSJA, t.KATEGORIAISTNIENIA, t.PRZEWAZAJACAFUNKCJABUDYNKU, t.FUNKCJAOGOLNABUDYNKU, t.LICZBAKONDYGNACJI, t.NAZWA, t.FSBUD, t.INFORMACJADODATKOWA, t.KODKST, t.ZRODLODANYCHGEOMETRYCZNYCH) AS __sig FROM bdot10k_buildings t) l
+                 USING (PRZESTRZENNAZW, LOKALNYID)
+             WHERE s.__sig IS DISTINCT FROM l.__sig;"#
+        );
+        assert_eq!(
+            build_sql(&crate::dataset::PRG),
+            r#"DROP TABLE IF EXISTS diff_added;
+         DROP TABLE IF EXISTS diff_removed;
+         DROP TABLE IF EXISTS diff_modified;
+
+         CREATE TEMP TABLE diff_added AS
+             SELECT lokalny_id FROM prg_addresses__staging ANTI JOIN prg_addresses USING (lokalny_id);
+         CREATE TEMP TABLE diff_removed AS
+             SELECT lokalny_id FROM prg_addresses ANTI JOIN prg_addresses__staging USING (lokalny_id);
+         CREATE TEMP TABLE diff_modified AS
+             SELECT lokalny_id FROM
+                 (SELECT lokalny_id, hash(t.numer_porzadkowy, t.ulica, t.miejscowosc, t.kod_pocztowy, t.teryt_miejscowosc, ST_AsWKB(t.geom)) AS __sig FROM prg_addresses__staging t) s
+                 JOIN
+                 (SELECT lokalny_id, hash(t.numer_porzadkowy, t.ulica, t.miejscowosc, t.kod_pocztowy, t.teryt_miejscowosc, ST_AsWKB(t.geom)) AS __sig FROM prg_addresses t) l
+                 USING (lokalny_id)
+             WHERE s.__sig IS DISTINCT FROM l.__sig;"#
         );
     }
 }
