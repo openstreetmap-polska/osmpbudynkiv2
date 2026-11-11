@@ -34,6 +34,7 @@ use tracing::warn;
 use crate::config::{Config as AppConfig, JobConfig};
 use crate::osm::kvstore::RocksDB;
 use crate::server::DbPool;
+use crate::utils::format_duration;
 
 /// Per-job-run context handed to the blocking closure.
 ///
@@ -397,6 +398,16 @@ fn log_memory_if_out_of_memory(job: &'static str, pool: &DbPool, err: &anyhow::E
     warn!(job, %duckdb_memory, "DuckDB memory after an out-of-memory failure");
 }
 
+/// A run at least this long gets its `job finished` line at INFO; a shorter
+/// one at DEBUG. `tile_refresh` ticks every 10 s and `osm_update` every 60 s,
+/// almost always finishing in well under a second, so an unconditional INFO
+/// line would add ~10k lines a day that say nothing.
+const SLOW_RUN_LOG_THRESHOLD: Duration = Duration::from_secs(5);
+
+fn is_slow_run(elapsed: Duration) -> bool {
+    elapsed >= SLOW_RUN_LOG_THRESHOLD
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn supervise(
     job: Arc<dyn Job>,
@@ -521,16 +532,30 @@ pub(crate) async fn supervise(
                 // start a second writer and violate no-overlap.
                 let run_error = match (&mut handle).await {
                     Ok(Ok(())) => {
-                        tracing::info!(job = name, "job completed AFTER timeout was recorded");
+                        tracing::info!(
+                            job = name,
+                            elapsed = %format_duration(started_inst.elapsed()),
+                            "job completed AFTER timeout was recorded"
+                        );
                         None
                     }
                     Ok(Err(e)) => {
                         let message = format!("{e:#}");
-                        tracing::error!(job = name, error = %message, "job failed after timeout");
+                        tracing::error!(
+                            job = name,
+                            error = %message,
+                            elapsed = %format_duration(started_inst.elapsed()),
+                            "job failed after timeout"
+                        );
                         Some(message)
                     }
                     Err(e) => {
-                        tracing::error!(job = name, error = %e, "job panicked after timeout");
+                        tracing::error!(
+                            job = name,
+                            error = %e,
+                            elapsed = %format_duration(started_inst.elapsed()),
+                            "job panicked after timeout"
+                        );
                         Some(format!("task panicked after timeout: {e}"))
                     }
                 };
@@ -539,7 +564,30 @@ pub(crate) async fn supervise(
         };
 
         let finished_sys = SystemTime::now();
-        let elapsed_ms = started_inst.elapsed().as_millis() as u64;
+        let elapsed = started_inst.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
+        // One line per run, so a slow run can be read off the journal instead
+        // of inferred from the gaps between a job's own messages.
+        let outcome_label = match &outcome {
+            JobOutcome::Success => "success",
+            JobOutcome::Error(_) => "error",
+            JobOutcome::TimedOut => "timed_out",
+        };
+        if is_slow_run(elapsed) {
+            tracing::info!(
+                job = name,
+                outcome = outcome_label,
+                elapsed = %format_duration(elapsed),
+                "job finished"
+            );
+        } else {
+            tracing::debug!(
+                job = name,
+                outcome = outcome_label,
+                elapsed = %format_duration(elapsed),
+                "job finished"
+            );
+        }
         let next = finished_sys + cfg.interval;
 
         // A run that timed out but then returned `Ok` is slow, not failing:
@@ -638,6 +686,16 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn only_a_run_at_or_over_the_threshold_is_logged_at_info() {
+        assert!(!is_slow_run(Duration::from_millis(88)));
+        assert!(!is_slow_run(
+            SLOW_RUN_LOG_THRESHOLD - Duration::from_millis(1)
+        ));
+        assert!(is_slow_run(SLOW_RUN_LOG_THRESHOLD));
+        assert!(is_slow_run(Duration::from_secs(600)));
+    }
 
     fn make_parts() -> (DbPool, Arc<RocksDB>, Arc<AppConfig>, tempfile::TempDir) {
         let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");

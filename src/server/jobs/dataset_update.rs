@@ -1,10 +1,12 @@
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 
 use crate::cli::UpdateSource;
 use crate::dataset::DatasetSpec;
 use crate::server::jobs::{Job, JobContext};
+use crate::utils::format_duration;
 
 /// Serializes the three dataset refreshes against each other.
 ///
@@ -60,7 +62,17 @@ impl Job for DatasetUpdateJob {
     fn run(&self, ctx: &JobContext) -> Result<()> {
         // Poisoning only means a previous refresh panicked; the lock guards
         // memory headroom, not shared state, so recovering is correct.
+        //
+        // The wait is logged separately from the run. All three refreshes
+        // start together and the supervisor's timeout clock runs while one
+        // queues here, so a job's duration alone cannot tell a slow refresh
+        // from one that sat behind another source's apply until its own
+        // timeout cancelled it (bdot10k and prg behind a 3 h EGIB apply,
+        // 2026-11-10).
+        let queued = Instant::now();
         let _guard = refresh_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let waited = queued.elapsed();
+        let started = Instant::now();
 
         let conn = ctx
             .pool
@@ -73,6 +85,7 @@ impl Job for DatasetUpdateJob {
         // it is. Taken after a failure too, which is when it matters most.
         tracing::info!(
             job = self.name,
+            waited = %format_duration(waited),
             duckdb_memory = %crate::db_memory::summary_or_note(&conn),
             "DuckDB memory before refresh"
         );
@@ -88,6 +101,8 @@ impl Job for DatasetUpdateJob {
         tracing::info!(
             job = self.name,
             ok = result.is_ok(),
+            waited = %format_duration(waited),
+            elapsed = %format_duration(started.elapsed()),
             duckdb_memory = %crate::db_memory::summary_or_note(&conn),
             "DuckDB memory after refresh"
         );
