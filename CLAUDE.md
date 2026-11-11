@@ -614,6 +614,23 @@ the extra columns would only ever be constants, and de-duplicating across
 sources at read time is the whole reason the tile job's per-tick work stays
 small.
 
+**Gotcha — both queue readers break timestamp ties by render block, and the
+tie is the common case.** `now()` is transaction-start-scoped, so a dataset
+refresh enqueues its whole delta under one `enqueued_at`. Ordered by
+`MIN(enqueued_at)` alone, a tick took those cells in hash order — scattered
+over the changed area — which defeats the two things `tile_refresh` relies on:
+adjacent cells share eight of nine ring tiles and their z12/z13 parents, but
+only cells in the *same tick* collapse; and `render_blocks` batches by common
+ancestor, which a scattered tick mostly cannot. `tile_dirty::block_order_sql`
+is the one home for the tiebreak (z12 block, then z13, then z14, shifts derived
+from `RENDER_BLOCK_SHIFT`). The drain uses it too, because each 64-cell commit
+enqueues its tile cells under its own timestamp, and that only arrives as a
+compact run if the drain took them compactly. Age still comes first, so
+nothing is starved. Measured on the queue a real EGIB refresh left (42,348
+cells, every tile resident): 10.7 → 3.5 tiles rendered per cell, 309 → 32 ms
+per cell. The tick also deletes its queue rows in one statement now, not one
+per cell (798 → 12 ms a tick: each DELETE scans the unindexed queue).
+
 **Gotcha — dirty-queue source strings must match everywhere.**
 `match_dirty_cells.source` is a plain string (`"bdot10k"` / `"egib"` / `"prg"`),
 not an enum, and every producer must spell it identically. To enumerate the

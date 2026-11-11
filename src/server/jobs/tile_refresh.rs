@@ -67,6 +67,11 @@
 //! expands every cell first and collects the result into one
 //! `BTreeSet<TileKey>` before doing anything else, so a shared parent is
 //! re-rendered once regardless of how many dirty cells produced it.
+//!
+//! That only helps cells that land in the same tick, so which cells a tick
+//! takes matters as much as the dedup itself: the queue read orders cells that
+//! share a timestamp by render block (`tile_dirty::block_order_sql`), which
+//! makes a tick a compact patch of the map instead of a scatter across it.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -74,7 +79,7 @@ use anyhow::{Context, Result};
 use duckdb::Connection;
 
 use crate::server::jobs::{Job, JobContext};
-use crate::server::tile_dirty::tiles_for_cell;
+use crate::server::tile_dirty::{block_order_sql, tiles_for_cell};
 use crate::server::tile_store::{self, TileKey, TileStore};
 use crate::server::tiles;
 
@@ -99,6 +104,11 @@ pub struct TileRefreshStats {
     /// (logged, not fatal).
     pub failed: u64,
 }
+
+/// Cells per queue `DELETE` in [`tick`]. A tick's cells fit in one statement
+/// at the default `batch_size`; the chunking only bounds the statement text
+/// for an operator who raised it.
+const QUEUE_DELETE_CHUNK: usize = 1024;
 
 pub struct TileRefreshJob {
     batch_size: usize,
@@ -217,14 +227,18 @@ pub fn tick(
     // Oldest-enqueued-first, mirroring drain_batch's GROUP BY + ORDER BY
     // MIN(enqueued_at) shape (equivalent to DISTINCT, since it also collapses
     // to one row per cell) so a sustained backlog doesn't starve later cells.
+    // Cells sharing a timestamp -- a whole dataset refresh does -- are taken
+    // one render block at a time rather than in hash order: see
+    // `tile_dirty::block_order_sql` for what a scattered tick costs.
     let cells: Vec<(i32, i32)> = {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT cell_x, cell_y FROM tile_dirty_cells
              WHERE enqueued_at <= ?::TIMESTAMPTZ
              GROUP BY cell_x, cell_y
-             ORDER BY MIN(enqueued_at)
+             ORDER BY MIN(enqueued_at), {}
              LIMIT ?",
-        )?;
+            block_order_sql("cell_x", "cell_y")
+        ))?;
         let rows = stmt.query_map(duckdb::params![batch_start, batch_size as i64], |r| {
             Ok((r.get::<_, i32>(0)?, r.get::<_, i32>(1)?))
         })?;
@@ -310,19 +324,38 @@ pub fn tick(
     // tick cut short leaves the rest for the next one. Same batch_start cutoff
     // as the read; see this function's doc.
     let mut deferred = 0u64;
+    let mut settled: Vec<(i32, i32)> = Vec::with_capacity(cells.len());
     for (cx, cy) in &cells {
         if tiles_for_cell(*cx, *cy)
             .iter()
             .any(|k| unsettled.contains(k))
         {
             deferred += 1;
-            continue;
+        } else {
+            settled.push((*cx, *cy));
         }
+    }
+    // One statement per chunk rather than one per cell: each DELETE scans the
+    // whole queue, which has no index, so 256 of them against the ~43k rows a
+    // dataset refresh leaves measured 0.85 s a tick -- as much as the renders
+    // of a well-clustered tick. The cells are `i32`s read out of this table
+    // moments ago, so they are interpolated, as in the drain's tile enqueue.
+    for chunk in settled.chunks(QUEUE_DELETE_CHUNK) {
+        let values = chunk
+            .iter()
+            .map(|(x, y)| format!("({x},{y})"))
+            .collect::<Vec<_>>()
+            .join(", ");
         conn.execute(
-            "DELETE FROM tile_dirty_cells
-             WHERE cell_x = ? AND cell_y = ? AND enqueued_at <= ?::TIMESTAMPTZ",
-            duckdb::params![cx, cy, batch_start],
-        )?;
+            &format!(
+                "DELETE FROM tile_dirty_cells
+                 USING (VALUES {values}) d(cx, cy)
+                 WHERE cell_x = d.cx AND cell_y = d.cy
+                   AND enqueued_at <= ?::TIMESTAMPTZ"
+            ),
+            duckdb::params![batch_start],
+        )
+        .context("tile_refresh: delete drained queue rows")?;
     }
 
     Ok(TileRefreshStats {
@@ -639,6 +672,70 @@ mod tests {
         // 12 (z14) + 1 (z13) + 1 (z12) = 14 total, well under 2x either
         // cell's own 11-key expansion (9 ring + 1 z13 + 1 z12).
         assert_eq!(keys.len(), 14);
+    }
+
+    /// Cells sharing a timestamp -- a dataset refresh enqueues its whole delta
+    /// under one -- must be taken a render block at a time, not in whatever
+    /// order the aggregate emits. Two z14 blocks, interleaved in the INSERT so
+    /// insertion order cannot pass this by accident; a tick sized to one
+    /// block has to drain exactly one of them.
+    #[test]
+    fn a_tick_takes_cells_sharing_a_timestamp_one_render_block_at_a_time() {
+        let c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+
+        // Blocks (x >> 3, y >> 3) = (512, 1024) and (900, 1024), 64 cells each.
+        c.execute_batch(
+            "INSERT INTO tile_dirty_cells
+             SELECT CASE WHEN b = 0 THEN 4096 ELSE 7200 END + x, 8192 + y, TIMESTAMPTZ '2020-01-01'
+             FROM range(8) t(x), range(8) u(y), range(2) v(b)
+             ORDER BY hash(x, y, b);",
+        )
+        .unwrap();
+
+        let stats = tick(&c, &s, 64, &|| false).unwrap();
+        assert_eq!(stats.cells, 64);
+
+        let left: Vec<i32> = {
+            let mut stmt = c
+                .prepare("SELECT DISTINCT cell_x >> 3 FROM tile_dirty_cells")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            left,
+            vec![900],
+            "the tick must drain the whole first block and leave the other whole"
+        );
+        assert_eq!(queued(&c), 64);
+    }
+
+    /// Age still comes first: the block order only breaks ties, so a cell
+    /// enqueued earlier is not starved by a later, better-clustered batch.
+    #[test]
+    fn an_older_cell_is_taken_before_a_newer_block() {
+        let c = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        c.execute_batch(
+            "INSERT INTO tile_dirty_cells VALUES
+                 (4096, 8192, TIMESTAMPTZ '2020-01-02'),
+                 (9000, 9000, TIMESTAMPTZ '2020-01-01');",
+        )
+        .unwrap();
+
+        tick(&c, &s, 1, &|| false).unwrap();
+
+        let left: (i32, i32) = c
+            .query_row("SELECT cell_x, cell_y FROM tile_dirty_cells", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(left, (4096, 8192), "the older cell (9000, 9000) goes first");
     }
 
     /// A dirty cell whose expanded tile keys are all absent from the store

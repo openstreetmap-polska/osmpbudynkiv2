@@ -105,13 +105,21 @@ pub fn drain_batch(
         // GROUP BY + ORDER BY MIN(enqueued_at) (equivalent to the DISTINCT it
         // replaces, since it also collapses to one row per (source, cell_x,
         // cell_y)) drains oldest-enqueued first. Alphabetical source ordering
-        // would starve later sources indefinitely under a sustained backlog.
+        // would starve later sources indefinitely under a sustained backlog,
+        // which is why `source` only breaks ties.
+        //
+        // Within one timestamp -- every cell of a dataset refresh has the
+        // same one -- cells are taken a render block at a time. Each group of
+        // `CELLS_PER_COMMIT` enqueues its tile cells under its own timestamp,
+        // so this is what makes `tile_refresh` see them as compact runs it
+        // can dedup and batch; see `tile_dirty::block_order_sql`.
         let mut stmt = conn.prepare(&format!(
             "SELECT source, cell_x, cell_y FROM match_dirty_cells
              WHERE enqueued_at <= ?::TIMESTAMPTZ AND source IN ({source_list})
              GROUP BY source, cell_x, cell_y
-             ORDER BY MIN(enqueued_at)
-             LIMIT ?"
+             ORDER BY MIN(enqueued_at), source, {block_order}
+             LIMIT ?",
+            block_order = tile_dirty::block_order_sql("cell_x", "cell_y"),
         ))?;
         let rows = stmt.query_map(duckdb::params![batch_start, batch_size as i64], |r| {
             Ok((
@@ -459,6 +467,41 @@ mod tests {
             remaining,
             vec![(100, 100)],
             "the earlier-enqueued cell (102,100) must drain first"
+        );
+    }
+
+    /// Within one timestamp the drain takes cells a render block at a time,
+    /// which is what makes the tile cells each commit enqueues a compact run
+    /// `tile_refresh` can dedup and batch. Two z14 blocks interleaved in the
+    /// INSERT; a batch sized to one block must drain exactly one of them.
+    #[test]
+    fn cells_sharing_a_timestamp_drain_one_render_block_at_a_time() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO match_dirty_cells
+             SELECT 'bdot10k', 14, CASE WHEN b = 0 THEN 4096 ELSE 7200 END + x, 8192 + y,
+                    TIMESTAMPTZ '2020-01-01'
+             FROM range(8) t(x), range(8) u(y), range(2) v(b)
+             ORDER BY hash(x, y, b);",
+        )
+        .unwrap();
+
+        let s = drain_batch(&c, 64, &|| false).unwrap();
+        assert_eq!(s.cells, 64);
+
+        let left: Vec<i32> = {
+            let mut stmt = c
+                .prepare("SELECT DISTINCT cell_x >> 3 FROM match_dirty_cells")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            left,
+            vec![900],
+            "the batch must drain the whole first block and leave the other whole"
         );
     }
 

@@ -95,6 +95,46 @@ pub fn tiles_for_cell(cell_x: i32, cell_y: i32) -> Vec<TileKey> {
     keys
 }
 
+/// `ORDER BY` keys that walk z14 cells one render block at a time: the z12
+/// block first, then the z13 and z14 blocks inside it, then the cell.
+///
+/// Both queue readers append this after `MIN(enqueued_at)`, so it only orders
+/// cells that share a timestamp -- and those are the ones that matter. `now()`
+/// is transaction-start-scoped, so every cell a dataset refresh enqueues
+/// carries one timestamp, and without a tiebreak a tick takes whatever the
+/// hash aggregate emits first: cells scattered over the whole changed area.
+/// For `jobs::tile_refresh` that defeats both things a tick relies on:
+///
+/// - **Dedup.** Adjacent cells share eight of their nine ring tiles and their
+///   z12/z13 parents, but only cells in the *same tick* collapse. Scattered, a
+///   z14 tile is re-rendered once per dirty neighbour over the backlog and a
+///   z12 parent once per tick that holds any of its 16 cells.
+/// - **Batching.** `tiles::render_blocks` groups by common ancestor, and a
+///   scattered tick is mostly blocks of one tile.
+///
+/// Measured on the queue a real EGIB refresh left (42,348 cells, every tile
+/// resident, production's limits), 256 cells a tick: 10.7 tiles rendered per
+/// cell in ~600 blocks a tick, 309 ms per cell, became 3.5 tiles per cell in
+/// ~38 blocks, 32 ms per cell.
+///
+/// The drain uses the same keys so the tile cells it enqueues -- 64 per
+/// commit, each commit its own timestamp -- arrive as compact runs too.
+///
+/// The shifts come from the tiers themselves ([`MIN_PERSISTED_ZOOM`] up to
+/// [`CHANGE_CELL_ZOOM`], each `tiles::RENDER_BLOCK_SHIFT` wide), so a change to
+/// either moves this with it.
+pub fn block_order_sql(cell_x: &str, cell_y: &str) -> String {
+    let mut keys = Vec::new();
+    for z in MIN_PERSISTED_ZOOM..=CHANGE_CELL_ZOOM {
+        let shift = CHANGE_CELL_ZOOM - z + crate::server::tiles::RENDER_BLOCK_SHIFT;
+        keys.push(format!("{cell_x} >> {shift}"));
+        keys.push(format!("{cell_y} >> {shift}"));
+    }
+    keys.push(cell_y.to_string());
+    keys.push(cell_x.to_string());
+    keys.join(", ")
+}
+
 /// Enqueue one changed cell.
 ///
 /// Test-only: every real producer already holds a *set* of changed cells (a
@@ -233,6 +273,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!((x, y), (100, 200));
+    }
+
+    /// The shifts are derived from the tier constants; this pins what they
+    /// come out as today, so a change to either constant shows up here.
+    #[test]
+    fn the_block_order_walks_the_z12_then_z13_then_z14_render_block() {
+        assert_eq!(
+            block_order_sql("cx", "cy"),
+            "cx >> 5, cy >> 5, cx >> 4, cy >> 4, cx >> 3, cy >> 3, cy, cx"
+        );
+    }
+
+    /// The property the tick relies on: under this order, any run of 64 cells
+    /// out of a dense area is one z14 render block, and any aligned run of 256
+    /// is the four blocks under one z13 block -- so their rings and parents
+    /// collapse. Plain `(x, y)` order would hand out 1-cell-wide strips.
+    #[test]
+    fn a_dense_area_is_handed_out_one_whole_render_block_at_a_time() {
+        let conn = conn();
+        // A 32x32 square aligned to a z12 render block (4096 = 128 << 5).
+        conn.execute_batch(
+            "CREATE TABLE cells AS
+             SELECT 4096 + x AS cx, 8192 + y AS cy FROM range(32) a(x), range(32) b(y);",
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT cx, cy FROM cells ORDER BY {}",
+                block_order_sql("cx", "cy")
+            ))
+            .unwrap();
+        let ordered: Vec<(i32, i32)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ordered.len(), 1024);
+
+        for run in ordered.chunks(64) {
+            let blocks: BTreeSet<(i32, i32)> = run.iter().map(|(x, y)| (x >> 3, y >> 3)).collect();
+            assert_eq!(
+                blocks.len(),
+                1,
+                "a run of 64 must be one z14 block: {run:?}"
+            );
+        }
+        for run in ordered.chunks(256) {
+            let blocks: BTreeSet<(i32, i32)> = run.iter().map(|(x, y)| (x >> 4, y >> 4)).collect();
+            assert_eq!(blocks.len(), 1, "a run of 256 must be one z13 block");
+        }
     }
 
     /// The SQL and Rust enqueue paths must land the same cells -- the
