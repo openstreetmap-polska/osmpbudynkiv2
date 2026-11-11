@@ -107,6 +107,11 @@ binary, easy to deploy.
   `COPY FROM DATABASE`, which grows every RTREE row by row and scrambles row
   order under `preserve_insertion_order = false` — reasons on `src/db_copy.rs`.
   RocksDB is not copied
+- `db reindex` — drop and rebuild every RTREE index in place (requires
+  exclusive access; seconds per index, no data changes). The only way an
+  existing database picks up `db::RTREE_MIN_NODE_CAPACITY`, since `db copy`
+  replays each index's stored DDL; also shrinks indexes grown by weeks of
+  writes. See the gotcha under *Storage and schema*
 - `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package`,
   `/updates`, `/stats` + `/stats/areas` + `/stats/units` (the `stats.html`
   page's data, queried per request, cached only by HTTP `max-age`), `POST /report`,
@@ -1034,6 +1039,41 @@ spatial release fixes it:
 
 So **never create an RTREE index on a pooled connection**. A `CREATE INDEX`
 that runs inside a server job would bring the crash back.
+
+**Gotcha — every RTREE index is built with `min_node_capacity = 16`, and the
+default makes a clustered delete pathological.** When a delete leaves an
+R-tree node under the minimum (DuckDB's default: 50 of 128), spatial dissolves
+it and re-inserts every remaining entry from the root. A split leaves ~64
+entries a leaf, so modifying a region's rows in place — new entries in, old
+ones out, which is what a dataset refresh does and what every drained cell
+does to `*_unmatched` — halves each leaf to ~32 and the region's leaves
+dissolve into each other over and over. Rows scattered over the country never
+trigger it, so a uniform benchmark reads fine. Measured on the national
+`egib_buildings`, capped like production: COMMIT of 699,946 clustered rows
+deleted and re-inserted, 132.5–145.8 s → 4.5–6.6 s; the apply of a real
+2.54M-row `update egib` delta, **27m 58s → 27.6 s** (production: 3h 14m for
+3.26M rows). Four things:
+
+1. **One home**: `db::RTREE_INDEXES` (the set) and `db::RTREE_MIN_NODE_CAPACITY`
+   (the option). Loaders call `db::create_rtree_indexes(conn, table)`; nothing
+   spells `CREATE INDEX ... USING RTREE` by hand outside test fixtures.
+2. **Never 0.** A split only rebalances a side that fell *below* the minimum,
+   so at 0 it can leave one node full and the insert retries forever (the
+   same test did not finish in ten minutes).
+3. **The option is fixed when the index is built**, and `db copy` replays the
+   stored DDL, old options included. `db reindex` is the migration: it walks
+   the declared list (so an interrupted run is repaired by running it again),
+   takes seconds per index (all 11 on the national database: 33 s), and the
+   server warns at start while any index is outdated. It builds each index
+   from scratch, so it also resets one that weeks of writes have grown
+   (production held 5.1 GiB of index memory against ~2.4 GiB freshly built).
+4. **It is a refresh fix, not a drain fix.** The drain's 64-cell commits got
+   cheaper too (46.8 → 18.6 ms), but 81% of a drain is the per-cell match
+   INSERT (19 ms a cell), which no index option touches. And it only helps
+   rows that are *replaced*: deleting a region's rows outright still empties
+   whole leaves (30 s for the same 699,946 rows). The index work happens
+   inside COMMIT, and a refresh in the middle of it did not stop within 45 s
+   of SIGTERM.
 
 **Gotcha — the same index loss has a second, unrelated trigger: an expression
 equality filter on the indexed column alongside the `ST_Intersects`.** Both

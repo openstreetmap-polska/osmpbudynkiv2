@@ -173,11 +173,7 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
         crate::shutdown::check_requested()?;
 
         let t = std::time::Instant::now();
-        conn.execute_batch(
-            "CREATE INDEX bdot10k_buildings_geom_idx ON bdot10k_buildings USING RTREE (geom);
-             CREATE INDEX bdot10k_buildings_centroid_idx ON bdot10k_buildings USING RTREE (centroid);",
-        )
-        .context("Failed to create spatial indexes on bdot10k_buildings")?;
+        crate::db::create_rtree_indexes(conn, crate::dataset::BDOT10K.table)?;
         info!(
             elapsed = %format_duration(t.elapsed()),
             "Step done: create spatial indexes"

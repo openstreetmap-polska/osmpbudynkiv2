@@ -152,6 +152,14 @@ pub enum DbAction {
         /// Path of the new database file; must not exist
         dest: PathBuf,
     },
+    /// Drop and rebuild every spatial (RTREE) index in place. Needed once on
+    /// a database created before the indexes got their current options --
+    /// the server logs a warning at start while any is outdated -- and
+    /// useful later to shrink indexes that have grown from weeks of writes.
+    ///
+    /// Takes seconds per index and changes no data. Requires exclusive access
+    /// to the database -- do not run this while a `run` server has it open.
+    Reindex,
 }
 
 #[derive(Subcommand)]

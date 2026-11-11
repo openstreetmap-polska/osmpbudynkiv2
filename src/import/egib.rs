@@ -135,11 +135,7 @@ pub fn import(conn: &Connection, config: &Config, file: Option<&Path>, url: &str
         crate::shutdown::check_requested()?;
 
         let t = std::time::Instant::now();
-        conn.execute_batch(
-            "CREATE INDEX egib_buildings_geom_idx ON egib_buildings USING RTREE (geom);
-             CREATE INDEX egib_buildings_centroid_idx ON egib_buildings USING RTREE (centroid);",
-        )
-        .context("Failed to create spatial indexes on egib_buildings")?;
+        crate::db::create_rtree_indexes(conn, crate::dataset::EGIB.table)?;
         info!(
             elapsed = %format_duration(t.elapsed()),
             "Step done: create spatial index"

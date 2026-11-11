@@ -165,6 +165,14 @@ fn main() -> Result<()> {
             // a tile renders changes.
             db_copy::copy_database(&conn, Path::new(&config.db_path), &dest)?;
         }
+        Command::Db {
+            action: cli::DbAction::Reindex,
+        } => {
+            // No `clear_tile_store`: an index holds no row of its own, so
+            // nothing a tile renders changes.
+            db::reindex(&conn)?;
+            info!("Index rebuild complete");
+        }
         Command::Run => {
             let rt = tokio::runtime::Runtime::new()?;
             let config = Arc::new(config);

@@ -31,6 +31,7 @@ pub fn init_db(
 
     create_schema(&conn)?;
     bind_rtree_indexes(&conn);
+    warn_about_outdated_rtree_indexes(&conn);
 
     Ok(conn)
 }
@@ -427,6 +428,178 @@ fn create_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// `min_node_capacity` every RTREE index in this database is created with.
+///
+/// DuckDB's default is 50 (40% of the 128-entry node), and it makes a delete
+/// of *spatially clustered* rows pathological. When a delete leaves a node
+/// below the minimum, spatial dissolves it: every remaining entry is orphaned
+/// and re-inserted from the root (`RTree::LeafDelete`/`BranchDelete`). A split
+/// leaves ~64 entries a leaf, so modifying a region's rows -- new entries in,
+/// old entries out, which is what a dataset refresh and every drained cell do
+/// -- halves each leaf to ~32, under the minimum, and the whole region's
+/// leaves dissolve into each other again and again. Scattered rows never
+/// trigger it, which is why a uniform benchmark does not see it.
+///
+/// Measured on the national `egib_buildings` (17.6M rows, two indexes, both
+/// built by `CREATE INDEX`), capped like production:
+///
+/// | | default (50) | 16 |
+/// |---|---|---|
+/// | COMMIT of 699,946 clustered rows, deleted and re-inserted | 132.5-145.8 s | 4.5 s |
+/// | `update egib`, real 08-15 -> 11-09 delta (2.54M rows): apply | 27m 58s | 27.6 s |
+///
+/// **Never 0.** A split only rebalances a side that fell below the minimum,
+/// so at 0 it can leave one node still full and the insert retries without
+/// end -- the same test did not finish in ten minutes. The minimum must stay
+/// positive, and at most half the node (spatial rejects more).
+///
+/// The option is part of the index, so it is fixed when the index is built:
+/// [`reindex`] is how an existing database picks it up.
+pub const RTREE_MIN_NODE_CAPACITY: u32 = 16;
+
+/// Every RTREE index in the schema, as `(index, table, column)`.
+///
+/// The one home for the set: the loaders build their table's entries through
+/// [`create_rtree_indexes`], `create_schema` the serving tables', and
+/// [`reindex`] walks all of it. A new index goes here, not into a loader.
+pub const RTREE_INDEXES: &[(&str, &str, &str)] = &[
+    ("bdot10k_buildings_geom_idx", "bdot10k_buildings", "geom"),
+    (
+        "bdot10k_buildings_centroid_idx",
+        "bdot10k_buildings",
+        "centroid",
+    ),
+    ("egib_buildings_geom_idx", "egib_buildings", "geom"),
+    ("egib_buildings_centroid_idx", "egib_buildings", "centroid"),
+    ("prg_addresses_geom_idx", "prg_addresses", "geom"),
+    ("osm_buildings_geom_idx", "osm_buildings", "geom"),
+    ("osm_addresses_geom_idx", "osm_addresses", "geom"),
+    (
+        "osm_former_buildings_geom_idx",
+        "osm_former_buildings",
+        "geom",
+    ),
+    ("bdot10k_unmatched_geom_idx", "bdot10k_unmatched", "geom"),
+    ("egib_unmatched_geom_idx", "egib_unmatched", "geom"),
+    ("prg_unmatched_geom_idx", "prg_unmatched", "geom"),
+];
+
+/// The `CREATE INDEX` statement for one RTREE index -- the only place the
+/// options are spelled, so no index can be built without
+/// [`RTREE_MIN_NODE_CAPACITY`].
+fn rtree_index_sql(name: &str, table: &str, column: &str, if_not_exists: bool) -> String {
+    let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
+    format!(
+        "CREATE INDEX {guard}{name} ON {table} USING RTREE ({column}) \
+         WITH (min_node_capacity = {RTREE_MIN_NODE_CAPACITY});"
+    )
+}
+
+/// Build every index [`RTREE_INDEXES`] declares for `table`, which must exist
+/// and must not have them yet. Called by each loader once its table is full,
+/// so the index is bulk-built rather than grown row by row.
+///
+/// Must run on the connection `init_db` returned, never a pooled one -- see
+/// [`bind_rtree_indexes`].
+pub fn create_rtree_indexes(conn: &Connection, table: &str) -> Result<()> {
+    let declared: Vec<_> = RTREE_INDEXES
+        .iter()
+        .filter(|(_, t, _)| *t == table)
+        .collect();
+    anyhow::ensure!(
+        !declared.is_empty(),
+        "no RTREE index is declared for table {table}"
+    );
+    for (name, table, column) in declared {
+        conn.execute_batch(&rtree_index_sql(name, table, column, false))
+            .with_context(|| format!("Failed to create spatial index {name}"))?;
+    }
+    Ok(())
+}
+
+/// Drop and rebuild every RTREE index (`db reindex`).
+///
+/// Two reasons to run it, both on a database that already exists:
+///
+/// - **To apply [`RTREE_MIN_NODE_CAPACITY`]**, which an index only takes when
+///   it is built. Nothing else changes an existing index: `import` rebuilds one
+///   source's, and `db copy` replays each index's stored DDL, old options
+///   included.
+/// - **To undo growth.** An index that has been written to for weeks is
+///   larger than a freshly built one (production held 5.1 GiB of index memory
+///   against ~2.4 GiB for the same indexes just built), and DuckDB never
+///   evicts index memory (`docs/duckdb_index_memory.md`).
+///
+/// It walks [`RTREE_INDEXES`] rather than the catalog, so a run interrupted
+/// between a `DROP` and its `CREATE` is repaired by running it again. A table
+/// that does not exist yet (a source never imported) is skipped. Building is
+/// a bulk load -- seconds per index on the national tables -- and it happens
+/// on the CLI's own connection, which is what [`bind_rtree_indexes`] needs.
+///
+/// Changes no row, so nothing a tile renders moves.
+pub fn reindex(conn: &Connection) -> Result<()> {
+    for (name, table, column) in RTREE_INDEXES {
+        crate::shutdown::check_requested()?;
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM duckdb_tables()
+             WHERE database_name = current_database() AND schema_name = 'main'
+               AND table_name = ?",
+            duckdb::params![table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tracing::info!(index = name, table, "Skipped index: table does not exist");
+            continue;
+        }
+        let t = std::time::Instant::now();
+        conn.execute_batch(&format!("DROP INDEX IF EXISTS {name};"))
+            .with_context(|| format!("Failed to drop index {name}"))?;
+        conn.execute_batch(&rtree_index_sql(name, table, column, false))
+            .with_context(|| {
+                format!("Failed to rebuild index {name}; run `db reindex` again to restore it")
+            })?;
+        tracing::info!(
+            index = name,
+            elapsed_s = t.elapsed().as_secs_f64(),
+            "Rebuilt index"
+        );
+    }
+    conn.execute_batch("CHECKPOINT")
+        .context("Failed to checkpoint after rebuilding indexes")?;
+    Ok(())
+}
+
+/// Names of the RTREE indexes that were not built with
+/// [`RTREE_MIN_NODE_CAPACITY`] -- a database from before it existed, until
+/// `db reindex` runs. Read off the DDL DuckDB stores for each index.
+fn rtree_indexes_with_other_capacity(conn: &Connection) -> duckdb::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT index_name FROM duckdb_indexes()
+         WHERE database_name = current_database() AND sql ILIKE '%USING RTREE%'
+           AND NOT regexp_matches(sql, ?)
+         ORDER BY index_name",
+    )?;
+    let pattern = format!(r"min_node_capacity\s*=\s*{RTREE_MIN_NODE_CAPACITY}\b");
+    stmt.query_map(duckdb::params![pattern], |row| row.get::<_, String>(0))?
+        .collect()
+}
+
+/// Says so, once per start, when the database still carries indexes built
+/// with another `min_node_capacity`. Not an error: they answer queries
+/// correctly, they are only slow to delete from.
+fn warn_about_outdated_rtree_indexes(conn: &Connection) {
+    match rtree_indexes_with_other_capacity(conn) {
+        Ok(names) if !names.is_empty() => tracing::warn!(
+            indexes = %names.join(", "),
+            "RTREE indexes built without min_node_capacity = {RTREE_MIN_NODE_CAPACITY}: \
+             dataset refreshes and the match drain delete from them slowly. \
+             Stop the service and run `db reindex` to rebuild them (seconds each)"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::debug!(error = %e, "could not inspect RTREE index options"),
+    }
+}
+
 /// Read-path indexes for `/tiles` and `/package`, which scan the serving tables
 /// on a bbox predicate. Both callers must phrase that predicate as
 /// `ST_Intersects(geom, <constant>)` for these to be used at all: an RTREE index
@@ -446,12 +619,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
 /// down". Serving unindexed is strictly better than not serving, so a failure
 /// here is logged and startup continues.
 fn create_serving_indexes(conn: &Connection) {
-    for (name, table) in [
-        ("bdot10k_unmatched_geom_idx", "bdot10k_unmatched"),
-        ("egib_unmatched_geom_idx", "egib_unmatched"),
-        ("prg_unmatched_geom_idx", "prg_unmatched"),
-    ] {
-        let sql = format!("CREATE INDEX IF NOT EXISTS {name} ON {table} USING RTREE (geom);");
+    for (name, table, column) in RTREE_INDEXES
+        .iter()
+        .filter(|(_, table, _)| table.ends_with("_unmatched"))
+    {
+        let sql = rtree_index_sql(name, table, column, true);
         if let Err(e) = conn.execute_batch(&sql) {
             tracing::warn!(
                 index = name,
@@ -565,6 +737,126 @@ mod tests {
             assert_eq!(count, 0, "Table {table} should be empty initially");
         }
 
+        Ok(())
+    }
+
+    /// Spatial accepts a minimum from 0 to half the node, and 0 hangs the
+    /// first unbalanced split (see `RTREE_MIN_NODE_CAPACITY`). 128 is the
+    /// extension's default node size, which no index here overrides.
+    #[test]
+    fn the_rtree_min_node_capacity_is_positive_and_at_most_half_a_node() {
+        const { assert!(RTREE_MIN_NODE_CAPACITY >= 1 && RTREE_MIN_NODE_CAPACITY <= 128 / 2) };
+    }
+
+    fn spatial_db() -> Result<Connection> {
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        init_db(Path::new(":memory:"), &init_commands, None)
+    }
+
+    /// The indexes `create_schema` builds carry the shared option -- the check
+    /// that would catch a `CREATE INDEX` spelled by hand somewhere again.
+    #[test]
+    fn the_serving_indexes_are_built_with_the_shared_min_node_capacity() -> Result<()> {
+        let conn = spatial_db()?;
+        assert_eq!(
+            rtree_indexes_with_other_capacity(&conn)?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// A loader's indexes come from the same list, with the same option.
+    #[test]
+    fn create_rtree_indexes_builds_every_index_declared_for_the_table() -> Result<()> {
+        let conn = spatial_db()?;
+        conn.execute_batch(
+            "CREATE TABLE egib_buildings (id_budynku VARCHAR, geom GEOMETRY, centroid GEOMETRY);",
+        )?;
+        create_rtree_indexes(&conn, "egib_buildings")?;
+
+        let names: Vec<String> = conn
+            .prepare(
+                "SELECT index_name FROM duckdb_indexes()
+                 WHERE table_name = 'egib_buildings' ORDER BY index_name",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<duckdb::Result<_>>()?;
+        assert_eq!(
+            names,
+            ["egib_buildings_centroid_idx", "egib_buildings_geom_idx"]
+        );
+        assert!(rtree_indexes_with_other_capacity(&conn)?.is_empty());
+
+        assert!(
+            create_rtree_indexes(&conn, "no_such_table").is_err(),
+            "a table with no declared index is a caller's mistake, not a no-op"
+        );
+        Ok(())
+    }
+
+    /// `db reindex` on a database from before the option existed: the old
+    /// index is reported, rebuilt with the option, still there and still
+    /// usable -- and tables that were never imported are skipped, not an
+    /// error.
+    #[test]
+    fn reindex_rebuilds_an_index_built_with_other_options() -> Result<()> {
+        let conn = spatial_db()?;
+        // Only prg_addresses of the source tables exists, as on a database
+        // with one source imported. Its index is built the old way.
+        conn.execute_batch(
+            "CREATE TABLE prg_addresses AS
+                 SELECT i::VARCHAR AS lokalny_id, ST_Point(19 + i / 1000.0, 52.0) AS geom
+                 FROM range(500) t(i);
+             CREATE INDEX prg_addresses_geom_idx ON prg_addresses USING RTREE (geom);",
+        )?;
+        assert_eq!(
+            rtree_indexes_with_other_capacity(&conn)?,
+            ["prg_addresses_geom_idx"]
+        );
+
+        reindex(&conn)?;
+
+        assert!(rtree_indexes_with_other_capacity(&conn)?.is_empty());
+        let indexed: Vec<String> = conn
+            .prepare(
+                "SELECT table_name FROM duckdb_indexes()
+                 WHERE sql ILIKE '%USING RTREE%' ORDER BY table_name",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<duckdb::Result<_>>()?;
+        assert!(indexed.contains(&"prg_addresses".to_string()));
+        assert!(
+            !indexed
+                .iter()
+                .any(|t| t == "egib_buildings" || t == "bdot10k_buildings"),
+            "a table that does not exist must be skipped: {indexed:?}"
+        );
+        let hits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM prg_addresses
+             WHERE ST_Intersects(geom, ST_MakeEnvelope(19.0995, 51.9, 19.2005, 52.1))",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(hits, 101, "the rebuilt index must answer correctly");
+        Ok(())
+    }
+
+    /// A run that died between a DROP and its CREATE left no index behind;
+    /// running it again must put it back, which is why `reindex` walks the
+    /// declared list rather than the catalog.
+    #[test]
+    fn reindex_restores_an_index_that_is_missing() -> Result<()> {
+        let conn = spatial_db()?;
+        conn.execute_batch("DROP INDEX egib_unmatched_geom_idx;")?;
+
+        reindex(&conn)?;
+
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'egib_unmatched_geom_idx'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(n, 1);
         Ok(())
     }
 

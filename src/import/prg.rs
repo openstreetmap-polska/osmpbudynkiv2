@@ -73,8 +73,7 @@ pub fn import(
     );
 
     let t = std::time::Instant::now();
-    conn.execute_batch("CREATE INDEX prg_addresses_geom_idx ON prg_addresses USING RTREE (geom);")
-        .context("Failed to create spatial index on prg_addresses")?;
+    crate::db::create_rtree_indexes(conn, "prg_addresses")?;
     info!(
         elapsed = %format_duration(t.elapsed()),
         "Step done: create spatial index"

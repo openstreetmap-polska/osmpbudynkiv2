@@ -721,14 +721,9 @@ fn import_relation_former_buildings(conn: &Connection, pbf_path: &str) -> Result
 
 fn create_spatial_indexes(conn: &Connection) -> Result<()> {
     info!("Creating spatial indexes");
-    conn.execute_batch(
-        "
-        CREATE INDEX osm_buildings_geom_idx ON osm_buildings USING RTREE (geom);
-        CREATE INDEX osm_addresses_geom_idx ON osm_addresses USING RTREE (geom);
-        CREATE INDEX osm_former_buildings_geom_idx ON osm_former_buildings USING RTREE (geom);
-        ",
-    )
-    .context("Failed to create spatial indexes")?;
+    for table in ["osm_buildings", "osm_addresses", "osm_former_buildings"] {
+        crate::db::create_rtree_indexes(conn, table)?;
+    }
     Ok(())
 }
 
