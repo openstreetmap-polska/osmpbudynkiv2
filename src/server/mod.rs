@@ -207,9 +207,24 @@ pub type DbPool = Pool<ClonedConnectionManager>;
 /// server. Keep this above the sum when adding a cached query.
 const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 32;
 
+/// Pooled connections are never closed for age or idleness. r2d2's defaults
+/// (30 min lifetime, 10 min idle) would close them, and closing a connection
+/// is what turns <https://github.com/duckdb/duckdb-spatial/issues/915> into a
+/// crash: an RTREE index keeps the `ClientContext` of the connection that
+/// bound it, and the next write to its table reads it after the free.
+/// `db::bind_rtree_indexes` is the actual workaround. It binds every index on
+/// the base connection, so no pooled connection should ever bind one. This
+/// setting is the second line of defence for any other spatial or DuckDB
+/// state that captures a pooled connection's context the same way.
+/// **Revert to the defaults once a spatial release with the fix is in use**,
+/// together with `db::bind_rtree_indexes`. Nothing here depends on recycling:
+/// the pool size is fixed, and a connection that breaks is still dropped (see
+/// `ClonedConnectionManager::has_broken`).
 pub fn build_pool(base_conn: Connection, pool_size: u32) -> Result<DbPool> {
     Pool::builder()
         .max_size(pool_size)
+        .max_lifetime(None)
+        .idle_timeout(None)
         .build(ClonedConnectionManager::new(base_conn))
         .context("Failed to build DB connection pool")
 }
@@ -788,6 +803,17 @@ mod tests {
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 99, "only the one committed delete may have landed");
+    }
+
+    /// Workaround for <https://github.com/duckdb/duckdb-spatial/issues/915>:
+    /// closing a pooled connection is what lets an RTREE index read a freed
+    /// `ClientContext`, so the pool must never close one for age or
+    /// idleness. Delete this test together with the setting.
+    #[test]
+    fn pooled_connections_are_never_reaped() {
+        let pool = build_pool(table_of_100(), 2).unwrap();
+        assert_eq!(pool.max_lifetime(), None);
+        assert_eq!(pool.idle_timeout(), None);
     }
 
     /// A pooled connection is a clone with its own interrupt handle, so only

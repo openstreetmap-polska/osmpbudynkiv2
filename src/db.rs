@@ -30,8 +30,71 @@ pub fn init_db(
     }
 
     create_schema(&conn)?;
+    bind_rtree_indexes(&conn);
 
     Ok(conn)
+}
+
+/// Binds every RTREE index on this connection, so each one holds the
+/// `ClientContext` of a connection that outlives every writer.
+///
+/// **Workaround for <https://github.com/duckdb/duckdb-spatial/issues/915>;
+/// delete this function and its call in `init_db` once a spatial release
+/// with the fix is in use.** That release can also undo the pool settings in
+/// `server::build_pool`.
+///
+/// The bug: an RTREE index keeps an `ExpressionExecutor` built from the
+/// `ClientContext` of the connection that created it or, after the database
+/// is reopened, the first one whose query bound it. Every later
+/// insert into or delete from the table runs through that executor at
+/// COMMIT, whichever connection commits. Once the binding connection is
+/// closed, that is a read of freed memory. On DuckDB 2.0 it fails the commit
+/// with `INTERNAL Error: Attempted to dereference shared_ptr that is NULL!`,
+/// which invalidates the database. In production the first `/tiles` query
+/// bound the indexes on a pooled connection, the pool closed it, and the next
+/// `update osm` commit took the database down: five times on 2026-11-09.
+///
+/// Binding is lazy, so it has to be forced. Spatial's own
+/// `pragma_rtree_index_info()` binds every RTREE index in the database and
+/// fails if any stays unbound. `CREATE INDEX IF NOT EXISTS` does not bind
+/// one. Measured on the national database: all 11 indexes in 0.03 s, and
+/// 7 MiB of buffer pool.
+///
+/// It runs on the connection `init_db` returns, which the CLI uses throughout
+/// and `run` keeps as its pool's base connection for the server's lifetime.
+/// The indexes `import` creates later are created on that same connection.
+/// **An RTREE index created on a pooled connection (none is, today) would
+/// reintroduce the bug.**
+///
+/// Warns instead of failing, like `create_serving_indexes`. A failure leaves
+/// the server exposed to the crash, which is no worse than before this
+/// existed, rather than not starting at all.
+fn bind_rtree_indexes(conn: &Connection) -> Vec<String> {
+    let bound = conn
+        .prepare("SELECT index_name FROM pragma_rtree_index_info() ORDER BY index_name")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<duckdb::Result<Vec<_>>>()
+        });
+    match bound {
+        Ok(names) => {
+            tracing::debug!(
+                count = names.len(),
+                "bound RTREE indexes on the base connection"
+            );
+            names
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not bind RTREE indexes on the base connection; a write \
+                 to an RTREE-indexed table may invalidate the database once a \
+                 pooled connection that bound an index is closed \
+                 (https://github.com/duckdb/duckdb-spatial/issues/915)"
+            );
+            Vec::new()
+        }
+    }
 }
 
 fn create_schema(conn: &Connection) -> Result<()> {
@@ -569,6 +632,42 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(hits, 1, "the replayed row must be found through the index");
+        Ok(())
+    }
+
+    /// `bind_rtree_indexes` must reach every RTREE index of a reopened
+    /// database, whose indexes all start unbound, including those on empty
+    /// tables. If spatial renames or drops `pragma_rtree_index_info`, the
+    /// function only warns, so this test is what notices.
+    /// Workaround for <https://github.com/duckdb/duckdb-spatial/issues/915>:
+    /// delete this test together with the function.
+    #[test]
+    fn every_rtree_index_is_bound_on_the_base_connection() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("bind.duckdb");
+        let init_commands = vec!["INSTALL spatial".to_string(), "LOAD spatial".to_string()];
+        {
+            let conn = init_db(&path, &init_commands, None)?;
+            conn.execute_batch(
+                "INSERT INTO osm_buildings (osm_id, osm_type, geom)
+                     VALUES (1, 'way', ST_Point(21, 52));
+                 CREATE INDEX osm_buildings_geom_idx ON osm_buildings USING RTREE (geom);
+                 CREATE INDEX osm_addresses_geom_idx ON osm_addresses USING RTREE (geom);",
+            )?;
+        }
+
+        let conn = init_db(&path, &init_commands, None)?;
+        let mut expected: Vec<String> = conn
+            .prepare("SELECT index_name FROM duckdb_indexes() WHERE sql ILIKE '%USING RTREE%'")?
+            .query_map([], |row| row.get(0))?
+            .collect::<duckdb::Result<_>>()?;
+        expected.sort();
+        assert_eq!(
+            expected.len(),
+            5,
+            "three serving indexes plus the two above"
+        );
+        assert_eq!(bind_rtree_indexes(&conn), expected);
         Ok(())
     }
 

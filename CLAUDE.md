@@ -1017,6 +1017,24 @@ the one home for the text label: it changed with DuckDB 2.0 (`RTREE_INDEX_SCAN`
 → `Rtree Index Scan`), and a renamed label turns these tests into failures
 that look like lost indexes.
 
+**Gotcha — an RTREE index keeps the connection that bound it, so bind them on
+one that never closes.** This is the upstream bug
+[duckdb-spatial#915](https://github.com/duckdb/duckdb-spatial/issues/915).
+The index evaluates its key through the `ClientContext` of whichever
+connection created or first bound it, and it does so at every later COMMIT
+that writes to its table. Once that connection is closed, the read is of
+freed memory. On DuckDB 2.0 the commit fails with `Attempted to dereference
+shared_ptr that is NULL!`, which invalidates the database: five
+auto-restarts in production on 2026-11-09. The workaround has two halves,
+both marked with the issue link so they can be removed together once a
+spatial release fixes it:
+- `db::bind_rtree_indexes` binds every index on `init_db`'s connection,
+  which is the pool's base connection for the life of the server.
+- `server::build_pool` never reaps pooled connections.
+
+So **never create an RTREE index on a pooled connection**. A `CREATE INDEX`
+that runs inside a server job would bring the crash back.
+
 **Gotcha — the same index loss has a second, unrelated trigger: an expression
 equality filter on the indexed column alongside the `ST_Intersects`.** Both
 per-cell recomputes append a write-narrow guard
