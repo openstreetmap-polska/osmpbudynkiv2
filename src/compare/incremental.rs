@@ -5,9 +5,10 @@ use duckdb::Connection;
 
 use crate::compare::columns::classification_columns;
 use crate::compare::rule::{
-    Area, BDOT10K_EKSPLOATOWANY_FILTER, OSM_MATCH_BUFFER_DEG, buffer,
+    Area, BDOT10K_EKSPLOATOWANY_FILTER, CELL_BOUNDS_COLUMNS, CellSet, OSM_MATCH_BUFFER_DEG, buffer,
     unmatched_addresses_in_cell_sql, unmatched_buildings_sql,
 };
+use crate::dataset::DatasetSpec;
 use crate::dataset::{BDOT10K, EGIB, PRG};
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
@@ -63,30 +64,16 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<CellSql> {
     let cell_params = [Value::Int(cell_x), Value::Int(cell_y)];
     match source {
         "bdot10k" | "egib" => {
-            let (spec, id, dest, extra_filter) = if source == "bdot10k" {
-                (
-                    &BDOT10K,
-                    "LOKALNYID",
-                    "bdot10k_unmatched",
-                    Some(BDOT10K_EKSPLOATOWANY_FILTER),
-                )
-            } else {
-                (&EGIB, "id_budynku", "egib_unmatched", None)
-            };
-            let src = spec.table;
-            let cx = cell_x_sql("b.centroid");
-            let cy = cell_y_sql("b.centroid");
-            let cc = classification_columns(src);
-            let select = format!("b.{id}, b.geom, {cx}, {cy}, now(), {}", cc.source_exprs);
-            let extra = extra_filter
-                .map(|f| format!(" AND {f}"))
-                .unwrap_or_default();
+            let b = building_source(source);
+            let (cx, cy) = (cell_x_sql("b.centroid"), cell_y_sql("b.centroid"));
             let candidates = format!(
                 "WITH candidates AS MATERIALIZED (
                      SELECT * FROM {src} b
                      WHERE ST_Intersects(b.centroid, {}){extra}
                  )\n",
-                Area::Params(1).envelope_sql()
+                Area::Params(1).envelope_sql(),
+                src = b.spec.table,
+                extra = b.extra_sql(),
             );
             // Write-narrow: unmatched_buildings_sql's ST_Intersects test is
             // closed on all four cell edges, so a centroid exactly on a
@@ -97,11 +84,17 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<CellSql> {
             // that owns it.
             let inner = format!(
                 "{candidates}{} AND {cx} = $5 AND {cy} = $6",
-                unmatched_buildings_sql(spec, "candidates", &select, Area::Params(1), extra_filter)
+                unmatched_buildings_sql(
+                    b.spec,
+                    "candidates",
+                    &b.select,
+                    Area::Params(1),
+                    b.extra_filter
+                )
             );
             Ok(CellSql {
-                dest,
-                insert_cols: format!("{id}, geom, cell_x, cell_y, computed_at, {}", cc.dest_names),
+                dest: b.dest,
+                insert_cols: b.insert_cols,
                 inner,
                 params: envelope_params(write)
                     .into_iter()
@@ -113,11 +106,6 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<CellSql> {
             let read = buffer(write, OSM_MATCH_BUFFER_DEG);
             let cx = cell_x_sql("a.geom");
             let cy = cell_y_sql("a.geom");
-            let select = format!(
-                "a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc, \
-                 a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania, \
-                 a.teryt_gmina, a.gmina, {cx}, {cy}, now()"
-            );
             // Unlike the buildings branch above, this one does *not* build its
             // own candidate CTE: `unmatched_addresses_in_cell_sql` owns a
             // two-CTE chain of its own (`addr_candidates` -> `addr_resolved`,
@@ -139,18 +127,14 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<CellSql> {
                 unmatched_addresses_in_cell_sql(
                     &PRG,
                     "prg_addresses",
-                    &select,
+                    &prg_select(),
                     Area::Params(1),
                     Area::Params(5)
                 )
             );
             Ok(CellSql {
                 dest: "prg_unmatched",
-                insert_cols:
-                    "geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy, \
-                 teryt_miejscowosc, wazny_od_lub_data_nadania, teryt_gmina, gmina, \
-                 cell_x, cell_y, computed_at"
-                        .to_string(),
+                insert_cols: PRG_INSERT_COLS.to_string(),
                 inner,
                 params: envelope_params(write)
                     .into_iter()
@@ -161,6 +145,161 @@ fn build_sql(source: &str, cell_x: i32, cell_y: i32) -> Result<CellSql> {
         }
         other => bail!("recompute_cell: unknown source {other}"),
     }
+}
+
+/// What the one-cell and multi-cell building statements share: everything
+/// about the source that is not the area.
+struct BuildingSource {
+    spec: &'static DatasetSpec,
+    dest: &'static str,
+    extra_filter: Option<&'static str>,
+    select: String,
+    insert_cols: String,
+}
+
+impl BuildingSource {
+    fn extra_sql(&self) -> String {
+        self.extra_filter
+            .map(|f| format!(" AND {f}"))
+            .unwrap_or_default()
+    }
+}
+
+/// `source` must be `bdot10k` or `egib`; the callers match on it first.
+fn building_source(source: &str) -> BuildingSource {
+    let (spec, id, dest, extra_filter) = if source == "bdot10k" {
+        (
+            &BDOT10K,
+            "LOKALNYID",
+            "bdot10k_unmatched",
+            Some(BDOT10K_EKSPLOATOWANY_FILTER),
+        )
+    } else {
+        (&EGIB, "id_budynku", "egib_unmatched", None)
+    };
+    let cx = cell_x_sql("b.centroid");
+    let cy = cell_y_sql("b.centroid");
+    let cc = classification_columns(spec.table);
+    BuildingSource {
+        spec,
+        dest,
+        extra_filter,
+        select: format!("b.{id}, b.geom, {cx}, {cy}, now(), {}", cc.source_exprs),
+        insert_cols: format!("{id}, geom, cell_x, cell_y, computed_at, {}", cc.dest_names),
+    }
+}
+
+const PRG_INSERT_COLS: &str = "geom, lokalny_id, numer_porzadkowy, ulica, miejscowosc, kod_pocztowy, \
+     teryt_miejscowosc, wazny_od_lub_data_nadania, teryt_gmina, gmina, \
+     cell_x, cell_y, computed_at";
+
+fn prg_select() -> String {
+    format!(
+        "a.geom, a.lokalny_id, a.numer_porzadkowy, a.ulica, a.miejscowosc, \
+         a.kod_pocztowy, a.teryt_miejscowosc, a.wazny_od_lub_data_nadania, \
+         a.teryt_gmina, a.gmina, {}, {}, now()",
+        cell_x_sql("a.geom"),
+        cell_y_sql("a.geom")
+    )
+}
+
+/// The multi-cell twin of [`build_sql`]: one statement recomputing every cell
+/// in `cells`, with the same rows as running `build_sql`'s once per cell.
+///
+/// A drained cell costs ~10 ms before it reads a row (three RTREE scans and
+/// two spatial joins to set up), and a run of neighbouring cells pays that
+/// once here instead of once each. Measured on the national tables under
+/// production's limits, 512 EGIB cells in eight 8x8 blocks: 7.3 s -> 1.5 s,
+/// identical rows.
+///
+/// **Each row is still decided against its own cell**, never the union:
+///
+/// - Buildings: `candidates` joins every row to its cell's bounds
+///   ([`CELL_BOUNDS_COLUMNS`]) and [`Area::Cells`] makes the rule test both
+///   the row and the OSM side against them. The join is on the row's
+///   canonical cell tag, so it is the write-narrow guard as well.
+/// - Addresses: the rule reads only the union here, and [`CellSet::owns_sql`]
+///   appended to it applies the cell's own envelope and tag. The OSM read
+///   needs no per-cell half: every address rule is bounded by a distance the
+///   buffer already covers
+///   (`rule::tests::osm_match_buffer_covers_the_widest_match_distance`), so a
+///   wider read finds nothing a cell's own read would not.
+///
+/// Two shapes follow from the RTREE traps in CLAUDE.md. The union scan sits
+/// alone in `in_bounds`, with the join on the cell tag in a CTE of its own:
+/// an equality on an expression over the indexed column, next to the
+/// `ST_Intersects`, turns the index scan into a sequential one. And **the
+/// text depends only on `source`**, as [`build_sql`]'s does: the union is
+/// `$1..$4` and the cells are one text parameter ([`CellSet::param`]) -- `$5`
+/// for buildings, `$9` for prg after its read envelope `$5..$8` -- so the
+/// caller can `prepare_cached` it.
+fn build_cells_sql(source: &str) -> Result<CellSql> {
+    match source {
+        "bdot10k" | "egib" => {
+            let b = building_source(source);
+            let (cx, cy) = (cell_x_sql("b.centroid"), cell_y_sql("b.centroid"));
+            let [x1, y1, x2, y2] = CELL_BOUNDS_COLUMNS;
+            let area = Area::Cells(1);
+            let candidates = format!(
+                "WITH in_bounds AS MATERIALIZED (
+                     SELECT * FROM {src} b
+                     WHERE ST_Intersects(b.centroid, {envelope}){extra}
+                 ),
+                 candidates AS MATERIALIZED (
+                     SELECT b.*, c.{x1}, c.{y1}, c.{x2}, c.{y2}
+                     FROM in_bounds b
+                     JOIN {cells} c ON {cx} = c.cx AND {cy} = c.cy
+                 )\n",
+                src = b.spec.table,
+                envelope = area.envelope_sql(),
+                extra = b.extra_sql(),
+                cells = CellSet::cells_sql(5),
+            );
+            let inner = format!(
+                "{candidates}{}",
+                unmatched_buildings_sql(b.spec, "candidates", &b.select, area, b.extra_filter)
+            );
+            Ok(CellSql {
+                dest: b.dest,
+                insert_cols: b.insert_cols,
+                inner,
+                params: Vec::new(),
+            })
+        }
+        "prg" => {
+            let inner = format!(
+                "{} AND {}",
+                unmatched_addresses_in_cell_sql(
+                    &PRG,
+                    "prg_addresses",
+                    &prg_select(),
+                    Area::Cells(1),
+                    Area::Cells(5)
+                ),
+                CellSet::owns_sql("a.geom", 9)
+            );
+            Ok(CellSql {
+                dest: "prg_unmatched",
+                insert_cols: PRG_INSERT_COLS.to_string(),
+                inner,
+                params: Vec::new(),
+            })
+        }
+        other => bail!("recompute_cells: unknown source {other}"),
+    }
+}
+
+/// The values [`build_cells_sql`]'s statement is run with for `cells`.
+fn cells_params(source: &str, cells: &CellSet) -> Vec<duckdb::types::Value> {
+    use duckdb::types::Value;
+    let union = cells.union();
+    let envelope = |b: crate::compare::rule::Bounds| [b.0, b.1, b.2, b.3].map(Value::Double);
+    let mut params: Vec<Value> = envelope(union).into();
+    if source == "prg" {
+        params.extend(envelope(buffer(union, OSM_MATCH_BUFFER_DEG)));
+    }
+    params.push(Value::Text(cells.param()));
+    params
 }
 
 /// Rebuild one z14 cell's slice of `<source>_unmatched` from current live data.
@@ -193,6 +332,35 @@ pub fn recompute_cell_in_txn(
     // Cheap: it re-reads the same envelope through the same RTREE index the
     // INSERT just used.
     crate::compare::totals::recompute_cell_in_txn(conn, source, cell_x, cell_y)?;
+    Ok(())
+}
+
+/// Rebuild several z14 cells' slices of `<source>_unmatched` with one
+/// statement per table, leaving exactly what [`recompute_cell_in_txn`] leaves
+/// when run once per cell (see [`build_cells_sql`]). Assumes an open
+/// transaction. The caller decides which cells are worth grouping: the
+/// statement reads the union of their bounds, so cells far apart read
+/// everything between them.
+pub fn recompute_cells_in_txn(conn: &Connection, source: &str, cells: &[(i32, i32)]) -> Result<()> {
+    if cells.is_empty() {
+        return Ok(());
+    }
+    let set = CellSet::new(cells);
+    let sql = build_cells_sql(source)?;
+    let dest = sql.dest;
+    // `prepare_cached` for all of them, as in `recompute_cell_in_txn`: every
+    // text is constant per source.
+    conn.prepare_cached(&format!(
+        "DELETE FROM {dest} WHERE {}",
+        CellSet::keys_in_sql(1)
+    ))?
+    .execute(duckdb::params![set.param()])?;
+    conn.prepare_cached(&format!(
+        "INSERT INTO {dest} ({}) {}",
+        sql.insert_cols, sql.inner
+    ))?
+    .execute(duckdb::params_from_iter(cells_params(source, &set)))?;
+    crate::compare::totals::recompute_cells_in_txn(conn, source, &set)?;
     Ok(())
 }
 
@@ -573,6 +741,260 @@ mod tests {
             ids,
             vec!["raw-equal".to_string()],
             "the mapped name matches at ~133m; raw equality does not"
+        );
+    }
+
+    /// Two neighbouring cells, `a` west of `b`, and their bounds.
+    fn neighbours() -> ((i32, i32), (i32, i32), f64, f64, f64) {
+        let (cx, cy) = (9147u32, 5411u32);
+        let (west, south, edge, north) = tile_to_bbox(CHANGE_CELL_ZOOM, cx, cy);
+        let _ = west;
+        (
+            (cx as i32, cy as i32),
+            (cx as i32 + 1, cy as i32),
+            edge,
+            south,
+            north,
+        )
+    }
+
+    /// Buildings exercising every way a row can leave or stay in the result,
+    /// in two neighbouring cells plus one cell the recompute is not asked for.
+    /// `straddler` is the one the multi-cell statement can get wrong: its
+    /// centroid is in `a`, its east end reaches into `b`, and the only OSM
+    /// building over it lies wholly in `b`.
+    fn seed_buildings(c: &Connection) {
+        let (_, _, edge, south, north) = neighbours();
+        let mid = (south + north) / 2.0;
+        c.execute_batch(&format!(
+            "INSERT INTO bdot10k_buildings (LOKALNYID, geom) VALUES
+                 ('plain-a',   ST_MakeEnvelope({edge} - 0.0100, {mid}, {edge} - 0.0098, {mid} + 0.0002)),
+                 ('matched-a', ST_MakeEnvelope({edge} - 0.0080, {mid}, {edge} - 0.0078, {mid} + 0.0002)),
+                 ('former-a',  ST_MakeEnvelope({edge} - 0.0060, {mid}, {edge} - 0.0058, {mid} + 0.0002)),
+                 ('straddler', ST_MakeEnvelope({edge} - 0.0003, {mid}, {edge} + 0.0002, {mid} + 0.0002)),
+                 ('boundary',  ST_Point({edge}, {mid} - 0.001)),
+                 ('plain-b',   ST_MakeEnvelope({edge} + 0.0100, {mid}, {edge} + 0.0102, {mid} + 0.0002)),
+                 ('matched-b', ST_MakeEnvelope({edge} + 0.0080, {mid}, {edge} + 0.0082, {mid} + 0.0002)),
+                 ('elsewhere', ST_MakeEnvelope({edge} + 0.2000, {mid}, {edge} + 0.2002, {mid} + 0.0002));
+             INSERT INTO bdot10k_buildings (LOKALNYID, geom, KATEGORIAISTNIENIA) VALUES
+                 ('w-budowie', ST_MakeEnvelope({edge} - 0.0040, {mid}, {edge} - 0.0038, {mid} + 0.0002), 'w budowie');
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             INSERT INTO osm_buildings VALUES
+                 (1,'way',NULL, ST_MakeEnvelope({edge} - 0.0081, {mid}, {edge} - 0.0077, {mid} + 0.0002)),
+                 (2,'way',NULL, ST_MakeEnvelope({edge} + 0.0079, {mid}, {edge} + 0.0083, {mid} + 0.0002)),
+                 (3,'way',NULL, ST_MakeEnvelope({edge} + 0.00005, {mid}, {edge} + 0.0003, {mid} + 0.0002));
+             INSERT INTO osm_former_buildings VALUES
+                 (4,'way','demolished:building','yes', ST_MakeEnvelope({edge} - 0.0061, {mid}, {edge} - 0.0057, {mid} + 0.0002));"
+        ))
+        .unwrap();
+    }
+
+    /// Every row of `table` and of `cell_totals`, as text, minus the
+    /// timestamp a recompute stamps.
+    fn snapshot(c: &Connection, table: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for sql in [
+            format!(
+                "SELECT x::VARCHAR FROM (SELECT * EXCLUDE (computed_at) FROM {table}) x ORDER BY 1"
+            ),
+            "SELECT t::VARCHAR FROM cell_totals t ORDER BY 1".to_string(),
+        ] {
+            let mut stmt = c.prepare(&sql).unwrap();
+            out.extend(
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .map(|r| r.unwrap()),
+            );
+        }
+        out
+    }
+
+    fn recompute_cells(c: &Connection, source: &str, cells: &[(i32, i32)]) {
+        c.execute_batch("BEGIN TRANSACTION").unwrap();
+        recompute_cells_in_txn(c, source, cells).unwrap();
+        c.execute_batch("COMMIT").unwrap();
+    }
+
+    fn unmatched_ids(c: &Connection, table: &str, id: &str) -> Vec<String> {
+        let mut s = c
+            .prepare(&format!("SELECT {id} FROM {table} ORDER BY {id}"))
+            .unwrap();
+        s.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// The multi-cell statement is an optimisation of the per-cell one and
+    /// must leave the same rows and the same totals.
+    #[test]
+    fn a_multi_cell_recompute_leaves_what_per_cell_recomputes_leave() {
+        let (a, b, ..) = neighbours();
+
+        let per_cell = conn();
+        seed_buildings(&per_cell);
+        recompute_cell(&per_cell, "bdot10k", a.0, a.1).unwrap();
+        recompute_cell(&per_cell, "bdot10k", b.0, b.1).unwrap();
+
+        let multi = conn();
+        seed_buildings(&multi);
+        recompute_cells(&multi, "bdot10k", &[a, b]);
+
+        assert_eq!(
+            unmatched_ids(&multi, "bdot10k_unmatched", "LOKALNYID"),
+            ["boundary", "plain-a", "plain-b", "straddler"],
+            "the fixture must leave rows in both cells, or the comparison below proves nothing"
+        );
+        assert_eq!(
+            snapshot(&multi, "bdot10k_unmatched"),
+            snapshot(&per_cell, "bdot10k_unmatched")
+        );
+
+        // Running it again replaces the cells' rows rather than adding to them.
+        recompute_cells(&multi, "bdot10k", &[a, b]);
+        assert_eq!(
+            snapshot(&multi, "bdot10k_unmatched"),
+            snapshot(&per_cell, "bdot10k_unmatched")
+        );
+    }
+
+    /// The building rule reads OSM from the row's own, unbuffered cell. An OSM
+    /// building wholly in the neighbour covers 30% of `straddler`, which is
+    /// over the match threshold, and the per-cell statement still leaves it
+    /// unmatched because that building does not touch the cell. A multi-cell
+    /// statement testing against the union of its cells would match it, and
+    /// the answer would then depend on which cells were drained together.
+    #[test]
+    fn a_multi_cell_recompute_tests_each_building_against_its_own_cell() {
+        let (a, b, ..) = neighbours();
+        let c = conn();
+        seed_buildings(&c);
+
+        let covered: f64 = c
+            .query_row(
+                "SELECT ST_Area(ST_Intersection(o.geom, g.geom)) / ST_Area(g.geom)
+                 FROM bdot10k_buildings g, osm_buildings o
+                 WHERE g.LOKALNYID = 'straddler' AND o.osm_id = 3",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            covered >= crate::compare::rule::MIN_OVERLAP_FRACTION,
+            "the fixture's OSM building must cover enough to match, got {covered}"
+        );
+
+        recompute_cells(&c, "bdot10k", &[a, b]);
+        assert!(
+            unmatched_ids(&c, "bdot10k_unmatched", "LOKALNYID").contains(&"straddler".to_string()),
+            "a building is matched only by OSM buildings touching its own cell"
+        );
+    }
+
+    /// The address twin: a match across the shared edge by proximity, one by
+    /// the street rule at ~133 m, a point exactly on the edge, and unmatched
+    /// addresses in both cells.
+    #[test]
+    fn a_multi_cell_address_recompute_leaves_what_per_cell_recomputes_leave() {
+        let (a, b, edge, south, north) = neighbours();
+        let mid = (south + north) / 2.0;
+        let seed = |c: &Connection| {
+            c.execute_batch(&format!(
+                "INSERT INTO street_name_mappings VALUES (NULL, 'gen. Kruka', 'Generała Kruka');
+                 INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, ulica, geom) VALUES
+                     ('plain-a',  '1', NULL, ST_Point({edge} - 0.0100, {mid})),
+                     ('near-a',   '2', NULL, ST_Point({edge} - 0.0001, {mid})),
+                     ('street-a', '5', 'gen. Kruka', ST_Point({edge} - 0.0002, {mid} + 0.003)),
+                     ('boundary', '3', NULL, ST_Point({edge}, {mid} - 0.001)),
+                     ('plain-b',  '4', NULL, ST_Point({edge} + 0.0100, {mid})),
+                     ('elsewhere','9', NULL, ST_Point({edge} + 0.2000, {mid}));
+                 INSERT INTO osm_addresses VALUES
+                     (1,'node','2',NULL,NULL,NULL, ST_Point({edge} + 0.0001, {mid})),
+                     (2,'node','5','Generała Kruka',NULL,NULL, ST_Point({edge} + 0.0002, {mid} + 0.0018));"
+            ))
+            .unwrap();
+        };
+
+        let per_cell = conn();
+        seed(&per_cell);
+        recompute_cell(&per_cell, "prg", a.0, a.1).unwrap();
+        recompute_cell(&per_cell, "prg", b.0, b.1).unwrap();
+
+        let multi = conn();
+        seed(&multi);
+        recompute_cells(&multi, "prg", &[a, b]);
+
+        assert_eq!(
+            unmatched_ids(&multi, "prg_unmatched", "lokalny_id"),
+            ["boundary", "plain-a", "plain-b"],
+            "both cross-edge matches must hold, and unmatched rows must remain in both cells"
+        );
+        assert_eq!(
+            snapshot(&multi, "prg_unmatched"),
+            snapshot(&per_cell, "prg_unmatched")
+        );
+    }
+
+    /// The plan of the real multi-cell statement for `source`, bound to `cells`.
+    fn explain(c: &Connection, source: &str, cells: &CellSet) -> String {
+        let sql = build_cells_sql(source).unwrap();
+        let mut stmt = c.prepare(&format!("EXPLAIN {}", sql.inner)).unwrap();
+        let mut rows = stmt
+            .query(duckdb::params_from_iter(cells_params(source, cells)))
+            .unwrap();
+        let mut plan = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push_str(&row.get::<_, String>(1).unwrap_or_default());
+        }
+        plan
+    }
+
+    /// The multi-cell twin of `drain_candidate_cte_uses_the_centroid_rtree_index`,
+    /// on the same fixture and for the same reason: the join on the cell tag
+    /// is an equality on an expression over the indexed column, which loses
+    /// the index when it sits next to the `ST_Intersects`. It is in a CTE of
+    /// its own here; folding it into `in_bounds` fails this.
+    #[test]
+    fn a_multi_cell_statement_uses_the_centroid_rtree_index() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO bdot10k_buildings (LOKALNYID, geom)
+                 SELECT 'b' || i,
+                        ST_MakeEnvelope(20.0 + i * 0.0001, 52.0,
+                                        20.0 + i * 0.0001 + 0.00005, 52.00005)
+                 FROM range(20000) t(i);
+             UPDATE bdot10k_buildings SET centroid = ST_Centroid(geom);
+             CREATE INDEX bdot10k_buildings_centroid_idx ON bdot10k_buildings USING RTREE (centroid);",
+        )
+        .unwrap();
+        let (cx, cy) = lonlat_to_tile(20.5005, 52.00002, CHANGE_CELL_ZOOM);
+        let cells = CellSet::new(&[(cx as i32, cy as i32), (cx as i32 + 1, cy as i32)]);
+        let plan = explain(&c, "bdot10k", &cells);
+        assert!(
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
+            "the multi-cell candidate scan must use the centroid RTREE index, got plan: {plan}"
+        );
+    }
+
+    /// And the address twin, seeded like
+    /// `drain_prg_candidate_cte_uses_the_geom_rtree_index`.
+    #[test]
+    fn a_multi_cell_address_statement_uses_the_geom_rtree_index() {
+        let c = conn();
+        c.execute_batch(
+            "INSERT INTO street_name_mappings VALUES (NULL, 'gen. Kruka', 'Generała Kruka');
+             INSERT INTO prg_addresses (lokalny_id, numer_porzadkowy, geom)
+                 SELECT 'a' || i, '1', ST_Point(20.0 + i * 0.0001, 52.0)
+                 FROM range(20000) t(i);
+             CREATE INDEX prg_addresses_geom_idx ON prg_addresses USING RTREE (geom);",
+        )
+        .unwrap();
+        let (cx, cy) = lonlat_to_tile(20.5005, 52.0, CHANGE_CELL_ZOOM);
+        let cells = CellSet::new(&[(cx as i32, cy as i32), (cx as i32 + 1, cy as i32)]);
+        let plan = explain(&c, "prg", &cells);
+        assert!(
+            plan.contains(crate::db::EXPLAIN_RTREE_SCAN),
+            "the multi-cell address scan must use the geom RTREE index, got plan: {plan}"
         );
     }
 }

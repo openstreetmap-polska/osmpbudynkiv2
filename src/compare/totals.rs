@@ -42,7 +42,7 @@
 use anyhow::{Context, Result, bail};
 use duckdb::Connection;
 
-use crate::compare::rule::{Area, BDOT10K_EKSPLOATOWANY_FILTER};
+use crate::compare::rule::{Area, BDOT10K_EKSPLOATOWANY_FILTER, CellSet};
 use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
 struct TotalsSpec {
@@ -167,6 +167,54 @@ fn build_sql(
         point = s.point,
     );
     Ok((sql, params))
+}
+
+/// The multi-cell twin of [`build_sql`]: the totals of every cell of a
+/// [`CellSet`] in one statement, grouped by the row's cell tag.
+/// [`CellSet::owns_sql`] keeps each row counted under its own cell exactly as
+/// the per-cell statement does, and a cell holding nothing still produces no
+/// row. The text depends only on `source`: the union is `$1..$4` and the
+/// cells are text parameter `$5`.
+fn build_cells_sql(source: &str) -> Result<String> {
+    let s = spec(source)?;
+    let cx = cell_x_sql(s.point);
+    let cy = cell_y_sql(s.point);
+    let extra = s.filter.map(|f| format!("AND {f} ")).unwrap_or_default();
+    let envelope = Area::Cells(1).envelope_sql();
+    Ok(format!(
+        "WITH candidates AS MATERIALIZED (
+             SELECT * FROM {table} b
+             WHERE ST_Intersects({point}, {envelope}) {extra}
+         )
+         SELECT '{source}', {cx}, {cy}, count(*)::INTEGER
+         FROM candidates b
+         WHERE ST_Intersects({point}, {envelope})
+           {extra}AND {owns}
+         GROUP BY {cx}, {cy}",
+        table = s.table,
+        point = s.point,
+        owns = CellSet::owns_sql(s.point, 5),
+    ))
+}
+
+/// Rebuild the totals of several z14 cells of one source, leaving what
+/// [`recompute_cell_in_txn`] leaves when run once per cell. Assumes an open
+/// transaction.
+pub fn recompute_cells_in_txn(conn: &Connection, source: &str, cells: &CellSet) -> Result<()> {
+    let inner = build_cells_sql(source)?;
+    let (x1, y1, x2, y2) = cells.union();
+    conn.prepare_cached(&format!(
+        "DELETE FROM cell_totals WHERE source = $1 AND {}",
+        CellSet::keys_in_sql(2)
+    ))
+    .and_then(|mut stmt| stmt.execute(duckdb::params![source, cells.param()]))
+    .with_context(|| format!("cell_totals: failed to clear cells for {source}"))?;
+    conn.prepare_cached(&format!(
+        "INSERT INTO cell_totals (source, cell_x, cell_y, total) {inner}"
+    ))
+    .and_then(|mut stmt| stmt.execute(duckdb::params![x1, y1, x2, y2, cells.param()]))
+    .with_context(|| format!("cell_totals: failed to recompute cells for {source}"))?;
+    Ok(())
 }
 
 /// Rebuild one z14 cell's total for one source. Assumes an open transaction —

@@ -287,17 +287,20 @@ enabled = true
 interval_seconds = 30
 timeout_seconds = 300
 run_on_start = true
-# Max number of distinct dirty (source, cell) recomputed per tick.
+# Max number of distinct dirty (source, cell) recomputed per tick. Together
+# with interval_seconds this caps the drain: 2048 every 30 s is 68 cells a
+# second, however fast a cell is.
 #
-# A cell recompute costs roughly 0.01-0.2s on a Poland-scale database,
-# depending on local building density (measured at
-# docs/centroid_index_measured.md), so a 512-cell batch comfortably finishes
-# inside timeout_seconds. This relies on bdot10k_buildings/egib_buildings
+# A run of neighbouring cells costs roughly 8 ms a cell on a Poland-scale
+# database and a scattered cell roughly 20 ms, so a 2048-cell batch finishes
+# well inside timeout_seconds. A batch that does overrun it loses nothing:
+# what is finished is committed and the rest stays queued. This relies on
+# bdot10k_buildings/egib_buildings
 # carrying the persisted, RTREE-indexed `centroid` column that `import
 # bdot10k` / `import egib` create -- a database whose tables predate that
 # column will fail every bdot10k/egib cell recompute (column not found)
 # rather than just running slowly, until those sources are re-imported.
-batch_size = 512
+batch_size = 2048
 
 # Periodically re-enqueues every live government cell so the drain rebuilds it:
 # the safety net for a dropped enqueue. Unlike `compare reconcile` on the CLI,

@@ -577,18 +577,19 @@ or deletes a queue row for a change the recompute never read.
 `jobs::tile_refresh` follows the same convention for `tile_dirty_cells`.
 
 **Gotcha — a drain batch commits every `CELLS_PER_COMMIT` (64) cells, and
-cancellation commits.** Not per cell: 512 commits per batch, each a WAL append
-and flush, is the wrong ratio against ~0.098 s of real work per cell. Not per
-batch either: on DuckDB 1.5 that held 123–171 MiB of transaction memory until
-COMMIT (the chunked-writes rule below), and on 2.0 it would still make one failed
-cell roll back and replay up to 512. Three things make grouping safe, and none of
-them is obvious:
+cancellation commits.** Not per cell: a commit per cell is a WAL append and
+flush each, the wrong ratio against ~0.02 s of real work per cell or less. Not
+per batch either: on DuckDB 1.5 that held 123–171 MiB of transaction memory
+until COMMIT (the chunked-writes rule below), and on 2.0 it would still make
+one failed cell roll back and replay the whole batch. Three things make
+grouping safe, and none of them is obvious:
 
-1. **Cancellation commits rather than rolling back.** Each cell's recompute is
-   paired with its own queue delete, so a transaction is a *grouping of
-   independently valid units* and committing at any cell boundary is correct —
-   which is also what makes the 64-cell commits correct. `is_cancelled` is
-   still polled between cells. Rolling back instead would redo that work every
+1. **Cancellation commits rather than rolling back.** Each unit of work — a
+   cell, or a run of cells recomputed together (next gotcha) — is paired with
+   its own queue delete, so a transaction is a *grouping of independently
+   valid units* and committing at any unit boundary is correct — which is also
+   what makes the 64-cell commits correct. `is_cancelled` is still polled
+   between units. Rolling back instead would redo that work every
    tick and on every shutdown.
 2. **A failed group replays one cell at a time.** A poison cell would otherwise
    stall the queue forever, since nothing gets deleted. The replay isolates it,
@@ -601,6 +602,49 @@ them is obvious:
    (`tile_dirty_cells` is append-vs-append), and append-vs-delete-of-different-
    rows is not a conflict for DuckDB's optimistic CC. `drain_refresh_concurrency`
    drives `drain_batch` directly and is the standing evidence.
+
+**Gotcha — the drain recomputes a run of neighbouring cells with one
+statement, and every row is still decided against its own cell.** A drained
+cell costs ~10 ms before it reads a row (three RTREE scans and two spatial
+joins to set up), so `drain_group` hands each run of cells sharing a render
+block to `incremental::recompute_cells_in_txn`: one statement per table for the
+run, instead of one per cell. Measured draining a refresh-like queue of 18,065
+cells (three sources, 4×4-cell patches) on the national database: 6m 14s →
+2m 28s, with `*_unmatched` and `cell_totals` identical row for row. Five
+things:
+
+1. **The union of the cells only scopes the RTREE scans.** `rule::Area::Cells`
+   makes the building rule test each row, and the OSM side, against the row's
+   own cell as well (`CELL_BOUNDS_COLUMNS`, joined on in `candidates`). That is
+   not decoration: the building rule reads OSM from the *unbuffered* cell, so a
+   government building straddling a cell edge is not matched by an OSM building
+   lying wholly in the neighbour. Tested against the union it would be, and the
+   decision would then depend on which cells shared a statement. Guard:
+   `a_multi_cell_recompute_tests_each_building_against_its_own_cell`.
+   Addresses need no such half on the OSM read: every address rule is bounded
+   by a distance the buffer already covers.
+2. **The cells are one bound text parameter**, parsed back by
+   `rule::CellSet::cells_sql`, so the statement text depends on the source
+   alone and its plan is cached like the per-cell one. Spelled in as a
+   `VALUES` list, planning was ~26 ms a statement, half of a 16-cell
+   statement's cost. The bounds come back bit for bit
+   (`cell_bounds_survive_the_text_parameter_exactly`), which is what keeps a
+   row on a cell edge decided the same way as by the per-cell statement, where
+   they are bound as `f64`.
+3. **The join on the cell tag sits in a CTE of its own**, after the one that
+   scans by the union: it is an equality on an expression over the indexed
+   column, the same index-losing shape as the per-cell guard below.
+4. **Only cells close together share a statement** (`drain::reads_compactly`:
+   their bounding box holds at most four cells per cell recomputed). The
+   statement reads that whole box, so two cells in opposite corners of a block
+   would read 64. A lone or scattered cell — an OSM edit — keeps the per-cell
+   statement.
+5. **A failed run is taken apart by the same replay**, one cell at a time, so
+   a poison cell is still isolated and left queued. Cancellation is polled
+   between runs.
+
+The per-tick `batch_size` default went from 512 to 2048 with this: with the
+30 s interval it is the drain's ceiling whatever a cell costs.
 
 A queue row naming a source `dataset::spec_by_name` does not know is **purged**,
 not skipped: filtering it out of the read alone would leave it in the table

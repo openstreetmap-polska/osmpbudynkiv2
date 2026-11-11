@@ -322,6 +322,13 @@ pub struct MatchRefreshConfig {
     /// See `JobConfig::run_on_start`.
     pub run_on_start: bool,
     /// Max number of distinct dirty (source, cell) recomputed per tick.
+    ///
+    /// With the interval this is the drain's ceiling: 2048 every 30 s is 68
+    /// cells a second, however fast a cell is. It was 512 while a cell cost
+    /// ~20 ms; a run of neighbouring cells now costs ~8 ms a cell on the
+    /// national tables, so a full batch is still under 20 s. A batch that
+    /// overruns the timeout loses nothing, since cancellation commits what
+    /// is finished (`compare::drain::drain_batch`).
     pub batch_size: usize,
 }
 
@@ -332,7 +339,7 @@ impl Default for MatchRefreshConfig {
             interval_seconds: 30,
             timeout_seconds: 300,
             run_on_start: true,
-            batch_size: 512,
+            batch_size: 2048,
         }
     }
 }
@@ -999,7 +1006,7 @@ file_path = "/data/TERC.zip"
         assert!(config.jobs.match_refresh.enabled);
         assert_eq!(config.jobs.match_refresh.interval_seconds, 30);
         assert_eq!(config.jobs.match_refresh.timeout_seconds, 300);
-        assert_eq!(config.jobs.match_refresh.batch_size, 512);
+        assert_eq!(config.jobs.match_refresh.batch_size, 2048);
         assert!(config.jobs.tile_refresh.enabled);
         assert_eq!(config.jobs.tile_refresh.interval_seconds, 10);
         assert_eq!(config.jobs.tile_refresh.timeout_seconds, 300);

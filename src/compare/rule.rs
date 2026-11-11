@@ -12,6 +12,7 @@
 
 use crate::dataset::DatasetSpec;
 use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
+use crate::tile_math::{CHANGE_CELL_ZOOM, cell_x_sql, cell_y_sql, tile_to_bbox};
 
 /// (min_lon, min_lat, max_lon, max_lat).
 pub type Bounds = (f64, f64, f64, f64);
@@ -120,8 +121,9 @@ pub fn envelope_sql(area: Bounds) -> String {
     format!("ST_MakeEnvelope({x1}, {y1}, {x2}, {y2})")
 }
 
-/// The area a rule reads or writes: literal bounds, or the four numbered
-/// parameters `$n..$n+3` in [`envelope_sql`]'s argument order.
+/// The area a rule reads or writes: literal bounds, the four numbered
+/// parameters `$n..$n+3` in [`envelope_sql`]'s argument order, or several
+/// cells at once.
 ///
 /// `Params` exists for the per-cell drain, which runs the same statement for
 /// every cell: with the cell bound rather than spelled into the text, one
@@ -130,11 +132,31 @@ pub fn envelope_sql(area: Bounds) -> String {
 /// DuckDB 2.0, identical output). A bound
 /// parameter still counts as constant for the RTREE index scan, as on the
 /// tile path (`server::tiles`).
+///
+/// `Cells` exists for the drain's multi-cell recompute
+/// (`compare::incremental::recompute_cells_in_txn`), which runs one statement
+/// for a run of neighbouring cells. Each row is still tested against **its
+/// own cell**, exactly as the per-cell statement tests it: the parameters
+/// `$n..$n+3` are the union of the cells and only scope the RTREE scans, and
+/// [`Area::intersects_sql`] adds the row's own cell from
+/// [`CELL_BOUNDS_COLUMNS`] on the government alias `b`. That second half is
+/// not decoration. The building rule reads OSM from the *unbuffered* cell, so
+/// a government building straddling a cell edge is not matched by an OSM
+/// building lying wholly in the neighbour; testing against the union instead
+/// would make that decision depend on which cells happened to share a
+/// statement. Guard:
+/// `incremental::tests::a_multi_cell_recompute_tests_each_building_against_its_own_cell`.
 #[derive(Clone, Copy, Debug)]
 pub enum Area {
     Bounds(Bounds),
     Params(usize),
+    Cells(usize),
 }
+
+/// The four columns a [`Area::Cells`] statement must put on the government
+/// alias `b`: the bounds of the cell that row belongs to, in
+/// [`envelope_sql`]'s argument order. [`CellSet::cells_sql`] produces them.
+pub const CELL_BOUNDS_COLUMNS: [&str; 4] = ["cell_x1", "cell_y1", "cell_x2", "cell_y2"];
 
 impl From<Bounds> for Area {
     fn from(b: Bounds) -> Self {
@@ -144,11 +166,124 @@ impl From<Bounds> for Area {
 
 impl Area {
     /// The `ST_MakeEnvelope` call for this area; [`envelope_sql`] for bounds.
+    /// For `Cells` this is the union only, which is what scopes an RTREE scan;
+    /// a predicate on a row goes through [`Area::intersects_sql`].
     pub fn envelope_sql(self) -> String {
         match self {
             Area::Bounds(b) => envelope_sql(b),
-            Area::Params(n) => format!("ST_MakeEnvelope(${n}, ${}, ${}, ${})", n + 1, n + 2, n + 3),
+            Area::Params(n) | Area::Cells(n) => {
+                format!("ST_MakeEnvelope(${n}, ${}, ${}, ${})", n + 1, n + 2, n + 3)
+            }
         }
+    }
+
+    /// `geom` lies in this area. For `Cells`: in the union (the constant half
+    /// the RTREE scan uses) and in the cell of the `b` row being tested.
+    pub fn intersects_sql(self, geom: &str) -> String {
+        let envelope = self.envelope_sql();
+        match self {
+            Area::Bounds(_) | Area::Params(_) => format!("ST_Intersects({geom}, {envelope})"),
+            Area::Cells(_) => {
+                let [x1, y1, x2, y2] = CELL_BOUNDS_COLUMNS;
+                format!(
+                    "ST_Intersects({geom}, {envelope}) \
+                     AND ST_Intersects({geom}, ST_MakeEnvelope(b.{x1}, b.{y1}, b.{x2}, b.{y2}))"
+                )
+            }
+        }
+    }
+}
+
+/// The cells of a multi-cell statement, with their bounds.
+///
+/// A multi-cell statement takes its cells as **one text parameter**
+/// ([`CellSet::param`]) that [`CellSet::cells_sql`] turns back into rows, so
+/// its text depends on the source alone and one cached plan serves every run
+/// of cells. Spelled into the text as a `VALUES` list instead, each statement
+/// was planned from scratch: ~26 ms, half of a 16-cell statement's cost.
+///
+/// One home for the three things such a statement has to agree on: the union
+/// its RTREE scans read, each cell's own bounds, and the guard that writes a
+/// row only from the cell that owns it.
+pub struct CellSet {
+    cells: Vec<(i32, i32, Bounds)>,
+}
+
+impl CellSet {
+    /// `cells` must not be empty.
+    pub fn new(cells: &[(i32, i32)]) -> Self {
+        assert!(!cells.is_empty(), "a multi-cell statement needs a cell");
+        Self {
+            cells: cells
+                .iter()
+                .map(|&(x, y)| (x, y, tile_to_bbox(CHANGE_CELL_ZOOM, x as u32, y as u32)))
+                .collect(),
+        }
+    }
+
+    /// The smallest bounds holding every cell. Built from the cells' own
+    /// `f64`s with `min`/`max` only, so each cell lies inside it exactly.
+    pub fn union(&self) -> Bounds {
+        self.cells.iter().fold(self.cells[0].2, |u, &(_, _, b)| {
+            (u.0.min(b.0), u.1.min(b.1), u.2.max(b.2), u.3.max(b.3))
+        })
+    }
+
+    /// The value to bind where [`CellSet::cells_sql`] reads its parameter:
+    /// `cell_x,cell_y,x1,y1,x2,y2` per cell, joined by `;`.
+    ///
+    /// The bounds travel as decimal text and come back exact. Rust prints the
+    /// shortest decimal that reads back as the same `f64`, and DuckDB's
+    /// `VARCHAR -> DOUBLE` cast rounds correctly, so a row on a cell edge
+    /// meets the same bits here as in the per-cell statement, which binds
+    /// them as `f64`. Guard: `tests::cell_bounds_survive_the_text_parameter_exactly`.
+    pub fn param(&self) -> String {
+        self.cells
+            .iter()
+            .map(|(x, y, b)| format!("{x},{y},{},{},{},{}", b.0, b.1, b.2, b.3))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// A subquery giving one row per cell of the set bound as text parameter
+    /// `$n`: `cx`, `cy` and the four [`CELL_BOUNDS_COLUMNS`].
+    pub fn cells_sql(n: usize) -> String {
+        let [x1, y1, x2, y2] = CELL_BOUNDS_COLUMNS;
+        format!(
+            "(SELECT p[1]::INTEGER AS cx, p[2]::INTEGER AS cy,
+                     p[3]::DOUBLE AS {x1}, p[4]::DOUBLE AS {y1},
+                     p[5]::DOUBLE AS {x2}, p[6]::DOUBLE AS {y2}
+              FROM (SELECT string_split(unnest(string_split(${n}::VARCHAR, ';')), ',') AS p))"
+        )
+    }
+
+    /// True when the row whose representative point is `point` belongs to one
+    /// of the cells in parameter `$n`: its canonical cell tag names the cell,
+    /// and the point lies in that cell's bounds. Those are the two tests the
+    /// per-cell statement applies (its write-narrow guard and its own
+    /// envelope), so a row passes here exactly when its own cell's statement
+    /// would write it.
+    pub fn owns_sql(point: &str, n: usize) -> String {
+        let [x1, y1, x2, y2] = CELL_BOUNDS_COLUMNS;
+        format!(
+            "EXISTS (
+               SELECT 1 FROM {cells} own
+               WHERE own.cx = {cx} AND own.cy = {cy}
+                 AND ST_Intersects({point}, ST_MakeEnvelope(own.{x1}, own.{y1}, own.{x2}, own.{y2}))
+           )",
+            cells = Self::cells_sql(n),
+            cx = cell_x_sql(point),
+            cy = cell_y_sql(point),
+        )
+    }
+
+    /// `(cell_x, cell_y) IN (...)` over the cells in parameter `$n`, for the
+    /// deletes that go with a multi-cell statement.
+    pub fn keys_in_sql(n: usize) -> String {
+        format!(
+            "(cell_x, cell_y) IN (SELECT (cx, cy) FROM {})",
+            Self::cells_sql(n)
+        )
     }
 }
 
@@ -193,11 +328,12 @@ pub const FORMER_BUILDING_MIN_OVERLAP_FRACTION: f64 = 0.10;
 /// this — a suppressed row is "unmatched but for the veto" — so the clause
 /// text lives here once instead of being spelled out in each. Correlates on
 /// `b`, so a caller must alias its government-source relation `b`.
-fn osm_building_covers_sql(envelope: &str) -> String {
+fn osm_building_covers_sql(area: Area) -> String {
+    let in_area = area.intersects_sql("osm.geom");
     format!(
         "EXISTS (
                SELECT 1 FROM osm_buildings osm
-               WHERE ST_Intersects(osm.geom, {envelope})
+               WHERE {in_area}
                  AND ST_Intersects(osm.geom, b.geom)
                  AND ST_Area(ST_Intersection(osm.geom, b.geom)) / ST_Area(b.geom) >= {MIN_OVERLAP_FRACTION}
            )"
@@ -211,11 +347,12 @@ fn osm_building_covers_sql(envelope: &str) -> String {
 /// `suppressed_buildings_sql` requires it, and both read this one text.
 /// That is what makes `matched + unmatched + suppressed = total` exact
 /// rather than merely intended. Correlates on `b`, same as above.
-fn former_building_covers_sql(envelope: &str) -> String {
+fn former_building_covers_sql(area: Area) -> String {
+    let in_area = area.intersects_sql("f.geom");
     format!(
         "EXISTS (
                SELECT 1 FROM osm_former_buildings f
-               WHERE ST_Intersects(f.geom, {envelope})
+               WHERE {in_area}
                  AND ST_Intersects(f.geom, b.geom)
                  AND ST_Area(ST_Intersection(f.geom, b.geom)) / ST_Area(b.geom) >= {FORMER_BUILDING_MIN_OVERLAP_FRACTION}
            )"
@@ -307,19 +444,20 @@ pub fn unmatched_buildings_sql(
     area: impl Into<Area>,
     extra_filter: Option<&str>,
 ) -> String {
-    let envelope = area.into().envelope_sql();
+    let area = area.into();
     let extra = extra_filter
         .map(|f| format!("AND {f}\n           "))
         .unwrap_or_default();
     format!(
         "SELECT {select_list}
          FROM {source_table} b
-         WHERE ST_Intersects(b.centroid, {envelope})
+         WHERE {in_area}
            {extra}AND NOT {osm_covers}
            AND NOT {former_covers}
            AND NOT {reported}",
-        osm_covers = osm_building_covers_sql(&envelope),
-        former_covers = former_building_covers_sql(&envelope),
+        in_area = area.intersects_sql("b.centroid"),
+        osm_covers = osm_building_covers_sql(area),
+        former_covers = former_building_covers_sql(area),
         reported = reported_sql(spec, "b"),
     )
 }
@@ -394,8 +532,8 @@ pub fn suppressed_buildings_sql(
          SELECT {select_list}
          FROM candidates b
          WHERE NOT {osm_covers}",
-        former_covers = former_building_covers_sql(&envelope),
-        osm_covers = osm_building_covers_sql(&envelope),
+        former_covers = former_building_covers_sql(Area::Bounds(area)),
+        osm_covers = osm_building_covers_sql(Area::Bounds(area)),
     )
 }
 
@@ -446,8 +584,8 @@ pub fn reported_buildings_sql(
          WHERE NOT {osm_covers}
            AND NOT {former_covers}",
         reported = reported_sql(spec, "b"),
-        osm_covers = osm_building_covers_sql(&envelope),
-        former_covers = former_building_covers_sql(&envelope),
+        osm_covers = osm_building_covers_sql(Area::Bounds(area)),
+        former_covers = former_building_covers_sql(Area::Bounds(area)),
     )
 }
 
@@ -1492,5 +1630,47 @@ mod tests {
         const {
             assert!(NAME_MATCH_DISTANCE_METERS >= MATCH_DISTANCE_METERS);
         }
+    }
+
+    /// A multi-cell statement gets its cells' bounds as decimal text, where
+    /// the per-cell statement binds them as `f64`. They have to be the same
+    /// bits, or a row lying exactly on a cell edge could be decided
+    /// differently by the two.
+    #[test]
+    fn cell_bounds_survive_the_text_parameter_exactly() {
+        let c = conn();
+        let cells: Vec<(i32, i32)> = (0..500)
+            .map(|i| (8700 + i * 3, 5150 + (i * 7) % 600))
+            .collect();
+        let set = CellSet::new(&cells);
+
+        let mut stmt = c
+            .prepare(&format!(
+                "SELECT cx, cy, cell_x1, cell_y1, cell_x2, cell_y2 FROM {} ORDER BY cx, cy",
+                CellSet::cells_sql(1)
+            ))
+            .unwrap();
+        let got: Vec<(i32, i32, [u64; 4])> = stmt
+            .query_map(duckdb::params![set.param()], |r| {
+                let bits = |i| r.get::<_, f64>(i).map(f64::to_bits);
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    [bits(2)?, bits(3)?, bits(4)?, bits(5)?],
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let mut want: Vec<(i32, i32, [u64; 4])> = cells
+            .iter()
+            .map(|&(x, y)| {
+                let b = tile_to_bbox(CHANGE_CELL_ZOOM, x as u32, y as u32);
+                (x, y, [b.0, b.1, b.2, b.3].map(f64::to_bits))
+            })
+            .collect();
+        want.sort();
+        assert_eq!(got, want);
     }
 }
