@@ -112,9 +112,12 @@ binary, easy to deploy.
   existing database picks up `db::RTREE_MIN_NODE_CAPACITY`, since `db copy`
   replays each index's stored DDL; also shrinks indexes grown by weeks of
   writes. See the gotcha under *Storage and schema*
-- `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package`,
-  `/updates`, `/stats` + `/stats/areas` + `/stats/units` (the `stats.html`
-  page's data, queried per request, cached only by HTTP `max-age`), `POST /report`,
+- `run` — HTTP service (`/health`, `/status`, `/tiles/{z}/{x}/{y}`, `/package`
+  (a `bbox`, a POSTed polygon, or `?relation=<id>` — an OSM relation's area
+  assembled from RocksDB by `osm::boundary`, all-or-nothing, with its own
+  `max_relation_area_sq_deg` limit), `/updates`, `/stats` + `/stats/areas` +
+  `/stats/units` (the `stats.html` page's data, queried per request, cached
+  only by HTTP `max-age`), `POST /report`,
   `/josm_plugins/v2/nearest_building` — a compatibility endpoint for
   josm-plbuildings-server, shape pinned in `server::josm_plugins`) plus
   background update, drain, tile-refresh and reconcile jobs

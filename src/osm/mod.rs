@@ -1,3 +1,4 @@
+pub mod boundary;
 pub mod encoding;
 pub mod geometry;
 pub mod kvstore;

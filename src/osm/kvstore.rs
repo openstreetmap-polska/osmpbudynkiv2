@@ -531,6 +531,32 @@ pub fn multi_get_nodes_wkb_coords(db: &RocksDB, node_ids: &[i64]) -> Result<Opti
     Ok(Some(out))
 }
 
+/// Batch-look-up node coordinates, in decimicrodegrees, one entry per id in
+/// input order and `None` for a node the store does not have.
+///
+/// The per-node sibling of [`multi_get_nodes_wkb_coords`], for a caller that
+/// has to *name* what is missing rather than just give up:
+/// `osm::boundary` reports the nodes a relation's area is missing.
+pub fn multi_get_nodes(db: &RocksDB, node_ids: &[i64]) -> Result<Vec<Option<(i32, i32)>>> {
+    let keys: Vec<[u8; 8]> = node_ids
+        .iter()
+        .map(|id| encoding::encode_key(*id))
+        .collect();
+    let handle = cf(db, CF_NODES);
+    // `sorted_input: false` -- see `multi_get_nodes_wkb_coords`.
+    let batch = db
+        .batched_multi_get_pinned_batch_cf(&handle, &keys, false)
+        .context("batched MultiGet for nodes failed")?;
+    let mut out = Vec::with_capacity(node_ids.len());
+    for r in batch.iter() {
+        out.push(
+            r.context("batched MultiGet for nodes failed")?
+                .map(encoding::decode_node),
+        );
+    }
+    Ok(out)
+}
+
 pub fn delete_node(db: &RocksDB, node_id: i64) -> Result<()> {
     db.delete_cf(&cf(db, CF_NODES), encoding::encode_key(node_id))?;
     Ok(())

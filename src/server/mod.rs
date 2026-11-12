@@ -253,10 +253,13 @@ pub struct AppState {
     /// `TileStore::disabled()` (i.e. `config.cache.persist_tiles == false`) is
     /// a working no-op for the same reason `tile_cache` has one.
     pub tile_store: Arc<tile_store::TileStore>,
-    /// The RocksDB handle, for `/status`'s counters only -- nothing on the
-    /// request path reads through it (tiles go through `tile_store`).
-    /// Separate from `tile_store` because the counters are database-wide and
-    /// must stay readable when `persist_tiles = false`. `None` in tests.
+    /// The RocksDB handle, for `/status`'s counters and for
+    /// `GET /package?relation=`, which assembles the relation's area from the
+    /// stored members, ways and nodes (`osm::boundary`). Tiles do not read
+    /// through it -- they go through `tile_store`. Separate from `tile_store`
+    /// because the counters are database-wide and must stay readable when
+    /// `persist_tiles = false`. `None` in most tests, where a relation
+    /// request answers 503.
     pub kv: Option<Arc<crate::osm::kvstore::RocksDB>>,
 }
 

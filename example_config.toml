@@ -389,6 +389,10 @@ run_on_start = false
 # 0.04 = 0.2° x 0.2° which is roughly 14 x 22 km in Poland.
 # Published in GET /status; the frontend reads its drawing limit from there.
 max_area_sq_deg = 0.04
+# Maximum bounding-box area of an OSM relation requested by id
+# (GET /package?relation=<id>), in square degrees. 1.0 admits every powiat
+# (the largest, powiat białostocki, is 0.790). Not published.
+max_relation_area_sq_deg = 1.0
 
 # POST /report endpoint -- users marking a government object as one that should
 # not be proposed for import (bad source data, or OSM already maps it in a way

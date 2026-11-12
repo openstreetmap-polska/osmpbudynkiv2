@@ -630,12 +630,23 @@ pub struct PackageConfig {
     /// Published through `server::public_config`, which is where the frontend
     /// gets its drawing limit.
     pub max_area_sq_deg: f64,
+    /// Maximum bounding-box area of an OSM relation requested by id
+    /// (`GET /package?relation=`), in square degrees. Separate from
+    /// `max_area_sq_deg` because a relation is a whole administrative unit
+    /// rather than a hand-drawn area: 629 of the 2,477 gminas exceed 0.04.
+    /// The default admits every powiat: the largest, powiat białostocki,
+    /// measures 0.790. Measured on the release binary under production's
+    /// limits, the heaviest powiat package (powiat poznański, 34,557
+    /// features, 13.6 MB) took 3.2 s cold. Not published -- the frontend
+    /// draws nothing against it.
+    pub max_relation_area_sq_deg: f64,
 }
 
 impl Default for PackageConfig {
     fn default() -> Self {
         Self {
             max_area_sq_deg: 0.04,
+            max_relation_area_sq_deg: 1.0,
         }
     }
 }
@@ -1112,6 +1123,7 @@ batch_commit_threshold = 50
     fn test_package_config_defaults() {
         let config = load_config(None).unwrap();
         assert_eq!(config.package.max_area_sq_deg, 0.04);
+        assert_eq!(config.package.max_relation_area_sq_deg, 1.0);
     }
 
     #[test]

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::mappings::street_names::{resolved_street_expr_sql, resolved_street_join_sql};
+use crate::osm::boundary::RelationAreaError;
 
 use super::AppState;
 
@@ -52,14 +53,16 @@ pub struct RequestArea {
     pub max_lon: f64,
     pub max_lat: f64,
     pub polygon_geojson: String,
-    /// Whether `polygon_geojson` came from arbitrary client-drawn coordinates
-    /// (`parse_polygon_body`, POST) rather than being built by `from_envelope`
-    /// from a `bbox` query param (`parse_bbox`, GET). `check_request_geometry`
-    /// (see `serve_package`) only needs to run against the former -- a bbox
+    /// Whether `polygon_geojson` came from coordinates this code does not
+    /// control -- client-drawn (`parse_polygon_body`, POST) or assembled from
+    /// an OSM relation (`relation_area`, `GET ?relation=`; OSM enforces no
+    /// validity) -- rather than being built by `from_envelope` from a `bbox`
+    /// query param (`parse_bbox`, GET). `check_request_geometry` (see
+    /// `serve_package`) only needs to run against the former -- a bbox
     /// envelope is a rectangle this code constructed itself from four
     /// range-checked floats, so it cannot be topologically invalid, and
     /// running the GEOS round trip on it anyway would just be a wasted pool
-    /// acquisition and query on every `GET /package`.
+    /// acquisition and query on every `GET /package?bbox=`.
     pub is_user_supplied: bool,
 }
 
@@ -699,28 +702,112 @@ pub fn unmatched_bdot10k_buildings(
 #[derive(Debug, Deserialize)]
 pub struct PackageParams {
     pub bbox: Option<String>,
+    /// An OSM relation id, as an alternative to `bbox` on `GET`: the package
+    /// covers the relation's area (see `osm::boundary`). Kept as text so a
+    /// malformed id gets this module's JSON error rather than axum's
+    /// plain-text `Query` rejection.
+    pub relation: Option<String>,
     pub datasets: Option<String>,
 }
+
+pub const MISSING_AREA_MESSAGE: &str = "missing required parameter: either 'bbox' or 'relation'";
+pub const BOTH_AREAS_MESSAGE: &str = "pass either 'bbox' or 'relation', not both";
+pub const NO_RELATION_STORE_MESSAGE: &str = "relation lookup is not available on this server";
 
 pub async fn get_package(
     State(state): State<AppState>,
     Query(params): Query<PackageParams>,
 ) -> Response {
-    let bbox = match params.bbox.as_deref() {
-        Some(b) => b,
-        None => {
-            return error_response(StatusCode::BAD_REQUEST, "missing required parameter 'bbox'");
-        }
-    };
-    let area = match parse_bbox(bbox) {
-        Ok(a) => a,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
-    };
     let datasets = match parse_datasets(params.datasets.as_deref()) {
         Ok(d) => d,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
-    serve_package(state, area, datasets).await
+    match (params.bbox.as_deref(), params.relation.as_deref()) {
+        (Some(_), Some(_)) => error_response(StatusCode::BAD_REQUEST, BOTH_AREAS_MESSAGE),
+        (None, None) => error_response(StatusCode::BAD_REQUEST, MISSING_AREA_MESSAGE),
+        (Some(bbox), None) => {
+            let area = match parse_bbox(bbox) {
+                Ok(a) => a,
+                Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+            };
+            let max = state.config.package.max_area_sq_deg;
+            serve_package(state, area, datasets, max).await
+        }
+        (None, Some(relation)) => {
+            let relation_id = match parse_relation_id(relation) {
+                Ok(id) => id,
+                Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+            };
+            let area = match relation_area(&state, relation_id).await {
+                Ok(a) => a,
+                Err(response) => return response,
+            };
+            let max = state.config.package.max_relation_area_sq_deg;
+            serve_package(state, area, datasets, max).await
+        }
+    }
+}
+
+pub fn parse_relation_id(s: &str) -> Result<i64, String> {
+    match s.trim().parse::<i64>() {
+        Ok(id) if id > 0 => Ok(id),
+        _ => Err(format!(
+            "relation must be a positive OSM relation id, got '{s}'"
+        )),
+    }
+}
+
+/// Relation `relation_id`'s area as a `RequestArea`, or the response to send
+/// instead: 404 for a relation the store does not have, 400 for one that does
+/// not assemble into an area, 503 without a RocksDB handle (`AppState::kv` is
+/// `None` only in tests). The geometry is OSM's, so it is marked
+/// `is_user_supplied` and goes through `check_request_geometry` like a drawn
+/// polygon.
+async fn relation_area(state: &AppState, relation_id: i64) -> Result<RequestArea, Response> {
+    let Some(kv) = state.kv.clone() else {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            NO_RELATION_STORE_MESSAGE,
+        ));
+    };
+    let pool = state.pool.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = pool.get().context("Failed to acquire pool connection")?;
+        crate::osm::boundary::relation_area(&conn, &kv, relation_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(a))) => Ok(RequestArea {
+            min_lon: a.min_lon,
+            min_lat: a.min_lat,
+            max_lon: a.max_lon,
+            max_lat: a.max_lat,
+            polygon_geojson: a.geojson,
+            is_user_supplied: true,
+        }),
+        Ok(Ok(Err(e))) => {
+            let status = if e == RelationAreaError::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            Err(error_response(status, &e.message(relation_id)))
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, relation_id, "relation area lookup failed");
+            Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            ))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, relation_id, "relation area task panicked");
+            Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            ))
+        }
+    }
 }
 
 pub async fn post_package(
@@ -736,11 +823,19 @@ pub async fn post_package(
         Ok(d) => d,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
-    serve_package(state, area, datasets).await
+    let max = state.config.package.max_area_sq_deg;
+    serve_package(state, area, datasets, max).await
 }
 
-async fn serve_package(state: AppState, area: RequestArea, datasets: Vec<Dataset>) -> Response {
-    if let Err(e) = check_area(&area, state.config.package.max_area_sq_deg) {
+/// `max_sq_deg` is the caller's limit: `max_area_sq_deg` for a drawn or bbox
+/// area, `max_relation_area_sq_deg` for a relation.
+async fn serve_package(
+    state: AppState,
+    area: RequestArea,
+    datasets: Vec<Dataset>,
+    max_sq_deg: f64,
+) -> Response {
+    if let Err(e) = check_area(&area, max_sq_deg) {
         return error_response(StatusCode::BAD_REQUEST, &e);
     }
     // Topological validity needs GEOS, so it can't live in parse_polygon_body
@@ -1816,7 +1911,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
 
-        // Missing bbox.
+        // Missing bbox (and relation).
         let response = app
             .clone()
             .oneshot(
@@ -1828,6 +1923,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["error"], MISSING_AREA_MESSAGE);
 
         // Unknown dataset.
         let response = app
@@ -1840,6 +1936,158 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// `make_seeded_state` plus a RocksDB store holding two relations:
+    ///
+    /// - 100: the seed's whole bbox (21.0,52.2 .. 21.01,52.21), its outer ring
+    ///   split across two ways, with an inner ring around e1 -- so a1 and b1
+    ///   are inside and e1, though inside the bbox, is in the hole;
+    /// - 200: a single open way, which encloses nothing.
+    ///
+    /// The `TempDir` must outlive the state.
+    fn make_seeded_state_with_relations() -> (tempfile::TempDir, AppState) {
+        use crate::osm::boundary::tests::{put_relation, put_way, temp_kv};
+        let mut state = make_seeded_state();
+        let (dir, kv) = temp_kv();
+        put_way(
+            &kv,
+            10,
+            &[(1, 21.0, 52.2), (2, 21.01, 52.2), (3, 21.01, 52.21)],
+        );
+        put_way(
+            &kv,
+            11,
+            &[(3, 21.01, 52.21), (4, 21.0, 52.21), (1, 21.0, 52.2)],
+        );
+        put_way(
+            &kv,
+            20,
+            &[
+                (11, 21.0075, 52.2075),
+                (12, 21.0085, 52.2075),
+                (13, 21.0085, 52.2085),
+                (14, 21.0075, 52.2085),
+                (11, 21.0075, 52.2075),
+            ],
+        );
+        put_relation(
+            &kv,
+            100,
+            &[
+                ("way", 10, "outer"),
+                ("way", 11, "outer"),
+                ("way", 20, "inner"),
+            ],
+        );
+        put_way(&kv, 30, &[(31, 21.0, 52.2), (32, 21.01, 52.21)]);
+        put_relation(&kv, 200, &[("way", 30, "outer")]);
+        state.kv = Some(std::sync::Arc::new(kv));
+        (dir, state)
+    }
+
+    async fn get(app: &Router, uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
+    #[tokio::test]
+    async fn get_package_by_relation_exports_what_the_relation_covers_not_its_bbox() {
+        let (_dir, state) = make_seeded_state_with_relations();
+        let pool = state.pool.clone();
+        let app = package_app(state);
+        let (status, json) = get(&app, "/package?relation=100").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let features = json["features"].as_array().unwrap();
+        // a1 + b1; e1 sits in the inner ring's hole.
+        assert_eq!(features.len(), 2);
+        assert_eq!(features[0]["properties"]["addr:housenumber"], "12");
+        assert_eq!(features[1]["properties"]["source:building"], "BDOT");
+
+        // The export log records the relation's area, hole included -- not
+        // the bbox -- so /updates draws what was actually exported.
+        let conn = pool.get().unwrap();
+        let (logged_area, holes): (f64, i64) = conn
+            .query_row(
+                "SELECT ST_Area(area), ST_NInteriorRings(area) FROM package_exports",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            (logged_area - (0.0001 - 0.000001)).abs() < 1e-12,
+            "{logged_area}"
+        );
+        assert_eq!(holes, 1);
+    }
+
+    /// The two limits are separate: a relation is held to
+    /// `max_relation_area_sq_deg` alone, however small `max_area_sq_deg` is.
+    #[tokio::test]
+    async fn get_package_by_relation_is_held_to_its_own_area_limit() {
+        let (_dir, mut state) = make_seeded_state_with_relations();
+        // The relation's bbox is 0.0001 square degrees.
+        let config = |max_area_sq_deg, max_relation_area_sq_deg| {
+            let mut c = crate::config::Config::default();
+            c.package.max_area_sq_deg = max_area_sq_deg;
+            c.package.max_relation_area_sq_deg = max_relation_area_sq_deg;
+            std::sync::Arc::new(c)
+        };
+        state.config = config(0.00005, 0.25);
+        let app = package_app(state.clone());
+        let (status, _) = get(&app, "/package?relation=100").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        state.config = config(0.25, 0.00005);
+        let app = package_app(state);
+        let (status, json) = get(&app, "/package?relation=100").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(json["error"].as_str().unwrap().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn get_package_by_relation_errors() {
+        use crate::osm::boundary::RelationAreaError;
+        let (_dir, state) = make_seeded_state_with_relations();
+        let app = package_app(state);
+
+        let (status, json) = get(&app, "/package?relation=300").await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(json["error"], RelationAreaError::NotFound.message(300));
+
+        let (status, json) = get(&app, "/package?relation=200").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["error"],
+            RelationAreaError::OpenRings(vec![31, 32]).message(200)
+        );
+
+        for bad in ["abc", "0", "-5", ""] {
+            let (status, json) = get(&app, &format!("/package?relation={bad}")).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(json["error"], parse_relation_id(bad).unwrap_err(), "{bad}");
+        }
+
+        let (status, json) = get(&app, "/package?relation=100&bbox=21.0,52.2,21.01,52.21").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], BOTH_AREAS_MESSAGE);
+
+        let (status, json) = get(&app, "/package?relation=100&datasets=foo").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(json["error"].as_str().unwrap().contains("foo"));
+    }
+
+    #[tokio::test]
+    async fn get_package_by_relation_without_a_store_is_unavailable() {
+        let app = package_app(make_seeded_state());
+        let (status, json) = get(&app, "/package?relation=100").await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"], NO_RELATION_STORE_MESSAGE);
     }
 
     #[tokio::test]
