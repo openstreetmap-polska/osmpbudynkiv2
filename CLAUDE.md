@@ -37,7 +37,7 @@ everything non-DuckDB. Four load-bearing points:
    drops DuckDB's jemalloc.** jemalloc lives in the `duckdb-sources` submodule,
    which the published crate `exclude`s, and the `bundled` amalgamation backend
    has no jemalloc sources at all. Only `bundled-cmake` has it, and it *requires*
-   a git checkout. The tag pins a published release (`v1.20000.1`) — the git
+   a git checkout. The tag pins a published release (`v1.20001.0`, DuckDB 2.0.1) — the git
    source buys the build backend and nothing else.
    `bundled-cmake` is marked experimental upstream.
 2. **The dev-dependency must name the same source as the normal dependency.**
@@ -59,7 +59,7 @@ and hundreds of tests fail from this one cause. Two things:
 
 1. **duckdb-rs `v1.20000.1`+ stamps it itself**: its bundled-cmake build script
    passes `DUCKDB_EXPLICIT_VERSION`, derived from the crate version
-   (`1.20000.x` ⇒ `v2.0.0`, overridable with `DUCKDB_VERSION`), on every build.
+   (`1.20001.x` ⇒ `v2.0.1`, overridable with `DUCKDB_VERSION`), on every build.
    Up to 1.10506 this project forced it with a CMake toolchain file
    (`cmake/duckdb_version.cmake` via `.cargo/config.toml`), which had to move in
    lockstep with the tag and did not trigger a rebuild when edited; both are

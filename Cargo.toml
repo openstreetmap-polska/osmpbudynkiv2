@@ -8,7 +8,7 @@ anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
-# Git dependency, pinned to a release tag (v1.20000.1 = DuckDB v2.0.0), purely to
+# Git dependency, pinned to a release tag (v1.20001.0 = DuckDB v2.0.1), purely to
 # get `bundled-cmake`: DuckDB's jemalloc lives in `duckdb-sources`
 # (`third_party/jemalloc`), which the published crate excludes, and the `bundled`
 # amalgamation backend has no jemalloc sources at all. `bundled-cmake` builds via
@@ -19,7 +19,7 @@ ctrlc = { version = "3", features = ["termination"] }
 # `default-features = false` drops `vcpkg`, `pkg-config` and `download-lib`
 # (which puts `ureq` into the build script). All three only serve a linked,
 # non-bundled build; `duckdb` enables the `capi-v1` bindings itself.
-duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.20000.1", default-features = false, features = ["bundled-cmake", "appender-arrow", "vscalar", "r2d2"] }
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.20001.0", default-features = false, features = ["bundled-cmake", "appender-arrow", "vscalar", "r2d2"] }
 r2d2 = "0.8"
 flate2 = "1"
 # `import::prg` passes prg_convert's arrow `RecordBatch` into duckdb's Appender
@@ -62,7 +62,7 @@ assert_cmd = "2"
 # Must name the same source as the normal dependency above: a registry `duckdb`
 # alongside a git one would be two packages both declaring `links = "duckdb"`,
 # which cargo rejects outright.
-duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.20000.1", default-features = false, features = ["bundled-cmake"] }
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.20001.0", default-features = false, features = ["bundled-cmake"] }
 predicates = "3"
 tempfile = "3"
 tower = "0.5"
