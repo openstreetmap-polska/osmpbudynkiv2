@@ -30,14 +30,17 @@ jobs:
     name: cargo build & test (release)
     # Pinned, not `ubuntu-latest`: glibc and libstdc++ are backward- but not
     # forward-compatible, so the shipped binary runs only on a distro at least
-    # as new as the one that built it. `ubuntu-latest` is 24.04 (glibc 2.39,
-    # GLIBCXX_3.4.33) and produced a binary that would not start on the 22.04
-    # deployment target (glibc 2.35, GLIBCXX_3.4.30) -- it failed at exec with
-    # "version `GLIBC_2.38' not found", before `--version` could even print.
+    # as new as the one that built it. When the deployment target was 22.04
+    # (glibc 2.35, GLIBCXX_3.4.30), a 24.04-built binary (glibc 2.39,
+    # GLIBCXX_3.4.33) failed at exec with "version `GLIBC_2.38' not found",
+    # before `--version` could even print. The target is now Ubuntu 26.04
+    # (glibc 2.43, GLIBCXX_3.4.35, upgraded 2026-10-25), so 24.04 builds for
+    # it with headroom and outlives the 22.04 runner image, which GitHub
+    # retires around 22.04's end of standard support (April 2027).
     # DuckDB and RocksDB are what pull in libstdc++: both are compiled into the
     # binary but link the system C++ runtime dynamically. Move this pin only to
     # match the oldest distro actually deployed on, never to `latest`.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     # Cold, this job is dominated by DuckDB's CMake build on a 4-vCPU runner.
     # Warm, it is a few minutes. The ceiling is here so a hung build fails
     # instead of running into GitHub's 6-hour default.
