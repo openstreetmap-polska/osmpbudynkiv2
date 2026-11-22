@@ -80,10 +80,20 @@ RestartSec=5
 # Allocator tuning. This process contains *two* jemallocs -- DuckDB's prefixed
 # `duckdb_je_*` build and rust-rocksdb's unprefixed one, whose malloc/free
 # override glibc's and so back the entire Rust heap (see CLAUDE.md's jemalloc
-# gotcha). Both read this same MALLOC_CONF, so one line configures both.
+# gotcha). They read *different* variables, so this line configures only the
+# unprefixed one. DuckDB's is built with the `DUCKDB_JE_` prefix and reads
+# DUCKDB_JE_MALLOC_CONF instead, ignoring MALLOC_CONF entirely. Verified with
+# `stats_print:true`: under MALLOC_CONF only one allocator reports, carrying
+# these values. Without that variable DuckDB runs on the options it compiles
+# in: narenas = CPU count, dirty and muzzy decay 1 s, no background thread.
+# DuckDB 2.0.1 dropped muzzy to 0 (CVE-2026-97945, MADV_FREE'd pages zeroed
+# after reuse on some kernels). Those are sane defaults, so DuckDB's allocator
+# is deliberately left untuned here. On a pre-2.0.1 binary,
+# `Environment=DUCKDB_JE_MALLOC_CONF=muzzy_decay_ms:0` is the stopgap. It
+# overrides only the keys it names.
 #
-# Without it, both run at jemalloc's defaults -- notably `narenas` at 4x the
-# CPU count. jemalloc never migrates memory between arenas, so with 34 threads
+# Without the line below, the unprefixed jemalloc runs at jemalloc's
+# defaults -- notably `narenas` at 4x the CPU count. jemalloc never migrates memory between arenas, so with 34 threads
 # (8 pooled DuckDB connections, tokio workers, RocksDB background jobs) each
 # arena retains its own high-water mark independently and process RSS ratchets
 # upward under bursty allocation without ever coming back down. A production

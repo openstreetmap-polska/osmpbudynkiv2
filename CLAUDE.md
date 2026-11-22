@@ -31,7 +31,7 @@ installation — both are bundled.
 bundled copy renames its API to `duckdb_je_*` and serves DuckDB only;
 `rust-rocksdb`'s `jemalloc` feature pulls an *unprefixed* build whose
 `malloc`/`free` override glibc's, backing RocksDB, Rust's `alloc`, and
-everything non-DuckDB. Four load-bearing points:
+everything non-DuckDB. Five load-bearing points:
 
 1. **The `duckdb` git dep is deliberate; reverting it to crates.io silently
    drops DuckDB's jemalloc.** jemalloc lives in the `duckdb-sources` submodule,
@@ -49,6 +49,11 @@ everything non-DuckDB. Four load-bearing points:
 4. **`bundled-cmake` statically links the parquet extension.** This removes a
    runtime autoload dependency rather than changing behaviour.
    `DUCKDB_DISABLE_JEMALLOC=1` is the escape hatch for the DuckDB side only.
+5. **Runtime options are split the same way, silently.** `MALLOC_CONF` (the
+   unit's tuning line) reaches only the unprefixed jemalloc; DuckDB's reads
+   `DUCKDB_JE_MALLOC_CONF` and otherwise runs on options it compiles in. A
+   DuckDB option set through `MALLOC_CONF` is ignored with no warning.
+   Reasoning on `example.service`.
 
 **Gotcha — DuckDB's version stamp is the extension repository path.** DuckDB
 derives its version from `git describe`, which fails in cargo's tagless checkout,
