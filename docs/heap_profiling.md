@@ -31,13 +31,16 @@ the profile as evidence about DuckDB.
 
 ## Building
 
-**The binary must be built in the Ubuntu 22.04 container.** The deploy host
-(budynki.openstreetmap.org.pl) is Ubuntu 22.04 / **glibc 2.35**; a binary built
-on a newer distro links newer glibc symbol versions and dies at startup with a
-loader error, before any of this matters.
+**The binary must be built in the Ubuntu 24.04 container**, the same distro the
+release workflow builds on. The deploy host (budynki.openstreetmap.org.pl) is
+Ubuntu 26.04 / **glibc 2.43** since 2026-10-25 (22.04 / glibc 2.35 before). A
+binary built on a distro newer than the host links newer glibc symbol versions
+and dies at startup with a loader error, before any of this matters. Building
+on the developer's machine risks exactly that.
 
 ```bash
-./docker/build-profiling.sh          # builds osmpb-build:22.04 workload
+docker build -t osmpb-build:24.04 -f docker/build-ubuntu2404.Dockerfile docker   # once
+./docker/build-profiling.sh          # the build itself, inside osmpb-build:24.04
 ```
 
 That runs `cargo build --profile profiling --features heap-profiling` inside the
@@ -56,12 +59,12 @@ image. Two things it relies on:
 Verify the result before shipping it:
 
 ```bash
-# must print nothing above GLIBC_2.35
-objdump -T /mnt/nvme/osmpb-build/target/profiling/osmpbudynkiv2 \
+# must print nothing above GLIBC_2.43 (the host); 24.04 tops out at 2.39
+objdump -T /mnt/nvme/osmpb-build/target-24.04/profiling/osmpbudynkiv2 \
   | grep -oE 'GLIBC_[0-9.]+' | sort -V -u | tail -3
 
 # proof --enable-prof took effect on the RIGHT allocator (expect ~119, not 0)
-nm /mnt/nvme/osmpb-build/target/profiling/osmpbudynkiv2 | grep -cE '_rjem.*prof'
+nm /mnt/nvme/osmpb-build/target-24.04/profiling/osmpbudynkiv2 | grep -cE '_rjem.*prof'
 ```
 
 The second check is the one that matters, and it has to be spelled exactly like

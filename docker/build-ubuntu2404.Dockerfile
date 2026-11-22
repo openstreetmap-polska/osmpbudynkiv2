@@ -1,15 +1,23 @@
 # Build environment matching the production host.
 #
-# The deploy target (budynki.openstreetmap.org.pl) is **Ubuntu 22.04, glibc
-# 2.35**. A binary built on a newer distro links against newer glibc symbol
-# versions and fails to start there with a `GLIBC_2.3x not found` loader error
-# -- so every binary shipped to production must be built in here, not on the
-# developer's machine. Check what a built binary actually demands with:
+# Same distro as the release workflow's `runs-on: ubuntu-24.04` (glibc 2.39,
+# GLIBCXX_3.4.33), so a profiling build links what a release build links. The
+# deploy target (budynki.openstreetmap.org.pl) is **Ubuntu 26.04, glibc 2.43**
+# since 2026-10-25 (it was 22.04 / glibc 2.35 before). glibc and libstdc++ are
+# backward- but not forward-compatible: a binary built on a distro newer than
+# the host links newer symbol versions and fails to start with a
+# `GLIBC_2.xx not found` loader error. So a binary shipped to production is
+# built in here, not on the developer's machine, whose distro may be newer.
+# Check what a built binary actually demands with:
 #
 #   objdump -T target/... | grep -oE 'GLIBC_[0-9.]+' | sort -V -u | tail -1
 #
-# Anything above GLIBC_2.35 will not run on the server.
-FROM ubuntu:22.04
+# Anything above the host's glibc (2.43) will not run on the server.
+#
+# Build the image with:
+#
+#   docker build -t osmpb-build:24.04 -f docker/build-ubuntu2404.Dockerfile docker
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -34,8 +42,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Ubuntu 22.04 ships a rustc far too old for this crate's `edition = "2024"`
-# (needs >= 1.85), so install via rustup rather than apt.
+# Ubuntu's packaged rustc lags whatever `rust-toolchain.toml` asks for (22.04's
+# was too old even for this crate's `edition = "2024"`, which needs >= 1.85),
+# so install via rustup rather than apt.
 #
 # Installed to /usr/local rather than /root so the image can be run with
 # `--user $(id -u)`. That matters: the build bind-mounts the source tree to pick
